@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "molom"
+version = "0.1.0"
+description = "Standalone Avogadro-like molecule viewer/builder: ball-and-stick GL viewport with universal structure import"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Christian Nelle" },
+]
+keywords = [
+    "chemistry", "molecule", "viewer", "3d", "opengl", "ball-and-stick",
+    "xyz", "avogadro", "quantum chemistry",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Chemistry",
+]
+# Core runtime. rdkit/openbabel are OPTIONAL (SMILES + non-xyz formats degrade
+# gracefully without them, mirroring ORCA Workbench's tiering).
+dependencies = [
+    "numpy",
+    "PySide6",
+    "PyOpenGL",
+]
+
+[project.optional-dependencies]
+chem = ["rdkit", "openbabel-wheel"]
+
+[project.scripts]
+molom = "molom.__main__:main"
+
+[tool.setuptools]
+packages = ["molom", "molom.core", "molom.ui"]

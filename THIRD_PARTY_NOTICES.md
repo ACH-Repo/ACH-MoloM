@@ -1,0 +1,66 @@
+# Third-party notices
+
+## Avogadro 2 element data (BSD 3-Clause)
+
+`molom/core/elements.py` is transcoded from the Avogadro 2 libraries:
+
+- Source file: `avogadro/core/elementdata.h`
+  (https://github.com/OpenChemistry/avogadrolibs)
+- Data taken: element symbols, names, atomic masses, van der Waals radii,
+  covalent radii, and CPK-style display colours (119 entries: dummy + H..Og).
+- Behavioural constants replicated from the same project:
+  - Bond perception rule from `avogadro/core/molecule.cpp`
+    (`Molecule::perceiveBondsSimple`, tolerance 0.45 Å, minimum 0.32 Å).
+  - Ball-and-stick sizing from `avogadro/qtplugins/ballandstick/ballandstick.cpp`
+    (atom sphere = 0.3 x VdW radius, bond cylinder radius 0.1 Å,
+    double/triple-bond offsets and radius multipliers 1.3x / 1.15x).
+
+The Avogadro libraries are distributed under the BSD 3-Clause License:
+
+```
+Copyright 2011-2020 Kitware, Inc.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice,
+  this list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+* Neither the name of the copyright holder nor the names of its contributors
+  may be used to endorse or promote products derived from this software
+  without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+```
+
+### Underlying data references (cited in elementdata.h)
+
+- Van der Waals radii: S. Alvarez, *Dalton Trans.* **2013**, 42, 8617-8636.
+  doi:10.1039/C3DT50599E
+- Covalent radii: P. Pyykkö, M. Atsumi, *Chem. Eur. J.* **2009**, 15, 186-197.
+  doi:10.1002/chem.200800987
+- Colours: derived from the Jmol/CPK colour scheme
+  (http://jmol.sourceforge.net/jscolors/), with Avogadro's contrast tweaks
+  (H off-white, C 50% grey, F shifted blue).
+
+## ORCA Workbench (MIT)
+
+`molom/core/io.py` and `molom/core/_obabel_worker.py` are vendored ports of the
+universal structure-import cascade from ORCA Workbench
+(`orca_workbench/core/coords.py`, MIT License, same author). Changes made here
+should be considered for upstreaming and vice versa.
