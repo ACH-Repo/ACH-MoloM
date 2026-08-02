@@ -43,7 +43,25 @@ class MolObject:
         self.atom_label_text = {}    # idx -> custom label string
         self.atom_label_colors = {}  # idx -> (r, g, b) for the label text
         self.atom_label_modes = {}   # idx -> mode override
+        # Per-atom display, both sparse like the colours above. Essential for
+        # framework pictures: a MOF is unreadable until the hydrogens are off
+        # and the metal spheres are small enough not to burst their polyhedra.
+        self.atom_hidden = set()     # idx NOT drawn (still there, still real)
+        self.atom_scales = {}        # idx -> sphere-radius multiplier
         self.label_mode = "element"  # element | index | element_index | custom
+        # Set by the scene clock while playing: a FRACTIONAL frame position,
+        # or None to show the stored frame as-is. Display only — never
+        # written back into `structure.frames`.
+        self.play_position = None    # type: Optional[float]
+        self.play_rigid = True
+
+    def atom_scale_for(self, index):
+        # type: (int) -> float
+        return float(self.atom_scales.get(int(index), 1.0))
+
+    def element_indices(self, symbol):
+        # type: (str) -> list
+        return [i for i, s in enumerate(self.structure.symbols) if s == symbol]
 
     def label_mode_for(self, index):
         # type: (int) -> str
@@ -64,15 +82,32 @@ class MolObject:
             return "{}{}".format(sym, i)
         return sym
 
+    def display_coords(self):
+        # type: () -> np.ndarray
+        """Coordinates to DRAW: the stored frame, or an interpolated blend of
+        two frames while the timeline sits between them.
+
+        `play_position` is set by the scene clock each tick and is display-only
+        — the stored frames are never overwritten, so scrubbing a trajectory
+        cannot damage it and editing still works on real frame data.
+        """
+        s = self.structure
+        if self.play_position is None or s.n_frames < 2:
+            return s.coords
+        from . import interpolate
+        return interpolate.coords_at(s.frames, self.play_position,
+                                     rigid=self.play_rigid)
+
     def evaluated(self):
         # type: () -> tuple
         """(symbols, coords, bonds) after the modifier stack. Display and
         export use this; editing, picking and the force field use the base
         structure, so a 3000-atom slab still edits like one unit cell."""
         s = self.structure
+        coords = self.display_coords()
         if not modifiers.stack_is_active(self.modifiers):
-            return s.symbols, s.coords, s.bonds
-        return modifiers.evaluate_stack(self.modifiers, s.symbols, s.coords,
+            return s.symbols, coords, s.bonds
+        return modifiers.evaluate_stack(self.modifiers, s.symbols, coords,
                                         s.bonds)
 
     def apply_modifiers(self):

@@ -123,6 +123,43 @@ class Structure:
         return float((d + vdw).max())
 
     # ---------------------------------------------------------------- bonds
+    def connected_component(self, seeds):
+        # type: (list) -> set
+        """Every atom reachable by bonds from `seeds` (the seeds included).
+
+        Edit mode uses this to keep an operation on the fragment you are
+        actually working on: a molecule object can hold several disconnected
+        pieces (a metal centre and a ligand you have not bonded yet), and
+        aligning or dropping "the selection" should not drag an unrelated
+        piece along with it.
+        """
+        adjacency = {}
+        for bond in self.bonds:
+            a, b = int(bond[0]), int(bond[1])
+            adjacency.setdefault(a, []).append(b)
+            adjacency.setdefault(b, []).append(a)
+        seen = set()
+        stack = [int(s) for s in seeds]
+        while stack:
+            i = stack.pop()
+            if i in seen or not (0 <= i < self.n_atoms):
+                continue
+            seen.add(i)
+            stack.extend(adjacency.get(i, ()))
+        return seen
+
+    def fragments(self):
+        # type: () -> list
+        """All disconnected pieces, each a sorted list of atom indices."""
+        remaining = set(range(self.n_atoms))
+        out = []
+        while remaining:
+            seed = min(remaining)
+            piece = self.connected_component([seed])
+            out.append(sorted(piece))
+            remaining -= piece
+        return out
+
     def bonded_neighbors(self, i):
         # type: (int) -> List[int]
         out = []

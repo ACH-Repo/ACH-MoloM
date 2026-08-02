@@ -7,7 +7,9 @@ distinction is the whole point — an adsorption surface can be 40x40 unit
 cells on screen and export as 3200 atoms while you still edit the one unit
 cell that generates it.
 
-Only the array modifier for now. `apply` on the object bakes the result into
+Two so far: ARRAY (copies on a lattice) and SYMMETRY (a crystal's space-group
+operations, so the base molecule stays the asymmetric unit you edit while the
+viewport shows the full cell). `apply` on the object bakes the result into
 real atoms and drops the modifier, exactly like Blender's Apply.
 """
 
@@ -82,7 +84,58 @@ class ArrayModifier(Modifier):
         return d
 
 
-_KINDS = {"array": ArrayModifier}
+class SymmetryModifier(Modifier):
+    """Apply a crystal's symmetry operations, non-destructively.
+
+    The asym/cell/packing switch on the ❖ page REBUILDS the atom list, which
+    means the asymmetric unit you were editing is gone until you switch back.
+    As a modifier the base molecule stays the asymmetric unit — the thing you
+    actually edit — while the viewport and the exporter see the full cell.
+    That is the same bargain the array modifier makes for a slab.
+
+    The cell and the operations come from the structure's metadata, so this
+    modifier carries only the switches; it is not a place to store
+    crystallography twice.
+    """
+
+    kind = "symmetry"
+
+    def __init__(self, cell=None, symops=None, na=1, nb=1, nc=1,
+                 name="", enabled=True):
+        super().__init__(name or "Symmetry", enabled)
+        self.cell = cell                 # dict, as stored in metadata
+        self.symops = list(symops or [])
+        self.na, self.nb, self.nc = int(na), int(nb), int(nc)
+
+    def evaluate(self, symbols, coords, bonds):
+        from . import cif as cif_mod
+        if not self.cell or not self.symops:
+            return symbols, coords, bonds
+        try:
+            cell = cif_mod.Cell.from_dict(self.cell)
+            ops = [cif_mod.SymOp.from_xyz(t) for t in self.symops]
+        except (KeyError, TypeError, ValueError, cif_mod.CifError):
+            return symbols, coords, bonds
+        frac = cell.to_fractional(np.asarray(coords, dtype=float))
+        out_symbols, out_coords = cif_mod.build_view(
+            cell, list(symbols), frac, ops,
+            mode="packing" if max(self.na, self.nb, self.nc) > 1 else "cell",
+            na=self.na, nb=self.nb, nc=self.nc)
+        if not out_symbols:
+            return symbols, coords, bonds
+        # Bonds are NOT carried: the copies are new atoms whose connectivity
+        # is a perception job, and guessing it here would be wrong at the
+        # cell faces anyway (see the framework note in core/cif.py).
+        return out_symbols, np.asarray(out_coords), []
+
+    def to_dict(self):
+        d = super().to_dict()
+        d.update({"cell": self.cell, "symops": list(self.symops),
+                  "na": self.na, "nb": self.nb, "nc": self.nc})
+        return d
+
+
+_KINDS = {"array": ArrayModifier, "symmetry": SymmetryModifier}
 
 
 def from_dict(d):
@@ -94,6 +147,11 @@ def from_dict(d):
         return ArrayModifier(d.get("count", 3), d.get("offset", (5, 0, 0)),
                              d.get("relative", False), d.get("name", ""),
                              d.get("enabled", True))
+    if cls is SymmetryModifier:
+        return SymmetryModifier(d.get("cell"), d.get("symops"),
+                                d.get("na", 1), d.get("nb", 1),
+                                d.get("nc", 1), d.get("name", ""),
+                                d.get("enabled", True))
     return None
 
 

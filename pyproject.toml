@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "molom"
-version = "0.1.0"
+version = "0.2.0"
 description = "Standalone Avogadro-like molecule viewer/builder: ball-and-stick GL viewport with universal structure import"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -29,6 +29,9 @@ dependencies = [
     "numpy",
     "PySide6",
     "PyOpenGL",
+    # Animation export. Ships a STATIC ffmpeg binary, so there is no system
+    # install and no PATH hunting; a system ffmpeg is used if present.
+    "imageio-ffmpeg",
 ]
 
 [project.optional-dependencies]

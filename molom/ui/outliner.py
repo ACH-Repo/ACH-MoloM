@@ -15,12 +15,12 @@ and looking costs nothing.
 
 from typing import Optional
 
-from PySide6.QtCore import QEvent, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, Qt, Signal
 from PySide6.QtGui import QAction, QBrush, QColor
-from PySide6.QtWidgets import (QColorDialog, QComboBox, QHBoxLayout,
-                               QInputDialog, QLabel, QMenu, QToolButton,
-                               QTreeWidget, QTreeWidgetItem, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox,
+                               QHBoxLayout, QHeaderView, QInputDialog,
+                               QLabel, QMenu, QToolButton, QTreeWidget,
+                               QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from ..core import elements
 from ..core import style as style_mod
@@ -37,6 +37,95 @@ ROLE_ATOM = Qt.UserRole + 2
 # Short codes for the label-type square
 _MODE_CODE = {"element": "El", "index": "#", "element_index": "E#",
               "custom": "✎"}
+
+
+class CrystalControls(QWidget):
+    """The per-`.cif` switches that hang off a crystal's outliner row.
+
+    Only crystals get these — an ordinary molecule has no unit cell to show
+    and no asymmetric unit to fall back to, so the row would be lying. The
+    same pattern is the obvious home for future per-object kinds (a protein's
+    chains, say): the controls that are UNIQUE to a kind of object belong on
+    that object's row, and "Advanced" hands off to the full page while
+    remembering which object it came from.
+
+    Changes apply IMMEDIATELY. An Apply button on a two-state switch just
+    adds a step between deciding and seeing.
+    """
+
+    view_changed = Signal(int, str)      # obj_id, mode
+    box_toggled = Signal(int, bool)
+    poly_toggled = Signal(int, bool)
+    advanced = Signal(int)
+
+    def __init__(self, obj_id, mode="cell", show_box=True, show_poly=False,
+                 parent=None):
+        super().__init__(parent)
+        self.obj_id = int(obj_id)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(2, 0, 2, 0)
+        lay.setSpacing(2)          # this row shares width with a narrow dock
+        self._loading = True
+
+        # SHORT labels: this row shares its width with the tree. The full
+        # explanation lives in the tooltip, where it costs no space.
+        self.box_check = QCheckBox("Cell", self)
+        self.box_check.setChecked(bool(show_box))
+        self.box_check.setToolTip("Show the unit cell box for this crystal")
+        self.box_check.toggled.connect(
+            lambda v: None if self._loading
+            else self.box_toggled.emit(self.obj_id, bool(v)))
+
+        self.poly_check = QCheckBox("Poly", self)
+        self.poly_check.setChecked(bool(show_poly))
+        self.poly_check.setToolTip(
+            "Coordination polyhedra — draw a translucent solid through the "
+            "donor atoms around each metal centre, the usual way MOFs and "
+            "framework structures are shown")
+        self.poly_check.toggled.connect(
+            lambda v: None if self._loading
+            else self.poly_toggled.emit(self.obj_id, bool(v)))
+
+        self.asym_check = QCheckBox("Asym", self)
+        self.asym_check.setToolTip(
+            "Asymmetric unit — only the sites the file lists, before any "
+            "symmetry operation is applied")
+        self.full_check = QCheckBox("Full", self)
+        self.full_check.setToolTip(
+            "Full unit cell — every symmetry operation applied to fill it")
+        self.asym_check.setChecked(mode == "asym")
+        self.full_check.setChecked(mode != "asym")
+        self.asym_check.toggled.connect(
+            lambda v: self._pick("asym" if v else "cell"))
+        self.full_check.toggled.connect(
+            lambda v: self._pick("cell" if v else "asym"))
+
+        self.adv_button = QToolButton(self)
+        self.adv_button.setText("⋯")
+        self.adv_button.setAutoRaise(True)
+        self.adv_button.setToolTip(
+            "Open the unit-cell page for this crystal (packing, supercell, "
+            "cell parameters)")
+        self.adv_button.clicked.connect(
+            lambda: self.advanced.emit(self.obj_id))
+
+        for w in (self.box_check, self.poly_check, self.asym_check,
+                  self.full_check, self.adv_button):
+            w.setStyleSheet("QCheckBox { spacing: 3px; }")
+            lay.addWidget(w)
+        lay.addStretch(1)
+        self._loading = False
+
+    def _pick(self, mode):
+        """The two content checkboxes are exclusive but read better than
+        radio buttons in a row this narrow."""
+        if self._loading:
+            return
+        self._loading = True
+        self.asym_check.setChecked(mode == "asym")
+        self.full_check.setChecked(mode == "cell")
+        self._loading = False
+        self.view_changed.emit(self.obj_id, mode)
 
 
 class RowControls(QWidget):
@@ -69,10 +158,81 @@ class RowControls(QWidget):
         self.label_btn.clicked.connect(self._toggle_label)
         self.mode_btn = self._square("Label type")
         self.mode_btn.clicked.connect(self._pick_mode)
-        for b in (self.colour_btn, self.label_btn, self.mode_btn):
+        # Show/hide and per-element sphere size: without these a MOF cannot
+        # be drawn properly — the hydrogens bury the framework and the metal
+        # spheres burst out of their own coordination polyhedra.
+        self.show_btn = self._square(
+            "Show / hide these atoms in the viewport")
+        self.show_btn.clicked.connect(self._toggle_shown)
+        self.size_btn = self._square(
+            "Sphere size for these atoms — click for a slider")
+        self.size_btn.clicked.connect(self._pick_size)
+        for b in (self.colour_btn, self.show_btn, self.size_btn,
+                  self.label_btn, self.mode_btn):
             lay.addWidget(b)
         lay.addStretch(1)
         self.refresh()
+
+    def _toggle_shown(self):
+        obj, rows = self._obj, self._rows
+        hidden = sum(1 for i in rows if i in obj.atom_hidden)
+        show = hidden > len(rows) // 2      # mixed -> show them all
+        for i in rows:
+            if show:
+                obj.atom_hidden.discard(i)
+            else:
+                obj.atom_hidden.add(i)
+        self.refresh()
+        self.changed.emit()
+
+    def _pick_size(self):
+        """A slider in a popup, right under the square that opened it —
+        judging a sphere size means watching the viewport while you drag."""
+        from PySide6.QtWidgets import QSlider, QHBoxLayout, QFrame
+        popup = QFrame(self, Qt.Popup)
+        popup.setStyleSheet(
+            "QFrame { background: rgba(44,44,44,246); border: 1px solid"
+            " rgba(0,0,0,140); border-radius: 5px; }"
+            "QLabel { color: #dcdcdc; font-size: 11px; }")
+        row = QHBoxLayout(popup)
+        row.setContentsMargins(7, 4, 7, 4)
+        obj, rows = self._obj, self._rows
+        current = obj.atom_scale_for(rows[0])
+        slider = QSlider(Qt.Horizontal, popup)
+        slider.setRange(5, 300)                 # 0.05x .. 3.00x
+        slider.setValue(int(round(current * 100)))
+        slider.setFixedWidth(150)
+        readout = QLabel("{:.2f}x".format(current), popup)
+        readout.setMinimumWidth(40)
+
+        def apply(value):
+            scale = value / 100.0
+            readout.setText("{:.2f}x".format(scale))
+            for i in rows:
+                if abs(scale - 1.0) < 1e-6:
+                    obj.atom_scales.pop(i, None)
+                else:
+                    obj.atom_scales[i] = scale
+            self.refresh()
+            self.changed.emit()
+
+        slider.valueChanged.connect(apply)
+        row.addWidget(QLabel("Size", popup))
+        row.addWidget(slider)
+        row.addWidget(readout)
+        popup.adjustSize()
+        # Anchored on its RIGHT edge: the outliner lives against the right
+        # side of the window, so a popup growing rightwards runs off screen.
+        anchor = self.size_btn.mapToGlobal(self.size_btn.rect().bottomRight())
+        pos = anchor - QPoint(popup.width(), 0)
+        screen = self.screen().availableGeometry() if self.screen() else None
+        if screen is not None:
+            pos.setX(max(screen.left() + 2,
+                         min(pos.x(), screen.right() - popup.width() - 2)))
+            pos.setY(max(screen.top() + 2,
+                         min(pos.y(), screen.bottom() - popup.height() - 2)))
+        popup.move(pos)
+        popup.show()
 
     def _square(self, tip):
         b = QToolButton(self)
@@ -103,11 +263,39 @@ class RowControls(QWidget):
         on = sum(1 for i in rows if i in obj.atom_labels)
         state = "all" if on == len(rows) else ("some" if on else "none")
         fill = {"all": "#4a7ab0", "some": "#3d556e", "none": "rgba(255,255,255,18)"}
-        self.label_btn.setText({"all": "A", "some": "–", "none": ""}[state])
+        self.label_btn.setText({"all": "L", "some": "l", "none": "L"}[state])
         self.label_btn.setStyleSheet(
             "QToolButton {{ background: {}; border: 1px solid #1a1a1a;"
             " border-radius: 2px; color: #eee; font-size: 8px; }}".format(
                 fill[state]))
+
+        # H = these are shown (click to Hide), S = these are hidden (click to
+        # Show). A letter, not a glyph: an unlabelled square is a guess.
+        hidden = sum(1 for i in rows if i in obj.atom_hidden)
+        vis = "none" if hidden == len(rows) else ("some" if hidden else "all")
+        self.show_btn.setText({"all": "H", "some": "h", "none": "S"}[vis])
+        self.show_btn.setToolTip(
+            "Show these atoms again" if vis == "none"
+            else "Hide these atoms in the viewport")
+        self.show_btn.setStyleSheet(
+            "QToolButton {{ background: {}; border: 1px solid #1a1a1a;"
+            " border-radius: 2px; color: #eee; font-size: 8px; }}".format(
+                {"all": "rgba(255,255,255,18)", "some": "#3d556e",
+                 "none": "#6b3a3a"}[vis]))
+
+        # R = radius, replaced by the multiplier once it is not 1.
+        scales = {round(obj.atom_scale_for(i), 2) for i in rows}
+        if len(scales) == 1:
+            value = next(iter(scales))
+            size_text = "R" if abs(value - 1.0) < 1e-6 else "{:g}".format(value)
+            custom = abs(value - 1.0) > 1e-6
+        else:
+            size_text, custom = "~", True
+        self.size_btn.setText(size_text)
+        self.size_btn.setStyleSheet(
+            "QToolButton {{ background: {}; border: 1px solid #1a1a1a;"
+            " border-radius: 2px; color: #ddd; font-size: 8px; }}".format(
+                "#3d556e" if custom else "rgba(255,255,255,18)"))
 
         modes = {obj.label_mode_for(i) for i in rows}
         code = _MODE_CODE.get(next(iter(modes)), "?") if len(modes) == 1 \
@@ -205,6 +393,11 @@ class OutlinerPanel(QWidget):
     merge_requested = Signal(list)
     atom_display_changed = Signal()          # colours / labels edited
     atom_picked = Signal(int, int)           # obj_id, atom index
+    crystal_view_changed = Signal(int, str)  # obj_id, 'asym' | 'cell'
+    crystal_box_toggled = Signal(int, bool)
+    crystal_poly_toggled = Signal(int, bool)
+    crystal_advanced = Signal(int)           # open the unit-cell page
+    objects_selected = Signal(list)          # every molecule row selected
 
     EYE_COLUMN = 1
 
@@ -228,18 +421,30 @@ class OutlinerPanel(QWidget):
         self.tree.setColumnCount(3)
         self.tree.setHeaderLabels(["Molecule / atom", "", "Style"])
         self.tree.setSelectionMode(QTreeWidget.ExtendedSelection)
-        self.tree.header().setStretchLastSection(False)
-        self.tree.header().resizeSection(0, 168)
-        self.tree.header().resizeSection(1, 26)
-        self.tree.header().resizeSection(2, 96)
+        # The NAME column stretches; the eye and style columns are fixed.
+        # All three used to be fixed pixel widths totalling 290 px, so any
+        # dock narrower than that pushed the Style column out of reach behind
+        # a horizontal scrollbar — the per-molecule display settings simply
+        # could not be clicked. A stretching first column always fits.
+        head = self.tree.header()
+        head.setStretchLastSection(False)
+        head.setSectionResizeMode(0, QHeaderView.Stretch)
+        head.setSectionResizeMode(1, QHeaderView.Fixed)
+        head.setSectionResizeMode(2, QHeaderView.Fixed)
+        head.resizeSection(1, 26)
+        head.resizeSection(2, 96)
+        head.setMinimumSectionSize(22)
+        self.tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         lay.addWidget(self.tree, 1)
 
         self._loading = False
+        self.show_cell_box = True
         self._paint_state = None
         self._scene = None
         self._controls = []          # live RowControls, refreshed together
         self.tree.itemChanged.connect(self._on_item_changed)
         self.tree.itemClicked.connect(self._on_item_clicked)
+        self.tree.itemSelectionChanged.connect(self._on_selection_changed)
         self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         self.tree.itemExpanded.connect(self._on_expanded)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -286,6 +491,7 @@ class OutlinerPanel(QWidget):
                 lambda _i, oid=obj.id, c=combo:
                 self.style_changed.emit(oid, c.currentData()))
             self.tree.setItemWidget(item, 2, combo)
+            self._add_crystal_row(item, obj)
             self._add_element_groups(item, obj)
             if obj.id == active_id:
                 item.setSelected(True)
@@ -297,6 +503,32 @@ class OutlinerPanel(QWidget):
         self._restore_expanded(expanded)
         self._loading = False
         self._sync_label_combo(active_id)
+
+    def _add_crystal_row(self, parent_item, obj):
+        """A crystal gets one extra child row carrying its own switches.
+
+        Nothing is added for an ordinary molecule, so the outliner never
+        grows controls that cannot do anything.
+        """
+        if not (obj.structure.metadata or {}).get("cell"):
+            return
+        row = QTreeWidgetItem(["", "", ""])
+        row.setData(0, ROLE_KIND, "crystal")
+        row.setData(0, ROLE_OBJ, obj.id)
+        row.setFlags(Qt.ItemIsEnabled)
+        parent_item.addChild(row)
+        controls = CrystalControls(
+            obj.id,
+            mode=(obj.structure.metadata or {}).get("cell_view", "cell"),
+            show_box=self.show_cell_box,
+            show_poly=bool((obj.structure.metadata or {}).get("polyhedra")))
+        controls.view_changed.connect(self.crystal_view_changed)
+        controls.box_toggled.connect(self.crystal_box_toggled)
+        controls.poly_toggled.connect(self.crystal_poly_toggled)
+        controls.advanced.connect(self.crystal_advanced)
+        # Spanned: these are wider than the name column.
+        row.setFirstColumnSpanned(True)
+        self.tree.setItemWidget(row, 0, controls)
 
     def _add_element_groups(self, parent, obj):
         """One collapsed row per element; atoms are filled in on expand so a
@@ -425,10 +657,27 @@ class OutlinerPanel(QWidget):
         if kind == "add":
             self.add_requested.emit()
         elif kind == "object":
-            self.activated.emit(self._obj_id(item))
+            # Qt changes the selection on PRESS and emits itemClicked on
+            # RELEASE, so this ran last and collapsed a Ctrl/Shift selection
+            # back to the one row clicked. Respect what is actually selected.
+            chosen = self.selected_object_ids()
+            if len(chosen) > 1:
+                self.objects_selected.emit(list(chosen))
+            else:
+                self.activated.emit(self._obj_id(item))
         elif kind == "atom":
             self.atom_picked.emit(self._obj_id(item),
                                   int(item.data(0, ROLE_ATOM)))
+
+    def _on_selection_changed(self):
+        """Ctrl/Shift-selecting several molecule rows selects them ALL in the
+        viewport, so they can be grabbed and moved as a group — picking each
+        one by Shift+double-click in the 3D view was the only way before."""
+        if self._loading:
+            return
+        chosen = self.selected_object_ids()
+        if len(chosen) > 1:
+            self.objects_selected.emit(list(chosen))
 
     def _on_item_double_clicked(self, item, column):
         if column == 0 and self._kind(item) == "object":
@@ -545,11 +794,23 @@ class OutlinerPanel(QWidget):
         return out
 
     def highlight(self, obj_id):
+        """Make this the CURRENT row without destroying a multi-selection.
+
+        Plain `setCurrentItem` clears the selection and selects one row, so
+        Ctrl/Shift-picking several molecules was undone the moment the app
+        synced the active object back. If the row is already part of the
+        selection, only the current index moves.
+        """
+        from PySide6.QtCore import QItemSelectionModel
         for k in range(self.tree.topLevelItemCount()):
             item = self.tree.topLevelItem(k)
             if self._obj_id(item) == obj_id and self._kind(item) == "object":
                 self._loading = True
-                self.tree.setCurrentItem(item)
+                if item.isSelected():
+                    self.tree.setCurrentItem(item, 0,
+                                             QItemSelectionModel.NoUpdate)
+                else:
+                    self.tree.setCurrentItem(item)
                 self._loading = False
                 self._sync_label_combo(obj_id)
                 return

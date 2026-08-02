@@ -14,15 +14,20 @@ from PySide6.QtCore import QEvent, QSettings, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
-    QMainWindow, QMessageBox, QSlider, QSpinBox, QToolButton, QVBoxLayout,
-    QWidget,
+    QMainWindow, QMenu, QMessageBox, QSlider, QSpinBox, QToolButton,
+    QVBoxLayout, QWidget,
 )
 
 from .. import __version__
 from ..core import align as align_mod
 from ..core import build as build_mod
 from ..core import modifiers as modifiers_mod
-from ..core import bonding, edits, io, measure, project, rotations
+from ..core import bonding, edits, input_map, io, measure, project, rotations
+from ..core import cif as cif_mod
+from ..core import templates as tpl_mod
+from ..core import vibrations as vib_mod
+from ..core import timeline as timeline_mod
+from ..core import meta as meta_mod
 from ..core.camera import quat_from_mat3, quat_to_mat3
 from ..core import resolve as resolve_mod
 from ..core.ops import OperatorRegistry
@@ -30,15 +35,25 @@ from ..core.scene import Scene
 from ..core.structure import Structure
 from ..core import style as style_mod
 from ..core.undo import UndoStack
-from .dialogs import OperatorSearchDialog, ResolveNameDialog, SettingsDialog
+from .choice_popup import ChoicePopup
+from .dialogs import (MetaAtomDialog, OperatorSearchDialog, ResolveNameDialog,
+                      SettingsDialog)
 from .optimize_panel import OptimizeDock, OptimizeWorker, TASK_SELECTION
-from .properties import ModifierPage, PropertiesDock
+from .properties import (CrystalPage, ModifierPage,
+                         PropertiesDock, VibrationPage)
+from .timeline_panel import TimelinePanel
 from .toolbar import ViewportToolbar
 from .outliner import OutlinerPanel
+from .periodic_table import PeriodicTablePanel
 from .transform_panel import TransformDock
-from .viewport import MODE_EDIT, MODE_OBJECT, MolViewport
+from .viewport import (MODE_EDIT, MODE_OBJECT, MolViewport, cell_of,
+                       set_cell_reference)
 
 _MAX_RECENT = 8
+# Height reserved at the top of the viewport for the edit-mode header banner
+# (MolViewport._paint_edit_header draws it at y = 8). Floating overlays start
+# below this so they never cover the molecule's name.
+_VIEWPORT_HEADER_H = 36
 
 
 def apply_dark_theme(app):
@@ -87,6 +102,11 @@ class MainWindow(QMainWindow):
         self._repeat_macro = None        # {"delta"} after D + move
         self._macro_serial = -1          # viewport transform_serial it came from
         self._dup_grab_active = False
+        self._modes = {}          # obj_id -> [vibrations.Mode]
+        self._rest_geometry = {}  # obj_id -> equilibrium coords
+        self._active_mode = {}    # obj_id -> mode index playing
+        self._mode_amplitude = {} # obj_id -> Angstrom
+        self._mode_frames = {}    # obj_id -> frames per period
 
         self.viewport = MolViewport(self)
         self.viewport.set_scene(self.scene)
@@ -94,6 +114,8 @@ class MainWindow(QMainWindow):
             self.settings.value("rotate_speed", 1.0))
         self.viewport.precision_factor = float(
             self.settings.value("precision_factor", 0.5))
+        self.viewport.set_input_preset(
+            self.settings.value("input_preset", input_map.PRESET_AUTO))
         self.viewport.selection_changed.connect(self._on_selection_changed)
         self.viewport.status_message.connect(
             lambda t: self.statusBar().showMessage(t, 4000))
@@ -111,9 +133,16 @@ class MainWindow(QMainWindow):
             lambda: self.viewport.toggle_mode(self.active_id)
         self.viewport.set_atom_scale(
             float(self.settings.value("atom_scale", 0.9)))
+        self.viewport.label_scale = float(
+            self.settings.value("label_scale", 1.0))
         self.viewport.adjust_h = self.settings.value(
             "adjust_hydrogens", "true") in (True, "true")
 
+        # ONE clock for the whole scene: every trajectory runs off this
+        # playhead, so several can play together.
+        self.timeline = timeline_mod.Timeline()
+        self._rigid_interp = self.settings.value(
+            "rigid_interpolation", "true") in (True, "true")
         self._play_timer = QTimer(self)
         self._play_timer.timeout.connect(self._advance_frame)
 
@@ -139,6 +168,13 @@ class MainWindow(QMainWindow):
         self.outliner.activated.connect(self._on_obj_activated)
         self.outliner.add_requested.connect(self.on_outliner_add)
         self.outliner.merge_requested.connect(self.on_merge_ids)
+        self.outliner.crystal_view_changed.connect(self._on_crystal_row_view)
+        self.outliner.crystal_box_toggled.connect(
+            lambda _oid, on: self._set_cell_box(on))
+        self.outliner.crystal_poly_toggled.connect(self._on_crystal_poly)
+        self.outliner.crystal_advanced.connect(self._on_crystal_advanced)
+        self.outliner.objects_selected.connect(
+            self.viewport.select_whole_molecules)
 
         # The N panel lives along the BOTTOM edge: it pops in and out like
         # the outliner without competing with it for width.
@@ -153,6 +189,20 @@ class MainWindow(QMainWindow):
         # Blender's properties editor: one dock, a vertical tab strip, and a
         # page per topic. The force-field panel lives in it as a page rather
         # than competing for the same edge.
+        self.vibration_page = VibrationPage()
+        self.vibration_page.mode_selected.connect(self.on_animate_mode)
+        self.vibration_page.mode_settings.connect(self._on_mode_settings)
+        self.crystal_page = CrystalPage()
+        self.crystal_page.view_changed.connect(self.on_crystal_view)
+        self.crystal_page.box_toggled.connect(self._set_cell_box)
+        self.crystal_page.poly_check.toggled.connect(
+            lambda on: self._set_obj_flag("polyhedra", on))
+        self.crystal_page.sym_check.toggled.connect(
+            lambda on: self._set_obj_flag("show_symmetry", on))
+        self.crystal_page.ghost_check.toggled.connect(
+            lambda on: self._set_obj_flag("show_ghosts", on))
+        for _key, _box in self.crystal_page.kind_checks.items():
+            _box.toggled.connect(lambda _on: self._sync_symmetry_kinds())
         self.modifier_page = ModifierPage()
         self.modifier_page.changed.connect(self._on_modifiers_changed)
         self.modifier_page.add_requested.connect(self.on_add_modifier)
@@ -164,6 +214,10 @@ class MainWindow(QMainWindow):
         self.properties = PropertiesDock(
             [("outliner", "🗂", "Scene outliner", self.outliner),
              ("modifiers", "🔧", "Modifiers", self.modifier_page),
+             ("crystal", "❖", "Unit cell / crystal (CIF)",
+              self.crystal_page),
+             ("vibrations", "∿", "Vibrational normal modes (ORCA FREQ)",
+              self.vibration_page),
              ("forcefield", "⚛", "Force field",
               self.optimize_panel.widget())], self)
         self.addDockWidget(Qt.RightDockWidgetArea, self.properties)
@@ -193,15 +247,32 @@ class MainWindow(QMainWindow):
 
         # Blender's T-panel: a floating tool column over the viewport itself.
         self.toolbar = ViewportToolbar(self.viewport)
-        self.toolbar.move(8, 8)
+        # Below the edit-mode header band, not beside it: at y = 8 the first
+        # button sat ON TOP of "EDIT | <name> | draw: X", which read as the
+        # header text being clipped.
+        self.toolbar.move(8, _VIEWPORT_HEADER_H + 8)
         self.toolbar.tool_clicked.connect(self._on_tool_clicked)
         self.toolbar.set_enabled_tools(False)
         self.toolbar.show()
-        self.viewport.on_tool_changed = lambda on: self.toolbar.set_active(
-            "draw" if on else "select")
+        self.viewport.on_tool_changed = self._on_draw_tool_changed
+        self.viewport.on_measure_changed = self._on_measure_changed
+
+        # Avogadro's element picker, floating just right of the tool column.
+        # Edit mode only, and only with the draw tool OFF — see _sync_ptable.
+        self.ptable = PeriodicTablePanel(self.viewport)
+        self.ptable.element_picked.connect(self.viewport.apply_element)
+        self.ptable.meta_atom_requested.connect(self.on_meta_atom)
+        self.ptable.set_current(self.viewport.draw_element)
+        self.ptable.hide()
+        self.viewport.on_element_changed = self.ptable.set_current
+
+        # Both data-dependent tabs start greyed; nothing is loaded yet.
+        self._sync_crystal_page()
+        self._sync_vibration_page()
 
         self.ops = OperatorRegistry()
         self._register_operators()
+        self._install_shortcuts()
         self._build_menus()
         self._build_statusbar()
         self.setAcceptDrops(True)
@@ -246,18 +317,19 @@ class MainWindow(QMainWindow):
         has_active = lambda ctx: ctx._active_obj() is not None
 
         r("open", "Open structure file or project...", lambda c: c.on_open(),
-          category="File", shortcut="Ctrl+O")
+          category="File", shortcut="Ctrl+O", key="Ctrl+O")
         r("save_project", "Save project (savepoint)",
           lambda c: c.on_save_project(), enabled=has_obj, category="File",
-          shortcut="Ctrl+S")
+          shortcut="Ctrl+S", key="Ctrl+S")
         r("save_project_as", "Save project as...",
           lambda c: c.on_save_project_as(), enabled=has_obj, category="File",
-          shortcut="Ctrl+Shift+P")
+          shortcut="Ctrl+Shift+P", key="Ctrl+Shift+P")
         r("import_name", "Import molecule by name...",
           lambda c: c.on_import_by_name(), category="File",
-          shortcut="Ctrl+Shift+N")
+          shortcut="Ctrl+Shift+N", key="Ctrl+Shift+N")
         r("from_smiles", "Add molecule from SMILES...",
-          lambda c: c.on_from_smiles(), category="File", shortcut="F3 only")
+          lambda c: c.on_from_smiles(), category="File",
+          shortcut="File menu / F3")
         r("copy_smiles", "Copy SMILES of the selected molecule to clipboard",
           lambda c: c.on_copy_smiles(), enabled=sel, category="Molecule")
         r("name_from_structure", "Name molecule from its structure (PubChem)",
@@ -270,67 +342,81 @@ class MainWindow(QMainWindow):
           category="Molecule",
           aliases=("join", "combine", "unite"))
         r("paste", "Paste XYZ / SMILES", lambda c: c.on_paste(),
-          category="File", shortcut="Ctrl+V")
+          category="File", shortcut="Ctrl+V", key="Ctrl+V")
         r("save_as", "Export geometry (visible molecules)...",
           lambda c: c.on_save_as(), enabled=has_obj, category="File",
-          shortcut="Ctrl+E")
+          shortcut="Ctrl+E", key="Ctrl+E")
         r("export_image", "Export image (PNG snapshot of the viewport)...",
           lambda c: c.on_export_image(), enabled=has_obj, category="File",
-          shortcut="Ctrl+Shift+E")
+          shortcut="Ctrl+Shift+E", key="Ctrl+Shift+E")
         r("clear_scene", "Clear scene (remove all molecules)",
           lambda c: c.on_clear_scene(), enabled=has_obj, category="File")
 
         r("select_all", "Select all", lambda c: c.on_select_all(),
-          enabled=has_obj, category="Select", shortcut="Ctrl+A")
+          enabled=has_obj, category="Select", shortcut="Ctrl+A",
+          key="Ctrl+A")
         r("clear_selection", "Clear selection",
-          lambda c: c.viewport.set_selection([]), enabled=sel,
-          category="Select", shortcut="Alt+A (or Esc)")
+          lambda c: c.on_deselect_all(), enabled=sel,
+          category="Select", shortcut="Alt+A (or Esc)", key="Alt+A")
+        r("cancel", "Clear selection / cancel the active mode",
+          lambda c: c.on_escape(), category="Select", shortcut="Esc",
+          key="Esc", aliases=("escape", "abort"))
+        # E is a normal operator key again (round 20): elements are picked
+        # from the periodic table, so edit mode no longer needs to swallow
+        # letters and nothing competes for it.
         r("toggle_draw", "Draw tool on / off (edit mode)",
           lambda c: c.viewport.set_draw_tool(not c.viewport.draw_tool_active),
           enabled=lambda c: c.viewport.mode == MODE_EDIT, category="Edit",
-          shortcut="E")
+          shortcut="E", key="E")
         r("select_linked", "Select whole molecule of selection",
           lambda c: c.on_select_linked(), enabled=sel, category="Select",
-          shortcut="Ctrl+L")
+          shortcut="Ctrl+L", key="Ctrl+L")
         r("box_select", "Box select (arm tool)",
           lambda c: c.viewport.set_select_tool("box"), enabled=has_obj,
-          category="Select", shortcut="Shift+Space, B / dbl-click-drag")
+          category="Select", shortcut="Shift+Space, B / plain left-drag",
+          key="Shift+Space, B")
         r("lasso_select", "Lasso select (arm tool)",
           lambda c: c.viewport.set_select_tool("lasso"), enabled=has_obj,
-          category="Select", shortcut="Shift+Space, L")
+          category="Select", shortcut="Shift+Space, L",
+          key="Shift+Space, L")
 
         r("move_grab", "Move selection (grab)",
           lambda c: c.viewport.start_grab(), enabled=sel, category="Edit",
-          shortcut="G, then X/Y/Z, number")
+          shortcut="G, then X/Y/Z, number", key="G")
         r("rotate", "Rotate selection",
           lambda c: c.viewport.start_rotate(), enabled=sel, category="Edit",
-          shortcut="R, then X/Y/Z, degrees")
+          shortcut="R, then X/Y/Z, degrees", key="R")
         r("undo", "Undo", lambda c: c.on_undo(),
           enabled=lambda c: c.undo.can_undo, category="Edit",
-          shortcut="Ctrl+Z")
+          shortcut="Ctrl+Z", key="Ctrl+Z")
         r("redo", "Redo", lambda c: c.on_redo(),
           enabled=lambda c: c.undo.can_redo, category="Edit",
-          shortcut="Ctrl+Y")
+          shortcut="Ctrl+Y", key="Ctrl+Y")
+        # Alt+O, not plain O: in edit mode every unmodified letter belongs to
+        # the element buffer, and O is oxygen. Ctrl/Alt combos are the only
+        # ones that survive that policy (see MolViewport.event).
         r("origin_edit", "Origin: snap to selection and pick up (edit mode)",
           lambda c: c.on_origin_edit(),
           enabled=lambda c: c.viewport.mode == MODE_EDIT, category="Edit",
-          shortcut="O (edit mode), or click the orange dot")
+          shortcut="Alt+O (edit mode), or click the orange dot",
+          key="Alt+O")
         r("duplicate", "Duplicate selection into a new molecule",
           lambda c: c.on_duplicate(), enabled=sel, category="Edit",
-          shortcut="D")
+          shortcut="D", key="D")
         r("repeat_transform", "Repeat last action (duplicate + move)",
           lambda c: c.on_repeat_last(),
           enabled=lambda c: (c._repeat_macro is not None
                              or (c.viewport.last_transform is not None
                                  and bool(c.viewport.selection))),
-          category="Edit", shortcut="Shift+R")
+          category="Edit", shortcut="Shift+R", key="Shift+R")
         r("shuttle", "Shuttle mode: pilot the selected molecule",
           lambda c: c.on_shuttle(), enabled=has_active, category="View")
         r("toggle_hbonds", "Show suspected hydrogen bonds",
           lambda c: c.viewport.toggle_hbonds(), category="View",
           aliases=("h-bond", "hydrogen bonding", "contacts"))
         r("optimize_panel", "Force field: optimize geometry (panel)",
-          lambda c: c.on_toggle_optimize(), category="Edit", shortcut="Ctrl+R")
+          lambda c: c.on_toggle_optimize(), category="Edit", shortcut="Ctrl+R",
+          key="Ctrl+R")
         r("modifier_panel", "Modifiers panel (array, ...)",
           lambda c: c.on_toggle_properties("modifiers"), category="Modifier",
           aliases=("array", "properties", "stack"))
@@ -352,13 +438,13 @@ class MainWindow(QMainWindow):
           category="Edit")
         r("new_molecule", "New empty molecule (draw from scratch)",
           lambda c: c.on_new_molecule_op(), category="File",
-          shortcut="Ctrl+N")
+          shortcut="Ctrl+N", key="Ctrl+N")
         r("drop_floor", "Drop selection to the floor (z = 0)",
           lambda c: c.on_drop_to_floor(), enabled=sel, category="Transform",
-          shortcut="End")
+          shortcut="End", key="End")
         r("move_to_origin", "Move selection to the world origin",
           lambda c: c.on_move_to_origin(), enabled=sel, category="Transform",
-          shortcut="Home (Pos1)")
+          shortcut="Home (Pos1)", key="Home")
         r("apply_location", "Apply location (origin becomes 0,0,0)",
           lambda c: c.on_apply_transform(loc=True), enabled=has_active,
           category="Transform")
@@ -370,7 +456,7 @@ class MainWindow(QMainWindow):
           enabled=has_active, category="Transform")
         r("local_view", "Local view: isolate selection",
           lambda c: c.on_local_view(), enabled=has_obj, category="View",
-          shortcut="/")
+          shortcut="/", key="/")
         for plane in ("xy", "xz", "yz"):
             r("align_planar_" + plane,
               "Align largest planar part to {} plane".format(plane.upper()),
@@ -387,27 +473,50 @@ class MainWindow(QMainWindow):
         r("align_smart", "Align (selection-aware)",
           lambda c: c.on_align_smart(), enabled=sel, category="Edit",
           shortcut="A: 1 atom = to origin, 2 (one mol) = axis key, "
-                   "2 (two mols) = dock at 3 A, 3+ = plane key")
+                   "2 (two mols) = dock at 3 A, 3+ = plane key", key="A")
         r("add_atom", "Add atom...", lambda c: c.on_add_atom(),
-          category="Edit", shortcut="Shift+A")
+          category="Edit", shortcut="Shift+A (object mode)", key="Shift+A")
         r("delete_selected", "Delete selected atoms",
           lambda c: c.on_delete_selected(), enabled=sel, category="Edit",
-          shortcut="Del")
+          shortcut="Del", key="Del")
         r("change_element", "Change element of selection...",
           lambda c: c.on_change_element(), enabled=sel, category="Edit",
-          shortcut="F3 / menu (E is the draw tool)")
+          shortcut="F3 (in edit mode just type the symbol)")
+        r("load_frequencies",
+          "Vibrations: load ORCA frequencies for the active molecule...",
+          lambda c: c.on_load_frequencies(), enabled=has_active,
+          category="Molecule",
+          aliases=("freq", "normal mode", "ir", "raman", "orca",
+                   "vibration", "imaginary"))
+        r("pick_mode", "Vibrations: choose a normal mode to animate...",
+          lambda c: c.on_pick_mode(),
+          enabled=lambda c: bool(getattr(c, "_modes", {}).get(c.active_id)),
+          category="Molecule", aliases=("freq", "normal mode", "vibration"))
+        r("template_mark",
+          "Template: Set ligating atom(s) on the selected molecule",
+          lambda c: c.on_template_mark(), enabled=sel, category="Edit",
+          aliases=("ligand", "donor", "coordinating", "template", "anchor"))
+        r("template_coordinate",
+          "Template: Coordinate ligand onto the selected placeholders",
+          lambda c: c.on_template_coordinate(), enabled=sel, category="Edit",
+          aliases=("ligand", "attach", "dock", "template", "coordinate"))
+        r("join", "Join — bond 2 atoms (edit) / merge molecules (object)",
+          lambda c: c.on_join(), enabled=sel, category="Edit",
+          shortcut="J", key="J",
+          aliases=("merge", "bond", "combine", "connect", "weld"))
         r("cycle_bond", "Cycle bond between 2 selected (none-1-2-3)",
           lambda c: c.on_cycle_bond(), enabled=two_same, category="Edit",
-          shortcut="B")
+          shortcut="B (object mode; in edit mode hover a bond + 0-4)",
+          key="B")
         r("remove_bond", "Remove bond between 2 selected",
           lambda c: c.on_remove_bond(), enabled=two_same, category="Edit",
-          shortcut="Shift+B")
+          shortcut="Shift+B (object mode)", key="Shift+B")
 
         r("fit", "Fit view to scene", lambda c: c.viewport.fit_view(),
-          enabled=has_obj, category="View", shortcut="F")
+          enabled=has_obj, category="View", shortcut="F", key="F")
         r("toggle_projection", "Toggle perspective / orthographic",
           lambda c: c.viewport.toggle_projection(), category="View",
-          shortcut="Shift+O")
+          shortcut="Shift+O (object mode)", key="Shift+O")
         for axis, name in ((0, "X"), (1, "Y"), (2, "Z")):
             r("view_pos_" + name.lower(), "View along +{}".format(name),
               lambda c, a=axis: c.viewport.align_view_axis(a, 1),
@@ -417,23 +526,49 @@ class MainWindow(QMainWindow):
               category="View")
         r("toggle_grid", "Toggle floor grid",
           lambda c: c.viewport.toggle_grid(), category="View")
+        r("toggle_cell", "Show unit cell box (CIF imports)",
+          lambda c: c.on_toggle_cell(), category="View",
+          aliases=("crystal", "lattice", "unit cell", "cif", "box"))
+        r("meta_atom", "Meta atom: set coordination geometry on the selection",
+          lambda c: c.on_meta_atom(), enabled=sel, category="Edit",
+          aliases=("coordination", "metal", "dummy", "constraint",
+                   "geometry", "restraint"))
+
+        has_cell = lambda c: c._active_cell() is not None
+        r("crystal_asym", "Crystal: show the asymmetric unit only",
+          lambda c: c.on_crystal_view("asym"), enabled=has_cell,
+          category="Crystal", aliases=("cif", "symmetry", "asymmetric"))
+        r("crystal_cell", "Crystal: show the full unit cell",
+          lambda c: c.on_crystal_view("cell"), enabled=has_cell,
+          category="Crystal", aliases=("cif", "symmetry", "expand", "fill"))
+        r("crystal_packing", "Crystal: build a packing / supercell...",
+          lambda c: c.on_crystal_packing(), enabled=has_cell,
+          category="Crystal", aliases=("cif", "supercell", "lattice",
+                                       "repeat"))
+        r("cell_info", "Unit cell: report cell parameters and space group",
+          lambda c: c.on_cell_info(),
+          enabled=lambda c: c._active_cell() is not None,
+          category="Molecule", aliases=("crystal", "cif", "spacegroup",
+                                        "lattice parameters"))
         r("toggle_outliner", "Toggle outliner panel",
-          lambda c: c.on_toggle_outliner(), category="View", shortcut="M")
+          lambda c: c.on_toggle_outliner(), category="View", shortcut="M",
+          key="M")
         r("toggle_transform", "Toggle transform panel",
-          lambda c: c.on_toggle_transform(), category="View", shortcut="N")
+          lambda c: c.on_toggle_transform(), category="View", shortcut="N",
+          key="N")
         r("labels_element", "Toggle atom element labels",
           lambda c: c._label_actions["element"].trigger(), category="View")
         r("labels_index", "Toggle atom index labels",
           lambda c: c._label_actions["index"].trigger(), category="View")
         r("toggle_background", "Toggle background (Blender grey / white)",
           lambda c: c.viewport.toggle_background(), category="View",
-          shortcut="Ctrl+B")
+          shortcut="Ctrl+B", key="Ctrl+B")
         for st in style_mod.STYLES:
             r("style_" + st.key, "Display style: " + st.label,
               lambda c, s=st: c._set_style(s), category="View")
         r("reperceive", "Re-perceive bonds from geometry (active molecule)",
           lambda c: c.on_reperceive_bonds(), enabled=has_active,
-          category="Molecule", shortcut="Ctrl+P",
+          category="Molecule", shortcut="Ctrl+P", key="Ctrl+P",
           aliases=("recalculate bonds", "recompute bonds", "redetect bonds",
                    "rebuild connectivity", "reconnect"))
         r("perceive_orders", "Re-assign bond orders (active molecule)",
@@ -442,9 +577,11 @@ class MainWindow(QMainWindow):
 
         # No has_obj guard: Tab on an EMPTY scene starts a new molecule to
         # draw into, which is the whole point of drawing from scratch.
+        # Routed through on_tab_pressed so Tab still WALKS FIELDS while the
+        # transform panel has focus.
         r("toggle_mode", "Toggle edit / object mode",
-          lambda c: c.viewport.toggle_mode(c.active_id),
-          category="Edit", shortcut="Tab")
+          lambda c: c.on_tab_pressed(),
+          category="Edit", shortcut="Tab", key="Tab")
         r("set_draw_element", "Set draw element...",
           lambda c: c.on_set_draw_element(), category="Edit")
         for order, label in ((1, "single"), (2, "double"), (3, "triple")):
@@ -455,74 +592,105 @@ class MainWindow(QMainWindow):
         r("adjust_h", "Adjust hydrogens on selection",
           lambda c: c.on_adjust_hydrogens(), enabled=sel, category="Edit")
 
+        # The palette is itself an operator, registered ONCE. It used to be
+        # added straight to two menus with the same shortcut, which Qt reads
+        # as an ambiguous overload and refuses to fire — F3 opened nothing.
+        r("operator_search", "Search operations (this palette)",
+          lambda c: c.on_operator_search(), category="App", shortcut="F3",
+          key="F3", aliases=("command palette", "find command", "menu search",
+                             "operator search", "spotlight"))
         r("settings", "Settings...", lambda c: c.on_settings(),
-          category="App")
-        r("about", "About MoloM", lambda c: c.on_about(), category="App")
+          category="App", aliases=("preferences", "mouse", "trackpad",
+                                   "input", "options"))
+        r("about", "About MoloM", lambda c: c.on_about(), category="App",
+          aliases=("shortcuts", "keys", "navigation", "help"))
+        r("quit", "Quit MoloM", lambda c: c.close(), category="App",
+          shortcut="Ctrl+Q", key="Ctrl+Q", aliases=("exit",))
 
     def run_op(self, op_id):
         op = self.ops.get(op_id)
         if op is not None and op.enabled(self):
             op.run(self)
 
+    # -------------------------------------------------------------- shortcuts
+    def _install_shortcuts(self):
+        """Bind every operator that owns a key — independent of the menus.
+
+        Bindings used to ride along on menu entries, so thinning the menus
+        down to essentials silently unbound half the app (O, Home/End,
+        Shift+R, B/Shift+B, Ctrl+B, Ctrl+P, the box-select chord). Worse, F3
+        ended up on TWO menu actions, and Qt answers an ambiguous shortcut by
+        firing NEITHER — the operator palette simply stopped opening.
+
+        So: one QAction per operator, owned by the window, keys straight from
+        `core.ops`. Menus reuse these same action objects (see `_add_op`), so
+        an entry can never register a second copy of the same key.
+        """
+        clashes = self.ops.duplicate_keys()
+        if clashes:      # a programming error, and an invisible one at runtime
+            raise RuntimeError(
+                "two operators claim the same key: {}".format(clashes))
+        self._op_actions = {}
+        for op in self.ops.keyed():
+            act = QAction(op.label, self)
+            act.setShortcut(QKeySequence(op.key))
+            act.setShortcutContext(Qt.WindowShortcut)
+            act.triggered.connect(
+                lambda _checked=False, op_id=op.id: self.run_op(op_id))
+            self.addAction(act)
+            self._op_actions[op.id] = act
+
     # ------------------------------------------------------------------ menus
     def _build_menus(self):
         bar = self.menuBar()
 
         m_file = bar.addMenu("&File")
-        self._add_op(m_file, "open", "&Open...", QKeySequence.Open)
-        self._add_op(m_file, "save_project", "&Save project", "Ctrl+S")
-        self._add_op(m_file, "save_project_as", "Save project &as...",
-                     "Ctrl+Shift+P")
+        self._add_op(m_file, "open", "&Open...")
+        self._add_op(m_file, "save_project", "&Save project")
+        self._add_op(m_file, "save_project_as", "Save project &as...")
         m_file.addSeparator()
-        self._add_op(m_file, "import_name", "Import by &name...",
-                     "Ctrl+Shift+N")
+        self._add_op(m_file, "import_name", "Import by &name...")
         self._add_op(m_file, "from_smiles", "Add from &SMILES...")
-        self._add_op(m_file, "paste", "&Paste XYZ / SMILES",
-                     QKeySequence.Paste)
+        self._add_op(m_file, "paste", "&Paste XYZ / SMILES")
         m_file.addSeparator()
-        self._add_op(m_file, "new_molecule", "New &empty molecule", "Ctrl+N")
-        self._add_op(m_file, "save_as", "&Export geometry...", "Ctrl+E")
-        self._add_op(m_file, "export_image", "Export &image...",
-                     "Ctrl+Shift+E")
+        self._add_op(m_file, "new_molecule", "New &empty molecule")
+        self._add_op(m_file, "save_as", "&Export geometry...")
+        self._add_op(m_file, "export_image", "Export &image...")
         self._add_op(m_file, "clear_scene", "&Clear scene")
         m_file.addSeparator()
         self.recent_menu = m_file.addMenu("&Recent files")
         self._rebuild_recent_menu()
         m_file.addSeparator()
-        self._add(m_file, "E&xit", self.close, "Ctrl+Q")
+        self._add_op(m_file, "quit", "E&xit")
 
         # ESSENTIALS ONLY. Everything else lives in F3, which searches by
         # name and alias and greys out what does not apply — a menu that
         # lists every operator is slower to use than typing two letters.
+        # NOTE: the keys are NOT defined here (see _install_shortcuts); a
+        # menu is a shortlist, never the thing that keeps a key alive.
         m_edit = bar.addMenu("&Edit")
-        self._add_op(m_edit, "undo", "&Undo", QKeySequence.Undo)
-        self._add_op(m_edit, "redo", "&Redo", "Ctrl+Y")
+        self._add_op(m_edit, "undo", "&Undo")
+        self._add_op(m_edit, "redo", "&Redo")
         m_edit.addSeparator()
-        self._add(m_edit, "Toggle edit / object mode", self.on_tab_pressed,
-                  "Tab")
+        self._add_op(m_edit, "toggle_mode", "Toggle edit / object mode")
         m_edit.addSeparator()
-        self._add_op(m_edit, "duplicate", "&Duplicate selection", "D")
-        self._add_op(m_edit, "delete_selected", "&Delete selected atoms",
-                     QKeySequence.Delete)
+        self._add_op(m_edit, "duplicate", "&Duplicate selection")
+        self._add_op(m_edit, "delete_selected", "&Delete selected atoms")
         m_edit.addSeparator()
-        self._add_op(m_edit, "move_grab", "&Move selection (grab)", "G")
-        self._add_op(m_edit, "rotate", "Ro&tate selection", "R")
-        self._add_op(m_edit, "align_smart", "Ali&gn (selection-aware)", "A")
+        self._add_op(m_edit, "move_grab", "&Move selection (grab)")
+        self._add_op(m_edit, "rotate", "Ro&tate selection")
+        self._add_op(m_edit, "align_smart", "Ali&gn (selection-aware)")
         m_edit.addSeparator()
-        self._add(m_edit, "More operations...  (search)",
-                  self.on_operator_search, "F3")
+        self._add_op(m_edit, "operator_search", "&Search operations...")
 
         m_sel = bar.addMenu("&Select")
-        self._add_op(m_sel, "select_all", "Select &all",
-                     QKeySequence.SelectAll)
-        self._add(m_sel, "Clear selectio&n", self.on_deselect_all, "Alt+A")
-        self._add(m_sel, "Clear selection / cancel mode", self.on_escape,
-                  "Escape")
-        self._add_op(m_sel, "select_linked", "Select &linked (whole mol)",
-                     "Ctrl+L")
+        self._add_op(m_sel, "select_all", "Select &all")
+        self._add_op(m_sel, "clear_selection", "Clear selectio&n")
+        self._add_op(m_sel, "cancel", "Clear selection / cancel mode")
+        self._add_op(m_sel, "select_linked", "Select &linked (whole mol)")
         m_sel.addSeparator()
-        self._add_op(m_sel, "lasso_select", "La&sso select tool",
-                     "Shift+Space,L")
+        self._add_op(m_sel, "box_select", "&Box select tool")
+        self._add_op(m_sel, "lasso_select", "La&sso select tool")
 
         m_view = bar.addMenu("&View")
         group = QActionGroup(self)
@@ -536,9 +704,9 @@ class MainWindow(QMainWindow):
             self._style_actions[st.key] = act
         self._style_actions[style_mod.BALL_AND_STICK.key].setChecked(True)
         m_view.addSeparator()
-        self._add_op(m_view, "fit", "&Fit view", "F")
+        self._add_op(m_view, "fit", "&Fit view")
         self._add_op(m_view, "toggle_projection",
-                     "Perspective / &Orthographic", "Shift+O")
+                     "Perspective / &Orthographic")
         along = m_view.addMenu("View a&long")
         for axis, name in ((0, "X"), (1, "Y"), (2, "Z")):
             self._add_op(along, "view_pos_" + name.lower(), "+" + name)
@@ -553,15 +721,46 @@ class MainWindow(QMainWindow):
             m_view.addAction(act)
             self._label_actions[key] = act
         m_view.addSeparator()
-        self._add_op(m_view, "local_view", "&Local view (isolate)", "/")
-        self._add_op(m_view, "toggle_outliner", "Properties / out&liner", "M")
-        self._add_op(m_view, "toggle_transform", "Tra&nsform panel", "N")
-        self._add_op(m_view, "optimize_panel", "Force field panel", "Ctrl+R")
+        crystal = m_view.addMenu("Cr&ystal (CIF)")
+        self._add_op(crystal, "crystal_asym", "&Asymmetric unit")
+        self._add_op(crystal, "crystal_cell", "Full &unit cell")
+        self._add_op(crystal, "crystal_packing", "&Packing / supercell...")
+        crystal.addSeparator()
+        self._add_op(crystal, "toggle_cell", "Show unit cell &box")
+        self._add_op(crystal, "cell_info", "Cell &parameters...")
+        m_view.addSeparator()
+        self._add_op(m_view, "local_view", "&Local view (isolate)")
+        self._add_op(m_view, "toggle_outliner", "Properties / out&liner")
+        self._add_op(m_view, "toggle_transform", "Tra&nsform panel")
+        self._add_op(m_view, "optimize_panel", "Force field panel")
 
-        m_app = bar.addMenu("&App")
-        self._add(m_app, "Search operation...", self.on_operator_search, "F3")
+        # "A&pp", not "&App": a menu-bar mnemonic IS a shortcut, so Alt+A was
+        # claimed by both this menu and Blender's deselect-all — the same
+        # ambiguity that killed F3, and Alt+A simply stopped deselecting.
+        # _check_menu_mnemonics() keeps this from creeping back.
+        m_app = bar.addMenu("A&pp")
+        # The SAME action object as the Edit menu's entry — two actions with
+        # one key is the ambiguity that killed F3.
+        self._add_op(m_app, "operator_search", "&Search operations...")
         self._add_op(m_app, "settings", "&Settings...")
         self._add_op(m_app, "about", "&About MoloM")
+
+    def _check_menu_mnemonics(self):
+        """A menu-bar mnemonic is a real shortcut, so it can go ambiguous
+        against an operator key exactly like two QActions can — and Qt's
+        answer is the same: fire neither, silently. "&App" versus Blender's
+        Alt+A deselect is how that was found. Returns the clashes."""
+        keys = {op.key: op.id for op in self.ops.keyed()}
+        clashes = {}
+        for menu in self.menuBar().findChildren(QMenu):
+            title = menu.title()
+            i = title.find("&")
+            if i < 0 or i + 1 >= len(title):
+                continue
+            key = "Alt+" + title[i + 1].upper()
+            if key in keys:
+                clashes[key] = (title, keys[key])
+        return clashes
 
     def _add(self, menu, text, slot, shortcut=None):
         act = QAction(text, self)
@@ -571,14 +770,27 @@ class MainWindow(QMainWindow):
         menu.addAction(act)
         return act
 
-    def _add_op(self, menu, op_id, text, shortcut=None):
-        return self._add(menu, text, lambda: self.run_op(op_id), shortcut)
+    def _add_op(self, menu, op_id, text):
+        """Add an operator to a menu, REUSING its shortcut action if it has
+        one (Qt shows the key in the menu by itself). Menu entries never
+        define keys — `_install_shortcuts` owns that."""
+        act = self._op_actions.get(op_id)
+        if act is None:
+            return self._add(menu, text, lambda: self.run_op(op_id))
+        act.setText(text)
+        menu.addAction(act)
+        return act
 
     # ------------------------------------------------------------- status bar
     def _build_statusbar(self):
         self._measure_label = QLabel("")
         self._counts_label = QLabel("")
-        self.statusBar().addWidget(self._measure_label, 1)
+        # PERMANENT, both of them. A temporary showMessage() hides ordinary
+        # status widgets, and picking an atom emits one every time — so the
+        # measurement readout was being covered the instant it had something
+        # to say. That is the whole "measurement tool is unresponsive" bug;
+        # the measuring itself always worked.
+        self.statusBar().addPermanentWidget(self._measure_label, 1)
         self.statusBar().addPermanentWidget(self._counts_label)
 
     def _update_counts(self):
@@ -611,6 +823,9 @@ class MainWindow(QMainWindow):
                 self.outliner.highlight(obj_id)
                 self._sync_traj_bar()
                 self._sync_transform_panel()
+                # Picking a crystal in the VIEWPORT must unlock its unit-cell
+                # page too — the pane was only re-synced from outliner clicks.
+                self._sync_modifier_page()
 
     def _on_edit_committed(self):
         # A grab that a duplicate started makes "duplicate + this offset" the
@@ -690,14 +905,23 @@ class MainWindow(QMainWindow):
         self._position_outliner_tab()
 
     def on_tab_pressed(self):
-        """Tab toggles the mode — UNLESS a panel field has focus, where it
-        should walk to the next field like any form."""
+        """Tab toggles the mode — UNLESS a PANEL field has focus, where it
+        must walk to the next field like any form.
+
+        Checked against every panel, not just the transform one: the array
+        modifier's spin boxes had the same collision (Tab jumped into edit
+        mode instead of moving to the next number), and so would any panel
+        added later. The viewport itself is excluded, which is where Tab
+        genuinely means "switch mode".
+        """
         focus = QApplication.focusWidget()
-        panel = self.transform_panel.widget()
-        if focus is not None and panel is not None \
-                and panel.isAncestorOf(focus):
-            focus.focusNextChild()
-            return
+        if focus is not None and not self.viewport.isAncestorOf(focus) \
+                and focus is not self.viewport:
+            for panel in (self.transform_panel, self.properties,
+                          self.optimize_panel.widget()):
+                if panel is not None and panel.isAncestorOf(focus):
+                    focus.focusNextChild()
+                    return
         self.viewport.toggle_mode(self.active_id)
 
     def on_toggle_optimize(self):
@@ -725,24 +949,46 @@ class MainWindow(QMainWindow):
     def _sync_modifier_page(self):
         if self.properties.isVisible():
             self.modifier_page.sync(self._active_obj())
+            self._sync_crystal_page()
+            self._sync_vibration_page()
 
     def _on_modifiers_changed(self):
         self.viewport.refresh_geometry()
         self._update_counts()
+
+    def _new_symmetry_modifier(self, obj):
+        """Seeded from the molecule's own crystallography — a symmetry
+        modifier with no cell would be an empty box asking the user to type
+        192 operations."""
+        meta = obj.structure.metadata or {}
+        if not meta.get("cell"):
+            self.statusBar().showMessage(
+                "Symmetry modifier needs a unit cell — import a .cif first",
+                6000)
+            return None
+        return modifiers_mod.SymmetryModifier(
+            cell=meta.get("cell"), symops=list(meta.get("symops") or []))
 
     def on_add_modifier(self, kind):
         obj = self._active_obj()
         if obj is None:
             self.statusBar().showMessage("Select a molecule first", 4000)
             return
-        if kind != "array":
+        if kind == "symmetry":
+            mod = self._new_symmetry_modifier(obj)
+            if mod is None:
+                return
+            self.push_undo()
+            obj.modifiers.append(mod)
+        elif kind == "array":
+            self.push_undo()
+            # default offset along +X, just past the molecule, so the very
+            # first click already shows a sensible row instead of a pile-up
+            span = obj.structure.bounding_radius() * 2.0 + 1.0
+            obj.modifiers.append(modifiers_mod.ArrayModifier(
+                count=3, offset=(round(span, 2), 0.0, 0.0)))
+        else:
             return
-        self.push_undo()
-        # default offset along +X, just past the molecule, so the very first
-        # click already shows a sensible row instead of a pile-up
-        span = obj.structure.bounding_radius() * 2.0 + 1.0
-        obj.modifiers.append(modifiers_mod.ArrayModifier(
-            count=3, offset=(round(span, 2), 0.0, 0.0)))
         self._sync_modifier_page()
         self.viewport.refresh_geometry()
         self._update_counts()
@@ -792,7 +1038,13 @@ class MainWindow(QMainWindow):
         right (vertical strip), the transform and optimize ones on the
         bottom. The docks resize the central widget, so the compass — drawn
         inside the viewport — shifts with them automatically."""
-        c = self.centralWidget()
+        try:
+            c = self.centralWidget()
+        except RuntimeError:
+            # Teardown race: a dock's visibilityChanged can still fire after
+            # the window's C++ side is gone (PySide keeps the Python wrapper
+            # alive a moment longer). Nothing left to position.
+            return
         if c is None:
             return
         w, h = c.width(), c.height()
@@ -900,6 +1152,47 @@ class MainWindow(QMainWindow):
             return
         self.viewport.snap_origin_to_selection()
 
+    def _duplicate_in_place(self, sel):
+        """D in EDIT mode: copy the atoms into the SAME molecule.
+
+        Edit mode means "I am working inside this molecule", so spawning a
+        new outliner object is the wrong answer — you wanted another copy of
+        this fragment here, bonded up and ready to move. Object mode still
+        duplicates into a new object.
+        """
+        obj = self.viewport.edit_object()
+        if obj is None:
+            return
+        rows = sorted({i for o, i in sel if o == obj.id})
+        if not rows:
+            return
+        self.push_undo()
+        s = obj.structure
+        base = s.n_atoms
+        index_map = {}
+        for i in rows:
+            edits.add_atom(s, s.symbols[i], s.coords[i])
+            index_map[i] = s.n_atoms - 1
+        # Carry across the bonds INTERNAL to the copied fragment.
+        for bond in list(s.bonds):
+            a, b = int(bond[0]), int(bond[1])
+            if a in index_map and b in index_map:
+                order = bond[2] if len(bond) > 2 else 1
+                edits.add_bond(s, index_map[a], index_map[b], order=order)
+        for i in rows:                       # meta atoms copy their spec too
+            spec = meta_mod.get_meta(s, i)
+            if spec is not None:
+                meta_mod.set_meta(s, index_map[i], spec)
+        new_sel = [(obj.id, index_map[i]) for i in rows]
+        self.viewport.set_selection(new_sel)
+        self._after_edit()
+        self.statusBar().showMessage(
+            "Duplicated {} atom(s) inside {}".format(len(rows), obj.name),
+            4000)
+        # Straight into a grab, exactly like object-mode duplicate.
+        self._pending_suppress = True
+        self.viewport.start_grab()
+
     def on_duplicate(self):
         """D: copy the selection into new outliner objects and start moving
         them straight away. A partial copy gets fresh bond perception and
@@ -907,6 +1200,9 @@ class MainWindow(QMainWindow):
         sel = self.viewport.selection
         if not sel:
             self.statusBar().showMessage("Nothing selected to duplicate", 4000)
+            return
+        if self.viewport.mode == MODE_EDIT:
+            self._duplicate_in_place(sel)
             return
         self.push_undo()
         new_sel = []
@@ -1009,8 +1305,17 @@ class MainWindow(QMainWindow):
                     False, "Select the atoms to relax first.")
                 return
             fixed = [i for i in range(s.n_atoms) if i not in chosen]
+        # Meta atoms: freeze each locked centre AND its donors, so the
+        # coordination sphere cannot collapse under a force field that has no
+        # parameters for the metal. The ligands still relax around it.
+        frozen_meta = meta_mod.frozen_atoms(s)
+        if frozen_meta:
+            fixed = sorted(set(fixed) | set(frozen_meta))
         self.optimize_panel.set_running(
-            True, "Running {} on {}...".format(method, obj.name))
+            True, "Running {} on {}{}...".format(
+                method, obj.name,
+                " (holding {} meta centre(s))".format(
+                    len(meta_mod.all_meta(s))) if frozen_meta else ""))
         self._opt_target = obj.id
         self._opt_worker = OptimizeWorker(list(s.symbols), s.coords.copy(),
                                           list(s.bonds), method, steps,
@@ -1190,30 +1495,37 @@ class MainWindow(QMainWindow):
             ids = self.outliner.selected_object_ids()
         self.on_merge_ids(ids)
 
-    def on_merge_ids(self, ids):
+    def on_merge_ids(self, ids, mode=None):
         """Combine molecules into one object — the prerequisite for force-
-        field optimising an H-bonded pair as a single system."""
+        field optimising an H-bonded pair as a single system.
+
+        `mode` is "new" (keep the originals, hidden) or "replace" (consume
+        them). None asks with a dialog, for the outliner's context menu."""
         ids = [i for i in ids if self.scene.get(i) is not None]
         if len(ids) < 2:
             self.statusBar().showMessage(
                 "Select atoms of at least two molecules to merge", 5000)
             return
-        names = [self.scene.get(i).name for i in ids if self.scene.get(i)]
-        box = QMessageBox(self)
-        box.setWindowTitle("Merge molecules")
-        box.setText("Merge {} into one molecule?".format(", ".join(names)))
-        keep = QCheckBox("Keep the original molecules")
-        keep.setChecked(True)
-        box.setCheckBox(keep)
-        box.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
-        if box.exec() != QMessageBox.Ok:
-            return
+        if mode is None:
+            names = [self.scene.get(i).name for i in ids if self.scene.get(i)]
+            box = QMessageBox(self)
+            box.setWindowTitle("Merge molecules")
+            box.setText("Merge {} into one molecule?".format(", ".join(names)))
+            keep_box = QCheckBox("Keep the original molecules")
+            keep_box.setChecked(True)
+            box.setCheckBox(keep_box)
+            box.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+            if box.exec() != QMessageBox.Ok:
+                return
+            keep = keep_box.isChecked()
+        else:
+            keep = mode == "new"
         self.push_undo()
-        merged = self.scene.merge(ids, keep_originals=keep.isChecked())
+        merged = self.scene.merge(ids, keep_originals=keep)
         if merged is None:
             self.undo.discard_last()
             return
-        if keep.isChecked():
+        if keep:
             for i in ids:                  # hide the parts, show the whole
                 o = self.scene.get(i)
                 if o is not None:
@@ -1224,7 +1536,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "Merged into {} ({} atoms){}".format(
                 merged.name, merged.structure.n_atoms,
-                "; originals kept but hidden" if keep.isChecked() else ""),
+                "; originals kept but hidden" if keep else ""),
             9000)
 
     def on_move_to_origin(self):
@@ -1376,11 +1688,36 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "Flipped {} about its aligned axis".format(obj.name), 4000)
 
-    def _translate_object(self, obj, dv):
+    def _moved_rows(self, obj):
+        """Which atoms a whole-molecule transform should actually move.
+
+        In OBJECT mode: all of them — you are arranging a molecule. In EDIT
+        mode: only the fragment CONNECTED to the selection. One outliner
+        object routinely holds several disconnected pieces while you build
+        (a metal centre and a ligand not yet bonded), and shifting the atom
+        you just drew must not drag the untouched ligand with it.
+        """
+        if self.viewport.mode != MODE_EDIT:
+            return None
+        sel = [i for o, i in self.viewport.selection if o == obj.id]
+        if not sel:
+            return None
+        rows = obj.structure.connected_component(sel)
+        if len(rows) >= obj.structure.n_atoms:
+            return None                    # it IS the whole molecule
+        return sorted(rows)
+
+    def _translate_object(self, obj, dv, rows=None):
         dv = np.asarray(dv, dtype=float)
+        if rows is None:
+            rows = self._moved_rows(obj)
         for k in range(obj.structure.n_frames):
-            obj.structure.frames[k] = obj.structure.frames[k] + dv
-        obj.origin = obj.origin + dv
+            if rows is None:
+                obj.structure.frames[k] = obj.structure.frames[k] + dv
+            else:
+                obj.structure.frames[k][rows] += dv
+        if rows is None:
+            obj.origin = obj.origin + dv
 
     def on_align_smart(self):
         """A — selection-aware align (whole molecules only, never lone
@@ -1502,6 +1839,9 @@ class MainWindow(QMainWindow):
         ever change on explicit user action."""
         bonding.perceive_structure_bonds(s)
         bonding.perceive_structure_bond_orders(s)
+        # Pin a crystal's cell box to the atoms as imported, so it travels
+        # with them under any later transform.
+        set_cell_reference(s)
 
     def _install_structure(self, s, path=None, note=None):
         # type: (Structure, Optional[str], Optional[str]) -> None
@@ -1580,77 +1920,116 @@ class MainWindow(QMainWindow):
         self._sync_traj_bar()
         self._update_counts()
         self._sync_transform_panel()
+        # Also refreshes the crystal page AND greys its tab for the new
+        # active molecule — without this the page kept describing whichever
+        # object happened to be active when the dock was last opened.
+        self._sync_modifier_page()
 
     # -------------------------------------------------------- trajectory bar
     def _build_trajectory_bar(self):
-        self.traj_bar = QWidget(self)
-        lay = QHBoxLayout(self.traj_bar)
-        lay.setContentsMargins(6, 2, 6, 2)
-        self._play_btn = QToolButton(self.traj_bar)
-        self._play_btn.setText(">")
-        self._play_btn.setToolTip("Play / pause trajectory (Space)")
-        self._play_btn.clicked.connect(self.on_play_pause)
-        self._frame_slider = QSlider(Qt.Horizontal, self.traj_bar)
-        self._frame_slider.setMinimum(0)
-        self._frame_slider.valueChanged.connect(self.on_frame_slider)
-        self._frame_label = QLabel("0/0", self.traj_bar)
-        self._fps_spin = QSpinBox(self.traj_bar)
-        self._fps_spin.setRange(1, 60)
-        self._fps_spin.setValue(10)
-        self._fps_spin.setSuffix(" fps")
-        lay.addWidget(self._play_btn)
-        lay.addWidget(self._frame_slider, 1)
-        lay.addWidget(self._frame_label)
-        lay.addWidget(self._fps_spin)
+        """The timeline pane: transport bar + expandable per-track rows."""
+        self.traj_bar = TimelinePanel(self)
+        self.traj_bar.play_pause.connect(self.on_play_pause)
+        self.traj_bar.seek_requested.connect(self.on_seek)
+        self.traj_bar.interpolate_toggled.connect(self._on_interp_toggled)
+        self.traj_bar.fps_changed.connect(self._on_fps_changed)
+        self.traj_bar.tracks_changed.connect(self._on_tracks_edited)
         self.traj_bar.setVisible(False)
+        # kept as aliases so the older call sites keep reading naturally
+        self._play_btn = self.traj_bar.play_btn
+        self._frame_label = self.traj_bar.label
+        self._fps_spin = self.traj_bar.fps_spin
+        self._interp_check = self.traj_bar.interp_check
+
+    def _on_interp_toggled(self, on):
+        self.timeline.interpolate = bool(on)
+        self._apply_timeline()
+
+    def _on_fps_changed(self, fps):
+        self.timeline.fps = float(fps)
+        if self._play_timer.isActive():
+            self._play_timer.setInterval(int(1000 / max(int(fps), 1)))
+
+    def _on_tracks_edited(self):
+        """A row was dragged, toggled or had its end mode cycled."""
+        self._apply_timeline()
+
+    def on_seek(self, time):
+        self.timeline.seek(float(time))
+        self._apply_timeline()
 
     def _sync_traj_bar(self):
-        obj = self._active_obj()
-        s = obj.structure if obj is not None else None
-        multi = s is not None and s.n_frames > 1
-        if multi:
-            self._frame_slider.blockSignals(True)
-            self._frame_slider.setMaximum(s.n_frames - 1)
-            self._frame_slider.setValue(s.current_frame)
-            self._frame_slider.blockSignals(False)
-            self._frame_label.setText("{}/{}".format(s.current_frame + 1,
-                                                     s.n_frames))
-            self.traj_bar.setVisible(True)
-        else:
+        """Reconcile the scene clock with the scene, then the pane with it.
+
+        The pane is the SCENE playhead, not the active molecule's frame
+        index — every trajectory in the scene runs off it at once.
+        """
+        self.timeline.sync([(o.id, o.structure.n_frames)
+                            for o in self.scene.objects])
+        if not self.timeline.has_animation:
             self._play_timer.stop()
-            self._play_btn.setText(">")
+            self.timeline.playing = False
             self.traj_bar.setVisible(False)
+            for obj in self.scene.objects:
+                obj.play_position = None
+            return
+        self.traj_bar.sync(
+            self.timeline,
+            {o.id: o.name for o in self.scene.objects},
+            self._play_timer.isActive())
+        self.traj_bar.setVisible(True)
 
     def on_play_pause(self):
         if self._play_timer.isActive():
             self._play_timer.stop()
+            self.timeline.playing = False
             self._play_btn.setText(">")
         else:
+            self.timeline.playing = True
             self._play_timer.start(int(1000 / self._fps_spin.value()))
             self._play_btn.setText("||")
 
     def _advance_frame(self):
-        obj = self._active_obj()
-        if obj is None or obj.structure.n_frames < 2:
+        if not self.timeline.has_animation:
             self._play_timer.stop()
+            self.timeline.playing = False
             return
-        self._play_timer.setInterval(int(1000 / self._fps_spin.value()))
-        self._set_frame((obj.structure.current_frame + 1)
-                        % obj.structure.n_frames)
+        fps = float(self._fps_spin.value())
+        self._play_timer.setInterval(int(1000 / fps))
+        self.timeline.fps = fps
+        self.timeline.advance(1.0 / fps)
+        self._apply_timeline()
 
-    def on_frame_slider(self, value):
-        self._set_frame(int(value))
+    def _apply_timeline(self):
+        """Push the playhead onto every object, then repaint ONCE.
 
-    def _set_frame(self, i):
-        obj = self._active_obj()
-        if obj is None:
-            return
-        obj.structure.set_frame(i)
-        bonding.perceive_structure_bonds(obj.structure)
+        Bonds are re-perceived only when an object's nearest INTEGER frame
+        changes, never per interpolated tick: connectivity is a property of
+        the frame, and re-running perception 30 times a second would dominate
+        playback cost for no visible gain.
+        """
+        interpolating = self.timeline.interpolate
+        for obj in self.scene.objects:
+            position = self.timeline.frame_for(obj.id)
+            if position is None or obj.structure.n_frames < 2:
+                obj.play_position = None
+                continue
+            obj.play_rigid = self._rigid_interp
+            obj.play_position = position if interpolating else None
+            nearest = int(round(position))
+            if nearest != obj.structure.current_frame:
+                obj.structure.set_frame(nearest)
+                bonding.perceive_structure_bonds(obj.structure)
         self.viewport.refresh_geometry()
         self._sync_traj_bar()
         self._update_counts()
         self._on_selection_changed(self.viewport.selection)
+
+    def _set_frame(self, i):
+        """Seek the scene clock to an integer scene frame (kept for callers
+        that think in frames, e.g. loading a trajectory)."""
+        self.timeline.seek(float(i))
+        self._apply_timeline()
 
     def keyPressEvent(self, ev):
         if ev.key() == Qt.Key_Space and self.traj_bar.isVisible():
@@ -1959,6 +2338,14 @@ class MainWindow(QMainWindow):
             atoms, total = [], 0
             for o in vis:
                 sym, xyz, _b = o.evaluated()
+                # Meta atoms are written as the element they stand in for —
+                # the dummy is an editing device, not something a downstream
+                # program should ever see. Ones with no element chosen stay
+                # as the dummy rather than being guessed at.
+                for local, real in enumerate(
+                        meta_mod.resolved_symbols(o.structure)):
+                    if local < len(sym):
+                        sym[local] = real
                 atoms += [(sym[i], float(xyz[i][0]), float(xyz[i][1]),
                            float(xyz[i][2])) for i in range(len(sym))]
                 total += len(sym)
@@ -2084,6 +2471,7 @@ class MainWindow(QMainWindow):
             return
         self.push_undo()
         removed_objs = []
+        emptied = []
         for obj_id in sorted({p[0] for p in sel}):
             obj = self.scene.get(obj_id)
             if obj is None:
@@ -2091,7 +2479,17 @@ class MainWindow(QMainWindow):
             rows = [i for o, i in sel if o == obj_id]
             # take the hanging hydrogens with them
             edits.delete_atoms(obj.structure, rows, with_hydrogens=True)
+            meta_mod.prune(obj.structure)
             if obj.structure.n_atoms == 0:
+                # Emptying the molecule you are EDITING must not delete it:
+                # you are standing inside it with the draw tool, and removing
+                # the outliner entry leaves edit mode pointing at nothing, so
+                # nothing can be drawn any more. Deleting the object itself
+                # is an object-mode action.
+                if self.viewport.mode == MODE_EDIT \
+                        and obj_id == self.viewport.edit_obj_id:
+                    emptied.append(obj.name)
+                    continue
                 self.scene.remove(obj_id)
                 removed_objs.append(obj.name)
         self.viewport.set_selection([])
@@ -2099,6 +2497,10 @@ class MainWindow(QMainWindow):
         if removed_objs:
             self.statusBar().showMessage(
                 "Removed empty molecule(s): " + ", ".join(removed_objs), 4000)
+        elif emptied:
+            self.statusBar().showMessage(
+                "{} is empty — draw into it, or Tab out to delete it".format(
+                    ", ".join(emptied)), 5000)
 
     def on_change_element(self):
         sel = self.viewport.selection
@@ -2130,6 +2532,301 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "Select exactly 2 atoms of the SAME molecule first", 4000)
         return None
+
+    def on_load_frequencies(self):
+        """Read an ORCA FREQ output and remember its modes for this molecule.
+
+        The modes are NOT applied yet — picking one is a separate step, since
+        a FREQ job has 3N of them and you always want a specific one.
+        """
+        obj = self._active_obj()
+        if obj is None:
+            return
+        start = self.settings.value("last_dir", "")
+        path, _f = QFileDialog.getOpenFileName(
+            self, "ORCA frequency output for {}".format(obj.name), start,
+            "ORCA output (*.out *.log *.txt);;All files (*)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+            modes = vib_mod.parse_orca_frequencies(text)
+        except (vib_mod.VibrationError, OSError) as exc:
+            QMessageBox.warning(self, "Frequencies", str(exc))
+            return
+        # The output carries its own geometry, so if the active molecule is
+        # not the one the job ran on, build that molecule rather than
+        # refusing. Requiring the right structure to be open already, with
+        # the atoms in the same ORDER, is a promise no workflow can keep.
+        n_file = modes[0].displacements.shape[0]
+        if obj.structure.n_atoms != n_file:
+            atoms = vib_mod.parse_orca_geometry(text)
+            if len(atoms) != n_file:
+                QMessageBox.warning(
+                    self, "Frequencies",
+                    "This job has {} atoms but the active molecule has {}, "
+                    "and no matching geometry could be read from the "
+                    "file.".format(n_file, obj.structure.n_atoms))
+                return
+            s = Structure.from_atoms(
+                atoms, name=os.path.splitext(os.path.basename(path))[0])
+            self._install_structure(s, path=path)
+            obj = self._active_obj()
+        self._modes.setdefault(obj.id, [])
+        self._modes[obj.id] = modes
+        self.settings.setValue("last_dir", os.path.dirname(path))
+        real = [m for m in modes if not m.is_trivial]
+        imaginary = [m for m in modes if m.is_imaginary]
+        self.properties.setVisible(True)
+        self.properties.show_page("vibrations")
+        self._sync_vibration_page()
+        self._position_outliner_tab()
+        self.statusBar().showMessage(
+            "{}: {} modes ({} vibrational{}) — pick one in the ∿ "
+            "page".format(obj.name, len(modes), len(real),
+                          ", {} IMAGINARY".format(len(imaginary))
+                          if imaginary else ""), 12000)
+
+    def _sync_vibration_page(self):
+        """Unlock the ∿ page for a molecule that has FREQ data, exactly as
+        the ❖ page unlocks for a crystal."""
+        obj = self._active_obj()
+        modes = self._modes.get(obj.id) if obj is not None else None
+        tab = self.properties.buttons.get("vibrations")
+        if tab is not None:
+            tab[0].setEnabled(bool(modes))
+            tab[0].setToolTip(
+                "Vibrational normal modes — {}".format(
+                    obj.name if modes else
+                    "this molecule has no frequency data"))
+        self.vibration_page.set_modes(
+            modes or [], active=self._active_mode.get(obj.id if obj else None),
+            name=obj.name if obj is not None else "")
+
+    def on_animate_mode(self, index, amplitude=None, n_frames=None):
+        """Bake one mode into a looping track on the scene clock.
+
+        Nothing vibration-specific reaches the player: the mode becomes
+        ordinary frames, so it interpolates, sits in the multi-track pane and
+        plays alongside other trajectories like anything else.
+        """
+        obj = self._active_obj()
+        modes = self._modes.get(obj.id) if obj is not None else None
+        if obj is None or not modes:
+            return
+        mode = next((m for m in modes if m.index == int(index)), None)
+        if mode is None:
+            return
+        rest = self._rest_geometry.get(obj.id)
+        if rest is None:
+            rest = obj.structure.coords.copy()
+            self._rest_geometry[obj.id] = rest
+        amplitude = float(self._mode_amplitude.get(obj.id, 0.6)
+                          if amplitude is None else amplitude)
+        n_frames = int(self._mode_frames.get(obj.id, 20)
+                       if n_frames is None else n_frames)
+        self._mode_amplitude[obj.id] = amplitude
+        self._mode_frames[obj.id] = n_frames
+        self._active_mode[obj.id] = mode.index
+        self.push_undo()
+        obj.structure.frames = vib_mod.mode_frames(
+            rest, mode, amplitude=amplitude, n_frames=n_frames)
+        obj.structure.set_frame(0)
+        self._sync_traj_bar()
+        track = self.timeline.get(obj.id)
+        if track is not None:
+            track.end = timeline_mod.LOOP        # a vibration IS a loop
+        self._apply_timeline()
+        self._sync_vibration_page()
+        self.statusBar().showMessage(
+            "{}: animating {}".format(obj.name, mode.label().strip()), 9000)
+
+    def _on_mode_settings(self, index, amplitude, n_frames):
+        """A slider moved: re-bake only if this mode is the one playing."""
+        obj = self._active_obj()
+        if obj is None:
+            return
+        self._mode_amplitude[obj.id] = float(amplitude)
+        self._mode_frames[obj.id] = int(n_frames)
+        if self._active_mode.get(obj.id) == int(index):
+            self.on_animate_mode(index, amplitude, n_frames)
+
+    def on_pick_mode(self):
+        """Bake the chosen mode into a looping trajectory.
+
+        A normal mode is a displacement vector, not coordinates, so one
+        period is generated as frames and handed to the scene clock — the
+        track pane, interpolation and the export path then all work on it
+        with no vibration-specific code anywhere in the UI.
+        """
+        obj = self._active_obj()
+        modes = self._modes.get(obj.id if obj else None) or []
+        if obj is None or not modes:
+            self.statusBar().showMessage(
+                "Load an ORCA frequency file first (F3 'load ORCA "
+                "frequencies')", 6000)
+            return
+        listed = [m for m in modes if not m.is_trivial] or modes
+        labels = [m.label() for m in listed]
+        choice, ok = QInputDialog.getItem(
+            self, "Normal mode", "Animate which mode?", labels, 0, False)
+        if not ok:
+            return
+        mode = listed[labels.index(choice)]
+        rest = self._rest_geometry.get(obj.id)
+        if rest is None:
+            rest = obj.structure.coords.copy()
+            self._rest_geometry[obj.id] = rest
+        self.push_undo()
+        obj.structure.frames = vib_mod.mode_frames(
+            rest, mode, amplitude=float(
+                self.settings.value("vib_amplitude", 0.6)))
+        obj.structure.set_frame(0)
+        self._sync_traj_bar()
+        track = self.timeline.get(obj.id)
+        if track is not None:
+            track.end = timeline_mod.LOOP     # a vibration is a loop
+        self._apply_timeline()
+        self.statusBar().showMessage(
+            "{}: animating {}".format(obj.name, mode.label().strip()), 9000)
+
+    def on_template_mark(self):
+        """Step 1: remember which atoms of this molecule do the coordinating.
+
+        Nothing moves and no dialog opens — the marks just sit there (small
+        violet dots) while you go and build the centre.
+        """
+        sel = self.viewport.selection
+        obj_ids = {p[0] for p in sel}
+        if len(obj_ids) != 1:
+            self.statusBar().showMessage(
+                "Select the ligating atom(s) on ONE molecule", 5000)
+            return
+        obj = self.scene.get(next(iter(obj_ids)))
+        rows = sorted({i for _o, i in sel})
+        self.push_undo()
+        marked = tpl_mod.set_ligating(obj.structure, rows)
+        self.viewport.update()
+        self.statusBar().showMessage(
+            "{}: {} ligating atom(s) marked — now select the placeholder "
+            "atoms on the centre and run 'Template: Coordinate ligand'"
+            .format(obj.name, len(marked)), 12000)
+
+    def on_template_coordinate(self):
+        """Step 2: dock the marked ligand onto the selected placeholders."""
+        sel = self.viewport.selection
+        host_ids = {p[0] for p in sel}
+        if len(host_ids) != 1:
+            self.statusBar().showMessage(
+                "Select the placeholder atoms on ONE centre", 5000)
+            return
+        host = self.scene.get(next(iter(host_ids)))
+        slots = sorted({i for _o, i in sel})
+        donors = [o for o in self.scene.objects
+                  if o is not host and tpl_mod.get_ligating(o.structure)]
+        if not donors:
+            self.statusBar().showMessage(
+                "No ligand marked — run 'Template: Set ligating atom(s)' on "
+                "the ligand first", 8000)
+            return
+        ligand = donors[0]
+        if len(donors) > 1:
+            names = [o.name for o in donors]
+            choice, ok = QInputDialog.getItem(
+                self, "Coordinate ligand", "Which marked ligand?", names, 0,
+                False)
+            if not ok:
+                return
+            ligand = donors[names.index(choice)]
+        marks = tpl_mod.get_ligating(ligand.structure)
+        try:
+            centre = tpl_mod.check_placeholders(host.structure, slots)
+            rot, trans = tpl_mod.coordinate(
+                host.structure.coords, slots, centre,
+                ligand.structure.coords, marks)
+        except tpl_mod.TemplateError as exc:
+            self.statusBar().showMessage("Coordinate ligand: {}".format(exc),
+                                         10000)
+            return
+
+        self.push_undo()
+        # Bring a COPY of the ligand in, so the template stays reusable.
+        moved = ligand.structure.coords @ rot.T + trans
+        s = host.structure
+        offset = s.n_atoms
+        for k, symbol in enumerate(ligand.structure.symbols):
+            edits.add_atom(s, symbol, moved[k])
+        for bond in ligand.structure.bonds:
+            order = bond[2] if len(bond) > 2 else 1
+            edits.add_bond(s, offset + int(bond[0]), offset + int(bond[1]),
+                           order=order)
+        for donor in marks:
+            edits.add_bond(s, centre, offset + donor, order=1)
+        # The placeholders have been replaced, so they go — last, because
+        # deleting reindexes everything above them.
+        edits.delete_atoms(s, slots)
+        meta_mod.prune(s)
+        self.viewport.set_selection([])
+        self._after_edit()
+        self._sync_all()
+        self.statusBar().showMessage(
+            "{} coordinated onto {} — {} bond(s) made, {} placeholder(s) "
+            "removed".format(ligand.name, host.name, len(marks), len(slots)),
+            9000)
+
+    def on_join(self):
+        """J — Blender's Join, meaning whichever join makes sense here.
+
+        EDIT mode with exactly two atoms picked: bond them. Otherwise, if the
+        selection spans more than one molecule, merge those molecules — and
+        since "merge" has two reasonable answers, ask at the cursor rather
+        than guessing (Christian's Blender reference).
+        """
+        sel = self.viewport.selection
+        objs = sorted({p[0] for p in sel})
+        if self.viewport.mode == MODE_EDIT and len(objs) <= 1:
+            if len(sel) != 2:
+                self.statusBar().showMessage(
+                    "Join: select exactly 2 atoms to bond them", 5000)
+                return
+            self.on_cycle_bond_to_single()
+            return
+        if len(objs) < 2:
+            self.statusBar().showMessage(
+                "Join: select atoms in two or more molecules to merge them",
+                5000)
+            return
+        popup = ChoicePopup(
+            "Join {} molecules".format(len(objs)),
+            [("new", "Into a new molecule",
+              "Keep the originals (hidden) and add the merged copy"),
+             ("replace", "Replace the originals",
+              "Consume the originals — the merged molecule takes their place")],
+            self)
+        popup.chosen.connect(lambda mode: self.on_merge_ids(objs, mode))
+        popup.popup_at_cursor()
+
+    def on_cycle_bond_to_single(self):
+        """J on two atoms: make a bond if there is none, leave it alone if
+        there is (J is 'join', not 'cycle' — repeating it must not delete)."""
+        sel = self._two_same_object()
+        if sel is None:
+            return
+        obj = self.scene.get(sel[0][0])
+        i, j = sel[0][1], sel[1][1]
+        existing = any({int(b[0]), int(b[1])} == {i, j}
+                       for b in obj.structure.bonds)
+        if existing:
+            self.statusBar().showMessage("Those atoms are already bonded",
+                                         3000)
+            return
+        self.push_undo()
+        edits.add_bond(obj.structure, i, j, order=1)
+        self.statusBar().showMessage("Bonded {} to {}".format(
+            self.scene.pick_label((obj.id, i)),
+            self.scene.pick_label((obj.id, j))), 4000)
+        self._after_edit()
 
     def on_cycle_bond(self):
         sel = self._two_same_object()
@@ -2219,9 +2916,11 @@ class MainWindow(QMainWindow):
             vp.set_draw_tool(False)
             vp.set_origin_active(False)
             vp.set_select_tool(None)
+            vp.set_measure_tool(False)
             self.toolbar.set_active("select")
         elif tool_id == "draw":
             vp.set_origin_active(False)
+            vp.set_measure_tool(False)
             vp.set_draw_tool(not vp.draw_tool_active)
             self.toolbar.set_active(
                 "draw" if vp.draw_tool_active else "select")
@@ -2235,11 +2934,44 @@ class MainWindow(QMainWindow):
             self.toolbar.set_active(
                 "origin" if vp._origin_active else "select")
         elif tool_id == "measure":
-            self.statusBar().showMessage(
-                "Click 2-4 atoms — distance, angle and dihedral appear here",
-                6000)
+            # A real tool now: it used to only print a hint, so clicking it
+            # did nothing whatsoever.
+            on = not vp.measure_active
+            if on:
+                vp.set_draw_tool(False)
+                vp.set_origin_active(False)
+            vp.set_measure_tool(on)
         elif tool_id == "optimize":
             self.on_toggle_optimize()
+
+    def _on_measure_changed(self, on):
+        self.toolbar.set_active("measure" if on else "select")
+        self._sync_ptable()
+
+    def _on_draw_tool_changed(self, on):
+        self.toolbar.set_active("draw" if on else "select")
+        self._sync_ptable()
+
+    def _sync_ptable(self):
+        """The periodic table is up in PLAIN edit mode only.
+
+        With the draw tool armed the element is already on the toolbar and
+        every click is a drawing gesture, so the chart would just be a wall
+        between the cursor and the molecule. In plain edit mode the opposite
+        is true: clicks select, and the obvious next thing to do with a
+        selection is change what it is made of.
+        """
+        show = (self.viewport.mode == MODE_EDIT
+                and not self.viewport.draw_tool_active)
+        if show:
+            self.ptable.set_current(self.viewport.draw_element)
+            self._position_ptable()
+        self.ptable.setVisible(show)
+
+    def _position_ptable(self):
+        """Glued to the right edge of the floating tool column."""
+        x = self.toolbar.x() + self.toolbar.width() + 6
+        self.ptable.move(x, self.toolbar.y())
 
     def _on_mode_changed(self, mode):
         """Keep the window title honest about which mode is active."""
@@ -2247,6 +2979,7 @@ class MainWindow(QMainWindow):
         self._update_counts()
         edit = mode == MODE_EDIT
         self.toolbar.set_enabled_tools(edit)
+        self._sync_ptable()
         if not edit:
             self.toolbar.set_active("select")
             # Force-field clean-up is an edit-mode job; the panel only
@@ -2259,12 +2992,233 @@ class MainWindow(QMainWindow):
         self._sync_modifier_page()
         self._position_outliner_tab()
 
+    def _active_cell(self):
+        """The unit cell of the active molecule, or None."""
+        obj = self._active_obj()
+        return None if obj is None else cell_of(obj)
+
+    def _on_crystal_row_view(self, obj_id, mode):
+        """A checkbox on the crystal's own outliner row — applies at once."""
+        if obj_id != self.active_id:
+            self.active_id = obj_id          # act on the row you clicked
+            self.outliner.highlight(obj_id)
+        self.on_crystal_view(mode)
+
+    def _set_obj_flag(self, key, on):
+        """Per-object display flags live in metadata, so they ride undo
+        snapshots and savepoints without extra plumbing."""
+        obj = self._active_obj()
+        if obj is None:
+            return
+        if on:
+            obj.structure.metadata[key] = True
+        else:
+            obj.structure.metadata.pop(key, None)
+        self.viewport.refresh_geometry()
+        self.viewport.update()
+
+    def _sync_symmetry_kinds(self):
+        obj = self._active_obj()
+        if obj is None:
+            return
+        obj.structure.metadata["symmetry_kinds"] =             self.crystal_page.enabled_kinds()
+        self.viewport.update()
+
+    def _on_crystal_poly(self, obj_id, on):
+        """Coordination polyhedra are PER OBJECT — one framework shown as
+        solids next to a molecule shown as sticks is a normal figure."""
+        obj = self.scene.get(obj_id)
+        if obj is None:
+            return
+        if on:
+            obj.structure.metadata["polyhedra"] = True
+        else:
+            obj.structure.metadata.pop("polyhedra", None)
+        self.viewport.refresh_geometry()
+        self.viewport.update()
+        self._sync_crystal_page()
+
+    def _on_crystal_advanced(self, obj_id):
+        """"Advanced..." hands off to the unit-cell page, keeping the crystal
+        you came from active so the page is unambiguous about its subject."""
+        self.active_id = obj_id
+        self.outliner.highlight(obj_id)
+        self.properties.setVisible(True)
+        self.properties.show_page("crystal")
+        self._sync_crystal_page()
+        self._position_outliner_tab()
+
+    def on_toggle_cell(self):
+        self._set_cell_box(not self.viewport.show_cell)
+
+    def _set_cell_box(self, on):
+        self.viewport.show_cell = bool(on)
+        if self.crystal_page.box_check.isChecked() != bool(on):
+            self.crystal_page.box_check.blockSignals(True)
+            self.crystal_page.box_check.setChecked(bool(on))
+            self.crystal_page.box_check.blockSignals(False)
+        self.viewport.update()
+        self.statusBar().showMessage(
+            "Unit cell box {}".format("on" if on else "off"), 3000)
+
+    def _sync_crystal_page(self):
+        obj = self._active_obj()
+        cell = self._active_cell()
+        # Grey the ❖ tab itself when there is no crystal to talk about, so
+        # the page cannot be opened onto nothing.
+        tab = self.properties.buttons.get("crystal")
+        if tab is not None:
+            tab[0].setEnabled(cell is not None)
+            tab[0].setToolTip(
+                "Unit cell / crystal — {}".format(
+                    obj.name if cell is not None
+                    else "the active molecule has no unit cell"))
+        if obj is None or cell is None:
+            self.crystal_page.set_cell(None)
+            return
+        meta = obj.structure.metadata
+        self.crystal_page.set_cell(
+            cell, spacegroup=meta.get("spacegroup", ""),
+            n_asym=len(meta.get("asym_symbols") or ()),
+            n_atoms=obj.structure.n_atoms,
+            mode=meta.get("cell_view", "cell"))
+
+    def on_meta_atom(self):
+        """Configure the meta atom (the periodic table's ✳ button, and F3).
+
+        Opens whatever is or is not selected: the window IS where a meta atom
+        is defined, exactly like the chart is where an element is defined.
+        Confirming makes it the current draw element, so the next atom drawn
+        is a meta centre — and if atoms happen to be selected, they are
+        converted too, matching what picking an element does.
+        """
+        obj = self.viewport.edit_object() or self._active_obj()
+        sel = [i for o, i in self.viewport.selection
+               if obj is not None and o == obj.id]
+        current = self.viewport.meta_template
+        if obj is not None and sel:
+            current = meta_mod.get_meta(obj.structure, sel[0]) or current
+        dlg = MetaAtomDialog(self, current)
+        if not dlg.exec():
+            return
+        m = dlg.meta_atom()
+        # Arm it as the draw element whether or not anything was selected.
+        self.viewport.set_meta_template(m)
+        self.ptable.set_meta_label(m.element, m.geometry)
+        moved = 0
+        if obj is not None and sel:
+            self.push_undo()
+            for i in sel:
+                meta_mod.set_meta(obj.structure, i, m)
+                if dlg.idealize_now():
+                    moved += meta_mod.idealize(obj.structure, i, m)
+                    moved += meta_mod.dress_with_hydrogens(obj.structure, i, m)
+            self.viewport.set_selection([])
+            self.viewport.refresh_geometry()
+            self._update_counts()
+        self.statusBar().showMessage(
+            "Meta atom armed: {} r={:.2f} A{}{}".format(
+                m.geometry.replace("_", " "), m.distance,
+                " -> {} on export".format(m.element) if m.element
+                else " (no export element set)",
+                ", {} donor(s) placed".format(moved) if moved
+                else " — draw to place one"), 8000)
+
+    def on_crystal_view(self, mode, na=1, nb=1, nc=1):
+        """Rebuild a CIF import as asymmetric unit / full cell / packing.
+
+        The asymmetric unit and the operators are kept in metadata at import,
+        so every mode is regenerated from the SAME source rather than by
+        undoing the previous one — switching back and forth cannot drift.
+        """
+        obj = self._active_obj()
+        cell = self._active_cell()
+        if obj is None or cell is None:
+            self.statusBar().showMessage(
+                "The active molecule has no unit cell (import a .cif)", 5000)
+            return
+        meta = obj.structure.metadata
+        asym_symbols = meta.get("asym_symbols")
+        asym_frac = meta.get("asym_frac")
+        if not asym_symbols or not asym_frac:
+            self.statusBar().showMessage(
+                "This molecule has a cell but no stored asymmetric unit", 5000)
+            return
+        symops = [cif_mod.SymOp.from_xyz(t) for t in meta.get("symops")
+                  or ["x,y,z"]]
+        symbols, coords = cif_mod.build_view(
+            cell, asym_symbols, asym_frac, symops, mode=mode,
+            na=na, nb=nb, nc=nc)
+        if not symbols:
+            self.statusBar().showMessage("That view produced no atoms", 4000)
+            return
+        self.push_undo()
+        s = obj.structure
+        s.symbols = list(symbols)
+        s.frames = [np.asarray(coords, dtype=float)]
+        s.set_frame(0)
+        s.bonds = []
+        # Per-atom display overrides indexed the OLD atom list.
+        obj.atom_colors, obj.atom_labels = {}, set()
+        obj.atom_label_text, obj.atom_label_colors = {}, {}
+        obj.atom_label_modes = {}
+        self._perceive_fresh(s)
+        meta["cell_view"] = mode
+        self.viewport.set_selection([])
+        self._sync_all()
+        label = {"asym": "asymmetric unit", "cell": "full unit cell",
+                 "packing": "{}x{}x{} packing".format(na, nb, nc)}[mode]
+        self.statusBar().showMessage(
+            "{}: {} — {} atoms".format(obj.name, label, s.n_atoms), 6000)
+
+    def on_crystal_packing(self):
+        na, ok = QInputDialog.getInt(self, "Packing", "Cells along a:", 2, 1, 12)
+        if not ok:
+            return
+        nb, ok = QInputDialog.getInt(self, "Packing", "Cells along b:", na,
+                                     1, 12)
+        if not ok:
+            return
+        nc, ok = QInputDialog.getInt(self, "Packing", "Cells along c:", nb,
+                                     1, 12)
+        if not ok:
+            return
+        self.on_crystal_view("packing", na, nb, nc)
+
+    def on_cell_info(self):
+        obj = self._active_obj()
+        cell = self._active_cell()
+        if obj is None or cell is None:
+            return
+        meta = obj.structure.metadata
+        n_asym = len(meta.get("asym_symbols") or ())
+        QMessageBox.information(
+            self, "Unit cell — {}".format(obj.name),
+            "a = {:.4f} A\nb = {:.4f} A\nc = {:.4f} A\n"
+            "alpha = {:.3f}\nbeta  = {:.3f}\ngamma = {:.3f}\n\n"
+            "Volume = {:.2f} A^3\nSpace group: {}\n"
+            "Symmetry operations: {}\n"
+            "Asymmetric unit: {} site(s)\nExpanded cell: {} atoms".format(
+                cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma,
+                cell.volume(), meta.get("spacegroup") or "not stated",
+                len(meta.get("symops") or ()), n_asym,
+                obj.structure.n_atoms))
+
     def on_operator_search(self):
         dlg = OperatorSearchDialog(self, self.ops, self)
         if dlg.exec() and dlg.chosen is not None:
             dlg.chosen.run(self)
 
     def on_settings(self):
+        """Settings is MODELESS — it has live-applying sliders, so being
+        locked out of the outliner and the viewport while judging a sphere
+        size or a label size was backwards. Nothing here needs the rest of
+        the app held still."""
+        existing = getattr(self, "_settings_dlg", None)
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
         dlg = SettingsDialog(
             self, rotate_speed=self.viewport.camera.rotate_speed,
             start_maximized=self.settings.value("start_maximized", "true")
@@ -2275,17 +3229,35 @@ class MainWindow(QMainWindow):
             atom_scale=self.viewport.atom_scale,
             render_scale=self.viewport.render_scale,
             render_subdiv=self.viewport.render_subdiv_bonus,
+            input_preset=self.viewport.input_preset,
+            label_scale=self.viewport.label_scale,
             on_speed_change=lambda v: setattr(self.viewport.camera,
                                               "rotate_speed", v),
-            on_atom_scale_change=self.viewport.set_atom_scale)
+            on_atom_scale_change=self.viewport.set_atom_scale,
+            on_label_scale_change=self._set_label_scale)
         old_speed = self.viewport.camera.rotate_speed
         old_scale = self.viewport.atom_scale
-        if dlg.exec():
+        old_labels = self.viewport.label_scale
+        self._settings_dlg = dlg
+        dlg.setModal(False)
+        dlg.finished.connect(
+            lambda result: self._settings_closed(dlg, result, old_speed,
+                                                 old_scale, old_labels))
+        dlg.show()
+
+    def _settings_closed(self, dlg, result, old_speed, old_scale, old_labels):
+        self._settings_dlg = None
+        dlg.deleteLater()
+        if result:
             self.viewport.camera.rotate_speed = dlg.rotate_speed()
+            self.viewport.set_input_preset(dlg.input_preset())
+            self.settings.setValue("input_preset", self.viewport.input_preset)
             self.viewport.precision_factor = dlg.precision_factor()
             self.viewport.adjust_h = dlg.adjust_hydrogens()
             self.undo.set_limit(dlg.undo_limit())
             self.viewport.set_atom_scale(dlg.atom_scale())
+            self._set_label_scale(dlg.label_scale())
+            self.settings.setValue("label_scale", dlg.label_scale())
             self.settings.setValue("rotate_speed", dlg.rotate_speed())
             self.settings.setValue("precision_factor", dlg.precision_factor())
             self.settings.setValue("undo_limit", dlg.undo_limit())
@@ -2303,6 +3275,12 @@ class MainWindow(QMainWindow):
         else:
             self.viewport.camera.rotate_speed = old_speed
             self.viewport.set_atom_scale(old_scale)
+            self._set_label_scale(old_labels)
+
+    def _set_label_scale(self, scale):
+        """Live-applies while the Settings slider moves."""
+        self.viewport.label_scale = max(0.1, float(scale))
+        self.viewport.update()
 
     def on_about(self):
         QMessageBox.about(
@@ -2310,8 +3288,12 @@ class MainWindow(QMainWindow):
             "MoloM {}\n\nStandalone molecule viewer/builder.\n"
             "Element data + rendering rules from Avogadro 2 (BSD-3);\n"
             "import cascade and name resolver shared with ORCA Workbench.\n\n"
-            "Navigation: two-finger scroll orbits (over an atom/bond: about "
-            "it),\nCtrl+scroll zoom, Shift+scroll pan; MMB orbit / RMB pan.\n"
-            "Click picks, dbl-click selects the molecule, dbl-click-drag "
+            "Navigation — mouse: wheel zooms, middle-drag orbits "
+            "(Shift pans,\nCtrl zooms), Alt+left-drag orbits too, right-drag "
+            "pans.\nTrackpad: two-finger scroll orbits (over the selected "
+            "atom it\ntumbles the molecule), Ctrl+scroll zooms, Shift+scroll "
+            "pans.\nSet the device under App > Settings.\n\n"
+            "Click picks, dbl-click selects the molecule, left-drag "
             "box-selects.\nG moves (X/Y/Z lock, Shift+X/Y/Z plane, number = "
-            "A), O ortho, F fit, F3 search.".format(__version__))
+            "A), Shift+O ortho,\nF fit, Tab edit mode — and F3 searches every "
+            "operator by name.".format(__version__))

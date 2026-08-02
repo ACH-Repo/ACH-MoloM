@@ -6,13 +6,18 @@ visible object; the floor grid is a procedural shader quad (apparently
 infinite, distance-faded). All chemistry/math lives in molom.core; this file
 uploads buffers, forwards events, and paints 2D overlays with QPainter.
 
-Input map (laptop-first; see docs/OPERATORS.md):
-- two-finger scroll  orbit: with atoms SELECTED this tumbles the anchored
+Input map (device-aware — see core/input_map.py and docs/OPERATORS.md):
+- scroll on a TRACKPAD orbits: with atoms SELECTED this tumbles the anchored
   molecule(s) about the selection anchor (camera/horizon stay put — the
   vertigo fix); with nothing selected it turntable-orbits the camera
   (yaw world Z + pitch only, NO roll). Ctrl=zoom, Shift=pan.
-- MMB drag = same orbit logic, RMB drag = pan (mouse fallback)
-- LMB click pick; dbl-click atom = select molecule; dbl-click-drag = box
+- a notched MOUSE WHEEL zooms instead (one notch = one step), because on a
+  desktop that is what every other program does and one notch of orbit is a
+  ~11 deg jump. Ctrl=zoom, Shift=pan there too. Which scheme applies is the
+  `input_preset` (auto detects it from pixelDelta per event).
+- MMB drag = orbit (Shift=pan, Ctrl=zoom), Alt+LMB drag = orbit for mice
+  without a usable middle button, RMB drag = pan
+- LMB click pick; dbl-click atom = select molecule; plain left-drag = box
   select; Shift+Space,B / L arm box/lasso tools
 - compass balls: hover lights labels, click = axis view (auto-ortho,
   pops back to perspective on the next orbit)
@@ -29,14 +34,16 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from OpenGL import GL
-from PySide6.QtCore import QEvent, QPoint, QPointF, Qt, QTimer, Signal
-from PySide6.QtGui import (QColor, QCursor, QFont, QFontMetricsF, QPainter,
-                           QPen, QPolygonF, QSurfaceFormat)
+from PySide6.QtCore import (QEvent, QPoint, QPointF, QRect, Qt, QTimer,
+                            Signal)
+from PySide6.QtGui import (QColor, QCursor, QFont, QFontMetricsF,
+                           QPainter, QPen, QPolygon, QPolygonF,
+                           QSurfaceFormat)
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
-from ..core import (bonding, edits, elements, grid as grid_mod, manipulate,
-                    meshes, picking, rotations, selection2d,
-                    style as style_mod)
+from ..core import (bonding, edits, elements, grid as grid_mod, input_map,
+                    manipulate, measure, meshes, picking, rotations,
+                    selection2d, style as style_mod)
 from ..core.camera import Camera, quat_from_mat3, quat_mul, quat_to_mat3
 
 BG_BLENDER = grid_mod.BACKGROUND          # Blender viewport grey (default)
@@ -50,6 +57,17 @@ _WHEEL_TO_PX = 0.6      # legacy scale, kept for callers passing raw units
 # which is what made scrolling feel like it jumped in fixed steps. Precision
 # trackpads report pixelDelta instead, which is smooth — prefer it.
 _WHEEL_DEG_TO_PX = 1.2  # rotation pixels per degree of wheel travel
+_WHEEL_NOTCH = 120.0    # angleDelta units in one detent of a mouse wheel
+_NOTCH_PAN_PX = 45.0    # Shift+wheel pan distance per detent
+_DRAG_ZOOM_PX = 40.0    # Ctrl+MMB drag pixels per zoom step
+# Atom labels: em size as a fraction of the atom's DIAMETER at scale 1.0.
+# Was a bold fit-to-0.8-of-the-width, which covered the sphere it labelled.
+_LABEL_FILL = 0.46
+# How far a long label may spread across the atom before it is squeezed.
+_LABEL_MAX_WIDTH = 1.15
+# Wide, humanist sans faces in preference order — a condensed UI font at this
+# size turns "8" and "B" into the same smudge.
+_LABEL_FAMILIES = ["Verdana", "DejaVu Sans", "Segoe UI", "Tahoma"]
 _ANCHOR_FLASH_S = 0.8   # crosshair stays visible this long after rotating
 _GESTURE_GAP_S = 0.6    # scroll pause that starts a new undo-able gesture
 _AXIS_COLORS = {0: QColor(226, 80, 80), 1: QColor(120, 190, 70),
@@ -59,10 +77,83 @@ _AXIS_COLORS = {0: QColor(226, 80, 80), 1: QColor(120, 190, 70),
 _MODIFIER_KEYS = (Qt.Key_Shift, Qt.Key_Control, Qt.Key_Alt, Qt.Key_Meta,
                   Qt.Key_AltGr, Qt.Key_CapsLock, Qt.Key_NumLock)
 _ANCHOR_COLOR = QColor(255, 208, 60)      # Avogadro-1 style yellow
+_MEASURE_COLOR = QColor(120, 235, 255)    # measurement overlay (cyan)
+_META_GLOW = (0.62, 0.42, 0.95)           # meta-atom emissive halo (violet)
+_LIGATING_COLOR = QColor(180, 120, 255)   # template 'this atom coordinates'
+_SYM_COLOR = QColor(255, 170, 90)         # symmetry element glyphs
+_GHOST_COLOR = QColor(150, 200, 255, 120) # symmetry-image ghosts
+_MAX_GHOSTS = 48                          # a 192-op group would be a fog
 _EDIT_ACCENT = QColor(255, 150, 40)       # edit-mode border/header tint
 
 MODE_OBJECT = "object"
 MODE_EDIT = "edit"
+
+
+def cell_of(obj):
+    """The unit Cell a scene object carries, or None.
+
+    Crystallography rides in `Structure.metadata["cell"]` so it round-trips
+    through savepoints and undo snapshots for free — those already deep-copy
+    metadata, and a parallel attribute would have to be taught to.
+    """
+    from ..core import cif as cif_mod
+    try:
+        d = obj.structure.metadata.get("cell")
+    except AttributeError:
+        return None
+    if not d:
+        return None
+    try:
+        return cif_mod.Cell.from_dict(d)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def set_cell_reference(structure):
+    """Pin the cell frame to the atoms as they stand RIGHT NOW.
+
+    Call after importing or rebuilding a crystal. From here the box follows
+    whatever rigid motion the atoms undergo (see `cell_corners_world`).
+    """
+    from ..core import cif as cif_mod
+    meta = structure.metadata
+    if not meta.get("cell") or structure.n_atoms < 3:
+        return
+    idx = cif_mod.reference_sample(structure.coords)
+    meta["cell_ref_idx"] = [int(i) for i in idx]
+    meta["cell_ref_xyz"] = [[float(v) for v in structure.coords[i]]
+                            for i in idx]
+
+
+def cell_corners_world(obj, cell=None):
+    """The 8 cell corners in world space, following the molecule.
+
+    The cell is stored in the coordinate frame the atoms had at import, so
+    the box is transported by the rigid motion recovered from a sample of
+    reference atoms. That is what makes it track a grab or a rotation LIVE:
+    this runs while painting, not on commit. NOT `obj.origin` — that is the
+    centroid, which both offsets the box (the bug Christian photographed)
+    and stays put during a plain grab.
+    """
+    from ..core import cif as cif_mod
+    cell = cell or cell_of(obj)
+    if cell is None:
+        return None
+    corners = cell.corners()
+    meta = obj.structure.metadata
+    idx = meta.get("cell_ref_idx")
+    ref = meta.get("cell_ref_xyz")
+    if not idx or not ref:
+        return corners
+    coords = obj.structure.coords
+    if any(i >= len(coords) for i in idx):
+        return corners           # atoms were deleted; stop pretending to fit
+    fit = cif_mod.rigid_from_reference(np.asarray(ref, dtype=float),
+                                       coords[list(idx)])
+    if fit is None:
+        return corners
+    rot, trans = fit
+    return corners @ rot.T + trans[None, :]
 
 Pick = Tuple[int, int]   # (object id, local atom index)
 
@@ -116,28 +207,44 @@ void main() {
 _LINE_FRAG = """
 #version 330 core
 in vec3 vColor;
+uniform float uAlpha;
 out vec4 fragColor;
-void main() { fragColor = vec4(vColor, 1.0); }
+void main() { fragColor = vec4(vColor, uAlpha); }
 """
 
 # Procedural "infinite" floor grid: a huge z=0 quad; the fragment shader
 # draws anti-aliased 1 A and 10 A lines plus the tinted X/Y axes, fading
 # with distance so the plane appears to stretch to the horizon.
+# The grid is a SCREEN-SPACE plane, not a big quad (round 20). A quad — even
+# a 5000 A one — has an edge you can zoom out to, and its lines are locked to
+# one spacing, so at distance the 1 A rulings alias into a moire that fights
+# the axis lines. Instead a full-screen triangle is unprojected into a ray per
+# fragment and intersected with z = 0: genuinely infinite, and the spacing can
+# follow the camera by decades the way Blender's does.
 _GRID_VERT = """
 #version 330 core
 layout(location = 0) in vec2 aPos;
-uniform mat4 uView;
-uniform mat4 uProj;
-out vec3 vWorld;
+uniform mat4 uInvViewProj;
+out vec3 vNear;
+out vec3 vFar;
+
+vec3 unproject(vec2 ndc, float z) {
+    vec4 p = uInvViewProj * vec4(ndc, z, 1.0);
+    return p.xyz / p.w;
+}
+
 void main() {
-    vWorld = vec3(aPos, 0.0);
-    gl_Position = uProj * uView * vec4(vWorld, 1.0);
+    vNear = unproject(aPos, -1.0);
+    vFar = unproject(aPos, 1.0);
+    gl_Position = vec4(aPos, 0.0, 1.0);
 }
 """
 
 _GRID_FRAG = """
 #version 330 core
-in vec3 vWorld;
+in vec3 vNear;
+in vec3 vFar;
+uniform mat4 uViewProj;
 uniform vec3 uCamPos;
 uniform float uFade;
 uniform vec3 uBase;
@@ -145,28 +252,64 @@ uniform vec3 uAxisX;
 uniform vec3 uAxisY;
 out vec4 fragColor;
 
+// Coverage of the nearest ruling of `step_`, antialiased by the on-screen
+// derivative so a line stays one pixel wide at any zoom.
 float gridline(vec2 p, float step_) {
     vec2 q = abs(fract(p / step_ - 0.5) - 0.5) * step_ / fwidth(p);
     return 1.0 - min(min(q.x, q.y), 1.0);
 }
 
 void main() {
-    vec2 p = vWorld.xy;
+    // Ray-plane intersection with z = 0. Rays going the other way never meet
+    // it — that is the horizon, and it costs one discard.
+    float denom = vFar.z - vNear.z;
+    if (abs(denom) < 1e-8) discard;
+    float t = -vNear.z / denom;
+    if (t <= 0.0 || t >= 1.0) discard;
+    vec3 world = vNear + t * (vFar - vNear);
+    vec2 p = world.xy;
+
+    // Depth, so molecules occlude the floor exactly as before.
+    vec4 clip = uViewProj * vec4(world, 1.0);
+    gl_FragDepth = clamp(0.5 + 0.5 * (clip.z / clip.w), 0.0, 1.0);
+
+    float dist = length(world - uCamPos);
+
+    // Spacing follows the camera in powers of ten: the decade below the
+    // current scale fades out as the next one fades in, so there is always
+    // roughly the same number of lines on screen and the fine rulings never
+    // collapse into moire.
+    // TWO levels only. A third, finer one looked right on paper but at 0.1x
+    // the main spacing it is ~80 rulings across the view: they alias into a
+    // crosshatch that reads as a texture on the molecule rather than a floor.
+    float lod = max(log(dist * 0.06) / log(10.0), 0.0);
+    float fade = fract(lod);
+    float s1 = pow(10.0, floor(lod));
+    float s2 = s1 * 10.0;
+
+    // The finer decade fades out across the decade, by which point the
+    // coarser one has taken its place — so the line count on screen stays
+    // roughly constant however far you zoom.
+    float g1 = gridline(p, s1) * (1.0 - fade);
+    float g2 = gridline(p, s2);
+    float a = max(g1 * 0.45, g2 * 0.80);
+
+    // Axes are drawn INSTEAD of the grid where they land, not max()'d with
+    // it: blending the two is what made them look chewed up at distance.
     vec2 fw = fwidth(p);
-    float a = max(gridline(p, 1.0) * 0.40, gridline(p, 10.0) * 0.80);
+    float ay = 1.0 - min(abs(p.x) / (1.6 * fw.x), 1.0);   // x = 0 -> Y axis
+    float ax = 1.0 - min(abs(p.y) / (1.6 * fw.y), 1.0);   // y = 0 -> X axis
     vec3 col = uBase;
-    float ay = 1.0 - min(abs(p.x) / (1.6 * fw.x), 1.0);   // x=0 -> Y axis
-    float ax = 1.0 - min(abs(p.y) / (1.6 * fw.y), 1.0);   // y=0 -> X axis
-    if (ax > 0.0) { col = uAxisX; a = max(a, ax); }
-    if (ay > 0.0) { col = uAxisY; a = max(a, ay); }
-    float dist = length(vWorld - uCamPos);
+    if (ax > ay && ax > 0.0) { col = uAxisX; a = ax; }
+    else if (ay > 0.0)       { col = uAxisY; a = ay; }
+
+    // Distance fade — both a horizon and a performance guard: fragments past
+    // uFade are thrown away before any of the above matters visually.
     a *= 1.0 - smoothstep(uFade * 0.45, uFade, dist);
     if (a <= 0.003) discard;
     fragColor = vec4(col, a);
 }
 """
-
-_GRID_EXTENT = 5000.0
 
 
 def _h_note(added, removed):
@@ -300,19 +443,20 @@ class _LineBuffer:
         GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.vbo)
         GL.glBufferData(GL.GL_ARRAY_BUFFER, data.nbytes, data, GL.GL_DYNAMIC_DRAW)
 
-    def draw(self):
+    def draw(self, mode=None):
         if not self.n_verts:
             return
         GL.glBindVertexArray(self.vao)
-        GL.glDrawArrays(GL.GL_LINES, 0, self.n_verts)
+        GL.glDrawArrays(GL.GL_LINES if mode is None else mode, 0,
+                        self.n_verts)
         GL.glBindVertexArray(0)
 
 
 class _GridQuad:
-    """The huge z=0 quad the procedural grid shader runs on."""
+    """Full-screen triangle pair in CLIP space; the shader unprojects it."""
 
     def __init__(self):
-        e = _GRID_EXTENT
+        e = 1.0
         verts = np.array([[-e, -e], [e, -e], [e, e],
                           [-e, -e], [e, e], [-e, e]], dtype=np.float32)
         self.vao = GL.glGenVertexArrays(1)
@@ -378,6 +522,10 @@ class MolViewport(QOpenGLWidget):
         self._press_pos = None           # drag slop measured from HERE
         self._select_tool = None         # None | 'box' | 'lasso'
         self._region_drag = None
+        self._nav_drag = None            # 'orbit'|'pan'|'zoom' while dragging
+        # 'auto' | 'trackpad' | 'mouse' — what a plain scroll means. Set from
+        # Settings; 'auto' decides per event (see core/input_map.py).
+        self.input_preset = input_map.PRESET_AUTO
         self._dbl_pos = None
         self._grab = None                # {'state','snap',...} while G active
         self._rotate = None              # {'state','snap',...} while R active
@@ -394,11 +542,12 @@ class MolViewport(QOpenGLWidget):
         self.draw_tool_active = False    # E arms drawing; otherwise clicks
                                          # only SELECT (accidental atoms were
                                          # the single worst edit-mode paper cut)
-        self._element_buffer = ""        # typed symbol, Enter confirms
         self._hover_bond = None          # (obj_id, i, j) under the cursor
         self._compass_hover_item = None  # (axis, sign) actually hovered
         self._dbl_empty = False
         self.show_hbonds = False         # suspected H-bond overlay
+        self.show_cell = True            # unit-cell box for CIF imports
+        self.polyhedra_alpha = 0.55      # coordination-solid opacity
         self.render_subdiv_bonus = 2     # extra sphere subdivisions on render
         self.render_scale = 2            # resolution multiplier on render
         self.adjust_h = True             # re-dress hydrogens on edits
@@ -407,6 +556,12 @@ class MolViewport(QOpenGLWidget):
         self.on_new_molecule = None      # app callback: () -> obj_id
         self.on_toggle_mode = None       # app callback: () -> None (Tab)
         self.on_tool_changed = None      # app callback: (draw_on) -> None
+        self.on_element_changed = None   # app callback: (symbol) -> None
+        self.meta_template = None        # armed MetaAtom, or None
+        self.measure_active = False      # measurement tool armed
+        self._measure_picks = []         # type: List[Pick]  click order
+        self.on_measure_changed = None   # app callback: (on) -> None
+        self.label_scale = 1.0           # Settings: atom-label size multiplier
         self._tumble_axis = None         # 0/1/2 world axis lock for tumbling
         self._tumble_local = False
         self._gesture_mode = None        # 'camera' | 'tumble', decided at start
@@ -499,8 +654,16 @@ class MolViewport(QOpenGLWidget):
              None: ""}[tool])
         self.update()
 
+    def set_input_preset(self, preset):
+        # type: (object) -> None
+        """'auto' | 'trackpad' | 'mouse' — what a plain scroll does."""
+        self.input_preset = input_map.normalize_preset(preset)
+
     def cancel_modes(self):
         """Esc hook: cancel any modal first, then an armed select tool."""
+        if self.measure_active:
+            self.set_measure_tool(False)
+            return True
         if self._shuttle is not None:
             self.stop_shuttle()
             return True
@@ -709,7 +872,15 @@ class MolViewport(QOpenGLWidget):
         else:
             self.mode = MODE_OBJECT
             self.edit_obj_id = None
-            self._element_buffer = ""
+            # Disarm the draw tool on the way OUT. It used to survive in
+            # object mode (where it does nothing and the toolbar reports
+            # "select"), so Tabbing back into edit mode came up with an armed
+            # tool nobody asked for — which is why the periodic table
+            # "sometimes" failed to appear. The flag and the toolbar must not
+            # be allowed to disagree.
+            self.draw_tool_active = False
+            if self.on_tool_changed is not None:
+                self.on_tool_changed(False)
             self.status_message.emit("Object mode")
         if self.on_mode_changed is not None:
             self.on_mode_changed(self.mode)
@@ -736,35 +907,110 @@ class MolViewport(QOpenGLWidget):
             self.on_tool_changed(on)
         self.update()
 
-    def set_draw_element(self, symbol):
-        # type: (str) -> None
-        if elements.atomic_number(symbol) == 0:
-            self.status_message.emit("Unknown element: {!r}".format(symbol))
+    def set_measure_tool(self, on):
+        # type: (bool) -> None
+        """Arm the measurement tool: clicks collect up to four atoms and the
+        distance / angle / dihedral is drawn IN THE VIEWPORT.
+
+        It reads out over the molecule rather than in the status bar, where
+        it was invisible behind every transient message. Picks are its own
+        list — measuring must not disturb the selection.
+        """
+        on = bool(on)
+        if on == self.measure_active:
             return
-        self.draw_element = symbol
-        self.status_message.emit("Draw element: {}".format(symbol))
+        self.measure_active = on
+        self._measure_picks = []
+        self.status_message.emit(
+            "Measure: click 2 atoms for a distance, 3 for an angle, 4 for a "
+            "dihedral (click again to unpick, Esc to finish)"
+            if on else "Measure tool off")
+        if self.on_measure_changed is not None:
+            self.on_measure_changed(on)
         self.update()
 
-    def _confirm_element_buffer(self):
-        """Enter after typing: set the draw element and, if atoms of the
-        edited molecule are selected, convert them right away."""
-        text = self._element_buffer.strip()
-        self._element_buffer = ""
-        if not text:
+    def _measure_click(self, pos):
+        hit = self._pick_at(pos)
+        if hit is None:
+            self._measure_picks = []
             self.update()
             return
-        symbol = text[0].upper() + text[1:].lower()
-        if elements.atomic_number(symbol) == 0:
-            self.status_message.emit("Unknown element: {!r}".format(text))
+        pick = self._atom_map[hit]
+        if pick in self._measure_picks:
+            self._measure_picks.remove(pick)      # click again to unpick
+        elif len(self._measure_picks) >= 4:
+            self._measure_picks = [pick]          # start a new measurement
+        else:
+            self._measure_picks.append(pick)
+        self.update()
+
+    def measure_text(self):
+        # type: () -> str
+        if self.scene is None or not self._measure_picks:
+            return ""
+        picks = []
+        for p in self._measure_picks:
+            c = self.scene.pick_coords(p)
+            if c is not None:
+                picks.append((self.scene.pick_label(p), c))
+        return measure.describe_picks(picks)
+
+    def set_meta_template(self, meta):
+        """Arm a meta atom as the thing the draw tool places.
+
+        Picking a real element from the chart clears it again — the two are
+        alternative answers to the same question ("what am I drawing?"), so
+        they must not both be live at once.
+        """
+        from ..core import meta as meta_mod
+        self.meta_template = meta
+        self.draw_element = meta_mod.META_SYMBOL
+        if self.on_element_changed is not None:
+            self.on_element_changed(self.draw_element)
+        self.update()
+
+    def set_draw_element(self, symbol):
+        # type: (str) -> None
+        """Set the draw element WITHOUT touching the selection (the toolbar
+        and dialogs use this; typing/the periodic table use apply_element)."""
+        resolved = elements.symbol_from_text(symbol)
+        if not resolved:
+            self.status_message.emit("Unknown element: {!r}".format(symbol))
+            return
+        self.meta_template = None        # a real element disarms the meta one
+        self.draw_element = resolved
+        if self.on_element_changed is not None:
+            self.on_element_changed(resolved)
+        self.status_message.emit("Draw element: {}".format(resolved))
+        self.update()
+
+    def apply_element(self, symbol):
+        # type: (str) -> None
+        """Set the draw element and, if atoms of the edited molecule are
+        selected, convert them right away.
+
+        The one path shared by typing + Enter, the periodic-table panel and
+        the Change element dialog — they must not drift apart.
+        """
+        symbol = elements.symbol_from_text(symbol)
+        if not symbol:
             self.update()
             return
+        self.meta_template = None        # a real element disarms the meta one
         self.draw_element = symbol
+        if self.on_element_changed is not None:
+            self.on_element_changed(symbol)
         obj = self.edit_object()
         rows = [i for o, i in self.selection if obj is not None and o == obj.id]
         if obj is not None and rows:
             self._begin_edit()
             added, removed = edits.set_element_adjusted(
                 obj.structure, rows, symbol, adjust_h=self.adjust_h)
+            # Converted atoms are DESELECTED: they are already the element
+            # that was asked for, so keeping them selected turns the next
+            # element pick into a second, unintended conversion of the same
+            # atoms (Christian's report — draw an Li, pick Cd, lose the Li).
+            self.set_selection([])
             self.status_message.emit(
                 "{} atom(s) -> {}{}   (draw element is now {})".format(
                     len(rows), symbol, _h_note(added, removed), symbol))
@@ -810,12 +1056,20 @@ class MolViewport(QOpenGLWidget):
             edits.add_atom(obj.structure, self.draw_element, p)
             new_idx = obj.structure.n_atoms - 1
             added = removed = 0
-            if self.adjust_h:
+            if self.meta_template is not None:
+                # CLICK-to-place must attach the meta spec too. Only the drag
+                # path did, so clicking left a bare Xx with no geometry and
+                # no glow — which looked like the glow was broken.
+                from ..core import meta as meta_mod
+                meta_mod.set_meta(obj.structure, new_idx, self.meta_template)
+                added = meta_mod.dress_with_hydrogens(
+                    obj.structure, new_idx, self.meta_template)
+            elif self.adjust_h:
                 added, removed = edits.adjust_hydrogens(obj.structure,
                                                         [new_idx])
             self.status_message.emit("Added {}{}".format(
                 self.draw_element, _h_note(added, removed)))
-            self.set_selection([(obj.id, new_idx)])
+            self.set_selection([])
         self.edit_committed.emit()
         self.refresh_geometry()
 
@@ -855,17 +1109,13 @@ class MolViewport(QOpenGLWidget):
             return
         self._align_wait = kind
         self.grabKeyboard()
-        self.status_message.emit(
-            "Align pair to axis: press X / Y / Z (Esc cancels)"
-            if kind == "axis" else
-            "Align selection plane: press X / Y / Z (or Shift+axis) for the "
-            "plane PERPENDICULAR to that axis — Shift+Z = XY plane (Esc "
-            "cancels)")
+        self.update()          # the prompt is painted, not just announced
 
     def _end_align_wait(self, msg=""):
         self._align_wait = None
         self.releaseKeyboard()
         self.releaseMouse()
+        self.update()
         if msg:
             self.status_message.emit(msg)
 
@@ -1287,6 +1537,7 @@ class MolViewport(QOpenGLWidget):
         self._sphere = _InstancedMesh(*meshes.icosphere(2))
         self._cylinder = _InstancedMesh(*meshes.cylinder(24))
         self._wire_lines = _LineBuffer()
+        self._poly_tris = _LineBuffer()   # same layout, GL_TRIANGLES
         self._grid_quad = _GridQuad()
         self._gl_ready = True
         self._needs_rebuild = True
@@ -1319,12 +1570,15 @@ class MolViewport(QOpenGLWidget):
                 rr = rr * self.atom_scale
             xyz = s.coords
             for i in range(s.n_atoms):
+                if i in obj.atom_hidden:
+                    continue          # hidden atoms are not pickable either
                 atom_map.append((obj.id, i))
                 coords.append(xyz[i])
-                radii.append(max(float(rr[i]), _MIN_PICK_RADIUS))
+                scaled = float(rr[i]) * obj.atom_scale_for(i)
+                radii.append(max(scaled, _MIN_PICK_RADIUS))
                 # what is actually DRAWN (wireframe draws no sphere at all) —
                 # label sizing and selection halos both key off this
-                drawn.append(max(float(rr[i]), 0.10 if st.wireframe else 0.0))
+                drawn.append(max(scaled, 0.10 if st.wireframe else 0.0))
         self._atom_map = atom_map
         self._flat_coords = (np.array(coords) if coords
                              else np.zeros((0, 3)))
@@ -1371,6 +1625,16 @@ class MolViewport(QOpenGLWidget):
                 for i, j, _o in bonds_e:
                     bonded[i] = bonded[j] = True
                 radii = np.where(bonded, 0.0, 0.12)
+            # Per-atom size and visibility from the outliner. Modifier copies
+            # follow their base atom, same rule as the colours.
+            if obj.atom_scales or obj.atom_hidden:
+                base_n = max(s.n_atoms, 1)
+                for i in range(len(radii)):
+                    base_i = i % base_n
+                    if base_i in obj.atom_hidden:
+                        radii[i] = 0.0
+                    else:
+                        radii[i] *= obj.atom_scale_for(base_i)
             hide = self._shuttle_hidden(coords)
             for i in range(len(sym_e)):
                 if hide is not None and hide[i]:
@@ -1384,7 +1648,13 @@ class MolViewport(QOpenGLWidget):
                     sphere_cols.append((colors[i][0], colors[i][1],
                                         colors[i][2], 1.0))
             if st.show_bonds:
+                base_n = max(s.n_atoms, 1)
                 for i, j, order in bonds_e:
+                    # A bond to a hidden atom goes with it — otherwise
+                    # turning hydrogens off leaves their sticks behind.
+                    if obj.atom_hidden and (i % base_n in obj.atom_hidden
+                                            or j % base_n in obj.atom_hidden):
+                        continue
                     p1, p2 = coords[i], coords[j]
                     mid = (p1 + p2) / 2.0
                     if st.wireframe:
@@ -1442,9 +1712,12 @@ class MolViewport(QOpenGLWidget):
             self._sphere.draw()
             self._cylinder.draw()
             self._draw_lines(self._wire_lines, view, proj)
+        if not empty:
+            self._draw_polyhedra(view, proj)
         if self.show_grid:
             self._draw_grid(view, proj)
         if not empty:
+            self._paint_meta_glow(view, proj)
             self._paint_selection(view, proj)
         self._paint_overlays(view, proj, empty)
 
@@ -1453,8 +1726,18 @@ class MolViewport(QOpenGLWidget):
         depth-write off and blended, so the fade never punches holes."""
         GL.glUseProgram(self._grid_prog)
         u = lambda n: GL.glGetUniformLocation(self._grid_prog, n)
-        GL.glUniformMatrix4fv(u("uView"), 1, GL.GL_TRUE, view)
-        GL.glUniformMatrix4fv(u("uProj"), 1, GL.GL_TRUE, proj)
+        # The shader needs both directions: viewProj to write depth, and its
+        # inverse to turn each pixel back into a world-space ray.
+        view_proj = np.asarray(proj, dtype=np.float64) @ np.asarray(
+            view, dtype=np.float64)
+        try:
+            inv_view_proj = np.linalg.inv(view_proj)
+        except np.linalg.LinAlgError:
+            return
+        GL.glUniformMatrix4fv(u("uViewProj"), 1, GL.GL_TRUE,
+                              view_proj.astype(np.float32))
+        GL.glUniformMatrix4fv(u("uInvViewProj"), 1, GL.GL_TRUE,
+                              inv_view_proj.astype(np.float32))
         r = quat_to_mat3(self.camera.rotation)
         eye = self.camera.center + r.T @ np.array([0.0, 0.0,
                                                    self.camera.distance])
@@ -1471,7 +1754,7 @@ class MolViewport(QOpenGLWidget):
         GL.glDepthMask(GL.GL_TRUE)
         GL.glDisable(GL.GL_BLEND)
 
-    def _draw_lines(self, buf, view, proj):
+    def _draw_lines(self, buf, view, proj, mode=None, alpha=1.0):
         if buf is None or not buf.n_verts:
             return
         GL.glUseProgram(self._line_prog)
@@ -1479,7 +1762,90 @@ class MolViewport(QOpenGLWidget):
                               1, GL.GL_TRUE, view)
         GL.glUniformMatrix4fv(GL.glGetUniformLocation(self._line_prog, "uProj"),
                               1, GL.GL_TRUE, proj)
-        buf.draw()
+        GL.glUniform1f(GL.glGetUniformLocation(self._line_prog, "uAlpha"),
+                       float(alpha))
+        buf.draw(mode)
+
+    def _draw_polyhedra(self, view, proj):
+        """Translucent coordination solids through each metal's donors.
+
+        Drawn AFTER the opaque geometry with depth-write off, like the grid:
+        the sticks inside a polyhedron should still read through it, which is
+        exactly how VESTA and every MOF figure look. Double-sided (culling
+        off) so the inside face is visible when the camera is within a large
+        cage.
+        """
+        if self.scene is None:
+            return
+        from ..core import polyhedra as poly_mod
+        chunks = []
+        for obj in self.scene.visible_objects():
+            if not (obj.structure.metadata or {}).get("polyhedra"):
+                continue
+            sym, xyz, bonds = obj.evaluated()
+            built = poly_mod.build(sym, xyz, bonds)
+            if built:
+                chunks.append(poly_mod.triangle_soup(built))
+        if not chunks:
+            if self._poly_tris is not None:
+                self._poly_tris.n_verts = 0
+            return
+        verts = np.vstack([c[0] for c in chunks])
+        cols = np.vstack([c[1] for c in chunks])
+        self._poly_tris.upload(np.hstack([verts, cols]))
+        GL.glEnable(GL.GL_BLEND)
+        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+        GL.glDepthMask(GL.GL_FALSE)
+        GL.glDisable(GL.GL_CULL_FACE)
+        self._draw_lines(self._poly_tris, view, proj, mode=GL.GL_TRIANGLES,
+                         alpha=self.polyhedra_alpha)
+        GL.glDepthMask(GL.GL_TRUE)
+        GL.glDisable(GL.GL_BLEND)
+
+    def _paint_meta_glow(self, view, proj):
+        """Layered translucent shells around every meta centre.
+
+        A cheap stand-in for a bloom pass: three concentric additively-blended
+        shells fall off outward, which reads as a glow without a second render
+        target or a post-process. Meta atoms are dummies — they must not look
+        like an ordinary element sitting in the structure.
+        """
+        from ..core import meta as meta_mod
+        if self.scene is None:
+            return
+        mats, rgba = [], []
+        for obj in self.scene.visible_objects():
+            table = meta_mod.all_meta(obj.structure)
+            if not table:
+                continue
+            st = self._object_style(obj)
+            for index in table:
+                if index >= obj.structure.n_atoms:
+                    continue
+                z = elements.atomic_number(obj.structure.symbols[index])
+                base = st.atom_radius(elements.radius_vdw(z))
+                if st.fixed_atom_radius is None:
+                    base *= self.atom_scale
+                base = max(base, 0.30)
+                for shell, alpha in ((1.35, 0.30), (1.9, 0.16), (2.6, 0.07)):
+                    m = np.zeros((4, 4))
+                    m[0, 0] = m[1, 1] = m[2, 2] = base * shell
+                    m[:3, 3] = obj.structure.coords[index]
+                    m[3, 3] = 1.0
+                    mats.append(m)
+                    rgba.append(_META_GLOW + (alpha,))
+        if not mats:
+            return
+        GL.glEnable(GL.GL_BLEND)
+        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE)      # additive = emissive
+        GL.glDepthMask(GL.GL_FALSE)
+        GL.glUseProgram(self._prog)
+        self._sphere.upload(np.array(mats), np.array(rgba))
+        self._sphere.draw()
+        GL.glDepthMask(GL.GL_TRUE)
+        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+        GL.glDisable(GL.GL_BLEND)
+        self._needs_rebuild = True   # sphere instances were overwritten
 
     def _paint_selection(self, view, proj):
         if not self.selection or self.scene is None:
@@ -1525,6 +1891,9 @@ class MolViewport(QOpenGLWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.TextAntialiasing)
+        if self.show_cell:
+            self._paint_cells(p)
+        self._paint_symmetry(p)
         if not empty:
             self._paint_labels(p)
         if self.show_compass:
@@ -1537,6 +1906,9 @@ class MolViewport(QOpenGLWidget):
         if self.show_hbonds:
             self._paint_hbonds(p)
         self._paint_anchor(p)
+        self._paint_ligating(p)
+        self._paint_measure(p)
+        self._paint_modal_prompt(p)
         self._paint_tumble_lock(p)
         if self._shuttle is not None:
             self._paint_shuttle(p)
@@ -1569,8 +1941,10 @@ class MolViewport(QOpenGLWidget):
         text = "SHUTTLE  |  {}  |  WASD + Q/E fly, scroll steer, " \
                "Ctrl+scroll roll, Esc land".format(
                    obj.name if obj is not None else "?")
-        rect = p.fontMetrics().boundingRect(text).adjusted(-8, -4, 8, 4)
-        rect.moveTo(10, 8)
+        # horizontalAdvance, NOT boundingRect: the tight rect ignores a bold
+        # face's side bearings, so the banner cropped its own last glyph.
+        fm = p.fontMetrics()
+        rect = QRect(10, 8, fm.horizontalAdvance(text) + 16, fm.height() + 8)
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(0, 0, 0, 140))
         p.drawRoundedRect(rect, 4, 4)
@@ -1686,16 +2060,342 @@ class MolViewport(QOpenGLWidget):
         p.setFont(f)
         text = "EDIT  |  {}  |  draw: {}".format(
             obj.name if obj is not None else "?", self.draw_element)
-        if self._element_buffer:
-            text += "  |  typing: {}_".format(self._element_buffer)
-        rect = p.fontMetrics().boundingRect(text).adjusted(-8, -4, 8, 4)
-        rect.moveTo(10, 8)
+        # horizontalAdvance, NOT boundingRect: the tight rect ignores a bold
+        # face's side bearings, so the banner cropped its own last glyph.
+        fm = p.fontMetrics()
+        rect = QRect(10, 8, fm.horizontalAdvance(text) + 16, fm.height() + 8)
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(0, 0, 0, 130))
         p.drawRoundedRect(rect, 4, 4)
-        p.setPen(_EDIT_ACCENT if not self._element_buffer
-                 else QColor(255, 255, 255))
+        p.setPen(_EDIT_ACCENT)
         p.drawText(rect, Qt.AlignCenter, text)
+
+    def _paint_cells(self, p):
+        """Unit-cell box for every visible object that carries a cell.
+
+        A QPainter overlay rather than GL geometry: it is 12 near-plane
+        clipped segments, it needs no buffer rebuild when a molecule moves,
+        and a cell outline reading THROUGH the structure is what every
+        crystallography viewer does anyway. The three cell vectors from the
+        origin are drawn in the axis colours (a = red, b = green, c = blue),
+        which is also how the compass reads.
+        """
+        if self.scene is None:
+            return
+        for obj in self.scene.visible_objects():
+            cell = cell_of(obj)
+            if cell is None:
+                continue
+            corners = cell_corners_world(obj, cell)
+            if corners is None:
+                continue
+            pen = QPen(QColor(200, 200, 210, 150), 1.2)
+            for i, j in cell.edges():
+                seg = self._segment_screen(corners[i], corners[j])
+                if seg is None:
+                    continue
+                (x0, y0), (x1, y1) = seg
+                p.setPen(pen)
+                p.drawLine(int(x0), int(y0), int(x1), int(y1))
+            # a/b/c from the origin corner, in the axis colours.
+            for axis, target in enumerate((1, 2, 3)):
+                seg = self._segment_screen(corners[0], corners[target])
+                if seg is None:
+                    continue
+                (x0, y0), (x1, y1) = seg
+                p.setPen(QPen(_AXIS_COLORS[axis], 2.0))
+                p.drawLine(int(x0), int(y0), int(x1), int(y1))
+
+    def _paint_symmetry(self, p):
+        """Symmetry elements and 'ghost' images of the asymmetric unit.
+
+        Two complementary pictures, both optional: the GHOSTS show where each
+        copy lands (usually the more immediate answer to "how does this fill
+        the cell"), and the GLYPHS name the operation doing it, in the
+        standard crystallographic language — a lens for a 2-fold, triangle
+        for 3, square for 4, hexagon for 6, an open circle for an inversion
+        centre, an outlined quad for a mirror. Screws and glides get an
+        arrow for their intrinsic translation.
+        """
+        if self.scene is None:
+            return
+        from ..core import cif as cif_mod
+        from ..core import symmetry as sym_mod
+        for obj in self.scene.visible_objects():
+            meta = obj.structure.metadata or {}
+            cell = cell_of(obj)
+            if cell is None or not (meta.get("show_symmetry")
+                                    or meta.get("show_ghosts")):
+                continue
+            ops = [cif_mod.SymOp.from_xyz(t) for t in meta.get("symops")
+                   or ("x,y,z",)]
+            fit = self._cell_fit(obj, cell)
+            to_world = lambda f: (np.asarray(f) @ cell.matrix()) @ fit[0].T \
+                + fit[1]
+
+            # ONE filtered list drives both pictures, so the glyphs and the
+            # ghosts can never disagree about which operations are in play.
+            active = sym_mod.filter_ops(ops, meta.get("symmetry_kinds"))
+            if meta.get("show_ghosts") and meta.get("asym_frac"):
+                self._paint_ghosts(p, meta, active, to_world)
+            if meta.get("show_symmetry"):
+                for element in sym_mod.classify_all(active):
+                    self._paint_symmetry_element(p, element, cell, to_world)
+
+    def _cell_fit(self, obj, cell):
+        """The rigid transform carrying stored cell space to world space."""
+        from ..core import cif as cif_mod
+        meta = obj.structure.metadata or {}
+        idx, ref = meta.get("cell_ref_idx"), meta.get("cell_ref_xyz")
+        coords = obj.structure.coords
+        if idx and ref and not any(i >= len(coords) for i in idx):
+            fit = cif_mod.rigid_from_reference(np.asarray(ref, dtype=float),
+                                               coords[list(idx)])
+            if fit is not None:
+                return fit
+        return np.eye(3), np.zeros(3)
+
+    def _paint_ghosts(self, p, meta, ops, to_world):
+        """Ghosts are FRAGMENTS, not dots — a scatter of circles says nothing
+        about what the copy IS, while a faint skeleton of the asymmetric unit
+        is instantly recognisable as the same thing moved."""
+        from ..core import symmetry as sym_mod
+        base = np.asarray(meta["asym_frac"], dtype=float)
+        bonds = self._ghost_bonds(meta, base)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(_GHOST_COLOR, 1.1))
+        for image in sym_mod.images_of(base, ops)[:_MAX_GHOSTS]:
+            world = to_world(image)
+            xy, front = self._project(world)
+            for i, j in bonds:
+                if not (front[i] and front[j]):
+                    continue
+                p.drawLine(int(xy[i, 0]), int(xy[i, 1]),
+                           int(xy[j, 0]), int(xy[j, 1]))
+            for k in range(len(xy)):
+                if front[k]:
+                    p.drawEllipse(int(xy[k, 0]) - 2, int(xy[k, 1]) - 2, 4, 4)
+
+    def _ghost_bonds(self, meta, frac):
+        """Connectivity of the asymmetric unit, cached on the metadata: it
+        depends only on the stored sites, so it never needs recomputing."""
+        cached = meta.get("_ghost_bonds")
+        if cached is not None:
+            return cached
+        from ..core import cif as cif_mod
+        symbols = list(meta.get("asym_symbols") or ())
+        cell = cif_mod.Cell.from_dict(meta["cell"])
+        pairs = []
+        if symbols and len(symbols) == len(frac):
+            adj = cif_mod.periodic_neighbours(symbols, frac, cell)
+            for i, neighbours in enumerate(adj):
+                pairs.extend((i, j) for j in neighbours if j > i)
+        meta["_ghost_bonds"] = pairs
+        return pairs
+
+    def _depth_fade(self, world_point):
+        """0 (far) .. 1 (near) for a world point, for depth cueing.
+
+        The symmetry overlay is 2D line art on top of a 3D scene, so nothing
+        tells you which axis is in front — which defeats the purpose when the
+        whole point is showing a 3D transformation. Fading and thinning the
+        far ends restores the ordering without a depth buffer or a real AO
+        pass, both of which would be a lot of machinery for line art.
+        """
+        r = quat_to_mat3(self.camera.rotation)
+        eye = self.camera.center + r.T @ np.array(
+            [0.0, 0.0, self.camera.distance])
+        dist = float(np.linalg.norm(np.asarray(world_point) - eye))
+        span = max(self.camera.distance, 1e-6)
+        return float(np.clip(1.0 - (dist - span * 0.4) / (span * 1.6),
+                             0.12, 1.0))
+
+    def _cued_pen(self, colour, world_point, width=1.6, style=Qt.SolidLine):
+        near = self._depth_fade(world_point)
+        faded = QColor(colour)
+        faded.setAlpha(int(70 + 185 * near))
+        return QPen(faded, max(width * (0.45 + 0.55 * near), 0.7), style)
+
+    def _paint_symmetry_element(self, p, element, cell, to_world):
+        from ..core import symmetry as sym_mod
+        span = 0.5 * max(cell.a, cell.b, cell.c)
+        centre_f = np.clip(element.point, -1.0, 2.0)
+        if element.kind == sym_mod.INVERSION:
+            world = to_world(centre_f[None, :])
+            xy, front = self._project(world)
+            if front[0]:
+                p.setPen(self._cued_pen(_SYM_COLOR, world[0], 1.8))
+                p.setBrush(Qt.NoBrush)
+                p.drawEllipse(int(xy[0, 0]) - 4, int(xy[0, 1]) - 4, 8, 8)
+            return
+        if element.direction is None:
+            return
+        # Cartesian direction: a fractional axis must go through the cell
+        # matrix or a non-cubic cell points it the wrong way.
+        world_dir = np.asarray(element.direction, dtype=float) @ cell.matrix()
+        norm = float(np.linalg.norm(world_dir))
+        if norm < 1e-9:
+            return
+        world_dir /= norm
+        centre = to_world(centre_f[None, :])[0]
+        if element.is_axis:
+            dashed = element.kind == sym_mod.SCREW
+            style = Qt.DashLine if dashed else Qt.SolidLine
+            # Drawn in depth-cued SEGMENTS so a line that recedes actually
+            # fades along its length instead of being uniformly flat.
+            steps = 12
+            ends = None
+            for k in range(steps):
+                t0 = -1.0 + 2.0 * k / steps
+                t1 = -1.0 + 2.0 * (k + 1) / steps
+                a = centre + world_dir * span * t0
+                b = centre + world_dir * span * t1
+                seg = self._segment_screen(a, b)
+                if seg is None:
+                    continue
+                (x0, y0), (x1, y1) = seg
+                p.setPen(self._cued_pen(_SYM_COLOR, (a + b) / 2.0, 1.8, style))
+                p.drawLine(int(x0), int(y0), int(x1), int(y1))
+                ends = (x1, y1, b)
+            if ends is not None:
+                p.setPen(self._cued_pen(_SYM_COLOR, ends[2], 1.6))
+                self._paint_axis_glyph(p, ends[0], ends[1], element.order,
+                                       dashed)
+        else:
+            # A plane: outline the quad where it cuts the cell.
+            u = np.cross(world_dir, [0.0, 0.0, 1.0])
+            if float(np.linalg.norm(u)) < 1e-6:
+                u = np.cross(world_dir, [0.0, 1.0, 0.0])
+            u /= np.linalg.norm(u)
+            v = np.cross(world_dir, u)
+            corners = [centre + u * span + v * span,
+                       centre - u * span + v * span,
+                       centre - u * span - v * span,
+                       centre + u * span - v * span]
+            dashed = element.kind == sym_mod.GLIDE
+            style = Qt.DashLine if dashed else Qt.SolidLine
+            for a, b in zip(corners, corners[1:] + corners[:1]):
+                seg = self._segment_screen(a, b)
+                if seg is None:
+                    continue
+                (x0, y0), (x1, y1) = seg
+                p.setPen(self._cued_pen(_SYM_COLOR, (a + b) / 2.0, 1.4, style))
+                p.drawLine(int(x0), int(y0), int(x1), int(y1))
+
+    def _paint_axis_glyph(self, p, x, y, order, hollow):
+        """The printed-table glyph: lens (2), triangle (3), square (4),
+        hexagon (6). Hollow marks a screw axis."""
+        x, y, r = int(x), int(y), 6
+        p.setPen(QPen(_SYM_COLOR, 1.4))
+        p.setBrush(Qt.NoBrush if hollow else _SYM_COLOR)
+        if order == 2:
+            p.drawEllipse(x - r, y - r // 2, 2 * r, r)
+            return
+        sides = {3: 3, 4: 4, 6: 6}.get(int(order))
+        if sides is None:
+            p.drawEllipse(x - r, y - r, 2 * r, 2 * r)
+            return
+        pts = []
+        for k in range(sides):
+            a = 2.0 * np.pi * k / sides - np.pi / 2.0
+            pts.append(QPoint(int(x + r * np.cos(a)), int(y + r * np.sin(a))))
+        p.drawPolygon(QPolygon(pts))
+
+    def _paint_modal_prompt(self, p):
+        """The active modal's instructions, drawn IN the viewport.
+
+        These lived in the status bar, where a 4-second timeout and any
+        other message wiped them out — so an align that was patiently
+        waiting for an axis key looked like nothing was happening at all.
+        """
+        if self._align_wait == "axis":
+            text = "ALIGN PAIR TO AXIS   X / Y / Z    (right-click or Esc: cancel)"
+        elif self._align_wait == "plane":
+            text = ("ALIGN PLANE   X / Y / Z = plane perpendicular to it, "
+                    "Shift+Z = XY    (right-click or Esc: cancel)")
+        else:
+            return
+        f = QFont()
+        f.setPixelSize(13)
+        f.setBold(True)
+        p.setFont(f)
+        fm = p.fontMetrics()
+        w = fm.horizontalAdvance(text) + 20
+        h = fm.height() + 10
+        x = max((self.width() - w) // 2, 6)
+        y = self.height() - h - 16
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 190))
+        p.drawRoundedRect(QRect(x, y, w, h), 5, 5)
+        p.setPen(_EDIT_ACCENT)
+        p.drawText(QRect(x, y, w, h), Qt.AlignCenter, text)
+
+    def _paint_ligating(self, p):
+        """Small violet dots on atoms marked as ligating, drawn on TOP like
+        the origin handle: a template marker has to be findable from any
+        angle, including through the molecule it sits on."""
+        if self.scene is None:
+            return
+        from ..core import templates as tpl_mod
+        for obj in self.scene.visible_objects():
+            rows = tpl_mod.get_ligating(obj.structure)
+            if not rows:
+                continue
+            coords = obj.structure.coords
+            rows = [i for i in rows if i < len(coords)]
+            if not rows:
+                continue
+            xy, front = self._project(coords[rows])
+            for k in range(len(xy)):
+                if not front[k]:
+                    continue
+                x, y = int(xy[k, 0]), int(xy[k, 1])
+                p.setPen(QPen(QColor(20, 10, 30, 200), 1.2))
+                p.setBrush(_LIGATING_COLOR)
+                p.drawEllipse(x - 4, y - 4, 8, 8)
+
+    def _paint_measure(self, p):
+        """Ringed picks, the chain between them, and the value — drawn OVER
+        the molecule, which is the one place it cannot be covered up."""
+        if not self._measure_picks or self.scene is None:
+            return
+        pts = []
+        for pick in self._measure_picks:
+            c = self.scene.pick_coords(pick)
+            if c is None:
+                continue
+            xy, front = self._project(np.asarray([c], dtype=float))
+            if front[0]:
+                pts.append((float(xy[0, 0]), float(xy[0, 1])))
+        if not pts:
+            return
+        pen = QPen(_MEASURE_COLOR, 1.6, Qt.DashLine)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        for a, b in zip(pts, pts[1:]):
+            p.drawLine(int(a[0]), int(a[1]), int(b[0]), int(b[1]))
+        f = QFont()
+        f.setPixelSize(11)
+        p.setFont(f)
+        for k, (x, y) in enumerate(pts):
+            p.setPen(QPen(_MEASURE_COLOR, 2.0))
+            p.drawEllipse(int(x) - 9, int(y) - 9, 18, 18)
+            p.drawText(int(x) + 11, int(y) - 9, str(k + 1))
+        text = self.measure_text()
+        if not text:
+            return
+        f.setPixelSize(13)
+        p.setFont(f)
+        fm = p.fontMetrics()
+        w = fm.horizontalAdvance(text) + 16
+        h = fm.height() + 8
+        x = int(min(max(pts[-1][0] + 18, 8), max(self.width() - w - 8, 8)))
+        y = int(min(max(pts[-1][1] + 14, 8), max(self.height() - h - 8, 8)))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 165))
+        p.drawRoundedRect(QRect(x, y, w, h), 4, 4)
+        p.setPen(_MEASURE_COLOR)
+        p.drawText(QRect(x, y, w, h), Qt.AlignCenter, text)
 
     def _paint_tumble_lock(self, p):
         """Dashed guide for an axis-locked anchored tumble (same look as the
@@ -1777,18 +2477,33 @@ class MolViewport(QOpenGLWidget):
             p.setPen(colour)
             p.drawText(x, y, text)
 
-    def _label_font(self, text, px_radius, fill=0.8):
-        """Bold font sized so the text spans ~`fill` of the atom's diameter.
-        Returns None when the atom is too small on screen to letter."""
-        target = max(px_radius * 2.0 * fill, 0.0)
-        if target < 7.0:                 # unreadable — don't clutter
+    def _label_font(self, text, px_radius, fill=_LABEL_FILL):
+        """Font for an atom label. None = too small on screen to letter.
+
+        Sized by the atom's RADIUS, not by the width of the text, so every
+        label in a molecule comes out the same height — fitting each string
+        to a fixed width instead made "C" 18 px and "C12" 6 px on identical
+        atoms, which is what made index labels look broken. Text only shrinks
+        when it would genuinely overhang the sphere.
+
+        NOT bold, and in a naturally wide sans: bold at the old fit made
+        every atom look shouted at.
+        """
+        size = px_radius * 2.0 * fill * self.label_scale
+        if size < 6.0:                   # unreadable — don't clutter
             return None
         f = QFont()
-        f.setBold(True)
-        f.setPixelSize(16)
-        probe = QFontMetricsF(f).horizontalAdvance(text) or 1.0
-        size = int(round(16.0 * target / probe))
-        f.setPixelSize(max(7, min(size, 200)))
+        f.setFamilies(_LABEL_FAMILIES)
+        f.setStyleHint(QFont.SansSerif)
+        f.setPixelSize(int(round(size)))
+        # Only long labels get squeezed, and only as far as the atom is wide.
+        max_w = px_radius * 2.0 * _LABEL_MAX_WIDTH * self.label_scale
+        width = QFontMetricsF(f).horizontalAdvance(text)
+        if width > max_w > 0.0:
+            size *= max_w / width
+            if size < 6.0:
+                return None
+            f.setPixelSize(int(round(size)))
         return f
 
     def _paint_compass(self, p):
@@ -1989,16 +2704,9 @@ class MolViewport(QOpenGLWidget):
     def event(self, ev):
         # During modals, keys like B/E/A/M/N must reach US, not the app's
         # single-letter QAction shortcuts.
-        if ev.type() == QEvent.ShortcutOverride and self.mode == MODE_EDIT \
-                and not (ev.modifiers() & (Qt.ControlModifier
-                                           | Qt.AltModifier
-                                           | Qt.MetaModifier)):
-            # Edit mode: every UNMODIFIED letter belongs to the element
-            # buffer (so Ar/Ag/Au/Dy type normally instead of firing align,
-            # duplicate, ...). Ctrl/Alt combos still reach the menus.
-            if Qt.Key_A <= ev.key() <= Qt.Key_Z:
-                ev.accept()
-                return True
+        # (Edit mode used to swallow every unmodified letter for the element
+        # buffer. Elements are picked from the periodic table now, so letters
+        # are ordinary hotkeys in BOTH modes again — round 20.)
         if self._keyboard_captured():
             if ev.type() == QEvent.ShortcutOverride:
                 ev.accept()
@@ -2013,6 +2721,12 @@ class MolViewport(QOpenGLWidget):
 
     def mousePressEvent(self, ev):
         pos = ev.position()
+        if self._align_wait is not None:
+            # RMB cancels, matching G/R. LMB is ignored: there is nothing to
+            # confirm until an axis has been chosen.
+            if ev.button() == Qt.RightButton:
+                self._end_align_wait("Align cancelled")
+            return
         if self._grab is not None:
             self._finish_grab(commit=ev.button() == Qt.LeftButton)
             return
@@ -2028,12 +2742,15 @@ class MolViewport(QOpenGLWidget):
         self._drag_button = ev.button()
         self._drag_moved = False
         self._press_pos = pos
+        self._draw_from = None
+        self._nav_drag = self._nav_drag_kind(ev.button(), ev.modifiers())
+        if self._nav_drag is not None:
+            return                       # a camera drag, never a pick or draw
         # Edit mode: pressing ON an atom arms the draw gesture. Dragging away
         # grows a new bonded atom (Avogadro's draw tool); releasing without
         # moving is a plain click and converts the atom instead. Arming on
         # PRESS is what keeps the two apart — a click's element change fires
         # on release, so a drag never triggers it.
-        self._draw_from = None
         if ev.button() == Qt.LeftButton and self.mode == MODE_EDIT \
                 and self.draw_tool_active and not self._origin_active \
                 and not self._origin_dot_hit(pos):
@@ -2043,8 +2760,30 @@ class MolViewport(QOpenGLWidget):
                     and self._atom_map[hit][0] == obj.id:
                 self._draw_from = self._atom_map[hit][1]
 
+    @staticmethod
+    def _nav_drag_kind(button, mods):
+        """Camera drags, identical on both input presets.
+
+        MMB is Blender's navigation button (Shift pans, Ctrl zooms); Alt+LMB
+        repeats orbit for the many desktop mice whose middle button is a
+        stiff scroll-wheel click, and RMB keeps the round-2 pan.
+        """
+        if button == Qt.MiddleButton:
+            if mods & Qt.ShiftModifier:
+                return "pan"
+            if mods & Qt.ControlModifier:
+                return "zoom"
+            return "orbit"
+        if button == Qt.LeftButton and (mods & Qt.AltModifier):
+            return "orbit"
+        if button == Qt.RightButton:
+            return "pan"
+        return None
+
     def mouseDoubleClickEvent(self, ev):
         if ev.button() != Qt.LeftButton or self.modal_active():
+            return
+        if self._nav_drag_kind(ev.button(), ev.modifiers()) is not None:
             return
         pos = ev.position()
         if self._compass_hit_at(pos.x(), pos.y()):
@@ -2117,7 +2856,7 @@ class MolViewport(QOpenGLWidget):
         # trackpad; double-click-drag still works, and an armed lasso tool
         # takes over the same drag.
         if self._drag_button == Qt.LeftButton and self._drag_moved \
-                and self._region_drag is None:
+                and self._region_drag is None and self._nav_drag is None:
             self._region_drag = {"kind": self._select_tool or "box",
                                  "points": [(self._press_pos.x(),
                                              self._press_pos.y())],
@@ -2129,10 +2868,12 @@ class MolViewport(QOpenGLWidget):
             self.update()
             return
         w, h = max(self.width(), 1), max(self.height(), 1)
-        if self._drag_button == Qt.MiddleButton:
+        if self._nav_drag == "orbit":
             self._orbit_input(dx, dy, cursor_pos=pos)
-        elif self._drag_button == Qt.RightButton:
+        elif self._nav_drag == "pan":
             self.camera.pan(dx, dy, w, h)
+        elif self._nav_drag == "zoom":
+            self.camera.zoom(-dy / _DRAG_ZOOM_PX)   # drag up = closer
         self._drag_last = pos
         self.update()
 
@@ -2368,7 +3109,7 @@ class MolViewport(QOpenGLWidget):
                 if self.adjust_h:
                     edits.adjust_hydrogens(obj.structure, [src, tgt])
                     edits.idealize_terminal_hydrogens(obj.structure, [src, tgt])
-                self.set_selection([(obj.id, tgt)])
+                self.set_selection([])       # see the note in the tail below
                 self.status_message.emit("Ring closed: bonded {} to {}".format(
                     self.scene.pick_label((obj.id, src)),
                     self.scene.pick_label((obj.id, tgt))))
@@ -2387,6 +3128,22 @@ class MolViewport(QOpenGLWidget):
         if fixed:
             note += "  ({} H re-placed)".format(fixed) if not note \
                 else "  [{} H re-placed]".format(fixed)
+        # An armed meta template makes the atom just drawn a coordination
+        # centre, not merely an Xx dummy.
+        if self.meta_template is not None:
+            from ..core import meta as meta_mod
+            meta_mod.set_meta(obj.structure, d["index"], self.meta_template)
+            # Dress it immediately: a bare dummy shows nothing of the geometry
+            # it enforces, so people free-draw a coordination number the spec
+            # was never meant for.
+            meta_mod.dress_with_hydrogens(obj.structure, d["index"],
+                                          self.meta_template)
+        # A drawing command leaves NOTHING selected. The atom you just drew is
+        # already the element you asked for, so leaving it selected means the
+        # next pick from the periodic table silently CONVERTS it instead of
+        # just changing what the next atom will be — you lose the atom you
+        # meant to keep and never see it happen.
+        self.set_selection([])
         self.status_message.emit("Added {}{}".format(self.draw_element, note))
         self.edit_committed.emit()
         self.refresh_geometry()
@@ -2399,8 +3156,18 @@ class MolViewport(QOpenGLWidget):
             self._dbl_pos = None
             self._press_pos = None
             self._draw_from = None
+            self._nav_drag = None
             return
         if self.modal_active():
+            return
+        if self._nav_drag is not None:
+            # A camera drag never picks on release — Alt+click would
+            # otherwise select whatever the orbit started over.
+            self._nav_drag = None
+            self._drag_last = None
+            self._drag_button = None
+            self._dbl_pos = None
+            self._press_pos = None
             return
         if self._region_drag is not None and ev.button() == Qt.LeftButton:
             self._finish_region_select()
@@ -2423,13 +3190,21 @@ class MolViewport(QOpenGLWidget):
             self._click_pick(ev)
 
     def wheelEvent(self, ev):
-        """Two-finger trackpad scroll = orbit; Ctrl = zoom; Shift = pan.
-        While the R modal runs, plain scroll ROTATES (the laptop path —
-        Blender's move-the-mouse-around-the-pivot needs a mouse); during any
-        modal, plain scroll never orbits underneath the modal."""
+        """Scroll: orbit on a trackpad, ZOOM on a notched mouse wheel;
+        Ctrl = zoom and Shift = pan on both (see core/input_map.py).
+
+        While the R modal runs, trackpad scroll ROTATES (the laptop path —
+        Blender's move-the-mouse-around-the-pivot needs a mouse, which mouse
+        users have); during any modal, plain scroll never orbits underneath
+        the modal.
+        """
         dx, dy = self._wheel_px(ev)
         ad = ev.angleDelta()
         mods = ev.modifiers()
+        action = input_map.wheel_action(
+            self.input_preset, not ev.pixelDelta().isNull(),
+            ctrl=bool(mods & Qt.ControlModifier),
+            shift=bool(mods & Qt.ShiftModifier))
         if self._shuttle is not None:
             rate = self.camera.rotate_speed * 2.0 * np.pi / Camera.PX_PER_REV
             r = quat_to_mat3(self.camera.rotation)
@@ -2444,12 +3219,18 @@ class MolViewport(QOpenGLWidget):
             self._shuttle_apply(rot=rot)
             self.update()
             return
-        if mods & Qt.ControlModifier:
-            self.camera.zoom((dy / 40.0) if not ev.pixelDelta().isNull()
-                             else ad.y() / 120.0)
-        elif mods & Qt.ShiftModifier:
+        if action == input_map.ZOOM:
+            # A detent is a fixed 120 units, so a mouse zooms in even steps;
+            # a trackpad's pixel deltas keep the continuous feel.
+            self.camera.zoom((ad.y() / _WHEEL_NOTCH) if ev.pixelDelta().isNull()
+                             else dy / 40.0)
+        elif action == input_map.PAN:
             w, h = max(self.width(), 1), max(self.height(), 1)
-            self.camera.pan(dx, dy, w, h)
+            if ev.pixelDelta().isNull():
+                sx, sy = ad.x() / _WHEEL_NOTCH, ad.y() / _WHEEL_NOTCH
+                self.camera.pan(sx * _NOTCH_PAN_PX, sy * _NOTCH_PAN_PX, w, h)
+            else:
+                self.camera.pan(dx, dy, w, h)
         elif self._rotate is not None:
             rate = self.camera.rotate_speed * 2.0 * np.pi / Camera.PX_PER_REV
             # Sign marked for flipping if scroll-rotate feels inverted.
@@ -2674,6 +3455,12 @@ class MolViewport(QOpenGLWidget):
         if self.scene is None:
             return
         pos = ev.position()
+        # The measure tool owns clicks outright while it is armed, in BOTH
+        # modes: it is a read-only inspection tool and must not disturb the
+        # selection, the draw tool or the origin handle.
+        if self.measure_active:
+            self._measure_click(pos)
+            return
         if self.mode == MODE_EDIT:
             # The origin handle takes clicks before anything else: on the dot
             # picks it up, anywhere else puts it down again (confirming).
@@ -2783,8 +3570,13 @@ class MolViewport(QOpenGLWidget):
                 self._end_align_wait()
                 if self.on_align_key is not None:
                     self.on_align_key(kind, axis)
-            else:
+            elif key == Qt.Key_Escape:
                 self._end_align_wait("Align cancelled")
+            # ANY OTHER KEY IS IGNORED. It used to cancel, so one stray
+            # keypress silently abandoned the operation — and since the
+            # prompt lived in the status bar it had usually expired by then,
+            # leaving no clue what happened. Esc or right-click cancel;
+            # nothing else does.
             return
         state = self._active_modal_state()
         if state is not None:
@@ -2843,36 +3635,12 @@ class MolViewport(QOpenGLWidget):
             return
         text = ev.text()
         if self.mode == MODE_EDIT:
-            # Edit mode: G and R stay transforms; EVERY other letter types an
-            # element symbol (so Fe, Na, Cu, Zn... type directly — Ga/Ge/Ru
-            # and friends need Enter first, then the letters). Digits set the
-            # bond order between two selected atoms.
+            # Elements are PICKED FROM THE PERIODIC TABLE, never typed
+            # (round 20). Typing them meant edit mode had to swallow every
+            # letter, which cost every letter hotkey and still could not spell
+            # Ge (G starts a grab) — and the tool key `e` collided with the
+            # tail of Ge/Fe/Be/He/Ne/Re/Se. Letters are plain hotkeys again.
             if key in _MODIFIER_KEYS:
-                return
-            if key in (Qt.Key_Return, Qt.Key_Enter):
-                self._confirm_element_buffer()
-                return
-            if key == Qt.Key_Backspace:
-                self._element_buffer = self._element_buffer[:-1]
-                self.update()
-                return
-            if key == Qt.Key_E and not self._element_buffer:
-                self.set_draw_tool(not self.draw_tool_active)
-                return
-            # G and R stay transforms in edit mode; every OTHER letter is
-            # element input (see the class docstring's key policy).
-            if key == Qt.Key_G and not self._element_buffer:
-                self.start_grab()
-                return
-            if key == Qt.Key_R and not self._element_buffer:
-                self.start_rotate()
-                return
-            if len(text) == 1 and text.isalpha():
-                self._element_buffer += text
-                self.status_message.emit(
-                    "Element: {}   (Enter confirms)".format(
-                        self._element_buffer))
-                self.update()
                 return
             if key == Qt.Key_Space:
                 # after an edit, grab the whole molecule you are working on

@@ -7,11 +7,13 @@ from typing import Optional
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox,
-                               QFormLayout, QHBoxLayout, QLabel, QLineEdit,
-                               QListWidget, QListWidgetItem, QPushButton,
-                               QSlider, QSpinBox, QVBoxLayout)
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog,
+                               QDialogButtonBox, QDoubleSpinBox, QFormLayout,
+                               QHBoxLayout, QLabel, QLineEdit, QListWidget,
+                               QListWidgetItem, QPushButton, QSlider,
+                               QSpinBox, QVBoxLayout)
 
+from ..core import input_map
 from ..core import resolve as resolve_mod
 
 
@@ -21,11 +23,24 @@ class SettingsDialog(QDialog):
     def __init__(self, parent, rotate_speed, start_maximized,
                  precision_factor=0.5, undo_limit=30, adjust_h=True,
                  atom_scale=1.0, render_scale=2, render_subdiv=2,
-                 on_speed_change=None, on_atom_scale_change=None):
+                 input_preset=input_map.PRESET_AUTO, label_scale=1.0,
+                 on_speed_change=None, on_atom_scale_change=None,
+                 on_label_scale_change=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         form = QFormLayout(self)
         self._on_speed_change = on_speed_change
+
+        self.input_combo = QComboBox()
+        for preset in input_map.PRESETS:
+            self.input_combo.addItem(input_map.PRESET_LABELS[preset], preset)
+        current = input_map.normalize_preset(input_preset)
+        self.input_combo.setCurrentIndex(input_map.PRESETS.index(current))
+        form.addRow("Pointing device:", self.input_combo)
+        form.addRow("", QLabel(
+            "Trackpad: two-finger scroll orbits, Ctrl+scroll zooms.\n"
+            "Mouse: the wheel zooms; middle-drag (or Alt+drag) orbits,\n"
+            "Shift+middle pans. Auto picks per scroll event."))
 
         row = QHBoxLayout()
         self.speed_slider = QSlider(Qt.Horizontal)
@@ -62,6 +77,19 @@ class SettingsDialog(QDialog):
         form.addRow("Sphere size:", srow)
         form.addRow("", QLabel("Scales every atom radius; the viewport\n"
                                "updates live."))
+
+        lrow = QHBoxLayout()
+        self.label_slider = QSlider(Qt.Horizontal)
+        self.label_slider.setRange(40, 250)              # 0.4x .. 2.5x
+        self.label_slider.setValue(int(round(label_scale * 100)))
+        self.label_label = QLabel("{:.2f}x".format(label_scale))
+        self._on_label_scale_change = on_label_scale_change
+        self.label_slider.valueChanged.connect(self._label_scale_changed)
+        lrow.addWidget(self.label_slider, 1)
+        lrow.addWidget(self.label_label)
+        form.addRow("Atom label size:", lrow)
+        form.addRow("", QLabel("Element / index labels scale with the atom;\n"
+                               "this multiplies that size."))
 
         self.undo_spin = QSpinBox()
         self.undo_spin.setRange(1, 500)
@@ -121,6 +149,15 @@ class SettingsDialog(QDialog):
         if self._on_atom_scale_change:
             self._on_atom_scale_change(scale)
 
+    def _label_scale_changed(self, value):
+        scale = value / 100.0
+        self.label_label.setText("{:.2f}x".format(scale))
+        if self._on_label_scale_change:
+            self._on_label_scale_change(scale)
+
+    def label_scale(self):
+        return self.label_slider.value() / 100.0
+
     def atom_scale(self):
         return self.scale_slider.value() / 100.0
 
@@ -133,6 +170,9 @@ class SettingsDialog(QDialog):
     def rotate_speed(self):
         return self.speed_slider.value() / 10.0
 
+    def input_preset(self):
+        return self.input_combo.currentData()
+
     def precision_factor(self):
         return self.precision_slider.value() / 100.0
 
@@ -144,6 +184,92 @@ class SettingsDialog(QDialog):
 
     def start_maximized(self):
         return self.maximized_check.isChecked()
+
+
+class MetaAtomDialog(QDialog):
+    """The meta-atom window: geometry, donor distance, and what it becomes.
+
+    Deliberately small — it is opened from a periodic-table cell, so it is in
+    the same flow as picking an element and should not feel like a detour.
+    """
+
+    def __init__(self, parent, current=None, label=""):
+        super().__init__(parent)
+        from ..core import coordination, meta as meta_mod
+        self.setWindowTitle("Meta atom" + (" — " + label if label else ""))
+        form = QFormLayout(self)
+        self._meta_mod = meta_mod
+
+        form.addRow(QLabel(
+            "A coordination centre that HOLDS ITS SHAPE while the\n"
+            "force field relaxes the ligands around it — for metals\n"
+            "MMFF/UFF have no parameters for."))
+
+        self.geometry_combo = QComboBox()
+        for name in sorted(coordination.GEOMETRY_DIRECTIONS):
+            n = len(coordination.GEOMETRY_DIRECTIONS[name])
+            self.geometry_combo.addItem(
+                "{}  ({} donors)".format(name.replace("_", " "), n), name)
+        form.addRow("Coordination geometry:", self.geometry_combo)
+
+        self.distance_spin = QDoubleSpinBox()
+        self.distance_spin.setRange(0.5, 6.0)
+        self.distance_spin.setSingleStep(0.05)
+        self.distance_spin.setDecimals(2)
+        self.distance_spin.setSuffix(" A")
+        self.distance_spin.setValue(2.0)
+        form.addRow("Centre-donor distance r:", self.distance_spin)
+
+        self.element_edit = QLineEdit()
+        self.element_edit.setPlaceholderText("e.g. Fe, or iron")
+        form.addRow("Becomes on export:", self.element_edit)
+        form.addRow("", QLabel(
+            "Left empty the atom is written as the dummy '{}'\n"
+            "rather than silently guessing an element.".format(
+                meta_mod.META_SYMBOL)))
+
+        self.locked_check = QCheckBox(
+            "Hold this geometry rigid during optimisation")
+        self.locked_check.setChecked(True)
+        form.addRow("", self.locked_check)
+
+        self.idealize_check = QCheckBox(
+            "Move the bonded donors onto the ideal positions now")
+        self.idealize_check.setChecked(True)
+        form.addRow("", self.idealize_check)
+
+        if current is not None:
+            i = self.geometry_combo.findData(current.geometry)
+            if i >= 0:
+                self.geometry_combo.setCurrentIndex(i)
+            self.distance_spin.setValue(current.distance)
+            self.element_edit.setText(current.element)
+            self.locked_check.setChecked(current.locked)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok
+                                   | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._accept_if_valid)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def _accept_if_valid(self):
+        from ..core import elements
+        text = self.element_edit.text().strip()
+        if text and not elements.symbol_from_text(text):
+            self.element_edit.selectAll()
+            self.element_edit.setFocus()
+            return                      # unknown element: don't close on it
+        self.accept()
+
+    def meta_atom(self):
+        return self._meta_mod.MetaAtom(
+            self.geometry_combo.currentData(),
+            self.distance_spin.value(),
+            self.element_edit.text().strip(),
+            self.locked_check.isChecked())
+
+    def idealize_now(self):
+        return self.idealize_check.isChecked()
 
 
 class OperatorSearchDialog(QDialog):
@@ -259,6 +385,16 @@ class ResolveNameDialog(QDialog):
         self.info = QLabel("")
         self.info.setWordWrap(True)
         lay.addWidget(self.info, 1)
+        # "did you mean X?" as a CLICKABLE list, not prose. OWB does this and
+        # it is obviously right: the whole point of a suggestion is that you
+        # take it, and retyping a name you just misspelled is the one thing
+        # you have already proved you cannot do.
+        self.suggestions = QListWidget(self)
+        self.suggestions.setVisible(False)
+        self.suggestions.setMaximumHeight(110)
+        self.suggestions.setToolTip("Click a suggestion to resolve it")
+        self.suggestions.itemClicked.connect(self._take_suggestion)
+        lay.addWidget(self.suggestions)
         row = QHBoxLayout()
         self.resolve_btn = QPushButton("Resolve")
         self.ok_btn = QPushButton("Import")
@@ -273,7 +409,7 @@ class ResolveNameDialog(QDialog):
         self.edit.returnPressed.connect(self._start_resolve)
         self.ok_btn.clicked.connect(self.accept)
         cancel.clicked.connect(self.reject)
-        self.resize(430, 220)
+        self.resize(430, 300)
 
     def _start_resolve(self):
         q = self.edit.text().strip()
@@ -304,3 +440,15 @@ class ResolveNameDialog(QDialog):
             self.resolution = None
             self.ok_btn.setEnabled(False)
             self.info.setText(res.error or "no result")
+        self._show_suggestions(getattr(res, "candidates", None) or [])
+
+    def _show_suggestions(self, names):
+        self.suggestions.clear()
+        for name in names[:12]:
+            self.suggestions.addItem(QListWidgetItem(str(name)))
+        self.suggestions.setVisible(bool(names))
+
+    def _take_suggestion(self, item):
+        self.edit.setText(item.text())
+        self.suggestions.setVisible(False)
+        self._start_resolve()

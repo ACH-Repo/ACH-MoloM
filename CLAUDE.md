@@ -49,6 +49,288 @@ fields, click-to-type with safe arithmetic eval, location + Euler-XYZ),
 **align-largest-planar-part to XY/XZ/YZ** (RANSAC plane clustering,
 core/align.py).
 
+## VERSION 0.2.0 (2026-08-03) — the line under this session
+Everything below shipped between 0.1.0 and 0.2.0: the PC/mouse input preset,
+the operator key table, CIF reading with symmetry, coordination polyhedra,
+meta atoms, the scene clock with a multi-track timeline, vibrational modes,
+per-element display control, and the symmetry modifier. 512 tests.
+
+Round 29 (2026-08-03, pre-0.2.0 fixes): **SymmetryModifier** — the ❖ page's
+asym/cell/packing switch REBUILDS the atom list, which throws away the
+asymmetric unit you were editing; as a modifier the base stays the asymmetric
+unit while the viewport and exporter see the full cell (verified: base 15,
+display 60, na=2 -> 120). **A FREQ import now builds its own molecule** from
+the output's `CARTESIAN COORDINATES (ANGSTROEM)` block if the active one does
+not match — requiring the right structure to be open already, with atoms in
+the same ORDER, is a promise no workflow keeps, and it was why the ∿ tab
+stayed greyed. **A stray keypress no longer cancels an align**: ANY non-axis
+key used to abort it, and the prompt lived in the status bar where a 4 s
+timeout had already erased it, so the operation vanished with no clue why.
+The prompt is painted in the viewport now, and Esc or RIGHT-CLICK cancel.
+**"Did you mean?" suggestions are clickable** (a QListWidget, as OWB does) —
+retyping a name you just misspelled is the one thing you have proved you
+cannot do.
+
+Round 28 (2026-08-03, modes page + ligand templates): **∿ Vibrations page**
+in the properties dock — one collapsed card per mode (a FREQ run has 3N, so a
+flat list of sliders is unreadable), with amplitude and frames-per-period
+sliders inside and an "A" button that bakes the mode onto the scene clock.
+The tab greys out exactly like ❖ does when the molecule has no FREQ data.
+Nothing vibration-specific reaches the player: a mode becomes ordinary
+frames, so it interpolates and plays alongside other trajectories.
+**Ligand templates** (`core/templates.py`): mark the coordinating atoms on a
+molecule ("Template: Set ligating atom(s)" — violet dots, no dialog), then
+select the placeholder atoms on a centre and "Template: Coordinate ligand".
+Kabsch for 3+ donors; 1 or 2 are under-determined so the free rotation is
+resolved explicitly (point the bulk AWAY from the centre) rather than left to
+a least-squares fluke. Also fixed: the outliner's Show/Hide and Radius squares
+had NO text at all (an earlier escape-mangled edit never applied — they now
+read H/S and R), and **Ctrl/Shift-click multi-select was undone by
+`highlight()`**, whose `setCurrentItem` clears the selection; it now moves
+the current index with `NoUpdate` when the row is already selected.
+
+Round 27 (2026-08-03, vibrational modes + UI principles): **ORCA normal
+modes** (`core/vibrations.py`) baked into a looping trajectory, so the scene
+clock, interpolation, the track pane and (later) the export all animate a
+vibration with NO vibration-specific code in the UI. `mode_frames` scales by
+the biggest-moving atom, because ORCA's eigenvectors are normalised but not
+to any physical amplitude — otherwise a stiff mode is invisible and a floppy
+one explodes. **Validated on a real ORCA 6 job**, vendored verbatim at
+`tests/data/orca_freq_h3po4.out`: 24 modes / 8 atoms, cross-checked against
+the file's own IR SPECTRUM table. Also: per-element outliner squares got
+LETTERS (H/S hide-show, R radius, L label), the radius popup anchors on its
+RIGHT edge (the outliner sits against the window edge), the symmetry-kind
+group got an expansion arrow, picking a crystal IN THE VIEWPORT now unlocks
+its unit-cell page, symmetry line art is depth-cued (segment-wise fade and
+thinning — 2D line art over a 3D scene otherwise gives no ordering), and
+`ui/dragcheck.py` makes any row of checkboxes paintable by dragging.
+
+Round 26 (2026-08-02, MOF display + symmetry corrections): **per-element
+show/hide and sphere size in the outliner** (`MolObject.atom_hidden` /
+`atom_scales`, two more squares on the shared RowControls). Sphere size was
+global, so a MOF's Zn spheres burst out of their own coordination polyhedra
+and the hydrogens buried the framework — the size square opens a slider under
+itself so you can judge it against the viewport while dragging. Hidden atoms
+lose their bonds too, and are not pickable. **A REAL MATHS ERROR fixed**: a
+plane NORMAL is covariant and transforms with the inverse-transpose of the
+cell matrix, not the matrix itself. Drawing mirrors and glides with the
+direct matrix is only right for a CUBIC cell — in benzoic acid's monoclinic
+cell an off-axis mirror came out **62 degrees wrong**, and MOF-5 being cubic
+is exactly why it looked fine. `symmetry.world_direction` now picks the right
+basis per element kind. **Ghosts are FRAGMENTS, not dots** — a scatter of
+circles says nothing about what the copy is; a faint skeleton of the
+asymmetric unit reads instantly as the same thing moved. **Symmetry elements
+filter by KIND** (rotation / screw / mirror / glide / inversion /
+rotoinversion), because Fm-3m draws every one of them at once and becomes an
+orange hairball — and `symmetry.filter_ops` feeds BOTH the glyphs and the
+ghosts from one list, so switching a kind off removes its elements and the
+copies it generates together. `filter_ops` deliberately does not de-duplicate
+(unlike `classify_all`): two distinct screw axes are one glyph but two
+different images of the asymmetric unit.
+
+Round 25 (2026-08-02, framework fix + symmetry + editing): **MOF-5 imported
+sprawled over 4x2x2 cells** — and the PARSER was innocent (it read Fm-3m, all
+192 operations, the right cell and the right 424 atoms). The bug was round
+19's whole-molecule unwrapping: a FRAMEWORK's bonded network percolates
+through the boundary, so walking it to make it "contiguous" marches it out
+forever. `unwrap_molecules` now detects percolation while walking — if a bond
+leads back to an already-placed atom demanding a DIFFERENT periodic image,
+the component closes on itself and is left plainly wrapped. Molecular
+crystals still get unwrapped. **`core/symmetry.py`**: classify a `SymOp` into
+the ELEMENT it represents (rotation / screw / mirror / glide / inversion /
+rotoinversion, with order, axis-or-normal, a point on it, and the intrinsic
+screw-pitch or glide vector) — pure linear algebra on the 3x3, and it
+collapses a 192-operation group to the handful of distinct elements worth
+drawing. Rendered as the standard glyphs (lens/triangle/square/hexagon,
+hollow = screw, dashed = glide) plus optional **ghost images** of the
+asymmetric unit. **J = Join** (Blender): in edit mode with two atoms it bonds
+them; across molecules it merges, asking new-vs-replace in an **at-the-cursor
+ChoicePopup** (`ui/choice_popup.py`, generic — every "one key, two meanings"
+case wants it). **D in edit mode duplicates INTO the same molecule** (with
+internal bonds and meta specs) instead of spawning an outliner object.
+**Whole-molecule transforms are fragment-scoped in edit mode**
+(`Structure.connected_component`): shifting a metal centre no longer drags an
+unbonded ligand sharing the object. **Meta glow fixed** — click-to-place
+never attached the spec, so it made a bare Xx; only the drag path did.
+
+Round 24 (2026-08-02, MOF batch): **coordination polyhedra**
+(`core/polyhedra.py`) — a translucent solid through the donor atoms of every
+metal centre, which is how MOFs and frameworks are actually drawn (VESTA,
+Diamond, every framework paper); balls and sticks are unreadable past a few
+nodes. Per-object toggle ("Poly" on the crystal's outliner row), coloured by
+the metal, drawn depth-tested with depth-write OFF and culling off so linkers
+read through it and a cage is visible from inside. The convex hull is
+computed here rather than via scipy: a coordination sphere is 4-9 points, so
+brute-force face-plane testing is exact and instant and saves a dependency.
+**Outliner crystal row shortened** to Cell / Poly / Asym / Full / ⋯ with the
+explanations in tooltips — it shares width with a narrow dock. **Selecting
+several molecules in the outliner now selects them in the VIEWPORT**, so they
+can be grabbed as a group (Shift+double-clicking each one in 3D was the only
+way before). **The crystal page greys out properly**: `_on_obj_activated` was
+never re-syncing it, so it kept describing whichever object was active when
+the dock was last opened; the supercell counts are now disabled unless
+Packing is chosen. **The transport slider is gone** (Christian's call) — the
+pane's own playhead is draggable from the ruler strip or anywhere down its
+line, and two scrubbers for one clock was redundant vertical space. The pane
+opens itself when there is anything to play, and auto-fits its height as
+tracks come and go unless you have dragged the grip yourself.
+**imageio-ffmpeg** is now a declared dependency (Christian approved it),
+ready for the animation export in roadmap 1d.
+
+Round 23 (2026-08-02, timeline pane + per-crystal outliner rows):
+**multi-row track pane** (`ui/timeline_panel.py`) — the transport bar gained
+a ▾ toggle and a drag grip that open a row per animated object against a
+shared time axis, with ONE playhead drawn across all of them. Rows are
+custom-painted (a row IS a bar on a time axis; laying that out with widgets
+would fight the mapping): drag a bar to slide the track's START, click the
+dot to disable it, double-click to cycle hold/loop/pingpong, click empty
+track space to seek. **Per-`.cif` outliner row** (Christian's annotated
+mock-up): a crystal gets ONE extra child row carrying "Show unit cell",
+"Asymmetric unit", "Full unit cell" and "Advanced…" — controls unique to that
+kind of object, on that object's row. "Advanced…" opens the ❖ page with the
+crystal you came from still active, and the ❖ TAB greys out when the active
+molecule has no cell. **The Apply button is gone**: every control there is a
+switch or a small count, and a change you have to confirm is a change you
+cannot judge. Christian's note that the same pattern will suit proteins later
+is recorded in `CrystalControls`' docstring.
+
+Round 22 (2026-08-02, SCENE CLOCK): **one playhead for the whole scene**
+(`core/timeline.py`). Each `Structure` used to own an integer `current_frame`
+and the bar drove whichever molecule was ACTIVE, so a second trajectory could
+not play at all. Now a `Timeline` holds scene time (a float, in frames) and a
+`Track` per object maps it through a **start offset, a speed and an end mode**
+(hold / loop / pingpong) — several trajectories run together, staggered or at
+different rates, and the bar is the scene playhead. **Frame interpolation**
+(`core/interpolate.py`) with the rotation fix: a plain lerp sends every atom
+along the chord, so a rotating molecule visibly shrinks at the halfway point;
+`rigid_lerp` splits out the Kabsch rigid part, turns it as a real rotation,
+and lerps only the residual deformation. Measured at 3000 atoms: 0.008 ms per
+frame plain, 0.25 ms rigid — far below the buffer upload that follows, so
+smooth playback costs nothing. Interpolated coordinates are **display-only**
+(`MolObject.play_position` -> `display_coords()` -> `evaluated()`); the stored
+frames are never written, so scrubbing cannot damage a trajectory. Bonds are
+re-perceived only when an object's nearest INTEGER frame changes, never per
+tick.
+
+Round 21 (2026-08-02, tools batch): **the measurement tool did not exist** —
+the toolbar button only printed a hint, so clicking it genuinely did nothing.
+It is a real checkable tool now: it owns clicks in both modes, collects up to
+four atoms in click order (click again to unpick), never touches the
+selection, and draws the value **in the viewport** rather than the status bar
+where it kept being covered. Esc finishes. **Outliner columns were three
+fixed pixel widths totalling 290 px**, so any narrower dock pushed the Style
+column behind a horizontal scrollbar and the per-molecule display settings
+could not be reached; the name column stretches now. **Tab in the array
+modifier's spin boxes jumped into edit mode** — `on_tab_pressed` checked only
+the transform panel, and now checks every panel. **Crystal page** in the
+properties dock (❖): the asymmetric-unit / full-cell / packing switch, the
+supercell counts, a cell-box checkbox and the cell parameters — it existed
+only in a menu and F3 before, which is exactly where nobody finds it. **Meta
+atoms glow** (three additively-blended shells, a cheap stand-in for bloom)
+and are **dressed with placeholder hydrogens on creation** so the geometry
+they enforce is visible and editable instead of being free-drawn over.
+
+Round 20 (2026-08-02, session bug batch): **element TYPING removed — the
+periodic table is the only way to pick an element.** Typing forced edit mode
+to swallow every letter (costing every letter hotkey), still could not spell
+Ge (G starts a grab), and the tool key `e` collided with the tail of
+Ge/Fe/Be/He/Ne/Re/Se. Letters are ordinary hotkeys in BOTH modes again and
+`E` is a normal operator key for the draw tool. **Measurement "tool
+unresponsive" was the status bar**: `_measure_label` was added with
+`addWidget`, and a temporary `showMessage` hides ordinary status widgets —
+which every atom pick emits. Both labels are permanent now. **Deleting every
+atom in edit mode no longer deletes the OBJECT** (you are standing inside it
+with the draw tool; removing the outliner entry left edit mode pointing at
+nothing, so nothing could be drawn). **Settings is modeless** — it
+live-applies sliders, so locking the viewport and outliner while judging a
+sphere size was backwards. **Meta atom opens regardless of selection** and
+arms as the draw element; the button then reads "Meta: Fe - octahedral", and
+picking a real element disarms it. Periodic-table cells nudge on press.
+**The grid is genuinely infinite**: it was a 5000 A quad with fixed 1/10 A
+rulings, so it had an edge and moired at distance. It is now a full-screen
+triangle unprojected per fragment onto z = 0, writing `gl_FragDepth`, with
+Blender-style spacing that steps by decades as the camera pulls back, and
+axes drawn INSTEAD of the grid where they land rather than blended with it.
+
+Round 19 (2026-08-02, crystal fixes + META ATOMS): **the cell box was drawn
+at `obj.origin`, which is the CENTROID** — so it sat a whole centroid vector
+away from its own atoms (Christian's benzoic-acid screenshot). It is now
+placed by a **Kabsch fit against reference atoms** stored at import
+(`cif.rigid_from_reference`), which also answers "update the frame DURING a
+transform": the fit runs while painting, so the box tracks a grab or rotate
+live. Hooking the transform paths instead was rejected — a plain grab moves
+atom coordinates without touching `obj.origin`, so there is no single frame
+to hang the cell off. **Molecules are reassembled across the cell boundary**
+(`cif.unwrap_molecules` + `periodic_neighbours`, minimum-image): wrapping
+each atom into [0,1) on its own left stray hydrogens stranded on the far
+face, which is what differed from the CCDC reference. **Asymmetric unit /
+full cell / packing** are switchable (View > Crystal, or F3), all regenerated
+from the stored asymmetric unit so switching cannot drift. **Meta atoms**
+(`core/meta.py` + the ✳ button on the periodic table): a centre carrying
+geometry + donor distance + the element it becomes on export. Locked centres
+freeze themselves AND their donors during optimisation, so the coordination
+sphere cannot collapse under a force field with no parameters for the metal,
+while the ligands still relax. Drawn as the dummy `Xx` in the app; written as
+the real element on export, and an unset element is REPORTED rather than
+guessed.
+
+Round 18 (2026-08-02, CIF + edit-mode paper cuts): **native CIF reader**
+(`core/cif.py`) that KEEPS the crystallography — cell, space group, symmetry
+operators and the asymmetric unit all survive into
+`Structure.metadata` (so they ride undo snapshots and `.molom` savepoints for
+free), and `expand()` applies the operators with minimum-image de-duplication
+so special positions do not pile atoms on top of each other. It runs BEFORE
+OpenBabel for `.cif`/`.mmcif` (OpenBabel reads the file but throws the
+symmetry away) and falls back to it silently. **Unit-cell box** drawn as a
+QPainter overlay with a/b/c in the axis colours, F3 "Show unit cell box" +
+"Unit cell: report cell parameters". Fixes from Christian's screenshot:
+**the tool column moved below the edit header** (at y=8 the first button sat
+on top of "EDIT | name | draw: X", which read as clipped text), banners now
+size from `horizontalAdvance` not `boundingRect`, **Alt+A deselects again**
+(the `&App` menu MNEMONIC claimed Alt+A — a mnemonic is a real shortcut, so
+it went ambiguous with deselect-all and Qt fired neither; the menu is now
+"A&pp" and `_check_menu_mnemonics()` guards it), **the draw tool is disarmed
+when leaving edit mode** (the flag used to survive into object mode where the
+toolbar reports "select", so Tabbing back came up armed and the periodic
+table stayed hidden — the "sometimes doesn't show"), and **drawing or
+converting an atom now leaves NOTHING selected** (otherwise the next pick
+from the periodic table silently converts the atom you just made).
+
+Round 17 (2026-08-02, element-picker batch): **floating periodic table**
+(`ui/periodic_table.py` + `core/ptable.py` layout) over the viewport, right
+of the tool column, in **plain edit mode only** — with the draw tool armed
+the element is on the toolbar and every click is a drawing gesture, so the
+chart would just be in the way. Cells are painted in the element's own Jmol
+colour (the table doubles as the viewport legend) and clicking one goes
+through the SAME path as typing (`MolViewport.apply_element`). **Typing now
+accepts full element NAMES, case-insensitively** ("carbon", "IRON") next to
+symbols — `elements.from_text`/`symbol_from_text`, which also stops a
+mistyped name being truncated into an element ("unobtainium" used to give
+uranium). **The draw toggle is unshifted `e` only**: Shift+E used to toggle
+too, which made Er/Eu/Es untypeable, and CapsLock is deliberately ignored so
+a stray CapsLock cannot turn "toggle the tool" into "type an element".
+**Atom labels are much smaller, not bold, and in a wide sans** (Verdana
+first), with a Settings size slider — and they are now sized by the atom's
+RADIUS rather than fitted to the text's width, which is what made "C" 18 px
+and "C12" 6 px on identical atoms.
+
+Round 16 (2026-08-01, PC/mouse batch — first session on the DESKTOP, not the
+laptop): **device-aware scroll** (`core/input_map.py`) — a notched mouse
+wheel now ZOOMS (one detent = one step) while a precision trackpad still
+orbits; Ctrl/Shift keep meaning zoom/pan on both, so only the plain gesture
+differs. The preset is *auto* by default and decides **per event** from
+`pixelDelta` (trackpads report it, wheels never do); Settings has an explicit
+trackpad/mouse override. Mouse navigation filled in: **Shift+MMB pan,
+Ctrl+MMB zoom-drag, Alt+LMB orbit** (mice whose wheel-click is unusable),
+RMB pan unchanged. **Every shortcut now comes from the operator registry**
+(`key=` on the op, installed by `_install_shortcuts`) instead of riding on a
+menu entry — the round-15 menu thinning had silently unbound O, Home, End,
+Shift+R, B, Shift+B, Ctrl+B, Ctrl+P and the box-select chord, and **F3 was
+bound TWICE (Edit + App menus), which Qt treats as an ambiguous overload and
+refuses to fire at all** — that is why the operator palette "disappeared".
+Origin edit moved from `O` to **Alt+O** (plain O is oxygen in edit mode; see
+the gotcha). `duplicate_keys()` makes a clash a startup error.
+
 Round 15 (2026-07-31, unified right pane): **ONE right-hand dock** — the
 outliner became a PAGE of the properties dock alongside Modifiers and Force
 field (`ui/properties.py` tab strip); no more separate outliner dock or FF
@@ -237,7 +519,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 66 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 228 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -292,9 +574,32 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
 - `core/scene.py` — Scene of MolObjects (structure + visible + style_key +
   unique `.001`-style names + **origin/orientation local frame** +
   snapshot/restore for undo). Selection/identity = (obj_id, atom).
-- `core/ops.py` — operator registry for F3 (labels, categories, shortcuts,
-  `enabled(ctx)` predicates; `search` ranks enabled-first). Log:
+- `core/ops.py` — operator registry for F3 (labels, categories, `enabled(ctx)`
+  predicates; `search` ranks enabled-first). Carries BOTH `shortcut` (prose
+  for the palette) and `key` (the QKeySequence string the window binds —
+  the single source of truth for hotkeys, see `duplicate_keys`). Log:
   docs/OPERATORS.md — KEEP IN SYNC.
+- `core/input_map.py` — ORBIT/ZOOM/PAN from the pointing-device preset plus
+  whether the wheel event carried `pixelDelta`. The whole trackpad-vs-mouse
+  decision, UI-free.
+- `core/timeline.py` — the SCENE CLOCK: one playhead in scene frames, one
+  `Track` per object (start offset / speed / hold-loop-pingpong). UI-free, so
+  the whole mapping is testable without a timer.
+- `core/interpolate.py` — coordinates BETWEEN frames. `rigid=True` splits the
+  Kabsch rigid motion out and rotates it properly instead of cutting the
+  chord; only the residual deformation is lerped.
+- `core/cif.py` — CIF parsing that keeps the crystallography: `Cell`
+  (fractional<->Cartesian matrix, corners/edges for the box), `SymOp`
+  (parses "-x+1/2, y, -z"), `parse_cif` -> asymmetric unit, `expand` ->
+  full cell with minimum-image de-duplication. No new dependency; the CIF
+  subset real files use is small. `ui/viewport.cell_of(obj)` reads the cell
+  back out of `Structure.metadata["cell"]`.
+- `core/ptable.py` — where each element sits in the 18-column chart (f-block
+  detached on rows 9/10) + the black-or-white text rule for a cell painted in
+  the element's colour. Drawn by `ui/periodic_table.py`.
+- `core/elements.py::from_text` — resolves a SYMBOL or a full NAME in any
+  case ("fe", "IRON"). Everything user-typed should go through this, not
+  `atomic_number`, which truncates and would read "iron" as iodine.
 - `core/manipulate.py` — G/R modal math (`GrabState`/`RotateState` on a
   shared constraint mixin: global/local axis+plane cycling, Shift-precision
   increment scaling, numeric buffers; ray-plane / ray-line solvers; the
@@ -347,6 +652,47 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
 - `__main__.py` — `molom [file]`; `--selftest` = headless core check (no GL);
   `show_startup()` = maximized default / windowed-upper-right setting.
 
+## Christian's cross-cutting UI principles (apply to EVERY new control)
+Stated 2026-08-03 as general rules, not one-off requests:
+- **rows of tick boxes must be paintable by dragging** — hold and sweep, like
+  the outliner's visibility eyes (`ui/dragcheck.py::install`);
+- **Tab walks fields in any panel** that takes typed input, never falling
+  through to a global hotkey (`MainWindow.on_tab_pressed` checks every panel);
+- **buttons carry a meaningful LETTER**, not just a glyph, with the
+  explanation in the tooltip;
+- **a group of sub-options needs a visible expansion arrow**, or nobody
+  discovers it;
+- **popups anchor so they stay on screen** (the outliner is against the right
+  edge, so its popups anchor right).
+He is a heavy Blender user: a control needing one click per item where a
+sweep would do reads as unfinished.
+
+## NEVER write a parser fixture from memory
+Round 27: I wrote a synthetic ORCA FREQ block instead of using a real file,
+and was rightly pulled up on it. Christian has real jobs on disk and will
+supply one. Vendor a VERBATIM excerpt into `tests/data/`. **Check ORCA
+Workbench first** — `ACH-Orca-Studio/orca_studio/core/orca_parser.py` already
+parses frequencies, IR and thermochemistry against real jobs; MoloM only adds
+the NORMAL MODES eigenvectors, and the shared parts are kept diffable exactly
+like `io.py` is with OWB's `coords.py`. Bonus: one ORCA file often prints a
+quantity twice (VIBRATIONAL FREQUENCIES and IR SPECTRUM), giving an
+independent cross-check inside a single fixture.
+
+## Ligand templates: the two design questions Christian asked (2026-08-03)
+- **Only GEMINAL placeholders.** Every selected placeholder must hang off ONE
+  shared atom (`templates.common_centre`). Placeholders on two different
+  centres describe a BRIDGING ligand, which is a genuinely different
+  operation — the ligand would have to span them, and "coordinate to what?"
+  has no single answer. Refused with a clear message rather than guessed at.
+- **Placeholders need NOT be hydrogen.** Any TERMINAL atom qualifies, so a
+  Cl, a dummy or a meta atom's dressing H all work the same way. The check is
+  "has exactly one bond", not "is hydrogen" — restricting to H would be an
+  arbitrary limit with no geometric justification.
+- Under-determined fits are resolved, not averaged: ONE donor gets translated
+  onto the slot and rotated so the ligand's bulk points away from the centre
+  (spin about the new bond left free for R); TWO donors align the donor-donor
+  vector then spin so the backbone points outward.
+
 ## Hard-won gotchas (don't re-learn these)
 - **QPainter resets GL state.** Overlays (hint, compass, rubber band, grab
   guide) use QPainter every frame now; `paintGL` re-asserts
@@ -390,10 +736,20 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   PARALLEL through the origin, not the world axis line) — Christian's spec.
   G pivots about the selection centroid. Anchored scroll-tumble requires
   EXACTLY ONE selected atom (multi-atom anchoring felt confusing).
-- The infinite grid is drawn AFTER opaque geometry, blended, depth-test ON
-  but depth-write OFF: molecules occlude it, it overlays below-floor atoms,
-  and the fade never punches holes in the depth buffer. QSurfaceFormat
-  needs GL 3.3 for `fwidth` AA in the grid shader (already required).
+- The grid is drawn AFTER opaque geometry, blended, depth-test ON but
+  depth-write OFF: molecules occlude it, it overlays below-floor atoms, and
+  the fade never punches holes in the depth buffer. QSurfaceFormat needs
+  GL 3.3 for `fwidth` AA (already required).
+- **The grid is SCREEN-SPACE, not a quad** (round 20). It was a 5000 A quad,
+  which has an edge you can zoom out to and one fixed spacing that moires at
+  distance. Now a full-screen triangle is unprojected per fragment and
+  intersected with z = 0 — truly infinite — and it writes `gl_FragDepth` so
+  molecules still occlude it. Spacing steps by DECADES with camera distance
+  (two levels, the finer fading out across each decade). A third, finer level
+  was tried and removed: at 0.1x the main spacing it aliases into a
+  crosshatch that reads as a texture on the molecule. Axes are drawn INSTEAD
+  of the grid where they land, never max()'d with it — blending the two is
+  what made them look chewed up when zoomed out.
 - **Box select is a PLAIN left-drag** (round 7). Requiring a double-click
   first was reported broken three times: a trackpad "double-tap-drag" does
   not reliably produce DblClick + moves. Don't put box select behind a
@@ -418,8 +774,68 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   is what quantised every view change into ~40 deg jumps.
 - **A single-letter QAction shortcut silently outranks the viewport.** E was
   bound to "Change element..." and never reached the draw-tool toggle. Any
-  key the edit mode wants must NOT also be a QAction shortcut — check the
-  menus before adding one.
+  key the edit mode wants must NOT also be a QAction shortcut — register the
+  operator with NO `key=` (E, X, Y, Z; a test pins this).
+- **`obj.origin` is the CENTROID, not the world origin** (round 19). Drawing
+  the unit cell at `origin + corners` displaced the box by a whole centroid
+  vector. Anything anchored to the atoms must be fitted to the ATOMS —
+  `cif.rigid_from_reference` (Kabsch against a stored sample) — because a
+  plain grab moves coordinates and leaves `obj.origin` alone. Doing the fit
+  while PAINTING is also what makes overlays track a drag live instead of
+  snapping at commit.
+- **A FRAMEWORK must not be unwrapped at all** (round 25). Round 19's
+  whole-molecule unwrapping assumed every bonded component is finite. In a
+  MOF it percolates through the boundary and is infinite, so the walk marches
+  the structure across cells (MOF-5 came out over 4x2x2). Detect it while
+  walking: a bond returning to a placed atom with a DIFFERENT periodic image
+  means the component closes on itself — leave that one wrapped.
+- **Wrap crystals by MOLECULE, never by atom** (round 19). Putting each atom
+  into [0,1) independently shreds anything straddling a face — the stray
+  hydrogens against the CCDC reference. Walk each bonded fragment choosing
+  the nearest periodic image, then shift the fragment by its centroid.
+  Bond perception for this must use the minimum image or the fragments are
+  cut open before you start (`cif.periodic_neighbours`).
+- **A menu-bar MNEMONIC is a shortcut too** (round 18). `&App` claimed Alt+A,
+  which is Blender's deselect-all, so the two went ambiguous and Alt+A
+  silently stopped working — the same failure as F3, from a completely
+  different direction. `MainWindow._check_menu_mnemonics()` compares every
+  menu title's `&` letter against the operator key table; a test pins it.
+- **Never let a tool flag outlive the mode that owns it** (round 18).
+  `draw_tool_active` stayed True after Tabbing out to object mode, where the
+  toolbar reports "select" — so the flag and the UI disagreed, and Tabbing
+  back in came up armed with the periodic table hidden. `set_mode` disarms it
+  on the way out.
+- **A drawing/conversion command must clear the selection** (round 18).
+  Leaving the new atom selected means the next element pick CONVERTS it
+  instead of only setting what the next atom will be: you silently lose the
+  atom you just drew. Clear in `_finish_draw_drag` and `apply_element`.
+- **Overlays start below `_VIEWPORT_HEADER_H`** (round 18). The floating tool
+  column at y = 8 covered the edit-mode header, which reads as the header
+  text being clipped rather than as two widgets overlapping.
+- **Two QActions with the same shortcut = NEITHER fires.** Qt reports an
+  "ambiguous shortcut overload" and skips both, so a doubled key looks
+  exactly like an unbound one. F3 sat on both the Edit and App menu entries
+  and the operator palette stopped opening (round 16). `_install_shortcuts`
+  now builds ONE action per operator and menus reuse those objects;
+  `OperatorRegistry.duplicate_keys()` raises at startup if two ops claim a
+  key.
+- **Keys must NOT live on menu entries** (round 16). The menus are
+  deliberately an essentials shortlist — thinning them in round 15 took the
+  shortcuts down with them (O, Home/End, Shift+R, B/Shift+B, Ctrl+B, Ctrl+P,
+  Shift+Space,B were bound nowhere). The binding belongs to the OPERATOR
+  (`key=`), which is also what makes an F3-only operator keyboard-reachable.
+- **Origin edit is Alt+O, not O** (round 16, supersedes the round-4 "final"
+  call). Round 11 gave edit mode every unmodified letter, and O is oxygen —
+  plain O could only ever type into the element buffer, so the binding was
+  dead on arrival. Ctrl/Alt combos are the only ones that survive that
+  policy; Shift+letter does NOT (it types capitals, e.g. the F of Fe), which
+  is why Shift+O/Shift+A/Shift+R are object-mode bindings.
+- **The wheel means different things on different devices** (round 16).
+  MoloM was built on a laptop where two-finger scroll orbits; on a desktop
+  mouse the same code turned every detent into a ~11 deg orbit jump and left
+  zoom behind a modifier. `core/input_map.py` decides ORBIT/ZOOM/PAN from the
+  preset + whether the event carried `pixelDelta`. Keep the decision there,
+  UI-free and tested — do NOT sprinkle device checks through `wheelEvent`.
 - **An exception raised inside a Qt slot does not stop the app — it prints
   and continues**, so a missing attribute in `_on_edit_committed` looked
   like a viewport *feel* problem ("orbiting gets stuck for a second"), not a
@@ -476,10 +892,40 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   nothing (this is how the edit-mode draw tool first appeared "dead").
   `_ensure_pick_data()` rebuilds them on demand, CPU-only; every pick path
   calls it, and `refresh_geometry()` sets `_pick_dirty`.
-- **Edit-mode key policy**: G and R stay transforms, EVERY other letter feeds
-  the element buffer (so Fe/Na/Cu/Zn type directly). Elements starting with
-  G or R need Enter-first. X/Y/Z are free outside a modal in edit mode (they
-  type Xe/Yb/Zn); in OBJECT mode they cycle the anchored-tumble axis lock.
+- **Edit-mode key policy (round 20, FINAL): elements are PICKED, never
+  typed.** The element buffer is gone, so letters are ordinary hotkeys in
+  both modes and `E` is a plain operator key for the draw tool. The buffer
+  cost every letter hotkey in edit mode, could not spell Ge (G starts a
+  grab), and whichever key toggled the tool collided with the tail of
+  Ge/Fe/Be/He/Ne/Re/Se. Do NOT reintroduce typing — the periodic table
+  (round 17) is the answer, and it also carries the meta atom.
+- **A readout the user must see belongs in the VIEWPORT, not the status bar**
+  (round 21). Even as a permanent widget the measurement was easy to miss at
+  the bottom of a maximised window; drawn over the molecule with the picked
+  atoms ringed, it cannot be. The status bar is for things you may ignore.
+- **Fixed pixel column widths make parts of a dock unreachable** (round 21).
+  The outliner's three columns summed to 290 px, so a narrower dock hid the
+  Style column behind a horizontal scrollbar with no hint it was there. Give
+  the name column `QHeaderView.Stretch` and keep the controls fixed.
+- **Tab-vs-mode is a PANEL question, not a transform-panel question**
+  (round 21). `on_tab_pressed` special-cased the transform panel, so the
+  array modifier's spin boxes still fell through to "toggle edit mode". Test
+  focus against every panel.
+- **A temporary `showMessage()` hides ordinary status widgets** — this bit
+  twice. The trajectory bar (round 2) and then the MEASUREMENT readout
+  (round 20), which looked like a dead tool because every atom pick emits a
+  status message that covered it. Anything that must stay visible in the
+  status bar is an `addPermanentWidget`.
+- **Emptying a molecule in EDIT mode must not delete the object** (round 20).
+  You are inside it with the draw tool; removing the outliner entry leaves
+  `edit_obj_id` dangling and nothing can be drawn. Deleting the object is an
+  object-mode action.
+- **Size atom labels from the atom's RADIUS, never by fitting the text to a
+  width** (round 17). Fitting each string to ~0.8 of the diameter meant the
+  font shrank as the label got longer: "C" 18 px and "C12" 6 px on identical
+  atoms, which is what made index labels look broken. Size by radius, then
+  squeeze ONLY if the text would overhang. Also not bold, and in a wide sans
+  — a condensed face at this size turns "8" and "B" into the same smudge.
 - Bond-order perception is greedy-by-length **plus an augmenting-path repair**
   — plain greedy is maximal but not maximum, so a six-ring could stall at two
   double bonds instead of three. The repair is what makes benzene Kekule.
@@ -487,27 +933,43 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   divisor 1); numpy math-convention matrices must be per-instance
   **transposed** before upload (`np.transpose(mats, (0,2,1))`).
 - Trajectory frame switches re-perceive bonds but KEEP user-assigned orders
-  (`keep_orders=True`); `Ctrl+P` re-perceives from scratch.
+  (`keep_orders=True`); `Ctrl+P` re-perceives from scratch. **Perception runs
+  only when the nearest INTEGER frame changes** (round 22) — never per
+  interpolated tick, or it would dominate playback cost.
+- **Interpolated coordinates are DISPLAY-ONLY** (round 22). They live in
+  `MolObject.play_position` and are evaluated by `display_coords()`, never
+  written back into `structure.frames` — scrubbing a trajectory must not be
+  able to damage it, and editing must still see real frame data. Same split
+  as the modifier stack: draw/export use `evaluated()`, edit uses
+  `obj.structure`.
+- **A plain lerp between frames is wrong for ROTATION** (round 22). Every
+  atom takes the straight chord, so the molecule contracts toward its
+  centroid halfway through a turn and springs back — bonds lose real length.
+  `interpolate.rigid_lerp` is the fix and is cheap (0.25 ms at 3000 atoms).
 - `elements.atomic_number` is tolerant ("C1"/"cl2" → 6/17) — same convention
   as OWB `transform._sym`. "D" (deuterium) is NOT in the table.
-- **Wheel events = trackpad orbit** (laptop-first per Christian): plain
-  scroll rotates, Ctrl zooms, Shift pans; MMB/RMB drag are the mouse
-  fallback (orbit/pan). LMB drag deliberately does NOT rotate. Scroll signs
-  are marked in `wheelEvent` for easy flipping if the feel is inverted on
-  some hardware. A "PC mouse preset" overhaul is expected later.
+- **Wheel events are device-dependent** (round 16, was laptop-only): a
+  trackpad scroll orbits, a mouse wheel zooms; Ctrl zooms and Shift pans on
+  both. MMB drag orbits (Shift pan, Ctrl zoom), Alt+LMB orbits, RMB pans.
+  LMB drag deliberately does NOT rotate — it box-selects. Scroll signs are
+  marked in `wheelEvent` for easy flipping if the feel is inverted on some
+  hardware.
 - Grid lines drawing across atoms below z=0 is CORRECT (depth-tested floor,
   same as Blender); don't "fix" it.
 - Selection is now a list of `(obj_id, atom_index)` tuples everywhere; bond
   edit ops require both picks in the SAME object.
 
 ## Environment
-- Dev machine: Windows, Python 3.10 (`python`), deps: numpy, PySide6,
-  PyOpenGL (+ rdkit, openbabel-wheel installed and optional at runtime —
-  graceful degradation mirrors OWB's tiering).
+- TWO dev machines (this is why round 16 happened): the **laptop** (Windows,
+  Python 3.10, precision trackpad) and the **desktop PC** (Windows, Python
+  3.13, wheel mouse — `C:\Users\chris\Documents\GitHub\ACH-MoloM`). Assume
+  input code must work on both; `pytest` had to be pip-installed on the PC.
+- Deps: numpy, PySide6, PyOpenGL (+ rdkit, openbabel-wheel installed and
+  optional at runtime — graceful degradation mirrors OWB's tiering).
 - NOT a cluster tool. No SLURM/ssh anywhere. The LiDO gateway has no
   PySide6/GPU — MoloM is for local machines; the gateway keeps molden.
-- Not a git repo yet (as of 2026-07-30). `git init` + first commit is a
-  sensible next step if the maintainer wants history.
+- It IS a git repo now (single "Initial commit", 2026-08-01), so behavioural
+  changes are diffable from here on.
 
 ## Verification workflow
 1. `python -m pytest tests/ -q` — 66 offline tests.
@@ -519,16 +981,31 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
    clicking (ethanol B&S, selection halos, stick, VdW, wireframe, ethene
    double bond, trajectory frame 3).
 
-## The meta-atom plan (Christian's question, 2026-07-31)
-Goal: guide pre-optimisation of metal-organic complexes without needing force
-field parameters for the metal. Design agreed:
-- a centre carries a `CoordinationSpec` (geometry + donor distance + locked);
-- `ideal_donor_positions` turns that into explicit target points;
-- the optimiser restrains donors to those targets (harmonic), freezes the
-  metal's own FF terms, and lets the organic ligands relax under MMFF/UFF.
-Shipped so far: the geometry half (`core/coordination.py`, tested). Still
-open: storing a spec on an atom (Structure metadata, must survive savepoints
-and undo), the UI to assign one, and the restrained optimiser itself.
+## Meta atoms (SHIPPED round 19 — `core/meta.py`)
+Goal: pre-optimise metal-organic complexes without force-field parameters for
+the metal. Christian's spec (2026-08-02): "open a small window in which
+coordination geometry and bond distance can be set... the meta atom will act
+as a constraint during optimization and keep that shape. After optimization
+the meta atom needs to be converted on export to a specific element."
+
+Shipped: `MetaAtom` (geometry + distance + export element + locked) stored in
+`Structure.metadata["meta_atoms"]` under STRING keys (savepoints are JSON);
+`MetaAtomDialog` off the periodic table's ✳ button; `idealize()` places the
+bonded donors on the template directions at r; `frozen_atoms()` feeds the
+optimiser's existing `fixed` list; `resolved_symbols()` swaps the dummy for
+the real element on export.
+
+**How the constraint actually works, and its limit:** the centre and its whole
+first coordination sphere are FROZEN (`fixed`), so distances and angles around
+the metal are held by construction while the ligands relax. That is rigid, not
+harmonic — a true restrained minimisation (donors pulled toward
+`ideal_donor_positions` by a penalty term, everything else free) needs RDKit
+position constraints (`MMFFAddPositionConstraint` / `UFFAddPositionConstraint`)
+and is the obvious next refinement. Freezing was chosen because it uses the
+`fixed` support that already existed and cannot blow up.
+Still open: index remapping is implemented (`remap`/`prune`) but NOT yet
+called from `edits.delete_atoms`, so deleting atoms around a meta centre can
+leave the table pointing at the wrong index.
 
 ## Rendering / image export (Christian asked about POV-Ray, 2026-07-31)
 Shipped: `Ctrl+Shift+E` saves the viewport framebuffer as PNG/JPG at its
@@ -549,13 +1026,183 @@ NOT recommended: bundling a Python ray tracer (slow, another dependency).
 Round-1 skeleton and round-2 Blender batch: DELIVERED (see "What this is").
 Christian said "there will be heaps more" — expect further Blender-parity
 batches. Known next items, rough order:
-1. PC/mouse control preset ("will need potential overhaul for PC later" —
-   the laptop two-finger scheme is explicitly interim); scroll-sign
-   feel-check on real trackpad hardware.
-2. Editing polish: element palette / periodic-table dialog, undo/redo (OWB
-   snapshot-undo patterns), H-fill, force-field cleanup (RDKit MMFF / OB UFF
-   on selection), R rotate modal to pair with G (bond-axis rotation of a
-   selection is the chemically meaningful one).
+1. ~~PC/mouse control preset~~ DELIVERED round 16 (`core/input_map.py`).
+   Still worth a feel-check on real hardware: scroll SIGNS on both devices,
+   the zoom step per detent (0.88^n), and whether mouse users want
+   zoom-to-cursor rather than zoom-to-centre.
+1b. **Crystallography / CIF.** Reader + cell box round 18; correct placement,
+   live-tracking box, whole-molecule wrapping and asym/cell/packing switching
+   round 19. Still open, in order:
+   - **pymatgen** — Christian OK'd it as a dependency (2026-08-02) and it is
+     NOT yet used. Worth it for: CIFs that give only a space-group SYMBOL and
+     no symop loop (our reader falls back to P1 and then silently shows just
+     the asymmetric unit — the biggest correctness gap left), disorder groups
+     and partial occupancies, and `.cif` EXPORT with a space group re-derived
+     by spglib. Keep our zero-dependency reader as the bottom tier and put
+     pymatgen above it, mirroring the rdkit/openbabel tiering.
+   - **displayed bonds are still non-periodic** — `unwrap_molecules` uses the
+     minimum image, but the `perceive_structure_bonds` that runs afterwards
+     does not, so a FRAMEWORK (as opposed to a molecular crystal) still shows
+     cut open at the cell faces.
+   - packing as an ARRAY MODIFIER rather than the current destructive rebuild.
+   - **SYMMETRY AS A MODIFIER** (Christian, 2026-08-02): now that
+     `core/symmetry.py` classifies operations, "apply these operations" is a
+     natural entry in the modifier stack alongside Array — non-destructive,
+     re-evaluated on demand, and stackable with packing. That is also the
+     clean way to make the asym/cell/packing switch stop being a destructive
+     rebuild.
+   - **PARTIAL OCCUPANCIES (`_atom_site_occupancy` != 1)**: the parser reads
+     the column but IGNORES it, so a disordered structure currently shows
+     every alternative position at once, superimposed. Christian flagged that
+     many viewers handle this badly and wants a large test set. Needed:
+     read occupancy and disorder-group tags, decide a display policy
+     (dominant component by default, with a way to see the others), and
+     carry it into export. Worth collecting several real disordered CIFs as
+     fixtures before writing any of it.
+   - ~~SCHEMATIC SYMMETRY OPERATIONS~~ DELIVERED round 25
+     (`core/symmetry.py` + the viewport overlay). Original scoping kept
+     below for the reasoning:
+   - **SCHEMATIC SYMMETRY OPERATIONS** (scoped 2026-08-02):
+     while "Asymmetric unit only" is on, show how that unit is repeated to
+     fill the cell. This is very tractable because `cif.SymOp` already holds
+     each operation as a rotation + translation, and crystallography has a
+     settled visual language for it — we do not have to invent one:
+       * a 2/3/4/6-fold ROTATION axis is a line along the invariant direction
+         (the rotation's eigenvector for eigenvalue +1) with the standard
+         lens/triangle/square/hexagon glyph at its end;
+       * a MIRROR is the invariant plane, drawn as a translucent quad;
+       * an INVERSION centre is a small open circle at the fixed point;
+       * a SCREW axis / GLIDE plane is the same glyph plus an arrow for the
+         translation part (`op.translation` projected on the axis/plane).
+     Classifying an op is standard linear algebra on its 3x3: `det` = +1
+     rotation / -1 rotoinversion, `trace` gives the order, the +1 eigenvector
+     gives the axis, and the translation component splits into the part along
+     the axis (screw/glide) and the part that can be removed by choosing the
+     origin. So the core work is a `classify(SymOp) -> (kind, order, point,
+     direction, glide_vector)` function — pure numpy, very testable — and the
+     drawing is then a handful of QPainter/GL glyphs. Also worth a "ghost"
+     mode: draw the asymmetric unit's symmetry images as faint outlines so
+     you SEE where each copy lands, which may communicate more than the
+     glyphs. Toggle-able, off by default. Estimate: the classifier is small;
+     the glyph set is the bulk of the work.
+   - the per-object row pattern (`outliner.CrystalControls`) is meant to be
+     reused for PROTEINS: unique checkboxes on the object's own row plus a
+     dedicated properties page, keeping awareness of which entry is being
+     edited. Christian's call, 2026-08-02.
+   - `fit_view` frames the ATOMS, so a cell box larger than its contents
+     overflows the view.
+   (Note AG Henke is a framework-materials group, so this is closer to the
+   day job than anything else on this roadmap.)
+1c. **Unified timeline + interpolation + keyframes** (Christian asked
+   2026-08-02; nothing built yet — this is the scoping.)
+   Today: `Structure.frames` is a list of Nx3 arrays, `set_frame(i)` snaps to
+   one, and the trajectory bar drives the ACTIVE object only. So playback is
+   integer-indexed, single-track, and a second trajectory cannot play.
+   - **Linear interpolation is the easy part and is nearly free.** A frame is
+     already a full coordinate array, so `lerp(frames[i], frames[i+1], t)` is
+     one numpy op over N atoms — cheaper per tick than the buffer upload that
+     follows it, which happens either way. Cost is O(atoms), not O(frames).
+     Needs a float `time` on the object rather than an int index, and
+     `coords` becoming an evaluated result. Watch two things: bond perception
+     currently re-runs on frame change (must NOT run per interpolated tick —
+     perceive on the nearest keyframe only), and interpolating a molecule
+     that ROTATES gives atoms travelling through the chord, not the arc. The
+     honest fix for that is per-fragment rigid (Kabsch) + residual lerp,
+     which `cif.rigid_from_reference` already provides.
+   - **Multiple simultaneous trajectories** need a scene-level clock instead
+     of a per-object index: one `Scene.time`, each object mapping it through
+     its own offset/scale/length. That is the real refactor; interpolation
+     without it just animates one molecule more smoothly.
+   - **The unified track pane** (draggable-taller, one playhead, one row per
+     object, rows arrangeable) follows naturally once the clock is
+     scene-level. Sensible order: scene clock -> interpolation -> multi-row
+     pane.
+   - **Keyframes are a bigger step than they look — but not enormous**, and
+     the ground is already prepared: a keyframe is "at time t, this property
+     has this value", and `MolObject` already keeps `origin`/`orientation`
+     transforms separate from atom coordinates. So keyframing the TRANSFORM
+     (position/rotation per object) is a contained feature: a sorted list of
+     (time, value) per channel, an interpolate-at-time, and the existing
+     transform paths reading the evaluated value. Estimate: comparable to the
+     modifier stack (round 14). Keyframing ATOM POSITIONS is a different
+     animal — it is a trajectory by another name, and should reuse the frame
+     machinery rather than a second system. Recommendation: do transform
+     keyframes only, and treat trajectories as the coordinate channel.
+1f. **ALIGN NEEDS PREVIEW-THEN-CONFIRM (open, reported twice).** Christian,
+   2026-08-03: *"Align still cancels after a single axis input such as x,y,z
+   for two (bond) and 2+ (plane). A on a single atom is ok the way it is
+   because it is not dependent on axes."*
+   What happens now: `arm_align_keys` waits, the first X/Y/Z key calls
+   `on_align_key` and the operation ENDS immediately. What is wanted: the
+   axis key APPLIES the alignment as a live preview and the operation stays
+   active until **left-click confirms**; **right-click / Esc cancels** and
+   reverts. That means you can press X, look, press Y instead, and only then
+   commit — the same contract G and R already have.
+   Explicitly OUT OF SCOPE: the **single-atom** case (A with one atom moves
+   the molecule so that atom sits at the world origin). It takes no axis
+   input, so it has nothing to preview — leave it applying immediately.
+   Round 29 fixed only the adjacent bug (a stray non-axis key used to CANCEL
+   the wait); the confirm step was deliberately not attempted before the
+   0.2.0 cut because it needs a real preview state: snapshot the geometry on
+   arm, re-apply from the snapshot on each axis press, restore on cancel.
+   Look at how `_grab`/`_rotate` hold `snap` for the pattern to copy.
+
+1e. **LIGAND TEMPLATE ATTACHMENT — SHIPPED BUT NOT WORKING PROPERLY.**
+   Christian tried it 2026-08-03: "templating still not working. will need
+   more work sometime else." The pieces exist (`core/templates.py`, the two
+   F3 operators, violet donor markers, 16 passing geometry tests) and the
+   synthetic case docks correctly, so the failure is in real use, NOT in the
+   maths — likely the workflow around it: which molecule is "the ligand"
+   when several are marked, what happens with a meta atom's dressing
+   hydrogens specifically, and whether the resulting fragment is where the
+   user expects to keep editing. START BY WATCHING THE ACTUAL FAILURE rather
+   than re-deriving the geometry. Original design sketch (2026-08-02; he noted
+   he is "not too sure how to implement it yet", so this is a design sketch,
+   not a spec). Wanted: mark the coordinating atom(s) on a ligand, mark the
+   replaceable hydrogens on a metal or meta atom, then F3 "Attach template
+   molecule as ligand" and have it placed correctly. Advanced enough that F3
+   alone is the right home for now — no tab.
+   The pieces already exist, which is the encouraging part:
+   - `meta.dress_with_hydrogens` already puts placeholder H's exactly on the
+     template directions, so "the replaceable hydrogens" ARE the attachment
+     points and their positions are already ideal;
+   - `cif.rigid_from_reference` (Kabsch) is exactly the fit needed: build the
+     donor atom(s) of the ligand as the source point set and the placeholder
+     position(s) as the target, and it hands back the rotation+translation
+     that docks the ligand;
+   - `coordination.ideal_donor_positions` gives the targets when there are no
+     placeholders to consume.
+   So the core function is roughly `attach(host, host_hydrogens, ligand,
+   ligand_donors) -> transform`, plus deleting the consumed H's and bonding
+   donor-to-centre. One donor needs a torsion choice (the ligand can spin
+   about the new bond) — default to minimising clashes, and let R adjust it
+   afterwards since the ligand is a fragment by then. Two or more donors are
+   fully determined by Kabsch. Store the marked atoms as a named "template"
+   on the source molecule so it can be reused.
+
+1d. **Animation EXPORT** (Christian asked 2026-08-02: "it sucks to have nice
+   animations in a viewport but not being able to render them"). Nothing built
+   yet. The viewport can already render one frame offscreen at a resolution
+   multiplier (`MolViewport.render_image`, used by Ctrl+Shift+E), and the
+   scene clock can now be stepped deterministically — so the export loop is
+   "seek, render, write" and is genuinely small.
+   Do NOT take a hard ffmpeg dependency:
+   - **PNG frame sequence** first. Zero dependencies, works everywhere, and
+     it is what you actually want feeding Blender/After Effects or a journal.
+     This alone unblocks the feature.
+   - **`imageio-ffmpeg`** as the OPTIONAL tier for direct mp4/gif. It pip-
+     installs a static ffmpeg binary, so there is no system-level install and
+     no PATH hunting — it fits the existing rdkit/openbabel graceful-
+     degradation pattern exactly. A system ffmpeg should be used if present.
+   - NOT OpenCV (heavy, and a video writer is all we need) and NOT Qt
+     multimedia (its encoders vary by platform build).
+   Watch: `render_image` currently excludes viewport furniture, which is
+   right for figures; an animation may want the cell box and labels, so the
+   exclusions need to be optional.
+2. Editing polish: ~~element palette / periodic-table dialog~~ DELIVERED
+   round 17; undo/redo (OWB snapshot-undo patterns), H-fill, force-field
+   cleanup (RDKit MMFF / OB UFF on selection), R rotate modal to pair with G
+   (bond-axis rotation of a selection is the chemically meaningful one).
 3. Viewport: atom labels, measurement overlays drawn in-viewport, depth-cue
    fog, screenshot export, grid distance-fade, numbered-frame outliner rows
    for trajectories.

@@ -155,6 +155,12 @@ COLORS = (
 )
 
 _SYMBOL_TO_Z = {s.lower(): z for z, s in enumerate(SYMBOLS)}
+# Full names, lower-cased. Typing "carbon" (or "CARBON", or "Carbon") is a
+# perfectly reasonable way to ask for C, and it disambiguates the pairs that
+# trip people up at the keyboard — "co" is cobalt, "carbon" cannot be.
+_NAME_TO_Z = {n.lower(): z for z, n in enumerate(NAMES) if z > 0}
+# Spellings Avogadro/PubChem/US sources use that our table does not.
+_NAME_TO_Z.update({"aluminum": 13, "cesium": 55, "sulphur": 16})
 
 
 def atomic_number(symbol):
@@ -169,6 +175,38 @@ def atomic_number(symbol):
         if z:
             return z
     return _SYMBOL_TO_Z.get(letters[:1].lower(), 0)
+
+
+def from_text(text):
+    # type: (str) -> int
+    """Atomic number for a symbol OR a full element name; 0 if unknown.
+
+    Case-insensitive on both, so "FE", "fe", "Iron" and "IRON" all give 26.
+    Names are checked FIRST: `atomic_number` is deliberately tolerant of
+    trailing junk, so it happily reads "nitrogen" as N — which is right by
+    luck, while "iron" would come out as iodine. Anything that is not a whole
+    name falls through to the tolerant symbol reading.
+    """
+    clean = "".join(ch for ch in str(text) if ch.isalpha()).lower()
+    if not clean:
+        return 0
+    z = _NAME_TO_Z.get(clean)
+    if z:
+        return z
+    # A real symbol is 1-2 letters, so stripping digits off "C1"/"Cl2" leaves
+    # at most two. Anything longer that did NOT match a name is a mistyped
+    # name, not a symbol with junk on the end — falling through to the
+    # tolerant reading would turn "unobtainium" into uranium.
+    if len(clean) > 2:
+        return 0
+    return atomic_number(clean)
+
+
+def symbol_from_text(text):
+    # type: (str) -> str
+    """Canonical symbol ("Fe") for a symbol or name; "" if unknown."""
+    z = from_text(text)
+    return SYMBOLS[z] if z else ""
 
 
 def symbol(z):

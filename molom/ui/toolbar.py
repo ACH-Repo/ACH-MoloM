@@ -33,13 +33,14 @@ class ViewportToolbar(QWidget):
     TOOLS = [
         ("select", "⬚", "Select — box select by dragging (default)", True),
         ("draw", "✎", "Draw atoms — click to change an element, drag from an "
-                      "atom to add one, drag onto another to close a ring (E, "
-                      "edit mode)", True),
+                      "atom to add one, drag onto another to close a ring "
+                      "(E, edit mode)", True),
         ("move", "✥", "Move the selection (G)", False),
         ("rotate", "⟳", "Rotate the selection (R)", False),
-        ("origin", "◉", "Object origin — pick the orange dot up (O, edit "
+        ("origin", "◉", "Object origin — pick the orange dot up (Alt+O, edit "
                         "mode)", True),
-        ("measure", "📏", "Measurement readout: click 2-4 atoms", False),
+        ("measure", "📏", "Measure — click 2 atoms for a distance, 3 for an "
+                          "angle, 4 for a dihedral (Esc finishes)", True),
         ("optimize", "⚛", "Force-field clean-up panel (Ctrl+R)", False),
     ]
 
