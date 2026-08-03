@@ -16,10 +16,11 @@ and looking costs nothing.
 from typing import Optional
 
 from PySide6.QtCore import QEvent, QPoint, Qt, Signal
-from PySide6.QtGui import QAction, QBrush, QColor
+from PySide6.QtGui import QAction, QBrush, QColor, QPalette
 from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox,
                                QHBoxLayout, QHeaderView, QInputDialog,
-                               QLabel, QMenu, QToolButton, QTreeWidget,
+                               QLabel, QMenu, QStyledItemDelegate,
+                               QToolButton, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from ..core import elements
@@ -33,10 +34,33 @@ LABEL_MODES = [("element", "Element"), ("index", "Index"),
 ROLE_KIND = Qt.UserRole          # "object" | "element" | "atom" | "add"
 ROLE_OBJ = Qt.UserRole + 1
 ROLE_ATOM = Qt.UserRole + 2
+ROLE_HIDDEN = Qt.UserRole + 3    # this molecule has hidden atoms
 
 # Short codes for the label-type square
 _MODE_CODE = {"element": "El", "index": "#", "element_index": "E#",
               "custom": "✎"}
+
+
+class _HiddenMarkDelegate(QStyledItemDelegate):
+    """Paints a hidden-atoms row in the mark colour, selected or not.
+
+    A plain `setForeground` loses to the selection highlight: Qt's style
+    draws selected text with `QPalette.HighlightedText`, so the row turns
+    white on blue and the warning vanishes exactly when you click it. Both
+    palette roles are overridden here, which is the only way that holds for
+    every style.
+    """
+
+    def __init__(self, colour, parent=None):
+        super().__init__(parent)
+        self._colour = colour
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        if index.data(ROLE_HIDDEN):
+            for role in (QPalette.Text, QPalette.HighlightedText,
+                         QPalette.WindowText, QPalette.ButtonText):
+                option.palette.setColor(role, self._colour)
 
 
 class CrystalControls(QWidget):
@@ -435,6 +459,8 @@ class OutlinerPanel(QWidget):
         head.resizeSection(2, 96)
         head.setMinimumSectionSize(22)
         self.tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._hidden_delegate = _HiddenMarkDelegate(self.HIDDEN_MARK, self)
+        self.tree.setItemDelegateForColumn(0, self._hidden_delegate)
         lay.addWidget(self.tree, 1)
 
         self._loading = False
@@ -479,8 +505,11 @@ class OutlinerPanel(QWidget):
                           | Qt.ItemIsUserCheckable)
             item.setCheckState(self.EYE_COLUMN,
                                Qt.Checked if obj.visible else Qt.Unchecked)
-            item.setToolTip(self.EYE_COLUMN, "Show / hide in viewport")
+            item.setToolTip(self.EYE_COLUMN,
+                            "Show / hide in viewport. Ticking it back on "
+                            "also un-hides every atom of this molecule.")
             self.tree.addTopLevelItem(item)
+            self._mark_hidden(item, obj)
             combo = QComboBox()
             for key, label in _STYLE_CHOICES:
                 combo.addItem(label, key)
@@ -503,6 +532,31 @@ class OutlinerPanel(QWidget):
         self._restore_expanded(expanded)
         self._loading = False
         self._sync_label_combo(active_id)
+
+    #: A molecule with hidden atoms — bright enough to catch the eye in a
+    #: long list, since the whole problem is that hidden atoms are invisible.
+    HIDDEN_MARK = QColor(255, 105, 105)
+
+    def _mark_hidden(self, item, obj):
+        """Flag the molecule's row while any of its atoms are hidden.
+
+        Without this the state is unfalsifiable: a molecule missing its
+        hydrogens looks exactly like a molecule that never had them, so you
+        cannot tell a display choice from a broken import. The row is the
+        only place that can say so, because it is the one thing still visible.
+
+        The flag is a ROLE, not a brush. Setting the foreground directly
+        works until the row is selected, at which point the style paints the
+        text in `HighlightedText` and the mark disappears against the blue —
+        so the one row you are looking at is the one that stops telling you
+        anything (Christian's screenshot). `_HiddenMarkDelegate` reads the
+        role and overrides both palette entries instead.
+        """
+        item.setData(0, ROLE_HIDDEN, True if obj.has_hidden else None)
+        item.setToolTip(0, "{} of {} atoms hidden — tick the eye off and "
+                           "on, or Alt+H, to bring them back".format(
+                               len(obj.atom_hidden), obj.structure.n_atoms)
+                        if obj.has_hidden else "")
 
     def _add_crystal_row(self, parent_item, obj):
         """A crystal gets one extra child row carrying its own switches.
@@ -589,12 +643,18 @@ class OutlinerPanel(QWidget):
 
     def refresh_row_controls(self):
         """Re-read every visible control (a group toggle changes its atoms'
-        squares and vice versa)."""
+        squares and vice versa) and re-mark the molecules that have hidden
+        atoms — hiding from a group square never goes through `sync`."""
         for c in list(self._controls):
             try:
                 c.refresh()
             except RuntimeError:        # widget already deleted by a re-sync
                 self._controls.remove(c)
+        for k in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(k)
+            obj = self._obj(item)
+            if obj is not None:
+                self._mark_hidden(item, obj)
 
     # --------------------------------------------------------- expand state
     def _expanded_keys(self):

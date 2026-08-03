@@ -39,6 +39,7 @@ from .choice_popup import ChoicePopup
 from .dialogs import (MetaAtomDialog, OperatorSearchDialog, ResolveNameDialog,
                       SettingsDialog)
 from .optimize_panel import OptimizeDock, OptimizeWorker, TASK_SELECTION
+from . import properties as properties_mod
 from .properties import (CrystalPage, ModifierPage,
                          PropertiesDock, VibrationPage)
 from .timeline_panel import TimelinePanel
@@ -95,6 +96,10 @@ class MainWindow(QMainWindow):
         self.active_id = None            # type: Optional[int]
         self.undo = UndoStack(limit=int(self.settings.value("undo_limit", 30)))
         self._last_axis_align = None     # {"obj_id", "axis", "pivot"}
+        self._align_preview = None       # pose captured when A armed
+        # Objects whose frame moved while they were hidden: their bonds are
+        # re-perceived when they come back, not while nobody can see them.
+        self._stale_bonds = set()
         self.project_path = None         # type: Optional[str]  (.molom)
         self._local_view = None          # {obj_id: visible} while isolated
         self._pending_suppress = False   # merge the next push into this one
@@ -107,6 +112,11 @@ class MainWindow(QMainWindow):
         self._active_mode = {}    # obj_id -> mode index playing
         self._mode_amplitude = {} # obj_id -> Angstrom
         self._mode_frames = {}    # obj_id -> frames per period
+        # Coalesces a slider drag into one re-bake instead of ~60 a second.
+        self._mode_rebake = QTimer(self)
+        self._mode_rebake.setSingleShot(True)
+        self._mode_rebake.setInterval(70)
+        self._mode_rebake.timeout.connect(self._rebake_mode)
 
         self.viewport = MolViewport(self)
         self.viewport.set_scene(self.scene)
@@ -126,6 +136,8 @@ class MainWindow(QMainWindow):
         self.viewport.on_model_edit_begin = self.push_undo
         self.viewport.on_model_edit_cancel = self._on_model_edit_cancel
         self.viewport.on_align_key = self._on_align_key
+        self.viewport.on_align_confirm = self._on_align_confirm
+        self.viewport.on_align_cancel = self._on_align_cancel
         self.viewport.on_edit_begin = self.push_undo
         self.viewport.on_mode_changed = self._on_mode_changed
         self.viewport.on_new_molecule = self.new_empty_molecule
@@ -158,7 +170,8 @@ class MainWindow(QMainWindow):
         self.outliner = OutlinerPanel(self)
         self.outliner.visibility_changed.connect(self._on_obj_visibility)
         self.outliner.atom_display_changed.connect(
-            lambda: (self.viewport.refresh_geometry(), self.viewport.update()))
+            lambda: (self.viewport.refresh_geometry(), self.viewport.update(),
+                     self.outliner.refresh_row_controls()))
         self.outliner.atom_picked.connect(
             lambda oid, i: self.viewport.set_selection([(oid, i)]))
         self.outliner.isolate_requested.connect(self._on_obj_isolate)
@@ -191,7 +204,8 @@ class MainWindow(QMainWindow):
         # than competing for the same edge.
         self.vibration_page = VibrationPage()
         self.vibration_page.mode_selected.connect(self.on_animate_mode)
-        self.vibration_page.mode_settings.connect(self._on_mode_settings)
+        self.vibration_page.settings_changed.connect(self._on_mode_settings)
+        self.vibration_page.load_requested.connect(self.on_load_frequencies)
         self.crystal_page = CrystalPage()
         self.crystal_page.view_changed.connect(self.on_crystal_view)
         self.crystal_page.box_toggled.connect(self._set_cell_box)
@@ -479,6 +493,15 @@ class MainWindow(QMainWindow):
         r("delete_selected", "Delete selected atoms",
           lambda c: c.on_delete_selected(), enabled=sel, category="Edit",
           shortcut="Del", key="Del")
+        r("hide_selected", "Hide the selected atoms",
+          lambda c: c.on_hide_selected(), enabled=sel, category="Edit",
+          shortcut="H", key="H",
+          aliases=("hide", "conceal", "invisible", "mask"))
+        r("unhide_all", "Show every hidden atom",
+          lambda c: c.on_unhide_all(),
+          enabled=lambda c: any(o.has_hidden for o in c.scene.objects),
+          category="Edit", shortcut="Alt+H", key="Alt+H",
+          aliases=("unhide", "reveal", "show hidden", "alt h"))
         r("change_element", "Change element of selection...",
           lambda c: c.on_change_element(), enabled=sel, category="Edit",
           shortcut="F3 (in edit mode just type the symbol)")
@@ -957,17 +980,72 @@ class MainWindow(QMainWindow):
         self._update_counts()
 
     def _new_symmetry_modifier(self, obj):
-        """Seeded from the molecule's own crystallography — a symmetry
-        modifier with no cell would be an empty box asking the user to type
-        192 operations."""
+        """Seeded from the molecule's own crystallography where it has any.
+
+        A PLAIN molecule gets a working modifier too, with a box drawn round
+        it and the identity operation — Christian's actual use case, 2026-08-
+        03: take a fragment, stack single operations (a glide, a screw axis)
+        one at a time, and watch an asymmetric unit turn into a cell. That is
+        a legitimate way to learn a space group, and refusing because the
+        molecule "has no cell" made the whole modifier unreachable for it.
+        The cell is a starting point to edit, not a fact being asserted.
+        """
         meta = obj.structure.metadata or {}
-        if not meta.get("cell"):
-            self.statusBar().showMessage(
-                "Symmetry modifier needs a unit cell — import a .cif first",
-                6000)
-            return None
+        if meta.get("cell") and meta.get("symops"):
+            return modifiers_mod.SymmetryModifier(
+                cell=meta.get("cell"), symops=list(meta.get("symops")))
+        cell, origin = self._default_cell_for(obj)
         return modifiers_mod.SymmetryModifier(
-            cell=meta.get("cell"), symops=list(meta.get("symops") or []))
+            cell=meta.get("cell") or cell,
+            symops=list(meta.get("symops") or ["x,y,z"]),
+            origin=None if meta.get("cell") else origin)
+
+    @staticmethod
+    def _default_cell_for(obj):
+        """A cubic box around the molecule, plus where to put its origin.
+
+        The origin is offset so the molecule lands near fractional
+        (0.3, 0.3, 0.3) — a GENERAL position. Put it on the cell origin
+        instead and every operation through that origin maps the molecule
+        onto itself, so adding a 2-fold produces no visible copy and the
+        modifier looks broken when it is working perfectly.
+        """
+        from ..core import cif as cif_mod
+        coords = obj.structure.coords
+        if len(coords) == 0:
+            side, centre = 10.0, np.zeros(3)
+        else:
+            extent = float(np.max(coords.max(axis=0) - coords.min(axis=0)))
+            side = max(round(extent * 2.5 + 4.0, 2), 6.0)
+            centre = coords.mean(axis=0)
+        cell = cif_mod.Cell(side, side, side, 90.0, 90.0, 90.0)
+        origin = centre - np.array([0.3, 0.3, 0.3]) @ cell.matrix()
+        return cell.to_dict(), origin
+
+    def _reduce_to_asymmetric_unit(self, obj):
+        """Put the object's atoms back to the sites the CIF actually listed.
+
+        Kept from `parse_cif` in `asym_symbols`/`asym_frac`, so this is a
+        restore rather than a re-derivation — working out which of the cell's
+        atoms were the original sites after the user has edited them is not a
+        question with a reliable answer.
+        """
+        from ..core import cif as cif_mod
+        meta = obj.structure.metadata or {}
+        symbols = list(meta.get("asym_symbols") or ())
+        frac = meta.get("asym_frac")
+        if not symbols or frac is None:
+            return False
+        cell = cif_mod.Cell.from_dict(meta["cell"])
+        coords = np.asarray(frac, dtype=float) @ cell.matrix()
+        obj.structure.symbols = symbols
+        obj.structure.frames = [coords.copy()]
+        obj.structure.current_frame = 0
+        obj.structure.bonds = []
+        bonding.perceive_structure_bonds(obj.structure)
+        bonding.perceive_structure_bond_orders(obj.structure)
+        meta["cell_view"] = "asym"
+        return True
 
     def on_add_modifier(self, kind):
         obj = self._active_obj()
@@ -980,6 +1058,30 @@ class MainWindow(QMainWindow):
                 return
             self.push_undo()
             obj.modifiers.append(mod)
+            # ...and REDUCE the base to the asymmetric unit. Without this the
+            # modifier re-applies the operations to a molecule that is
+            # already the full cell, de-duplicates straight back to what was
+            # there, and nothing whatsoever changes on screen — "Add doesn't
+            # do anything". The whole bargain of the modifier is that the
+            # base is the asymmetric unit you edit while the viewport shows
+            # the cell, so adding it has to put the base into that state.
+            reduced = self._reduce_to_asymmetric_unit(obj)
+            self._sync_modifier_page()
+            self.viewport.refresh_geometry()
+            self._update_counts()
+            if reduced:
+                self.statusBar().showMessage(
+                    "Symmetry modifier added to {}: the molecule is now its "
+                    "asymmetric unit ({} atoms) and the viewport shows the "
+                    "full cell ({} atoms)".format(
+                        obj.name, obj.structure.n_atoms,
+                        len(obj.evaluated()[0])), 9000)
+            else:
+                self.statusBar().showMessage(
+                    "Symmetry modifier added to {} with a plain box and the "
+                    "identity operation — open the card and add operations "
+                    "one at a time to build a cell".format(obj.name), 9000)
+            return
         elif kind == "array":
             self.push_undo()
             # default offset along +X, just past the molecule, so the very
@@ -1770,30 +1872,130 @@ class MainWindow(QMainWindow):
                 "Align needs atoms of ONE molecule (or exactly 2 atoms on "
                 "2 molecules)", 5000)
             return
+        obj = self.scene.get(unique[0])
+        if obj is None:
+            return
+        # Capture BEFORE arming: every axis key previews from this pose.
+        self._align_preview = self._align_capture(obj)
         self.viewport.arm_align_keys("axis" if len(sel) == 2 else "plane")
 
+    # -------------------------------------------------------- align preview
+    def _align_capture(self, obj):
+        """Everything `_rigid_rotate_object` touches, so a preview can be
+        re-applied from the ORIGINAL pose rather than compounding on itself.
+
+        Only the one object is copied — a whole-scene snapshot would rebuild
+        every MolObject, and the outliner's row widgets hold direct object
+        references that would then be pointing at the dead ones.
+        """
+        return {"obj_id": obj.id,
+                "frames": [f.copy() for f in obj.structure.frames],
+                "origin": obj.origin.copy(),
+                "orientation": obj.orientation.copy()}
+
+    def _align_rewind(self):
+        """Put the previewed object back exactly as it was."""
+        cap = self._align_preview
+        obj = self.scene.get(cap["obj_id"]) if cap else None
+        if obj is None:
+            return None
+        obj.structure.frames = [f.copy() for f in cap["frames"]]
+        obj.origin = cap["origin"].copy()
+        obj.orientation = cap["orientation"].copy()
+        return obj
+
     def _on_align_key(self, kind, axis):
-        """Axis key arrived from the viewport's align-wait state."""
-        if kind == "axis":
-            self.on_align_axis(axis)
+        """An axis key arrived: show what it would do, and keep waiting.
+
+        Every press rewinds to the captured pose first, so pressing X then Y
+        gives the Y alignment rather than Y-applied-on-top-of-X.
+        """
+        if self._align_preview is None:
+            return
+        obj = self._align_rewind()
+        if obj is None:
+            self.viewport._end_align_wait("The molecule is gone")
             return
         sel = self.viewport.selection
-        obj = self.scene.get(sel[0][0]) if sel else None
-        if obj is None or len(sel) < 3:
+        if kind == "axis":
+            done = self._preview_align_axis(obj, sel, axis)
+        else:
+            done = self._preview_align_plane(obj, sel, axis)
+        if not done:
             return
+        self.viewport.refresh_geometry()
+        self.viewport.update()
+
+    def _preview_align_axis(self, obj, sel, axis):
+        c = obj.structure.coords
+        if len(sel) != 2:
+            return False
+        v = c[sel[1][1]] - c[sel[0][1]]
+        if np.linalg.norm(v) < 1e-6:
+            self.statusBar().showMessage("The two atoms coincide", 4000)
+            return False
+        target = np.zeros(3)
+        target[axis] = 1.0
+        pivot = (c[sel[0][1]] + c[sel[1][1]]) / 2.0
+        self._rigid_rotate_object(
+            obj, align_mod.align_vector_to_axis(v, target), pivot)
+        self._align_preview["result"] = {
+            "last_axis": {"obj_id": obj.id, "axis": target,
+                          "pivot": pivot.copy()},
+            "message": "Aligned {}-{} of {} to the {} axis (Flip reverses "
+                       "it)".format(self.scene.pick_label(tuple(sel[0])),
+                                    self.scene.pick_label(tuple(sel[1])),
+                                    obj.name, "XYZ"[axis])}
+        return True
+
+    def _preview_align_plane(self, obj, sel, axis):
+        if len(sel) < 3:
+            return False
         pts = np.array([obj.structure.coords[i] for _o, i in sel])
         centroid, normal = align_mod.best_fit_plane(pts)
         target = np.zeros(3)
         target[axis] = 1.0                  # plane PERPENDICULAR to the key
-        self.push_undo()
-        rot = align_mod.align_vector_to_axis(normal, target)
-        self._rigid_rotate_object(obj, rot, centroid)
+        self._rigid_rotate_object(
+            obj, align_mod.align_vector_to_axis(normal, target), centroid)
+        plane = {0: "YZ", 1: "XZ", 2: "XY"}[axis]
+        self._align_preview["result"] = {
+            "last_axis": None,
+            "message": "Aligned the {}-atom selection plane of {} to the {} "
+                       "plane".format(len(sel), obj.name, plane)}
+        return True
+
+    def _on_align_confirm(self):
+        """Left-click: keep the preview, as ONE undo step."""
+        cap = self._align_preview
+        self._align_preview = None
+        if cap is None or "result" not in cap:
+            return
+        result = cap["result"]
+        # The undo entry has to be the pose from BEFORE the preview, so the
+        # scene is rewound, snapshotted, and rolled forward again. Pushing
+        # now would record the previewed pose and make Ctrl+Z do nothing.
+        obj = self.scene.get(cap["obj_id"])
+        if obj is not None:
+            after = self._align_capture(obj)
+            self._align_preview = cap
+            self._align_rewind()
+            self.push_undo()
+            self._align_preview = after
+            self._align_rewind()
+            self._align_preview = None
+        self._last_axis_align = result["last_axis"]
         self.viewport.refresh_geometry()
         self._on_edit_committed()
-        plane = {0: "YZ", 1: "XZ", 2: "XY"}[axis]
-        self.statusBar().showMessage(
-            "Aligned the {}-atom selection plane of {} to the {} plane"
-            .format(len(sel), obj.name, plane), 6000)
+        self.statusBar().showMessage(result["message"], 6000)
+
+    def _on_align_cancel(self):
+        """Right-click or Esc: put it back and leave no undo entry."""
+        if self._align_preview is None:
+            return
+        self._align_rewind()
+        self._align_preview = None
+        self.viewport.refresh_geometry()
+        self.viewport.update()
 
     def on_align_planar(self, plane_key):
         obj = self._active_obj()
@@ -1821,6 +2023,7 @@ class MainWindow(QMainWindow):
         return self.scene.objects[-1] if self.scene.objects else None
 
     def _sync_all(self, fit=False):
+        self._flush_stale_bonds()
         self.outliner.sync(self.scene, self.active_id)
         self.viewport.refresh_geometry()
         if fit:
@@ -1853,16 +2056,127 @@ class MainWindow(QMainWindow):
         self._sync_all(fit=True)
         if path:
             self._push_recent(path)
+            extra = self._attach_frequencies(obj, path)
+            note = ", ".join([n for n in (note, extra) if n]) or None
         self.statusBar().showMessage(
             "Added {}{}".format(obj.name,
                                 " ({})".format(note) if note else ""), 6000)
 
+    # ------------------------------------------------------------ vibrations
+    _FREQ_SUFFIXES = (".out", ".log", ".txt", ".orca", ".output")
+
+    def _attach_frequencies(self, obj, path):
+        # type: (object, str) -> Optional[str]
+        """Pick up normal modes from a file that was just OPENED normally.
+
+        Opening an ORCA FREQ output through Ctrl+O read the geometry (via
+        OpenBabel) and threw the modes away, so `_modes` stayed empty and the
+        ∿ tab stayed grey with no hint why — Christian, 2026-08-03: "which I
+        still cannot select and look at btw". Requiring the F3 loader for a
+        file whose whole point is the frequencies is a discoverability trap:
+        if the modes are in the file we just read, take them.
+
+        Cheap on non-FREQ files: only text-ish extensions are considered and
+        the header is looked for before anything is parsed.
+        """
+        if not path or not path.lower().endswith(self._FREQ_SUFFIXES):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+            if "VIBRATIONAL FREQUENCIES" not in text:
+                return None
+            modes = vib_mod.parse_orca_frequencies(
+                text, n_atoms=obj.structure.n_atoms)
+        except (vib_mod.VibrationError, OSError, ValueError):
+            return None                  # a geometry-only job: nothing to add
+        self._modes[obj.id] = modes
+        self._rest_geometry[obj.id] = obj.structure.coords.copy()
+        self._sync_vibration_page()
+        real = [m for m in modes if not m.is_trivial]
+        return "{} normal modes — see the ∿ page".format(len(real))
+
     # ----------------------------------------------------------- obj signals
+    def _catch_up_bonds(self, obj):
+        """Re-perceive the bonds of one object that moved while hidden."""
+        if obj.id in self._stale_bonds:
+            self._stale_bonds.discard(obj.id)
+            bonding.perceive_structure_bonds(obj.structure)
+
+    def _flush_stale_bonds(self):
+        """Anything that has become visible again catches up NOW, so its
+        connectivity is right even if the clock is paused."""
+        for obj in self.scene.objects:
+            if obj.visible:
+                self._catch_up_bonds(obj)
+
     def _on_obj_visibility(self, obj_id, visible):
+        """The molecule's eye. Ticking it back ON also un-hides every atom.
+
+        H hides a selection and nothing in the viewport says where it went —
+        so there has to be one obvious way back, and "show this molecule"
+        meaning "show ALL of this molecule" is it (Christian's call: cycling
+        the tick restores everything). Otherwise the only route out is
+        finding each element group whose square happens to read S.
+        """
         obj = self.scene.get(obj_id)
-        if obj is not None:
-            obj.visible = visible
-            self.viewport.refresh_geometry()
+        if obj is None:
+            return
+        obj.visible = visible
+        restored = obj.unhide_all() if visible else 0
+        self._flush_stale_bonds()
+        self.viewport.refresh_geometry()
+        if restored:
+            self.outliner.sync(self.scene, self.active_id)
+            self.statusBar().showMessage(
+                "{}: {} hidden atom(s) shown again".format(obj.name,
+                                                           restored), 5000)
+
+    # ------------------------------------------------------------ hide atoms
+    def on_hide_selected(self):
+        """H — hide the selected atoms (Blender's key, Blender's meaning).
+
+        Hides across every molecule the selection touches, so hiding a
+        picked-out shell of a framework is one keystroke rather than one per
+        object. The selection is cleared afterwards: leaving invisible atoms
+        selected means the next G or Delete acts on things you cannot see.
+        """
+        picks = list(self.viewport.selection)
+        if not picks:
+            self.statusBar().showMessage(
+                "Nothing selected — H hides the selected atoms", 4000)
+            return
+        by_obj = {}
+        for obj_id, atom in picks:
+            by_obj.setdefault(obj_id, []).append(atom)
+        self.push_undo()
+        total = 0
+        for obj_id, atoms in by_obj.items():
+            obj = self.scene.get(obj_id)
+            if obj is not None:
+                total += obj.hide_atoms(atoms)
+        if not total:
+            self.undo.discard_last()     # already hidden: not an edit
+            return
+        self.viewport.set_selection([])
+        self.viewport.refresh_geometry()
+        self.outliner.sync(self.scene, self.active_id)
+        self._update_counts()
+        self.statusBar().showMessage(
+            "Hid {} atom(s) — tick the molecule's eye off and on to bring "
+            "them back (Alt+H)".format(total), 8000)
+
+    def on_unhide_all(self):
+        """Alt+H — show every hidden atom in the scene, as Blender does."""
+        total = sum(o.unhide_all() for o in self.scene.objects)
+        if not total:
+            self.statusBar().showMessage("Nothing is hidden", 3000)
+            return
+        self.viewport.refresh_geometry()
+        self.outliner.sync(self.scene, self.active_id)
+        self._update_counts()
+        self.statusBar().showMessage(
+            "Showed {} hidden atom(s)".format(total), 5000)
 
     def _on_obj_isolate(self, obj_id):
         """Shift+click the eye: toggle between 'show only this one' and
@@ -1882,6 +2196,7 @@ class MainWindow(QMainWindow):
             for o in others:
                 o.visible = False
             msg = "Showing only {}".format(target.name)
+        self._flush_stale_bonds()
         self.outliner.sync(self.scene, self.active_id)
         self.viewport.refresh_geometry()
         self._update_counts()
@@ -1931,24 +2246,44 @@ class MainWindow(QMainWindow):
         self.traj_bar = TimelinePanel(self)
         self.traj_bar.play_pause.connect(self.on_play_pause)
         self.traj_bar.seek_requested.connect(self.on_seek)
-        self.traj_bar.interpolate_toggled.connect(self._on_interp_toggled)
+        self.traj_bar.smoothing_changed.connect(self._on_smoothing_changed)
         self.traj_bar.fps_changed.connect(self._on_fps_changed)
+        self.traj_bar.range_changed.connect(self._on_range_changed)
         self.traj_bar.tracks_changed.connect(self._on_tracks_edited)
         self.traj_bar.setVisible(False)
         # kept as aliases so the older call sites keep reading naturally
         self._play_btn = self.traj_bar.play_btn
         self._frame_label = self.traj_bar.label
         self._fps_spin = self.traj_bar.fps_spin
-        self._interp_check = self.traj_bar.interp_check
+        self._smooth_spin = self.traj_bar.smooth_spin
+        # Both knobs persist: they describe how YOU like to watch an
+        # animation, not anything about the file that happens to be open.
+        self.timeline.fps = float(self.settings.value(
+            "playback_fps", timeline_mod.DEFAULT_FPS))
+        self.timeline.smoothing = int(self.settings.value(
+            "playback_smoothing", timeline_mod.DEFAULT_SMOOTHING))
 
-    def _on_interp_toggled(self, on):
-        self.timeline.interpolate = bool(on)
+    def _on_smoothing_changed(self, images):
+        """How many images fill one source-frame interval."""
+        self.timeline.smoothing = int(images)
+        self.settings.setValue("playback_smoothing", int(images))
         self._apply_timeline()
 
     def _on_fps_changed(self, fps):
         self.timeline.fps = float(fps)
+        self.settings.setValue("playback_fps", int(fps))
         if self._play_timer.isActive():
             self._play_timer.setInterval(int(1000 / max(int(fps), 1)))
+
+    def _on_range_changed(self, first, last):
+        """The looping interval, as 0-based IMAGE indices from the spin
+        boxes. An end on the last image means 'follow the scene', so a
+        trajectory that grows later stays fully covered."""
+        start = self.timeline.time_of_image(first)
+        end = self.timeline.time_of_image(last)
+        self.timeline.set_range(
+            start, None if end >= self.timeline.duration - 1e-9 else end)
+        self._apply_timeline()
 
     def _on_tracks_edited(self):
         """A row was dragged, toggled or had its end mode cycled."""
@@ -1966,6 +2301,9 @@ class MainWindow(QMainWindow):
         """
         self.timeline.sync([(o.id, o.structure.n_frames)
                             for o in self.scene.objects])
+        # Re-baking a mode at a different frame count changes the duration
+        # under the playhead, so pull it back inside the looping interval.
+        self.timeline.seek(self.timeline.time)
         if not self.timeline.has_animation:
             self._play_timer.stop()
             self.timeline.playing = False
@@ -1990,6 +2328,13 @@ class MainWindow(QMainWindow):
             self._play_btn.setText("||")
 
     def _advance_frame(self):
+        """One timer tick draws exactly one IMAGE.
+
+        The timer therefore runs at the framerate and the step is one
+        subdivision of a source frame — which is what makes the two spin
+        boxes independent: `fps` sets how fast images go by, `smoothing` sets
+        how many of them there are between two frames of the input file.
+        """
         if not self.timeline.has_animation:
             self._play_timer.stop()
             self.timeline.playing = False
@@ -1997,7 +2342,7 @@ class MainWindow(QMainWindow):
         fps = float(self._fps_spin.value())
         self._play_timer.setInterval(int(1000 / fps))
         self.timeline.fps = fps
-        self.timeline.advance(1.0 / fps)
+        self.timeline.advance_images(1)
         self._apply_timeline()
 
     def _apply_timeline(self):
@@ -2019,7 +2364,17 @@ class MainWindow(QMainWindow):
             nearest = int(round(position))
             if nearest != obj.structure.current_frame:
                 obj.structure.set_frame(nearest)
-                bonding.perceive_structure_bonds(obj.structure)
+                # Bond perception is the expensive part of a tick, and it is
+                # unobservable on a molecule nobody can see — so an animated
+                # molecule you have hidden is deferred rather than computed
+                # and thrown away. Measured at 600 atoms / 40 frames: a
+                # hidden track cost 105% of a visible one before this.
+                if obj.visible:
+                    bonding.perceive_structure_bonds(obj.structure)
+                else:
+                    self._stale_bonds.add(obj.id)
+            elif obj.visible and obj.id in self._stale_bonds:
+                self._catch_up_bonds(obj)
         self.viewport.refresh_geometry()
         self._sync_traj_bar()
         self._update_counts()
@@ -2541,6 +2896,11 @@ class MainWindow(QMainWindow):
         """
         obj = self._active_obj()
         if obj is None:
+            # Reachable from the ∿ page's own button now, which is visible on
+            # an empty scene — so say why nothing happened.
+            self.statusBar().showMessage(
+                "Open or build a molecule first, or just open the ORCA .out "
+                "file directly — its modes are read on import.", 8000)
             return
         start = self.settings.value("last_dir", "")
         path, _f = QFileDialog.getOpenFileName(
@@ -2589,27 +2949,41 @@ class MainWindow(QMainWindow):
                           if imaginary else ""), 12000)
 
     def _sync_vibration_page(self):
-        """Unlock the ∿ page for a molecule that has FREQ data, exactly as
-        the ❖ page unlocks for a crystal."""
+        """Refresh the ∿ page for the active molecule.
+
+        The tab stays CLICKABLE even with no frequency data (unlike ❖): a
+        greyed square cannot tell you why it is greyed, and "I still cannot
+        select and look at it" was the actual report. The page explains
+        itself and carries the loader button instead.
+        """
         obj = self._active_obj()
         modes = self._modes.get(obj.id) if obj is not None else None
         tab = self.properties.buttons.get("vibrations")
         if tab is not None:
-            tab[0].setEnabled(bool(modes))
+            tab[0].setEnabled(True)
             tab[0].setToolTip(
                 "Vibrational normal modes — {}".format(
                     obj.name if modes else
-                    "this molecule has no frequency data"))
+                    "no frequency data on this molecule yet"))
+        obj_id = obj.id if obj is not None else None
         self.vibration_page.set_modes(
-            modes or [], active=self._active_mode.get(obj.id if obj else None),
-            name=obj.name if obj is not None else "")
+            modes or [], active=self._active_mode.get(obj_id),
+            name=obj.name if obj is not None else "",
+            amplitude=float(self._mode_amplitude.get(
+                obj_id, properties_mod.DEFAULT_AMPLITUDE)),
+            n_frames=int(self._mode_frames.get(
+                obj_id, vib_mod.DEFAULT_PERIOD_FRAMES)))
 
-    def on_animate_mode(self, index, amplitude=None, n_frames=None):
+    def on_animate_mode(self, index, amplitude=None, n_frames=None,
+                        push=True, resync=True):
         """Bake one mode into a looping track on the scene clock.
 
         Nothing vibration-specific reaches the player: the mode becomes
         ordinary frames, so it interpolates, sits in the multi-track pane and
         plays alongside other trajectories like anything else.
+
+        `push`/`resync` are off while a slider is being dragged — see
+        `_on_mode_settings` for why.
         """
         obj = self._active_obj()
         modes = self._modes.get(obj.id) if obj is not None else None
@@ -2622,14 +2996,17 @@ class MainWindow(QMainWindow):
         if rest is None:
             rest = obj.structure.coords.copy()
             self._rest_geometry[obj.id] = rest
-        amplitude = float(self._mode_amplitude.get(obj.id, 0.6)
-                          if amplitude is None else amplitude)
-        n_frames = int(self._mode_frames.get(obj.id, 20)
-                       if n_frames is None else n_frames)
+        amplitude = float(
+            self._mode_amplitude.get(obj.id, properties_mod.DEFAULT_AMPLITUDE)
+            if amplitude is None else amplitude)
+        n_frames = int(self._mode_frames.get(
+            obj.id, vib_mod.DEFAULT_PERIOD_FRAMES)
+            if n_frames is None else n_frames)
         self._mode_amplitude[obj.id] = amplitude
         self._mode_frames[obj.id] = n_frames
         self._active_mode[obj.id] = mode.index
-        self.push_undo()
+        if push:
+            self.push_undo()
         obj.structure.frames = vib_mod.mode_frames(
             rest, mode, amplitude=amplitude, n_frames=n_frames)
         obj.structure.set_frame(0)
@@ -2638,19 +3015,41 @@ class MainWindow(QMainWindow):
         if track is not None:
             track.end = timeline_mod.LOOP        # a vibration IS a loop
         self._apply_timeline()
-        self._sync_vibration_page()
+        if resync:
+            self._sync_vibration_page()
         self.statusBar().showMessage(
             "{}: animating {}".format(obj.name, mode.label().strip()), 9000)
 
-    def _on_mode_settings(self, index, amplitude, n_frames):
-        """A slider moved: re-bake only if this mode is the one playing."""
+    def _on_mode_settings(self, amplitude, n_frames):
+        """Amplitude or frames-per-period moved. Both belong to the FREQ
+        OBJECT, so re-bake whichever of its modes is currently animating.
+
+        Dragging the amplitude slider used to stutter badly, and neither
+        cause was the maths: every single slider tick took a **full deep
+        snapshot of the scene** for undo, and then rebuilt all 3N mode cards
+        as widgets through `_sync_vibration_page` — which also fed the
+        slider's own value back at it. Sixty of those a second is the stutter.
+        So the re-bake is coalesced onto a short timer, the page is NOT
+        rebuilt (the widgets already show what you are dragging), and one
+        undo step covers the whole gesture instead of one per pixel.
+        """
         obj = self._active_obj()
         if obj is None:
             return
         self._mode_amplitude[obj.id] = float(amplitude)
         self._mode_frames[obj.id] = int(n_frames)
-        if self._active_mode.get(obj.id) == int(index):
-            self.on_animate_mode(index, amplitude, n_frames)
+        if self._active_mode.get(obj.id) is None:
+            return                       # nothing playing: just remember it
+        if not self._mode_rebake.isActive():
+            self.push_undo()             # once per gesture, at its start
+        self._mode_rebake.start()
+
+    def _rebake_mode(self):
+        """The coalesced end of an amplitude / frame-count drag."""
+        obj = self._active_obj()
+        active = self._active_mode.get(obj.id) if obj is not None else None
+        if active is not None:
+            self.on_animate_mode(active, push=False, resync=False)
 
     def on_pick_mode(self):
         """Bake the chosen mode into a looping trajectory.
@@ -2679,9 +3078,13 @@ class MainWindow(QMainWindow):
             rest = obj.structure.coords.copy()
             self._rest_geometry[obj.id] = rest
         self.push_undo()
+        self._active_mode[obj.id] = mode.index
         obj.structure.frames = vib_mod.mode_frames(
-            rest, mode, amplitude=float(
-                self.settings.value("vib_amplitude", 0.6)))
+            rest, mode,
+            amplitude=float(self._mode_amplitude.get(
+                obj.id, properties_mod.DEFAULT_AMPLITUDE)),
+            n_frames=int(self._mode_frames.get(
+                obj.id, vib_mod.DEFAULT_PERIOD_FRAMES)))
         obj.structure.set_frame(0)
         self._sync_traj_bar()
         track = self.timeline.get(obj.id)
@@ -3124,6 +3527,31 @@ class MainWindow(QMainWindow):
                 ", {} donor(s) placed".format(moved) if moved
                 else " — draw to place one"), 8000)
 
+    def _crystal_view_via_modifier(self, obj, mod, mode, na, nb, nc):
+        """The asym/cell/packing switch, expressed through the modifier.
+
+        With a symmetry modifier on the stack the base IS the asymmetric
+        unit, so "asymmetric unit" means switching the modifier off and the
+        other two mean switching it on with a block size — no rebuilding of
+        atoms anywhere, which is the whole point of having it as a modifier.
+        """
+        self.push_undo()
+        mod.enabled = mode != "asym"
+        if mode == "packing":
+            mod.na, mod.nb, mod.nc = int(na), int(nb), int(nc)
+        else:
+            mod.na = mod.nb = mod.nc = 1
+        (obj.structure.metadata or {})["cell_view"] = mode
+        self._sync_modifier_page()
+        self.viewport.refresh_geometry()
+        self._update_counts()
+        label = {"asym": "asymmetric unit", "cell": "full unit cell",
+                 "packing": "{}x{}x{} packing".format(na, nb, nc)}[mode]
+        self.statusBar().showMessage(
+            "{}: symmetry modifier now shows the {} ({} atoms drawn from a "
+            "{}-atom base)".format(obj.name, label, len(obj.evaluated()[0]),
+                                   obj.structure.n_atoms), 7000)
+
     def on_crystal_view(self, mode, na=1, nb=1, nc=1):
         """Rebuild a CIF import as asymmetric unit / full cell / packing.
 
@@ -3143,6 +3571,15 @@ class MainWindow(QMainWindow):
         if not asym_symbols or not asym_frac:
             self.statusBar().showMessage(
                 "This molecule has a cell but no stored asymmetric unit", 5000)
+            return
+        # A symmetry MODIFIER is already generating the cell from the base.
+        # Rebuilding the base here too would expand an expanded structure —
+        # the switch has to drive the modifier instead, or the two fight.
+        sym_mods = [m for m in obj.modifiers
+                    if getattr(m, "kind", "") == "symmetry"]
+        if sym_mods:
+            self._crystal_view_via_modifier(obj, sym_mods[0], mode,
+                                            na, nb, nc)
             return
         symops = [cif_mod.SymOp.from_xyz(t) for t in meta.get("symops")
                   or ["x,y,z"]]

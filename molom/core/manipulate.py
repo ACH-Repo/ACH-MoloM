@@ -25,39 +25,70 @@ AXES = {
 AXIS_NAMES = {0: "X", 1: "Y", 2: "Z"}
 
 
+#: Smallest |sin| of the angle between a ray and the plane it is being
+#: intersected with (equivalently |cos| against the normal) that still counts
+#: as a usable hit. 0.15 is about 8.5 degrees, which caps the lever at ~7x:
+#: past that the intersection runs away toward infinity and then FLIPS SIGN
+#: as the ray crosses parallel, which reads as the selection suddenly
+#: reversing and accelerating away (Christian, 2026-08-03). Looking nearly
+#: along a drag plane genuinely gives the cursor almost no information about
+#: position in it, so refusing is more honest than amplifying the noise.
+_GRAZE = 0.15
+
+
 def ray_plane(origin, direction, p0, normal):
     # type: (np.ndarray, np.ndarray, np.ndarray, np.ndarray) -> Optional[np.ndarray]
-    """Intersection of ray with the plane through p0 with `normal`; None if
-    (near-)parallel."""
+    """Intersection of ray with the plane through p0 with `normal`.
+
+    None when the ray only GRAZES the plane, or when the plane is behind the
+    camera. Both are the same failure seen from different sides: as the
+    cursor rises past the plane's horizon the intersection shoots off to
+    infinity, crosses over, and comes back on the far side, so a grab that
+    was tracking the mouse suddenly bolts the other way. Returning None makes
+    the caller hold its last good value, which is what a modal should do when
+    the pointer stops meaning anything.
+    """
     origin = np.asarray(origin, float)
     direction = np.asarray(direction, float)
     p0 = np.asarray(p0, float)
     normal = np.asarray(normal, float)
-    denom = np.dot(direction, normal)
-    if abs(denom) < 1e-9:
+    dn = float(np.linalg.norm(direction)) * float(np.linalg.norm(normal))
+    if dn < 1e-12:
         return None
-    t = np.dot(p0 - origin, normal) / denom
+    denom = float(np.dot(direction, normal))
+    if abs(denom) / dn < _GRAZE:
+        return None
+    t = float(np.dot(p0 - origin, normal)) / denom
+    if t <= 0.0:
+        return None                  # the plane is behind us; the hit is not
     return origin + t * direction
 
 
 def ray_line_t(origin, direction, p0, axis):
-    # type: (np.ndarray, np.ndarray, np.ndarray, np.ndarray) -> float
+    # type: (np.ndarray, np.ndarray, np.ndarray, np.ndarray) -> Optional[float]
     """Parameter t of the closest point `p0 + t*axis` to the given ray.
 
-    Standard two-line closest-approach; falls back to a perpendicular
-    projection when ray and axis are (near-)parallel."""
+    Standard two-line closest-approach. None when the ray is nearly parallel
+    to the axis: the closest point then slides enormous distances for a pixel
+    of mouse movement, which is the axis-locked version of the runaway in
+    `ray_plane`. Looking down an axis you are dragging along genuinely gives
+    the cursor no information, so holding still is the honest answer.
+    """
     origin = np.asarray(origin, float)
     d = np.asarray(direction, float)
     p0 = np.asarray(p0, float)
     e = np.asarray(axis, float)
     w0 = p0 - origin
-    a = np.dot(d, d)
-    b = np.dot(d, e)
-    c = np.dot(e, e)
+    a = float(np.dot(d, d))
+    b = float(np.dot(d, e))
+    c = float(np.dot(e, e))
+    if a < 1e-12 or c < 1e-12:
+        return None
+    # sin^2 of the angle between the ray and the axis
     denom = a * c - b * b
-    if abs(denom) < 1e-12:
-        return float(-np.dot(w0, e) / c)
-    return float((np.dot(w0, d) * b - np.dot(w0, e) * a) / denom)
+    if denom / (a * c) < _GRAZE * _GRAZE:
+        return None
+    return float((float(np.dot(w0, d)) * b - float(np.dot(w0, e)) * a) / denom)
 
 
 def axis_screen_drag(axis_world, view_rot3, dx_px, dy_px):
@@ -228,6 +259,8 @@ class GrabState(_ConstraintMixin):
         e = self.axis_vector()
         if e is not None:
             t = ray_line_t(ray_origin, ray_dir, self.pivot, e)
+            if t is None:
+                return              # grazing: hold, do not bolt
             if self._start_t is None:
                 self._start_t = t
             raw = e * (t - self._start_t)

@@ -55,6 +55,139 @@ the operator key table, CIF reading with symmetry, coordination polyhedra,
 meta atoms, the scene clock with a multi-track timeline, vibrational modes,
 per-element display control, and the symmetry modifier. 512 tests.
 
+Round 33 (2026-08-03, cell display researched properly): the round-32
+boundary completion was HALF the convention and the missing half is what made
+urea look broken. Researched against the two reference viewers rather than
+guessed: **VESTA** draws atoms outside the cell that are bonded to atoms
+inside it ("Search atoms if A1 is included in the boundary", on by default),
+and **Mercury**'s packing dialog works in whole molecules, including one when
+*any* of its atoms fits. So a boundary copy now carries its whole MOLECULE,
+not just the atom — urea's C and O sit exactly on the x face and were being
+copied alone, leaving a bare C=O floating in the cell with its two NH2 groups
+on the other side. Rock salt must NOT be completed that way (Na and Cl fall
+inside the covalent criterion, so the "molecule" is the whole lattice), which
+needs a periodicity test that a two-atom cell can pass: the walk used by
+`unwrap_molecules` finds no second route in a cell that small, so
+`fragment_info` also asks whether a component **bonds to its own lattice
+image** — Na is 2.48 A from the Cl next door, urea's molecule is 2.7 A clear
+of its image and only H-bonded. NaCl: 8 corners + 1 centre. Urea: 4 complete
+molecules, no stranded atoms. **Symmetry elements crawled** because
+`_paint_symmetry` re-parsed 48 operators, re-classified them (an
+eigen-decomposition each) and re-imaged the ghosts on EVERY repaint — 12 ms a
+frame before anything was drawn, which a trackpad emitting 60+ events a
+second cannot survive. Cached on the inputs: 12 ms -> 0.11 ms. **The symmetry
+modifier now works on a plain molecule**, which is what Christian actually
+wanted it for: take a fragment, stack single operations (a glide, a screw
+axis) one at a time and watch an asymmetric unit become a cell. It invents a
+box, and OFFSETS the cell origin so the molecule sits at a general position —
+on the origin every operation through it maps the molecule onto itself and
+adding a 2-fold appears to do nothing. The card has a preset list of the
+standard elements plus a free-text field. **pymatgen was evaluated and NOT
+adopted**: on Christian's own urea.cif it returns 12 of 16 sites disordered
+with occupancy 2, because the CCDC file lists symmetry-redundant atoms
+(N1/N1C) that it merges instead of de-duplicating. ASE and MoloM's own reader
+both get 16 atoms right. pymatgen remains worth having for the P1-fallback
+gap (a space-group SYMBOL with no symop loop), which is a different problem.
+
+Round 32 (2026-08-03, five screenshot issues): **the drawn unit cell was not
+a unit cell.** Two independent faults. (a) Nothing completed the cell
+BOUNDARY, so rock salt showed one corner sodium instead of eight —
+`cif.boundary_images` now repeats every atom lying on a face/edge/corner onto
+its equivalent positions (per ATOM, not per fragment: NaCl's Na and Cl fall
+inside the covalent criterion, so a fragment walk lumps them into one unit
+whose centroid is nowhere near a face, and Mercury draws the boundary atom by
+atom anyway). Halite now comes out as the textbook 14 Na + 13 Cl. The cell
+CONTENT is unchanged — `expand(boundary=False)` still gives Z formula units.
+(b) A molecule centred exactly ON a cell face (urea's, by symmetry) had a
+centroid of exactly 1.0, so `floor()` decided between drawing it inside the
+box and dumping it outside on a floating-point coin toss; that is what
+"the asymmetric unit is left out from the unit cell" was. **The Symmetry
+(CIF) modifier did nothing** because it was appended to a molecule that was
+ALREADY the full cell — the operations de-duplicated straight back. Adding it
+now reduces the base to the stored asymmetric unit, and the asym/cell/packing
+switch drives the MODIFIER when one is present instead of rebuilding atoms
+underneath it. **G ran away and reversed**: `ray_plane` guarded only against
+|denom| < 1e-9, so as the cursor rose past the drag plane's horizon the
+intersection shot toward infinity and then flipped sign — `_GRAZE` (0.15,
+~8.5 degrees) now refuses the hit and the modal holds, and `ray_line_t` got
+the same guard for axis locks. **The cursor wraps on BOTH axes** now, to the
+opposite edge rather than the middle. **Zoom died while nothing was close**:
+the orbit centre drifts on every pan and anchored orbit (by design), and the
+fixed 0.5 A floor then stopped the dolly with the molecule 20 A away —
+measured at 22 A after twelve ordinary pans. Zooming past the floor now
+carries the centre forward, as Blender does, so it can never get stuck (F
+"fixed" it only because F re-fits the centre). **Ghosts were blank for NaCl**:
+every one of Pm-3m's 48 operations maps Na(0,0,0)+Cl(1/2,1/2,1/2) onto
+itself, so after the identity check there was nothing left — `images_of` now
+de-duplicates properly (one ghost per DISTINCT image, not per operator) and
+adds the lattice images that actually exist. **The depth cue was scaled by
+camera distance**, so a small cell occupied a sliver of the range and every
+line came out at the same alpha; it is calibrated on the cell's own near-far
+spread now and applies to the ghosts too. **The hidden-atoms row mark
+vanished when selected** — a foreground brush loses to `HighlightedText`, so
+the one row you clicked stopped warning you; `_HiddenMarkDelegate` overrides
+both palette roles.
+
+Round 31 (2026-08-03, hiding + mode picking + align preview): **hiding was
+broken by an undo hole** — `atom_hidden` and `atom_scales` arrived in round
+26 and were never added to `Scene.snapshot()`, so every restore silently
+un-hid everything and reset every sphere size. It reads as "hiding is
+broken", not as "undo is lossy", because a cancelled gesture restores a
+snapshot without the user ever pressing Ctrl+Z: hide, brush the viewport,
+atoms come back. Savepoints lost them too. **H hides the selection** across
+every molecule it touches (Alt+H shows everything again), the selection is
+cleared afterwards so the next G or Delete cannot act on atoms you cannot
+see, and **ticking a molecule's eye back on un-hides all of its atoms** —
+Christian's rule, because H only hides and there has to be one obvious way
+back. **A molecule with hidden atoms gets a bright red outliner row**: hidden
+atoms are invisible by definition, so the row is the only thing left that can
+say they exist. **Hiding an animated molecule now actually saves the work**
+(his question): bond perception ran regardless of visibility, so a hidden
+track cost 105% of a visible one; it is deferred and caught up on unhide —
+measured 5.96 -> 0.08 ms/tick at 600 atoms. **Vibration amplitude**: default
+0.2 A, slider 0.05-1.00, plus a type-in box that may exceed the slider (2 A
+put the whole usable range in the first fifth of the travel). The **stutter
+while dragging it** was not the maths — every slider tick took a full deep
+scene snapshot for undo AND rebuilt all 3N mode cards; the re-bake is
+coalesced onto a 70 ms timer, the page is not rebuilt, and one undo step
+covers the gesture. **Modes sort by frequency or IR intensity and filter by a
+live cm-1 range**; the IR SPECTRUM block is parsed for the intensities, which
+`Mode.intensity` had always left as None. Playback defaults are now
+**smoothing 3, framerate 60**. **Roadmap 1f DELIVERED**: align is a preview
+modal — an axis key applies and stays live, another axis key replaces it
+(rewinding first, so previews never compound), left-click confirms as ONE
+undo step, right-click/Esc reverts exactly. The single-atom case still
+applies at once, as specified.
+
+Round 30 (2026-08-03, playback spec): **frames, images and seconds are three
+different things** and the player used to muddle them. A *frame* comes out of
+an input file and its count is a property of the data; an *image* is one
+picture drawn; `fps` is **images per second** and is global. So the `Smooth`
+tick box — a switch that could say whether to interpolate but never how much
+— became **`Smoothing`, a count of images per source-frame interval**, and
+one playback timer tick now draws exactly one image (`timeline.advance_images`).
+Consequence worth knowing: at a fixed framerate, doubling the smoothing plays
+*slower* as well as smoother, exactly like shooting video at 60 fps and
+playing it at 30; raise the framerate to match. The bar reads
+`Loop [a]-[b]  Smoothing [n img]  Framerate [n fps]  Playback: cur / total`,
+all in images. **Loop limits** (`Timeline.range_start/range_end`, stored in
+FRAMES so changing the smoothing cannot move them) bound the interval the
+playhead wraps over; they are on the bar and also draggable in the track
+pane, which veils the excluded part. `seek()` now CLAMPS to the interval
+while `advance`/`step_frames` wrap — scrubbing past a limit must park on it,
+not teleport. **Normal-mode sampling always includes the extremes**: a mode
+is sampled as `sin(2*pi*k/n)`, whose turning points sit at k = n/4 and 3n/4,
+so unless four divides n the amplitude peaks are never reached (n = 6 tops
+out at 0.87 of the requested amplitude). `vibrations.period_frames` snaps the
+count; the spin box steps in fours. **Frames-per-period and amplitude moved
+to the top of the ∿ page**, per FREQ object — they were always stored per
+object and the per-card sliders merely reset themselves on every rebuild.
+**The ∿ page is reachable at last** (Christian: "which I still cannot select
+and look at btw"): opening an ORCA `.out` normally read the geometry through
+OpenBabel and threw the modes away, so the tab stayed grey forever unless you
+found the F3 loader — `_attach_frequencies` now picks modes up from any
+opened file, and the tab is always clickable with the page explaining itself.
+
 Round 29 (2026-08-03, pre-0.2.0 fixes): **SymmetryModifier** — the ❖ page's
 asym/cell/packing switch REBUILDS the atom list, which throws away the
 asymmetric unit you were editing; as a modifier the base stays the asymmetric
@@ -519,7 +652,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 228 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 595 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -584,7 +717,9 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   decision, UI-free.
 - `core/timeline.py` — the SCENE CLOCK: one playhead in scene frames, one
   `Track` per object (start offset / speed / hold-loop-pingpong). UI-free, so
-  the whole mapping is testable without a timer.
+  the whole mapping is testable without a timer. Also owns the round-30
+  frames/images/seconds split (`smoothing`, `fps`, `advance_images`) and the
+  looping interval (`range_start`/`range_end`, `play_start`/`play_end`).
 - `core/interpolate.py` — coordinates BETWEEN frames. `rigid=True` splits the
   Kabsch rigid motion out and rotates it properly instead of cutting the
   chord; only the residual deformation is lerped.
@@ -946,6 +1081,139 @@ independent cross-check inside a single fixture.
   atom takes the straight chord, so the molecule contracts toward its
   centroid halfway through a turn and springs back — bonds lose real length.
   `interpolate.rigid_lerp` is the fix and is cheap (0.25 ms at 3000 atoms).
+- **A panel writing its own widgets from `sync()` must guard against the
+  signals that causes** (round 30). `TimelinePanel.sync` sets every spin box
+  from the clock; `valueChanged` does not care who moved it, so each refresh
+  fired "the user changed the framerate" back at the app — which then
+  overwrote the clock it was displaying AND persisted the value to QSettings.
+  The `_loading` flag around the writes is not optional. Same shape as the
+  outliner's `highlight()`/`setCurrentItem` bug in round 28.
+- **Tests must not write to the real QSettings** (round 30). `MainWindow`
+  persists genuine preferences, so a test that drives a spin box writes its
+  throwaway value into the developer's live config — a test run left MoloM
+  starting at 10 fps with smoothing off, which then looked like a code bug.
+  `tests/conftest.py` redirects QSettings into a temp INI. Note that
+  `setDefaultFormat` is NOT enough on Windows: the two-argument
+  `QSettings(org, app)` constructor always uses NativeFormat (the registry),
+  where `setPath` has no effect — the four-argument form has to be forced.
+- **`fps` means IMAGES per second, not frames per second** (round 30). With
+  `smoothing` images per source frame, a scene of `d` frames runs for
+  `d * smoothing / fps` seconds, so raising the smoothing at a fixed
+  framerate slows playback down. That is the correct reading of the spec
+  (more pictures in the same second), not a bug — the two knobs sit next to
+  each other on the bar precisely so the trade is visible.
+- **Sample a normal mode on a multiple of FOUR frames** (round 30). The
+  turning points of `sin(2*pi*k/n)` are at k = n/4 and 3n/4, so any other n
+  never reaches ±amplitude: n = 6 peaks at 0.87 of what was asked for, and
+  the highest and lowest points of the chemical coordinate — the whole reason
+  to look at a mode — are cut off. `vibrations.period_frames` snaps it, and
+  rounds half-way cases UP explicitly because Python's banker's `round()`
+  would send 10 down to 8 while sending 14 up to 16.
+- **A boundary copy must carry its whole MOLECULE** (round 33). Completing
+  the cell boundary atom-by-atom strands the rest of the molecule on the
+  other side of the face — urea's C and O are exactly ON the x face, so the
+  cell showed a bare C=O with no NH2 groups. Both reference viewers complete
+  the molecule (VESTA searches for bonded atoms beyond the boundary, Mercury
+  packs whole molecules), so `boundary_images` takes the atom's whole
+  fragment. The exception is a PERIODIC component, which is infinite and
+  cannot be completed — carry only the atom there, or rock salt sprouts a
+  slab of chlorines.
+- **A two-atom cell cannot reveal periodicity by walking** (round 33).
+  `unwrap_molecules`'s test — two routes to the same atom disagreeing by a
+  lattice vector — needs a loop inside the cell, and NaCl has two atoms and
+  no loop, so it came back "finite" and got treated as a molecule.
+  `fragment_info` therefore also asks whether the component **bonds to its
+  own lattice image**: Na is 2.48 A from the Cl of the cell next door, while
+  urea's molecule is 2.7 A clear of its image and only H-bonded (beyond the
+  covalent criterion). Use `fragment_info`, not `fragments`, whenever the
+  molecular-vs-framework distinction matters.
+- **Nothing camera-independent may be recomputed in a paint path**
+  (round 33). `_paint_symmetry` re-parsed 48 operators, re-classified them
+  (an eigen-decomposition each) and re-imaged the ghosts every repaint: 12 ms
+  per frame before a line was drawn, which turned trackpad zooming into a
+  slideshow. `_symmetry_plan` caches on (object, symop strings, kind filter,
+  asymmetric unit) — 0.11 ms. Overlays are cheap to write and expensive to
+  leave uncached; check any new one.
+- **pymatgen is not automatically a better CIF reader** (round 33). On a
+  real CCDC file that lists symmetry-redundant atoms (urea's N1 and N1C are
+  the same site), pymatgen merges them into partially-occupied sites and
+  returns occupancy 2 — 12 of 16 sites disordered. ASE and our own reader
+  both give the correct 16 atoms. Its real value would be the P1 fallback
+  (space-group SYMBOL, no symop loop), which is a separate gap; adopt it
+  there, as a tier, not as a replacement.
+- **A drawn unit cell must COMPLETE ITS BOUNDARY** (round 32). Expanding the
+  asymmetric unit into [0,1) gives the cell's contents, not its picture: an
+  atom at the origin belongs to all eight corners, one on a face to both
+  faces. Every crystallography viewer draws it that way, and without it rock
+  salt is a single sodium in a corner. `cif.boundary_images` does it PER
+  ATOM — a fragment walk lumps NaCl's Na and Cl into one unit whose centroid
+  is nowhere near a face, and Mercury is per-atom too (which is why its urea
+  picture shows part-molecules at the corners). Keep `expand(boundary=False)`
+  for anything that wants the CONTENT, e.g. an export that must have Z
+  formula units.
+- **A modifier that regenerates a structure must not be added on top of an
+  already-regenerated one** (round 32). The symmetry modifier was appended to
+  a molecule showing the full cell, so it re-applied the operations, the
+  de-duplication threw them all away, and the visible result was identical —
+  "Add doesn't do anything". Adding it reduces the base to the stored
+  asymmetric unit, and the ❖ page's asym/cell/packing switch drives the
+  MODIFIER whenever one is present rather than rebuilding the atoms it feeds
+  on. Any future generative modifier needs the same handshake.
+- **A ray-plane solver needs a GRAZING guard, not just a parallel one**
+  (round 32). `abs(denom) < 1e-9` is only the exactly-parallel case; well
+  before that the intersection is already thousands of units away, and the
+  moment the ray crosses parallel it FLIPS SIGN. In a grab that reads as the
+  selection reversing and rocketing off, which is impossible to diagnose from
+  the symptom. `manipulate._GRAZE` refuses the hit and the modal holds still.
+  Same for `ray_line_t` when you sight along the locked axis.
+- **The orbit centre drifts, so an absolute zoom floor eventually strands
+  you** (round 32). `pan` and anchored `orbit` both move `camera.center` by
+  design; after a dozen pans it can be 20 A from anything. Clamping distance
+  at a fixed 0.5 A then kills zoom while the molecule is still far away, and
+  the only cure is F (which re-fits the centre). Zooming past the floor now
+  carries the centre forward along the view direction — Blender's dolly — so
+  progress is always possible. Do not reintroduce a bare clamp.
+- **Depth cues must be calibrated on WHAT IS DRAWN, not on camera distance**
+  (round 32). A 2.9 A cell viewed from a normal distance spans a sliver of a
+  camera-distance-scaled range, so every line comes out at the same alpha and
+  the cue is invisible. `set_depth_cue_extent` normalises against the cell's
+  own near-to-far spread, which makes the nearest line full and the furthest
+  faint at any zoom.
+- **A QTreeWidget foreground brush loses to the selection highlight**
+  (round 32). Qt paints selected text with `QPalette.HighlightedText`, so a
+  row coloured with `setForeground` goes blank the moment it is clicked — the
+  one row you are looking at is the one that stops telling you anything. Flag
+  the row with a Qt.UserRole and override BOTH palette roles in a
+  `QStyledItemDelegate` (`outliner._HiddenMarkDelegate`).
+- **Every new per-object display field MUST be added to `Scene.snapshot`
+  AND `restore`** (round 31). `atom_hidden` / `atom_scales` were added in
+  round 26 and forgotten there, so any restore threw them away — and because
+  a cancelled viewport gesture restores a snapshot, the symptom was "I hide
+  atoms and they come straight back", with no undo pressed and nothing in the
+  UI to blame. `to_dict`/`from_dict` build on `snapshot`, so savepoints lost
+  them as well. When adding a field to `MolObject`, grep for `atom_colors` —
+  it appears in all four places, and that is the checklist.
+- **Hiding must actually stop the work, not just the drawing** (round 31).
+  `refresh_geometry` already skipped invisible objects, so hiding looked like
+  an optimisation, but `_apply_timeline` re-perceived bonds for EVERY object
+  regardless — the expensive part of a tick — and a hidden animated molecule
+  measured 105% of a visible one. Perception is deferred while hidden and
+  flushed by `_flush_stale_bonds` when the object comes back (in
+  `_sync_all`, the eye handler, and isolate). Anything else added to the
+  per-tick loop should ask the same question.
+- **A slider that re-bakes geometry must not snapshot per tick** (round 31).
+  The amplitude slider pushed a full deep scene copy for undo AND rebuilt all
+  3N mode cards on every `valueChanged`, which at ~60 Hz is the stutter that
+  got reported. Coalesce onto a short single-shot timer, push ONE undo at the
+  start of the gesture, and do not rebuild the panel that owns the widget you
+  are dragging — it feeds the value back at you.
+- **A greyed tab cannot explain why it is greyed** (round 30). The ∿ page
+  locked itself until FREQ data existed, and the only way to load FREQ data
+  was an F3 operator — so opening an ORCA output and looking for the modes
+  found a dead grey square. Prefer "always clickable, page says what is
+  missing and offers the action" for anything the user has to DISCOVER; save
+  the greyed-tab pattern (❖) for properties of an object that plainly either
+  has a unit cell or does not.
 - `elements.atomic_number` is tolerant ("C1"/"cl2" → 6/17) — same convention
   as OWB `transform._sym`. "D" (deuterium) is NOT in the table.
 - **Wheel events are device-dependent** (round 16, was laptop-only): a
@@ -972,7 +1240,9 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 66 offline tests.
+1. `python -m pytest tests/ -q` — 595 offline tests. `tests/conftest.py`
+   sandboxes QSettings, so a GUI test can drive a real control without
+   writing into your own MoloM configuration.
 2. `python -m molom --selftest` — headless core sanity.
 3. GUI smoke: a scripted QTimer run that opens examples, switches styles,
    selects atoms, drives the trajectory bar, and grabs framebuffers lives in
@@ -1043,14 +1313,13 @@ batches. Known next items, rough order:
    - **displayed bonds are still non-periodic** — `unwrap_molecules` uses the
      minimum image, but the `perceive_structure_bonds` that runs afterwards
      does not, so a FRAMEWORK (as opposed to a molecular crystal) still shows
-     cut open at the cell faces.
+     cut open at the cell faces. Round 32's boundary completion helps the
+     picture (the atoms are there now) but the bonds across a face are still
+     perceived non-periodically.
    - packing as an ARRAY MODIFIER rather than the current destructive rebuild.
-   - **SYMMETRY AS A MODIFIER** (Christian, 2026-08-02): now that
-     `core/symmetry.py` classifies operations, "apply these operations" is a
-     natural entry in the modifier stack alongside Array — non-destructive,
-     re-evaluated on demand, and stackable with packing. That is also the
-     clean way to make the asym/cell/packing switch stop being a destructive
-     rebuild.
+   - ~~SYMMETRY AS A MODIFIER~~ DELIVERED round 29 (`SymmetryModifier`): the
+     base stays the asymmetric unit while the viewport and exporter see the
+     full cell. Packing is still a destructive rebuild (above).
    - **PARTIAL OCCUPANCIES (`_atom_site_occupancy` != 1)**: the parser reads
      the column but IGNORES it, so a disordered structure currently shows
      every alternative position at once, superimposed. Christian flagged that
@@ -1116,7 +1385,8 @@ batches. Known next items, rough order:
    - **The unified track pane** (draggable-taller, one playhead, one row per
      object, rows arrangeable) follows naturally once the clock is
      scene-level. Sensible order: scene clock -> interpolation -> multi-row
-     pane.
+     pane. DELIVERED rounds 22/23; round 30 then split frames from images and
+     added the loop limits (see the round-30 entry).
    - **Keyframes are a bigger step than they look — but not enormous**, and
      the ground is already prepared: a keyframe is "at time t, this property
      has this value", and `MolObject` already keeps `origin`/`orientation`
@@ -1128,7 +1398,34 @@ batches. Known next items, rough order:
      animal — it is a trajectory by another name, and should reuse the frame
      machinery rather than a second system. Recommendation: do transform
      keyframes only, and treat trajectories as the coordinate channel.
-1f. **ALIGN NEEDS PREVIEW-THEN-CONFIRM (open, reported twice).** Christian,
+1g. **RANK MODES BY A VIEWPORT SELECTION** (Christian's long-term idea,
+   2026-08-03, NOT built): "allow the user to make a selection in the
+   viewport of certain atoms whose vibrations they are interested in and
+   calculate their offset during different modes, use that as a ranking
+   parameter". A button — "Filter modes by selection" — next to the existing
+   Sort by / Range controls on the ∿ page.
+   **Yes, this is very tractable**, and cheaper than it sounds: a mode is
+   already a displacement vector per atom, so the ranking number is
+   `norm(mode.displacements[selected]).sum()` (or its RMS), which is one
+   numpy slice per mode — 3N of those is microseconds. It wants normalising
+   by the mode's total displacement, otherwise every high-amplitude mode
+   ranks above a mode that is genuinely LOCALISED on the selection; the
+   useful quantity is the FRACTION of the mode's motion carried by the
+   selected atoms, which is exactly a participation ratio. So:
+   `core/vibrations.py::selection_weight(mode, indices) -> 0..1`, then a
+   third entry in the existing `SORT_KEYS` and a filter threshold. The sort
+   and filter plumbing from round 31 already exists — this is one core
+   function plus one combo entry. Worth doing when the ∿ page is next open.
+   Mass-weighting is the one judgement call: a C-H stretch is nearly all
+   hydrogen motion, so an unweighted ratio over-rewards hydrogens.
+
+1f. ~~ALIGN NEEDS PREVIEW-THEN-CONFIRM~~ DELIVERED round 31: the axis key
+   previews (rewinding the captured pose first, so X then Y is the Y
+   alignment and not Y-on-top-of-X), left-click confirms as one undo step,
+   right-click/Esc reverts. The single-atom case still applies immediately,
+   as specified. Original report kept below.
+
+   **(was open, reported twice).** Christian,
    2026-08-03: *"Align still cancels after a single axis input such as x,y,z
    for two (bond) and 2+ (plane). A on a single atom is ok the way it is
    because it is not dependent on axes."*
@@ -1146,6 +1443,10 @@ batches. Known next items, rough order:
    0.2.0 cut because it needs a real preview state: snapshot the geometry on
    arm, re-apply from the snapshot on each axis press, restore on cancel.
    Look at how `_grab`/`_rotate` hold `snap` for the pattern to copy.
+   Implementation note (round 31): the preview capture is per-OBJECT
+   (`_align_capture`: frames + origin + orientation), not a whole-scene
+   snapshot — `scene.restore` rebuilds every MolObject, and the outliner's
+   row widgets hold direct object references that would then be dangling.
 
 1e. **LIGAND TEMPLATE ATTACHMENT — SHIPPED BUT NOT WORKING PROPERLY.**
    Christian tried it 2026-08-03: "templating still not working. will need

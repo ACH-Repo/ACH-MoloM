@@ -262,11 +262,32 @@ class Camera:
         up = r.T @ np.array([0.0, 1.0, 0.0])
         self.center = self.center - right * dx_px * per_px + up * dy_px * per_px
 
+    MIN_DISTANCE = 0.5
+    MAX_DISTANCE = 5000.0
+
     def zoom(self, steps):
         """Dolly in/out; steps > 0 zooms in. Exponential so it feels uniform.
-        Drives the ortho half-height too, so zoom works in both projections."""
-        self.distance = float(np.clip(self.distance * (0.88 ** steps),
-                                      0.5, 5000.0))
+        Drives the ortho half-height too, so zoom works in both projections.
+
+        Zooming in past the floor **carries the orbit centre forward** rather
+        than stopping dead. Without that, zoom silently dies whenever the
+        orbit centre has drifted away from what you are looking at — and it
+        drifts on every pan and every anchored orbit, both of which move it
+        by design. Measured: twelve ordinary pans put the centre 22 A from
+        the molecule, after which the camera sat at the 0.5 A floor with
+        nothing anywhere near it. That is the "max zoom knocked off course,
+        and I am definitely not too close" report, and why F (which re-fits
+        the centre) cured it. Blender behaves the same way — you can always
+        keep travelling toward what is in front of you.
+        """
+        target = self.distance * (0.88 ** steps)
+        if target < self.MIN_DISTANCE:
+            shortfall = self.MIN_DISTANCE - target
+            forward = quat_to_mat3(self.rotation).T @ np.array([0.0, 0.0, -1.0])
+            self.center = self.center + forward * shortfall
+            target = self.MIN_DISTANCE
+        self.distance = float(np.clip(target, self.MIN_DISTANCE,
+                                      self.MAX_DISTANCE))
 
     def fit(self, center, bounding_radius):
         """Frame a sphere (molecule centroid + bounding radius)."""

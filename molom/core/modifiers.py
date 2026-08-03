@@ -101,11 +101,18 @@ class SymmetryModifier(Modifier):
     kind = "symmetry"
 
     def __init__(self, cell=None, symops=None, na=1, nb=1, nc=1,
-                 name="", enabled=True):
+                 name="", enabled=True, origin=None):
         super().__init__(name or "Symmetry", enabled)
         self.cell = cell                 # dict, as stored in metadata
         self.symops = list(symops or [])
         self.na, self.nb, self.nc = int(na), int(nb), int(nc)
+        # WHERE the cell sits in world space. A CIF's cell starts at the
+        # world origin and its atoms are already placed against it, so this
+        # is zero there. It matters for a hand-built cell: a molecule sitting
+        # ON the origin is mapped onto ITSELF by every operation through the
+        # origin, so adding a 2-fold appears to do nothing at all.
+        self.origin = (np.zeros(3) if origin is None
+                       else np.asarray(origin, dtype=float).reshape(3))
 
     def evaluate(self, symbols, coords, bonds):
         from . import cif as cif_mod
@@ -116,7 +123,8 @@ class SymmetryModifier(Modifier):
             ops = [cif_mod.SymOp.from_xyz(t) for t in self.symops]
         except (KeyError, TypeError, ValueError, cif_mod.CifError):
             return symbols, coords, bonds
-        frac = cell.to_fractional(np.asarray(coords, dtype=float))
+        origin = np.asarray(self.origin, dtype=float).reshape(3)
+        frac = cell.to_fractional(np.asarray(coords, dtype=float) - origin)
         out_symbols, out_coords = cif_mod.build_view(
             cell, list(symbols), frac, ops,
             mode="packing" if max(self.na, self.nb, self.nc) > 1 else "cell",
@@ -126,12 +134,13 @@ class SymmetryModifier(Modifier):
         # Bonds are NOT carried: the copies are new atoms whose connectivity
         # is a perception job, and guessing it here would be wrong at the
         # cell faces anyway (see the framework note in core/cif.py).
-        return out_symbols, np.asarray(out_coords), []
+        return out_symbols, np.asarray(out_coords) + origin, []
 
     def to_dict(self):
         d = super().to_dict()
         d.update({"cell": self.cell, "symops": list(self.symops),
-                  "na": self.na, "nb": self.nb, "nc": self.nc})
+                  "na": self.na, "nb": self.nb, "nc": self.nc,
+                  "origin": [float(v) for v in self.origin]})
         return d
 
 
@@ -151,7 +160,8 @@ def from_dict(d):
         return SymmetryModifier(d.get("cell"), d.get("symops"),
                                 d.get("na", 1), d.get("nb", 1),
                                 d.get("nc", 1), d.get("name", ""),
-                                d.get("enabled", True))
+                                d.get("enabled", True),
+                                d.get("origin"))
     return None
 
 

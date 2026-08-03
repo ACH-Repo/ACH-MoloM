@@ -131,7 +131,7 @@ def test_crystal_page_switches_the_view(tmp_path, win):
     win._sync_crystal_page()
     page = win.crystal_page
     assert page.asym_radio.isEnabled()
-    assert win._active_obj().structure.n_atoms == 8      # full cell
+    assert win._active_obj().structure.n_atoms == 27     # full cell
     page.asym_radio.setChecked(True)
     page._apply()
     QApplication.processEvents()
@@ -140,7 +140,7 @@ def test_crystal_page_switches_the_view(tmp_path, win):
     page.na.setValue(2), page.nb.setValue(1), page.nc.setValue(1)
     page._apply()
     QApplication.processEvents()
-    assert win._active_obj().structure.n_atoms == 16
+    assert win._active_obj().structure.n_atoms == 54     # two drawn cells
 
 
 def test_cell_box_checkbox_drives_the_viewport(win):

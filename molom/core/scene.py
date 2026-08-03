@@ -59,6 +59,34 @@ class MolObject:
         # type: (int) -> float
         return float(self.atom_scales.get(int(index), 1.0))
 
+    # --------------------------------------------------------- hiding atoms
+    @property
+    def has_hidden(self):
+        # type: () -> bool
+        """Whether anything on this molecule is hidden.
+
+        Worth a name of its own: hidden atoms are invisible BY DEFINITION, so
+        the only way to know they exist is for something else to say so — the
+        outliner marks the molecule's row.
+        """
+        return bool(self.atom_hidden)
+
+    def hide_atoms(self, indices):
+        # type: (object) -> int
+        """Hide these atoms. Returns how many newly went away."""
+        n = self.structure.n_atoms
+        wanted = {int(i) for i in indices if 0 <= int(i) < n}
+        added = wanted - self.atom_hidden
+        self.atom_hidden |= wanted
+        return len(added)
+
+    def unhide_all(self):
+        # type: () -> int
+        """Show everything again. Returns how many came back."""
+        n = len(self.atom_hidden)
+        self.atom_hidden = set()
+        return n
+
     def element_indices(self, symbol):
         # type: (str) -> list
         return [i for i, s in enumerate(self.structure.symbols) if s == symbol]
@@ -358,6 +386,14 @@ class Scene:
                                       in o.atom_label_colors.items()},
                 "atom_label_modes": {int(k): str(v) for k, v
                                      in o.atom_label_modes.items()},
+                # Round 26 added these two and forgot to snapshot them, so
+                # every undo silently un-hid whatever you had hidden and
+                # reset every sphere size — which reads as "hiding is
+                # broken", not as "undo is lossy". Sorted list, not a set,
+                # so `to_dict` stays JSON-safe for savepoints.
+                "atom_hidden": sorted(int(i) for i in o.atom_hidden),
+                "atom_scales": {int(k): float(v)
+                                for k, v in o.atom_scales.items()},
                 "label_mode": o.label_mode,
             })
         return {"objects": objs, "next_id": self._next_id}
@@ -416,6 +452,9 @@ class Scene:
             obj.atom_label_modes = {
                 int(k): str(v) for k, v
                 in (d.get("atom_label_modes") or {}).items()}
+            obj.atom_hidden = {int(i) for i in (d.get("atom_hidden") or [])}
+            obj.atom_scales = {int(k): float(v) for k, v
+                               in (d.get("atom_scales") or {}).items()}
             obj.label_mode = d.get("label_mode", "element")
             self.objects.append(obj)
         self._next_id = snap["next_id"]

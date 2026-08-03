@@ -406,8 +406,8 @@ def parse_cif(text):
 
 
 # -------------------------------------------------------------------- expansion
-def expand(data, tol=0.1, wrap=True, whole_molecules=True):
-    # type: (CifData, float, bool, bool) -> Tuple[List[str], np.ndarray]
+def expand(data, tol=0.1, wrap=True, whole_molecules=True, boundary=True):
+    # type: (CifData, float, bool, bool, bool) -> Tuple[List[str], np.ndarray]
     """Apply every symmetry op to every site -> (symbols, CARTESIAN coords).
 
     Copies that land on an existing atom (within `tol` Angstrom, measured
@@ -417,6 +417,11 @@ def expand(data, tol=0.1, wrap=True, whole_molecules=True):
 
     `whole_molecules` then reassembles fragments split by the wrap, so the
     cell shows complete molecules rather than atoms stranded on a far face.
+
+    `boundary` repeats the atoms that lie exactly ON the cell boundary onto
+    every equivalent corner, edge and face — see `boundary_images`. It is on
+    by default because it is what every crystallography viewer draws, and
+    without it rock salt shows a single sodium instead of eight corners.
     """
     if data.n_sites == 0:
         return [], np.zeros((0, 3))
@@ -438,6 +443,13 @@ def expand(data, tol=0.1, wrap=True, whole_molecules=True):
     out = np.asarray(fracs)
     if wrap and whole_molecules:
         out = unwrap_molecules(symbols, out, data.cell)
+    if wrap and boundary:
+        groups = (fragment_info(symbols, out, data.cell) if whole_molecules
+                  else None)
+        extra_symbols, extra_frac = boundary_images(symbols, out, groups)
+        if extra_symbols:
+            symbols = list(symbols) + extra_symbols
+            out = np.vstack([out, extra_frac])
     return symbols, out @ matrix
 
 
@@ -528,10 +540,185 @@ def unwrap_molecules(symbols, frac, cell, tol=1e-3):
         if periodic:
             out[fragment] = wrapped[fragment]          # leave it wrapped
             continue
-        shift = np.floor(out[fragment].mean(axis=0))
+        # Bring the fragment back so its CENTROID is in [0, 1). The nudge
+        # matters: a molecule sitting exactly on a cell face (urea's, by
+        # symmetry) has a centroid of exactly 1.0, and whether floor() sees
+        # 1.0 or 0.99999 then decides between drawing it inside the box and
+        # dumping it outside — which is what made urea's asymmetric unit
+        # look like it had been left out of its own unit cell.
+        shift = np.floor(out[fragment].mean(axis=0) + 1e-6)
         if np.any(shift):
             out[fragment] -= shift
     return out
+
+
+def fragment_info(symbols, frac, cell, tol=1e-3):
+    # type: (list, np.ndarray, Cell, float) -> List[tuple]
+    """[(indices, is_periodic), ...] for each bonded component.
+
+    `is_periodic` marks a component that is INFINITE — a framework, or an
+    ionic lattice like rock salt where Na and Cl fall inside the covalent
+    criterion. Such a component cannot be "completed" into a molecule; a
+    finite one can, and must be, or the cell shows half molecules.
+
+    Two independent tests, because either alone gets a real case wrong:
+
+    * a walk that reaches the same atom by two routes disagreeing by a
+      lattice vector (what `unwrap_molecules` uses) — catches MOF-5;
+    * whether the component BONDS TO ITS OWN LATTICE IMAGE. Rock salt has
+      only two atoms in the cell, so there is no second route to find and
+      the walk says "finite" — but Na(0,0,0) is 2.48 A from the Cl of the
+      cell next door, which is exactly what makes it a lattice rather than
+      an NaCl molecule. Urea's molecule, by contrast, is 2.7 A clear of its
+      own image at the nearest approach and only H-bonded to it, which is
+      beyond the covalent criterion.
+    """
+    from . import elements
+    frac = np.asarray(frac, dtype=float).reshape(-1, 3)
+    n = len(symbols)
+    if n == 0:
+        return []
+    matrix = cell.matrix()
+    adj = periodic_neighbours(symbols, frac, cell)
+    placed = np.array(frac, dtype=float)
+    seen = np.zeros(n, dtype=bool)
+    radii = np.array([elements.radius_covalent(elements.atomic_number(s))
+                      or 2.0 for s in symbols])
+    shifts = np.array([[a, b, c] for a in (-1, 0, 1) for b in (-1, 0, 1)
+                       for c in (-1, 0, 1)
+                       if (a, b, c) != (0, 0, 0)], dtype=float)
+    out = []
+    for seed in range(n):
+        if seen[seed]:
+            continue
+        seen[seed] = True
+        group, stack, periodic = [seed], [seed], False
+        while stack:
+            i = stack.pop()
+            for j in adj[i]:
+                d = frac[j] - frac[i]
+                target = placed[i] + (d - np.round(d))
+                if not seen[j]:
+                    seen[j] = True
+                    placed[j] = target
+                    group.append(j)
+                    stack.append(j)
+                elif np.any(np.abs(placed[j] - target) > tol):
+                    periodic = True
+        group = sorted(group)
+        if not periodic:
+            periodic = _touches_own_image(placed[group], radii[group],
+                                          matrix, shifts)
+        out.append((group, periodic))
+    return out
+
+
+def _touches_own_image(block, radii, matrix, shifts):
+    # type: (np.ndarray, np.ndarray, np.ndarray, np.ndarray) -> bool
+    """Does this component bond to a lattice translation of itself?"""
+    cart = block @ matrix
+    limit = radii[:, None] + radii[None, :] + 0.45
+    for shift in shifts:
+        other = cart + (shift @ matrix)[None, :]
+        d = np.linalg.norm(cart[:, None, :] - other[None, :, :], axis=2)
+        if np.any((d > 0.32) & (d < limit)):
+            return True
+    return False
+
+
+def fragments(symbols, frac, cell):
+    # type: (list, np.ndarray, Cell) -> List[List[int]]
+    """Bonded groups of atom indices, using the minimum image."""
+    adj = periodic_neighbours(symbols, frac, cell)
+    n = len(symbols)
+    seen = [False] * n
+    out = []
+    for seed in range(n):
+        if seen[seed]:
+            continue
+        seen[seed] = True
+        group, stack = [seed], [seed]
+        while stack:
+            i = stack.pop()
+            for j in adj[i]:
+                if not seen[j]:
+                    seen[j] = True
+                    group.append(j)
+                    stack.append(j)
+        out.append(sorted(group))
+    return out
+
+
+def boundary_images(symbols, frac, groups=None, tol=1e-4):
+    # type: (list, np.ndarray, Optional[list], float) -> Tuple[List[str], np.ndarray]
+    """Complete the closed cell [0,1]^3 by repeating what lies ON it.
+
+    A site at a corner, edge or face belongs to every equivalent position of
+    the closed box, and that is how crystallography is drawn everywhere
+    (Mercury, VESTA, Diamond): rock salt is **eight** sodiums at the corners
+    around one chlorine in the middle, not one sodium at one corner. The
+    content of the cell is unchanged — Z is still Z — these are the same
+    atoms seen from the neighbouring cells, and drawing them is what makes
+    the picture read as a repeating structure instead of a lone fragment.
+
+    Whether the ATOM is on the boundary decides IF a copy is made; what gets
+    copied is the atom's whole MOLECULE, so the copy is a molecule rather
+    than a stray carbon and oxygen floating at the far face with nothing
+    attached — which is what urea looked like, its C and O sitting on the x
+    face with their NH2 groups left behind on the other side. Both reference
+    viewers do this: VESTA draws atoms outside the boundary that are bonded
+    to atoms inside it, and Mercury includes a whole molecule when any of its
+    atoms falls in the cell.
+
+    A PERIODIC component (a framework, or an ionic lattice like rock salt
+    where Na and Cl fall inside the covalent criterion) is infinite and
+    cannot be completed, so only the atom itself is copied. That is what
+    keeps NaCl at eight corner sodiums instead of sprouting a slab.
+
+    `groups` is `[(indices, is_periodic), ...]` from `fragment_info`; without
+    it every atom is treated as its own periodic component, i.e. per-atom.
+
+    Returns the ADDED atoms.
+    """
+    frac = np.asarray(frac, dtype=float).reshape(-1, 3)
+    if groups is None:
+        groups = [([i], True) for i in range(len(frac))]
+    member = {}
+    for group, periodic in groups:
+        for index in group:
+            member[index] = (group, periodic)
+    out_symbols = []
+    out_frac = []
+    seen = set()
+    for index in range(len(frac)):
+        f = frac[index]
+        options = []
+        for axis in range(3):
+            shifts = [0.0]
+            if abs(f[axis]) <= tol:
+                shifts.append(1.0)
+            elif abs(f[axis] - 1.0) <= tol:
+                shifts.append(-1.0)
+            options.append(shifts)
+        group, periodic = member.get(index, ([index], True))
+        carried = [index] if periodic else group
+        for da in options[0]:
+            for db in options[1]:
+                for dc in options[2]:
+                    if da == 0.0 and db == 0.0 and dc == 0.0:
+                        continue
+                    delta = np.array([da, db, dc])
+                    for k in carried:
+                        point = frac[k] + delta
+                        key = (k, da, db, dc)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        out_symbols.append(symbols[k])
+                        out_frac.append(point)
+    if not out_frac:
+        return [], np.zeros((0, 3))
+    return out_symbols, np.asarray(out_frac)
 
 
 def rigid_from_reference(ref, cur):

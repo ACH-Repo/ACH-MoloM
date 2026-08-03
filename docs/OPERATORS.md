@@ -89,6 +89,8 @@ drag that *starts on an atom* draws instead (see the mode table above).
 | **Duplicate selection** — in OBJECT mode a new outliner object inheriting the parent's style and local frame (a partial copy is re-perceived and hydrogen-filled); in EDIT mode the atoms are copied **into the same molecule**, with their internal bonds and any meta-atom specs, because edit mode means "I am working inside this molecule". Movement starts immediately, and duplicate+move is ONE undo step | **D** | selection not empty |
 | **Repeat last action** — repeats the whole last ACTION, not just its transform: after `D, X, 6, confirm` it duplicates again and offsets the new copy by the same 6 Å, so holding Shift+R lays down a row of copies. After a plain G/R it falls back to repeating just that move/rotation | **Shift+R** | a transform happened |
 | **Drop to floor** — moves the selected molecules so the selection centroid lands on z = 0 | **End** | selection not empty |
+| **Hide the selected atoms** — across every molecule the selection touches. The selection is cleared afterwards, so the next G or Delete cannot act on atoms you can no longer see | **H** | selection not empty |
+| **Show every hidden atom** in the scene | **Alt+H** | something is hidden |
 | **Object origin — edit mode only.** The orange dot is always drawn on top of the molecule, so it is clickable from any angle. Click it to **pick the origin up** (the Unreal-style gizmo appears); G moves it and R turns its frame through the full modal (axis locks, object-local repress, typed numbers, precision); click anywhere else to **set it down**. While it is picked up the **transform panel switches to the ORIGIN's own transform**, so it can be typed in as well as dragged. `Alt+O` snaps it to the selection centroid and picks it up in one go | **Alt+O** / click the dot | edit mode |
 | Origin: snap to selection centroid | — (F3) | active molecule exists |
 | Origin: align compass rotation with world — resets the object's local frame to the world axes | — (F3) | active molecule exists |
@@ -108,8 +110,19 @@ Always moves/rotates **whole molecules**, never individual atoms.
 | 2 atoms, one molecule | waits for an axis key | **X / Y / Z** → the pair lands on that axis |
 | 3+ atoms, one molecule | waits for an axis key | **X / Y / Z** (Shift optional) → the selection's best-fit plane goes into the plane **perpendicular** to that axis, so **Shift+Z = XY plane** |
 
-Esc cancels a pending wait. Holding Shift while pressing the axis key is
-fine — bare modifier presses are ignored while waiting.
+**The axis key is a PREVIEW, not a commit.** It applies the alignment and
+leaves the operation live, so you can press X, look at it, press Y instead,
+and only then keep it — the same contract G and R have:
+
+| | |
+|---|---|
+| **X / Y / Z** | apply that alignment and keep waiting. Pressing another axis key replaces it; previews are re-applied from the original pose, so X then Y gives the Y alignment, never Y on top of X |
+| **left-click** (or Enter) | keep it — one undo step for the whole operation |
+| **right-click** or **Esc** | put it back exactly as it was, leaving no undo entry |
+
+The **1-atom** case has no axis to choose, so it still applies at once.
+Holding Shift while pressing the axis key is fine — bare modifier presses are
+ignored while waiting, and no other key cancels.
 | Delete selected atoms — **their terminal hydrogens go too** | Del | selection not empty |
 | Change element of selection... | E | selection not empty |
 | Cycle bond none→1→2→3→none | B | exactly 2 atoms of one molecule |
@@ -220,12 +233,14 @@ water                    [eye] [style]
 - Everything below a molecule is **collapsed by default**; atom rows are
   built only when a group is expanded, so a big structure costs nothing
   until you look inside it.
-- Element groups **and** individual atoms carry the same three squares —
+- Element groups **and** individual atoms carry the same five squares —
   the only difference is how many atoms the click applies to:
 
   | Square | Click | Right-click |
   |---|---|---|
   | **Colour** | pick a colour | reset to the element colour |
+  | **H / S** | hide these atoms (`H` = shown, `S` = hidden, `h` = mixed) | — |
+  | **R** | sphere size for these atoms — opens a slider under the square | — |
   | **Label on/off** | toggle labels (`A` = all on, `–` = some) | — |
   | **Label type** | menu: element / index / element+index / custom, plus custom text (single atom) and label colour | — |
 
@@ -243,6 +258,18 @@ water                    [eye] [style]
   you cross (Blender's checkbox drag).
 - **Shift+click an eye** toggles between "show only this one" and "show
   everything except this one".
+- **Ticking an eye back ON also un-hides every atom of that molecule.** `H`
+  only hides, so cycling the tick is the one obvious way back — otherwise
+  the only route out is hunting for whichever element group's square happens
+  to read `S`.
+- **A molecule with hidden atoms has a bright red row.** Hidden atoms are
+  invisible by definition, so without the mark a molecule missing its
+  hydrogens looks exactly like one that never had any: you cannot tell a
+  display choice from a broken import.
+- Hiding is not just cosmetic — a hidden molecule's atoms are **not drawn,
+  not pickable, and their bonds go with them**, and an animated molecule you
+  have hidden stops costing anything per frame (its bonds are re-perceived
+  when it comes back, not while nobody can see it).
 - Rows are **multi-selectable** (Ctrl/Shift). Right-click for select /
   rename / hide / delete, and with several rows highlighted, **Merge**.
 - **"+ New molecule"** under the list creates an empty object and drops its
@@ -268,6 +295,25 @@ while the viewport and the exporter see the full cell. Bonds are not carried
 across the copies (connectivity is a perception job, and would be wrong at
 the cell faces anyway).
 
+**Adding it puts the molecule into that state.** A `.cif` import already
+shows the full cell, so appending the modifier to it would re-apply the
+operations, de-duplicate straight back to the same atoms, and change nothing
+on screen. Adding therefore reduces the base to the asymmetric unit the file
+listed (kept in metadata since import, so this is a restore rather than a
+guess) and lets the modifier regenerate the cell. Once it is on the stack the
+❖ page's asym / full cell / packing switch drives the **modifier** instead of
+rebuilding atoms underneath it — "asymmetric unit" simply turns the modifier
+off. **It works on a plain molecule too**, which is the most instructive way to
+use it: take a fragment, add one operation at a time — a 2-fold, a glide, a
+centring — and watch an asymmetric unit turn into a cell. A box is invented
+around the molecule, with its origin offset so the molecule sits at a
+*general* position; put it on the cell origin instead and every operation
+through that origin maps the molecule onto itself, so nothing appears to
+happen. The card carries a preset list of the standard elements (inversion
+centre, 2/3/4/6-fold axes, 2₁ screws, mirrors, a/b/c/n glides, A/B/C/I
+centrings) and a free-text field taking any operation in the CIF's own xyz
+notation.
+
 ## Crystallography (CIF)
 `.cif` / `.mmcif` go through MoloM's **own** reader before OpenBabel, because
 OpenBabel parses the file but hands back a bag of Cartesian atoms with the
@@ -292,6 +338,34 @@ convention as the compass. Toggle it from F3 ("Show unit cell box").
 strands hydrogens on the far face; each bonded fragment is instead walked
 using the nearest periodic image and then shifted by its centroid, so the
 cell shows complete molecules the way CCDC/Mercury do.
+
+**The drawn cell completes its boundary.** Expanding the asymmetric unit into
+[0, 1) gives the cell's *contents*, which is not the same thing as its
+*picture*: an atom at the origin belongs to all eight corners, one on a face
+to both faces, one on an edge to all four. So rock salt draws as **14 Na**
+(8 corners + 6 face centres) around **13 Cl** (12 edge midpoints + the body
+centre) — the diagram every textbook shows — rather than a single sodium in
+one corner. The content is unchanged: these are the same atoms seen from the
+neighbouring cells, and Z is still Z.
+
+A boundary copy brings its **whole molecule**, not just the atom. Urea's
+carbon and oxygen sit exactly on the x face, so copying them alone put a bare
+C=O in the cell with its two NH2 groups left on the other side. This follows
+the two reference viewers: VESTA draws atoms outside the boundary that are
+bonded to atoms inside it, and Mercury packs whole molecules, including one
+when *any* of its atoms fits.
+
+A **periodic** component is the exception — a framework, or an ionic lattice
+like rock salt where Na and Cl fall inside the covalent criterion. It is
+infinite and cannot be completed, so only the atom travels. Telling the two
+apart needs more than a walk through the cell: NaCl has two atoms and no loop
+to find, so it also asks whether the component bonds to its own lattice image
+(Na is 2.48 Å from the chlorine next door; urea's molecule is 2.7 Å clear of
+its own image and only H-bonded).
+
+A molecule whose centroid sits exactly ON a face (urea's does, by symmetry)
+is placed inside the box, not outside it. That decision used to come down to
+whether floating point produced 1.0 or 0.99999.
 
 **The box follows its molecule live.** Its placement is a Kabsch fit against
 reference atoms recorded at import, recomputed while painting — so it tracks
@@ -328,28 +402,87 @@ periodic, so a *framework* still shows cut at the cell faces; packing is a
 destructive rebuild rather than a modifier; CIF export is not implemented.
 
 ## Vibrational modes (∿ page)
-Load an ORCA FREQ output with F3 "load ORCA frequencies"; the **∿** tab in
-the properties dock then unlocks for that molecule, exactly as ❖ does for a
-crystal. Each mode is a collapsed card showing its wavenumber — imaginary
-modes in orange, translations/rotations hidden unless you ask for them. The
-**A** button animates a mode; the expansion arrow reveals **amplitude** and
-**frames per period** sliders.
+**Just open the ORCA FREQ output** — the modes are read off it as the file
+is imported. (F3 "load ORCA frequencies" still attaches a job to a molecule
+that is already open, and the page carries the same button.) Unlike ❖, the
+**∿** tab is always clickable: with no frequency data the page says so rather
+than greying itself out, because a dead tab cannot tell you what is missing.
+
+Each mode is one row showing its wavenumber — imaginary modes in orange,
+translations/rotations hidden unless you ask for them — with an **A** button
+that animates it.
+
+Above the list sit the settings that turn a mode into frames, and they
+belong to the whole imported FREQ object rather than to one mode:
+
+| Setting | Means |
+|---|---|
+| **Amplitude** | peak displacement of the busiest atom, in Angstrom. Slider 0.05–1.00 (default **0.2**); the box beside it takes typed values and may go higher, which simply pegs the slider |
+| **Frames / period** | how finely one oscillation is sampled |
+| **Sort by** | **Frequency** (the spectrum, ascending) or **IR intensity** (strongest first — which bands you would actually see). The intensity in km/mol is shown on each row |
+| **Range** | a cm-1 window, filtering the list live as you type. Either end may be left empty for no bound |
+
+Amplitude is scaled that way because ORCA's eigenvectors are normalised but
+not to any physical size, so without it a stiff mode is invisible and a
+floppy one explodes.
+
+IR intensities come from the output's `IR SPECTRUM` table, which only lists
+the vibrations — the translations and rotations have no intensity and sort to
+the bottom. A job with no such block (a plain Hessian, or Raman only) still
+works; there is simply nothing to sort by.
+
+**Frames per period steps in fours, and that is not cosmetic.** A mode is
+sampled as `sin(2*pi*k/n)`, whose turning points fall at k = n/4 and k = 3n/4.
+Unless four divides n those are not whole frames and the sampling never
+reaches the extremes of the oscillation — at n = 6 the animation peaks at
+0.87 of the amplitude you asked for, so the highest and lowest points of the
+chemical coordinate, which are the reason to look at the mode at all, are
+quietly cut off. Any count you type is snapped to the nearest multiple of
+four. The player's **Smoothing** then subdivides between these frames, which
+is why a fairly small count still looks continuous.
 
 Animating bakes one period of the mode into ordinary trajectory frames, so it
 arrives on the scene clock like any other track: it interpolates, it appears
 in the multi-track pane, and it plays alongside other trajectories. The track
 is set to loop, because a vibration is one.
 
-Amplitude is the peak displacement of the busiest atom in Angstrom — ORCA's
-eigenvectors are normalised but not to any physical size, so without that
-scaling a stiff mode is invisible and a floppy one explodes.
-
 ## Trajectory playback (the scene clock)
 There is **one playhead for the whole scene**, not one per molecule, so every
 trajectory loaded plays at the same time. The bar under the viewport is that
-playhead: play/pause (**Space**), a scrub slider with sub-frame resolution, a
-**Smooth** checkbox, the playback rate, and a **▾** toggle that opens the
-track rows.
+playhead: play/pause (**Space**), the loop limits, the two playback knobs, a
+position readout, and a **▾** toggle that opens the track rows.
+
+### Frames, images and seconds
+Three different things, kept apart deliberately:
+
+| | |
+|---|---|
+| a **frame** | a coordinate set that came out of an input file. How many there are is a property of the data — a trajectory's steps, one sample of a normal mode — and nothing the player chooses. |
+| an **image** | one picture the player draws. **Smoothing** says how many fill the gap between two consecutive frames (1 = no interpolation, draw the frames themselves). |
+| **Framerate** | images per second. Global, because it is a property of the playback rather than of any one molecule. |
+
+So one source frame lasts `Smoothing / Framerate` seconds, and **Playback**
+counts images: `current / total`. Keeping the two knobs separate is what lets
+a 12-frame optimisation and a 200-frame trajectory both play at a watchable
+speed without touching the data.
+
+One consequence is worth knowing: at a fixed framerate, doubling the
+smoothing plays *slower* as well as smoother — twice as many pictures in the
+same second is half the trajectory per second, exactly like shooting video at
+60 fps and playing it back at 30. Raise the framerate too if you want the
+original speed. Both knobs sit next to each other so the trade is visible.
+
+### Loop limits
+**Loop [first] - [last]** bound the interval the playhead runs over, in
+images, so you can loop the interesting twenty frames of a five-hundred-frame
+run. They are also draggable in the track pane — the two green handles — and
+everything outside them is veiled. Leaving the end on its maximum means "to
+the end of the scene", so a trajectory that grows later stays covered.
+
+The limits are stored in frames, so changing the smoothing renumbers them but
+does not move them. Dragging the playhead past a limit parks it there rather
+than wrapping: a wrap under the cursor is unreadable while scrubbing.
+Playback itself still wraps, per the end mode.
 
 **The track pane** (▾, or drag the grip above it to resize) shows one row per
 animated molecule on a shared time axis with a single playhead across all of
@@ -362,6 +495,7 @@ line anywhere down the rows.
 | In the rows | Does |
 |---|---|
 | drag the playhead / ruler | scrub the scene clock |
+| drag a green handle | move that end of the **looping interval** |
 | drag a bar sideways | slide that track's **start offset** |
 | click the dot in the gutter | enable / disable that track |
 | double-click a bar | cycle its end mode: hold → loop → pingpong |
@@ -375,8 +509,8 @@ Each object gets a **track** mapping scene time to its own frames through a
 different rates, off the same clock. A molecule with one frame is a still and
 simply never moves. The scene runs as long as its longest track.
 
-**Smooth** interpolates between frames instead of stepping. A plain blend
-would send every atom along the straight chord between its two positions,
+**Smoothing** above 1 interpolates between frames instead of stepping. A
+plain blend would send every atom along the straight chord between positions,
 which makes a *rotating* molecule contract toward its centroid halfway
 through the turn and spring back — bonds visibly losing length. Instead the
 rigid part of the motion is extracted (Kabsch) and turned as a real rotation,

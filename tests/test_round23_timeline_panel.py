@@ -190,13 +190,13 @@ def test_only_a_cif_object_gets_crystal_controls(crystal_win):
 def test_the_row_checkboxes_apply_immediately(crystal_win):
     from PySide6.QtWidgets import QApplication
     ctrl = _controls(crystal_win)[0]
-    assert crystal_win._active_obj().structure.n_atoms == 8
+    assert crystal_win._active_obj().structure.n_atoms == 27
     ctrl.asym_check.setChecked(True)          # no Apply button pressed
     QApplication.processEvents()
     assert crystal_win._active_obj().structure.n_atoms == 2
     ctrl.full_check.setChecked(True)
     QApplication.processEvents()
-    assert crystal_win._active_obj().structure.n_atoms == 8
+    assert crystal_win._active_obj().structure.n_atoms == 27
 
 
 def test_the_content_checkboxes_are_exclusive(crystal_win):

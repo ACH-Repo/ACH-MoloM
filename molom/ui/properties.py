@@ -10,15 +10,24 @@ competing ones). The strip is what makes room for the pages that will follow
 from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QDoubleValidator
 
 from . import dragcheck
+from ..core import vibrations
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDockWidget,
-                               QSlider,
+                               QLineEdit, QSlider,
                                QDoubleSpinBox, QFormLayout, QFrame,
                                QHBoxLayout, QLabel, QPushButton, QRadioButton,
                                QScrollArea, QSizePolicy, QSpinBox,
                                QStackedWidget, QToolButton, QVBoxLayout,
                                QWidget)
+
+#: Amplitude defaults for a normal mode, in Angstrom. 0.2 A reads as a
+#: vibration; the old 0.6 A default with a 2 A ceiling put the whole usable
+#: range in the first fifth of the slider (Christian, 2026-08-03).
+DEFAULT_AMPLITUDE = 0.2
+AMP_MIN_STEPS = 5        # slider counts hundredths of an Angstrom
+AMP_MAX_STEPS = 100
 
 _TAB_STYLE = """
 QToolButton {
@@ -179,16 +188,178 @@ class ModifierPage(QWidget):
                 lambda v, m=mod, s=summary:
                 self._set(m, "relative", bool(v), s))
             form.addRow("", rel)
+        elif getattr(mod, "kind", "") == "symmetry":
+            # Without these the card is a bare title with an arrow that opens
+            # onto nothing, which reads as a modifier that did not work.
+            note = QLabel("The molecule stays the asymmetric unit; the "
+                          "viewport and any export see the full cell.")
+            note.setWordWrap(True)
+            note.setStyleSheet("color: rgba(200,200,200,150);")
+            form.addRow(note)
+            cells = QHBoxLayout()
+            cells.setSpacing(2)
+            for a, attr in enumerate(("na", "nb", "nc")):
+                box = QSpinBox()
+                box.setRange(1, 12)
+                box.setValue(int(getattr(mod, attr, 1)))
+                box.setMaximumWidth(52)
+                box.setToolTip("Cells along " + "abc"[a])
+                box.valueChanged.connect(
+                    lambda v, m=mod, k=attr, s=summary:
+                    self._set(m, k, int(v), s))
+                cells.addWidget(box)
+            cells.addStretch(1)
+            holder2 = QWidget()
+            holder2.setLayout(cells)
+            form.addRow("Cells:", holder2)
+            form.addRow(self._symop_editor(mod, summary))
         body.setVisible(False)              # collapsed by default
         outer.addWidget(body)
         return card
 
+    #: Ready-made single operations, so a space group can be built up one
+    #: element at a time without remembering the xyz syntax. Christian's use
+    #: case: take a fragment and watch it become a cell, a glide at a time.
+    SYMOP_PRESETS = [
+        ("Inversion centre", "-x,-y,-z"),
+        ("2-fold about c", "-x,-y,z"),
+        ("2-fold about b", "-x,y,-z"),
+        ("2-fold about a", "x,-y,-z"),
+        ("3-fold about c", "-y,x-y,z"),
+        ("4-fold about c", "-y,x,z"),
+        ("6-fold about c", "x-y,x,z"),
+        ("2_1 screw along c", "-x,-y,1/2+z"),
+        ("2_1 screw along b", "-x,1/2+y,-z"),
+        ("2_1 screw along a", "1/2+x,-y,-z"),
+        ("Mirror perp. c", "x,y,-z"),
+        ("Mirror perp. b", "x,-y,z"),
+        ("Mirror perp. a", "-x,y,z"),
+        ("a-glide perp. c", "1/2+x,y,-z"),
+        ("b-glide perp. c", "x,1/2+y,-z"),
+        ("c-glide perp. a", "-x,y,1/2+z"),
+        ("n-glide perp. c", "1/2+x,1/2+y,-z"),
+        ("A-centring", "x,1/2+y,1/2+z"),
+        ("B-centring", "1/2+x,y,1/2+z"),
+        ("C-centring", "1/2+x,1/2+y,z"),
+        ("I-centring", "1/2+x,1/2+y,1/2+z"),
+    ]
+
+    def _symop_editor(self, mod, summary):
+        """Add and remove individual symmetry operations on this modifier.
+
+        The point of stacking operations by hand is to SEE what each one
+        does, so this is a list you can grow one entry at a time rather than
+        a space-group name you either know or do not. Anything the CIF reader
+        accepts is accepted here, and the presets cover the elements you would
+        normally reach for.
+        """
+        holder = QWidget()
+        col = QVBoxLayout(holder)
+        col.setContentsMargins(0, 2, 0, 0)
+        col.setSpacing(2)
+
+        row = QHBoxLayout()
+        row.setSpacing(3)
+        preset = QComboBox()
+        preset.addItem("Add operation...", "")
+        for label, xyz in self.SYMOP_PRESETS:
+            preset.addItem("{}   ({})".format(label, xyz), xyz)
+        preset.setToolTip("Append one symmetry operation to this modifier")
+        typed = QLineEdit()
+        typed.setPlaceholderText("or type: -x, 1/2+y, -z")
+        typed.setToolTip("Any operation in the CIF's own xyz notation")
+        add = QToolButton()
+        add.setText("+")
+        add.setToolTip("Add the typed operation")
+        row.addWidget(preset, 1)
+        col.addLayout(row)
+        row2 = QHBoxLayout()
+        row2.setSpacing(3)
+        row2.addWidget(typed, 1)
+        row2.addWidget(add)
+        col.addLayout(row2)
+
+        listing = QVBoxLayout()
+        listing.setContentsMargins(0, 0, 0, 0)
+        listing.setSpacing(1)
+        col.addLayout(listing)
+
+        def rebuild_list():
+            while listing.count():
+                item = listing.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.setParent(None)
+                    w.deleteLater()
+            for k, text in enumerate(mod.symops):
+                line = QHBoxLayout()
+                line.setSpacing(3)
+                tag = QLabel("{}.  {}".format(k + 1, text))
+                tag.setStyleSheet("color: rgba(210,210,210,190);"
+                                  " font-family: monospace;")
+                drop = QToolButton()
+                drop.setText("x")
+                drop.setAutoRaise(True)
+                drop.setToolTip("Remove this operation")
+                drop.clicked.connect(
+                    lambda _c=False, i=k: remove(i))
+                line.addWidget(tag, 1)
+                line.addWidget(drop)
+                wrap = QWidget()
+                wrap.setLayout(line)
+                listing.addWidget(wrap)
+
+        def remove(index):
+            if 0 <= index < len(mod.symops):
+                mod.symops.pop(index)
+                summary.setText(self._summary(mod))
+                rebuild_list()
+                if not self._loading:
+                    self.changed.emit()
+
+        def append(text):
+            text = (text or "").strip()
+            if not text:
+                return
+            from ..core import cif as cif_mod
+            try:
+                cif_mod.SymOp.from_xyz(text)
+            except Exception:
+                typed.setStyleSheet("border: 1px solid #b05050;")
+                typed.setToolTip("Not a symmetry operation: expected three "
+                                 "comma-separated terms like '-x, 1/2+y, -z'")
+                return
+            typed.setStyleSheet("")
+            if text not in mod.symops:
+                mod.symops.append(text)
+                summary.setText(self._summary(mod))
+                rebuild_list()
+                if not self._loading:
+                    self.changed.emit()
+
+        def take_preset(index):
+            data = preset.itemData(index)
+            if data:
+                append(data)
+            preset.setCurrentIndex(0)
+
+        preset.currentIndexChanged.connect(take_preset)
+        add.clicked.connect(lambda: append(typed.text()))
+        typed.returnPressed.connect(lambda: append(typed.text()))
+        rebuild_list()
+        return holder
+
     @staticmethod
     def _summary(mod):
-        if getattr(mod, "kind", "") == "array":
+        kind = getattr(mod, "kind", "")
+        if kind == "array":
             unit = "x size" if mod.relative else "A"
             return "x{}  ({:.2g}, {:.2g}, {:.2g}) {}".format(
                 mod.count, *[float(v) for v in mod.offset], unit)
+        if kind == "symmetry":
+            block = "" if max(mod.na, mod.nb, mod.nc) <= 1 else \
+                "  {}x{}x{}".format(mod.na, mod.nb, mod.nc)
+            return "{} ops{}".format(len(mod.symops), block)
         return ""
 
     def _toggle(self, body, arrow):
@@ -384,17 +555,25 @@ class CrystalPage(QWidget):
 
 
 class VibrationPage(QWidget):
-    """Normal modes of a FREQ job: one expandable card per mode.
+    """Normal modes of a FREQ job: one card per mode, over the settings that
+    turn a mode into frames.
 
     Same card idiom as the modifier stack — a header you can scan (the
-    frequency plus a play button) and a body, collapsed, holding the
-    sliders. A FREQ run has 3N modes, so a flat list of sliders would be
-    unreadable; collapsed cards let you skim the spectrum and open only the
-    one you care about.
+    frequency plus an animate button). A FREQ run has 3N modes, so a flat
+    list of sliders would be unreadable; cards let you skim the spectrum and
+    pick the one you care about.
+
+    Amplitude and frames-per-period sit at the TOP, not on each card, because
+    they are properties of the imported FREQ object rather than of one mode
+    (round 30 — they were always stored per object, the per-card sliders just
+    made it look otherwise and reset themselves on every rebuild). Frames per
+    period steps in FOURS so both turning points of the oscillation are
+    always sampled; see `core.vibrations.period_frames`.
     """
 
     mode_selected = Signal(int)                 # mode index -> animate it
-    mode_settings = Signal(int, float, int)     # index, amplitude, n_frames
+    settings_changed = Signal(float, int)       # amplitude, frames/period
+    load_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -405,11 +584,102 @@ class VibrationPage(QWidget):
         self.summary.setWordWrap(True)
         lay.addWidget(self.summary)
 
+        self.load_btn = QPushButton("Load ORCA frequencies...")
+        self.load_btn.setToolTip(
+            "Read normal modes from an ORCA FREQ output. Opening the .out "
+            "file directly picks them up on its own.")
+        self.load_btn.clicked.connect(self.load_requested)
+        lay.addWidget(self.load_btn)
+
+        # ---- per-OBJECT settings, above the mode list
+        self.settings_box = QWidget()
+        form = QFormLayout(self.settings_box)
+        form.setContentsMargins(0, 2, 0, 2)
+        form.setSpacing(3)
+        # 0.05 .. 1.00 A on the slider: 2 A swings atoms clean through their
+        # neighbours and reads as an explosion rather than a vibration, so
+        # the useful range was squeezed into the first fifth of the travel.
+        self.amp_slider = QSlider(Qt.Horizontal)
+        self.amp_slider.setRange(AMP_MIN_STEPS, AMP_MAX_STEPS)
+        self.amp_slider.setValue(int(round(DEFAULT_AMPLITUDE * 100)))
+        self.amp_slider.setMaximumWidth(130)
+        self.amp_slider.setToolTip(
+            "Peak displacement of the busiest atom, in Angstrom")
+        # ...and a box to TYPE in, which may go past the slider's top end:
+        # the slider is calibrated for reading a mode, not for the occasional
+        # deliberately absurd amplitude used to see where a mode is going.
+        self.amp_spin = QDoubleSpinBox()
+        self.amp_spin.setRange(0.01, 50.0)
+        self.amp_spin.setDecimals(2)
+        self.amp_spin.setSingleStep(0.05)
+        self.amp_spin.setSuffix(" A")
+        self.amp_spin.setValue(DEFAULT_AMPLITUDE)
+        self.amp_spin.setMaximumWidth(86)
+        self.amp_spin.setToolTip(
+            "Type an exact amplitude. Values above the slider's {:g} A top "
+            "end are allowed and simply peg the slider.".format(
+                AMP_MAX_STEPS / 100.0))
+        amp_row = QHBoxLayout()
+        amp_row.setSpacing(4)
+        amp_row.addWidget(self.amp_slider, 1)
+        amp_row.addWidget(self.amp_spin)
+        amp_holder = QWidget()
+        amp_holder.setLayout(amp_row)
+
+        self.frames_spin = QSpinBox()
+        self.frames_spin.setRange(4, 120)
+        self.frames_spin.setSingleStep(4)         # keeps the extremes sampled
+        self.frames_spin.setValue(20)
+        self.frames_spin.setMaximumWidth(80)
+        self.frames_spin.setToolTip(
+            "Frames generated for one period of the mode. Steps in fours so "
+            "the sampling lands exactly on both turning points of the "
+            "oscillation — otherwise the highest and lowest points of the "
+            "coordinate are never reached. The player's Smoothing then "
+            "subdivides between these frames.")
+        form.addRow("Amplitude:", amp_holder)
+        form.addRow("Frames / period:", self.frames_spin)
+
+        # ---- which modes to show, and in what order
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItem("Frequency", vibrations.SORT_FREQUENCY)
+        self.sort_combo.addItem("IR intensity", vibrations.SORT_INTENSITY)
+        self.sort_combo.setMaximumWidth(130)
+        self.sort_combo.setToolTip(
+            "Frequency lists the spectrum in order; IR intensity puts the "
+            "bands you would actually see at the top")
+        form.addRow("Sort by:", self.sort_combo)
+
+        self.low_edit = QLineEdit()
+        self.high_edit = QLineEdit()
+        for edit, tip in ((self.low_edit, "Lowest wavenumber to show"),
+                          (self.high_edit, "Highest wavenumber to show")):
+            edit.setValidator(QDoubleValidator(-100000.0, 100000.0, 2, edit))
+            edit.setPlaceholderText("any")
+            edit.setMaximumWidth(62)
+            edit.setToolTip(tip + " — leave empty for no bound. The list "
+                                  "filters as you type.")
+        range_row = QHBoxLayout()
+        range_row.setSpacing(4)
+        range_row.addWidget(self.low_edit)
+        range_row.addWidget(QLabel("-"))
+        range_row.addWidget(self.high_edit)
+        range_row.addWidget(QLabel("cm-1"))
+        range_row.addStretch(1)
+        range_holder = QWidget()
+        range_holder.setLayout(range_row)
+        form.addRow("Range:", range_holder)
+        lay.addWidget(self.settings_box)
+
         self.trivial_check = QCheckBox("Show translations / rotations")
         self.trivial_check.setToolTip(
             "The first six modes of a non-linear molecule are rigid motions "
             "at ~0 cm-1, not vibrations")
         lay.addWidget(self.trivial_check)
+
+        self.count_label = QLabel("")
+        self.count_label.setStyleSheet("color: rgba(200,200,200,150);")
+        lay.addWidget(self.count_label)
 
         self.body = QWidget()
         self.column = QVBoxLayout(self.body)
@@ -420,19 +690,70 @@ class VibrationPage(QWidget):
 
         self._modes = []
         self._active = None
+        self._loading = False
         self.trivial_check.toggled.connect(lambda _v: self._rebuild())
+        self.amp_slider.valueChanged.connect(self._on_amp_slider)
+        self.amp_spin.valueChanged.connect(self._on_amp_typed)
+        self.frames_spin.valueChanged.connect(self._emit_settings)
+        self.sort_combo.currentIndexChanged.connect(lambda _i: self._rebuild())
+        for edit in (self.low_edit, self.high_edit):
+            edit.textChanged.connect(lambda _t: self._rebuild())
         dragcheck.install(self)
         self.set_modes([])
 
+    # ---------------------------------------------------------- amplitude
+    def _on_amp_slider(self, value):
+        """Slider moved: mirror it into the type-in box and emit once."""
+        if self._loading:
+            return
+        self._loading = True
+        self.amp_spin.setValue(value / 100.0)
+        self._loading = False
+        self._emit_settings()
+
+    def _on_amp_typed(self, value):
+        """Box edited: peg the slider (the box may go past its top end)."""
+        if self._loading:
+            return
+        self._loading = True
+        self.amp_slider.setValue(
+            max(AMP_MIN_STEPS, min(int(round(value * 100)), AMP_MAX_STEPS)))
+        self._loading = False
+        self._emit_settings()
+
+    def amplitude(self):
+        # type: () -> float
+        """The typed box is authoritative — it is the one that can exceed
+        the slider's range."""
+        return float(self.amp_spin.value())
+
+    def _emit_settings(self, _value=0):
+        if not self._loading:
+            self.settings_changed.emit(self.amplitude(),
+                                       self.frames_spin.value())
+
     # ------------------------------------------------------------- content
-    def set_modes(self, modes, active=None, name=""):
+    def set_modes(self, modes, active=None, name="",
+                  amplitude=DEFAULT_AMPLITUDE,
+                  n_frames=vibrations.DEFAULT_PERIOD_FRAMES):
         self._modes = list(modes or [])
         self._active = active
-        self.setEnabled(bool(self._modes))
+        # The PAGE stays usable with no data — only the parts that need modes
+        # are switched off, so the tab can always be opened and read.
+        self.settings_box.setEnabled(bool(self._modes))
+        self.trivial_check.setEnabled(bool(self._modes))
+        self._loading = True
+        self.amp_spin.setValue(float(amplitude))
+        self.amp_slider.setValue(
+            max(AMP_MIN_STEPS,
+                min(int(round(float(amplitude) * 100)), AMP_MAX_STEPS)))
+        self.frames_spin.setValue(int(n_frames))
+        self._loading = False
         if not self._modes:
             self.summary.setText(
-                "No vibrational data.\n"
-                "F3 → \"load ORCA frequencies\" for this molecule.")
+                "<b>{}</b> has no vibrational data.<br>Open an ORCA FREQ "
+                "output (the modes are picked up automatically), or load one "
+                "onto this molecule below.".format(name or "This molecule"))
         else:
             real = [m for m in self._modes if not m.is_trivial]
             imaginary = [m for m in self._modes if m.is_imaginary]
@@ -444,39 +765,58 @@ class VibrationPage(QWidget):
                 name or "", len(self._modes), len(real), note))
         self._rebuild()
 
+    @staticmethod
+    def _number(edit):
+        """A half-typed bound is no bound — "-" and "" both mean unbounded,
+        which is what keeps the list from blinking empty mid-keystroke."""
+        text = edit.text().strip().replace(",", ".")
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+    def visible_modes(self):
+        # type: () -> list
+        """The modes the list is currently showing, in list order."""
+        shown = vibrations.filter_modes(
+            self._modes, self._number(self.low_edit),
+            self._number(self.high_edit),
+            include_trivial=self.trivial_check.isChecked())
+        return vibrations.sort_modes(shown, self.sort_combo.currentData())
+
     def _rebuild(self):
         while self.column.count():
             widget = self.column.takeAt(0).widget()
             if widget is not None:
                 widget.setParent(None)
                 widget.deleteLater()
-        show_trivial = self.trivial_check.isChecked()
-        for mode in self._modes:
-            if mode.is_trivial and not show_trivial:
-                continue
+        shown = self.visible_modes()
+        for mode in shown:
             self.column.addWidget(self._mode_card(mode))
+        if self._modes and not shown:
+            empty = QLabel("No mode in that range.")
+            empty.setStyleSheet("color: rgba(200,200,200,150);")
+            self.column.addWidget(empty)
+        self.count_label.setText(
+            "{} of {} modes shown".format(len(shown), len(self._modes))
+            if self._modes else "")
 
     def _mode_card(self, mode):
+        """One row per mode: frequency + the button that animates it.
+
+        No body to expand any more — the two settings that used to live in
+        one belong to the whole FREQ object and are now at the top of the
+        page, so a card is a single scannable line.
+        """
         card = QFrame()
         card.setFrameShape(QFrame.StyledPanel)
         lit = 34 if self._active == mode.index else 10
         card.setStyleSheet(
             "QFrame {{ background: rgba(255,255,255,{}); border: 1px solid"
             " rgba(0,0,0,60); border-radius: 4px; }}".format(lit))
-        outer = QVBoxLayout(card)
-        outer.setContentsMargins(4, 3, 4, 3)
-        outer.setSpacing(2)
-
-        body = QWidget()
-        head = QHBoxLayout()
+        head = QHBoxLayout(card)
+        head.setContentsMargins(6, 2, 4, 2)
         head.setSpacing(4)
-        arrow = QToolButton()
-        arrow.setText("▸")
-        arrow.setFixedWidth(16)
-        arrow.setAutoRaise(True)
-        arrow.setToolTip("Amplitude and smoothness for this mode")
-        arrow.clicked.connect(
-            lambda _c=False, b=body, a=arrow: self._toggle(b, a))
 
         title = QLabel("{:.2f} cm-1".format(mode.wavenumber))
         if mode.is_imaginary:
@@ -485,6 +825,15 @@ class VibrationPage(QWidget):
         elif mode.is_trivial:
             title.setStyleSheet("color: rgba(200,200,200,140);")
 
+        # The intensity is on the card, not just in the sort order: sorting
+        # by a number you cannot see is a list you have to trust blindly.
+        intensity = QLabel("" if mode.intensity is None
+                           else "{:.0f}".format(mode.intensity))
+        intensity.setStyleSheet("color: rgba(190,205,225,170);")
+        intensity.setToolTip("IR intensity, km/mol")
+        intensity.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        intensity.setMinimumWidth(38)
+
         play = QToolButton()
         play.setText("A")            # a LETTER, per the outliner convention
         play.setAutoRaise(True)
@@ -492,44 +841,10 @@ class VibrationPage(QWidget):
         play.clicked.connect(
             lambda _c=False, i=mode.index: self.mode_selected.emit(i))
 
-        head.addWidget(arrow)
         head.addWidget(title, 1)
+        head.addWidget(intensity)
         head.addWidget(play)
-        holder = QWidget()
-        holder.setLayout(head)
-        outer.addWidget(holder)
-
-        form = QFormLayout(body)
-        form.setContentsMargins(20, 2, 2, 2)
-        form.setSpacing(3)
-        amp = QSlider(Qt.Horizontal)
-        amp.setRange(5, 200)                 # 0.05 .. 2.00 Angstrom
-        amp.setValue(60)
-        amp.setToolTip("Peak displacement of the busiest atom, in Angstrom")
-        steps = QSlider(Qt.Horizontal)
-        steps.setRange(6, 60)                # frames per period
-        steps.setValue(20)
-        steps.setToolTip(
-            "Frames per period. More is smoother, though the player "
-            "interpolates between them anyway")
-        for widget in (amp, steps):
-            widget.setMaximumWidth(150)
-        amp.valueChanged.connect(
-            lambda v, i=mode.index, s=steps:
-            self.mode_settings.emit(i, v / 100.0, s.value()))
-        steps.valueChanged.connect(
-            lambda v, i=mode.index, a=amp:
-            self.mode_settings.emit(i, a.value() / 100.0, v))
-        form.addRow("Amplitude:", amp)
-        form.addRow("Frames:", steps)
-        body.setVisible(False)
-        outer.addWidget(body)
         return card
-
-    @staticmethod
-    def _toggle(body, arrow):
-        body.setVisible(not body.isVisible())
-        arrow.setText("▾" if body.isVisible() else "▸")
 
 
 class PropertiesDock(QDockWidget):

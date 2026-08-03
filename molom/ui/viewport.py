@@ -83,6 +83,10 @@ _LIGATING_COLOR = QColor(180, 120, 255)   # template 'this atom coordinates'
 _SYM_COLOR = QColor(255, 170, 90)         # symmetry element glyphs
 _GHOST_COLOR = QColor(150, 200, 255, 120) # symmetry-image ghosts
 _MAX_GHOSTS = 48                          # a 192-op group would be a fog
+#: The unit cell's eight corners in fractional coordinates — the reference
+#: extent the symmetry overlay's depth cue is calibrated against.
+_UNIT_CORNERS = np.array([[a, b, c] for a in (0.0, 1.0)
+                          for b in (0.0, 1.0) for c in (0.0, 1.0)])
 _EDIT_ACCENT = QColor(255, 150, 40)       # edit-mode border/header tint
 
 MODE_OBJECT = "object"
@@ -534,7 +538,11 @@ class MolViewport(QOpenGLWidget):
         self.last_transform = None       # for Shift+R (repeat last)
         self.transform_serial = 0        # bumped whenever last_transform is set
         self._align_wait = None          # 'axis'|'plane' while A waits for key
+        self._align_previewed = None     # axis currently PREVIEWED, or None
+        self._cue_range = None           # (near, far) for the depth cue
         self.on_align_key = None         # app callback: (kind, axis) -> None
+        self.on_align_confirm = None     # app callback: keep the preview
+        self.on_align_cancel = None      # app callback: put it back
         # edit mode (Blender's Tab): chemistry editing on ONE object
         self.mode = MODE_OBJECT
         self.edit_obj_id = None          # type: Optional[int]
@@ -1103,21 +1111,46 @@ class MolViewport(QOpenGLWidget):
     # ------------------------------------------------------------ align keys
     def arm_align_keys(self, kind):
         # type: (str) -> None
-        """A pressed with a 2-atom ('axis') or 3+-atom ('plane') selection:
-        wait for an axis key, then hand off to the app's align logic."""
+        """A pressed with a 2-atom ('axis') or 3+-atom ('plane') selection.
+
+        This is a PREVIEW modal, the same contract G and R already have: an
+        axis key applies the alignment and leaves it on screen, another axis
+        key replaces it, LEFT-CLICK confirms and right-click or Esc reverts.
+        It used to commit and end on the first axis key, so you could not
+        press X, look at it, and change your mind — reported twice.
+        """
         if self.modal_active():
             return
         self._align_wait = kind
+        self._align_previewed = None       # which axis is on screen, if any
         self.grabKeyboard()
         self.update()          # the prompt is painted, not just announced
 
-    def _end_align_wait(self, msg=""):
+    def _end_align_wait(self, msg="", cancel=False):
+        was_previewing = self._align_previewed is not None
         self._align_wait = None
+        self._align_previewed = None
         self.releaseKeyboard()
         self.releaseMouse()
         self.update()
+        if cancel and was_previewing and self.on_align_cancel is not None:
+            self.on_align_cancel()
         if msg:
             self.status_message.emit(msg)
+
+    def _confirm_align(self):
+        """Left-click with a preview showing: keep it."""
+        if self._align_previewed is None:
+            self.status_message.emit(
+                "Press X, Y or Z first — there is nothing to confirm yet")
+            return
+        self._align_wait = None
+        self._align_previewed = None
+        self.releaseKeyboard()
+        self.releaseMouse()
+        self.update()
+        if self.on_align_confirm is not None:
+            self.on_align_confirm()
 
     # --------------------------------------------------------------- helpers
     def _view_dir(self):
@@ -1477,10 +1510,17 @@ class MolViewport(QOpenGLWidget):
         self.refresh_geometry()
 
     def _wrap_cursor(self, pos, margin=6):
-        """Blender's infinite drag: when the pointer reaches either vertical
-        edge of the VIEWPORT during a modal, teleport it to the middle so the
-        drag can keep going. Horizontal only — Blender does not wrap
-        vertically either, and it makes rotations feel like they jump.
+        """Blender's infinite drag: when the pointer reaches an edge of the
+        VIEWPORT during a modal, teleport it to the opposite side so the drag
+        can keep going.
+
+        BOTH axes wrap (round 32). It used to be horizontal only, on the
+        theory that a vertical wrap makes rotations jump — but a grab is far
+        more often vertical than a rotate is, and running out of screen
+        upwards is exactly where the pointer leaves the window and the drag
+        dies. Wrapping to the OPPOSITE edge rather than to the middle also
+        keeps the gesture's direction unbroken: jumping to the centre halves
+        the travel available before the next wrap.
 
         The state is `reseed()`ed rather than updated, so the teleport moves
         the reference and not the value; updating instead made the molecule
@@ -1489,13 +1529,22 @@ class MolViewport(QOpenGLWidget):
         state = self._active_modal_state()
         if state is None:
             return
-        x, w = pos.x(), self.width()
-        if margin < x < w - margin:
+        x, y = pos.x(), pos.y()
+        w, h = self.width(), self.height()
+        new_x, new_y = x, y
+        if x <= margin:
+            new_x = w - margin - 2
+        elif x >= w - margin:
+            new_x = margin + 2
+        if y <= margin:
+            new_y = h - margin - 2
+        elif y >= h - margin:
+            new_y = margin + 2
+        if new_x == x and new_y == y:
             return
-        new_x = w * 0.5
         state.reseed()
-        QCursor.setPos(self.mapToGlobal(QPoint(int(new_x), int(pos.y()))))
-        self._drag_last = QPointF(new_x, pos.y())
+        QCursor.setPos(self.mapToGlobal(QPoint(int(new_x), int(new_y))))
+        self._drag_last = QPointF(new_x, new_y)
 
     def _modal_mouse(self, pos):
         if self._grab is not None:
@@ -2119,28 +2168,63 @@ class MolViewport(QOpenGLWidget):
         """
         if self.scene is None:
             return
-        from ..core import cif as cif_mod
-        from ..core import symmetry as sym_mod
         for obj in self.scene.visible_objects():
             meta = obj.structure.metadata or {}
             cell = cell_of(obj)
             if cell is None or not (meta.get("show_symmetry")
                                     or meta.get("show_ghosts")):
                 continue
-            ops = [cif_mod.SymOp.from_xyz(t) for t in meta.get("symops")
-                   or ("x,y,z",)]
+            plan = self._symmetry_plan(obj, meta)
             fit = self._cell_fit(obj, cell)
             to_world = lambda f: (np.asarray(f) @ cell.matrix()) @ fit[0].T \
                 + fit[1]
 
-            # ONE filtered list drives both pictures, so the glyphs and the
-            # ghosts can never disagree about which operations are in play.
-            active = sym_mod.filter_ops(ops, meta.get("symmetry_kinds"))
-            if meta.get("show_ghosts") and meta.get("asym_frac"):
-                self._paint_ghosts(p, meta, active, to_world)
+            # Calibrate the depth cue on the CELL, so the near corner is
+            # always full strength and the far one always faint whatever the
+            # zoom. Scaling by camera distance instead made a small cell come
+            # out uniformly flat, which is "there are no depth cues".
+            self.set_depth_cue_extent(to_world(_UNIT_CORNERS))
+
+            if meta.get("show_ghosts") and plan["ghosts"] is not None:
+                self._paint_ghosts(p, meta, plan["ghosts"], to_world)
             if meta.get("show_symmetry"):
-                for element in sym_mod.classify_all(active):
+                for element in plan["elements"]:
                     self._paint_symmetry_element(p, element, cell, to_world)
+            self._cue_range = None
+
+    def _symmetry_plan(self, obj, meta):
+        """Parsed operators, classified elements and ghost images, CACHED.
+
+        All three were recomputed on every repaint, and none of them depends
+        on the camera: 48 operators cost ~0.9 ms to re-parse, ~8 ms to
+        re-classify (an eigen-decomposition each) and ~3 ms to re-image, so
+        simply having symmetry switched on burned 12 ms per frame before a
+        single line was drawn. A trackpad emitting 60+ scroll events a second
+        then has no chance — "it slows zooming to a crawl". The key is
+        everything the result depends on, so a changed filter or a re-imported
+        cell still rebuilds.
+        """
+        from ..core import cif as cif_mod
+        from ..core import symmetry as sym_mod
+        strings = tuple(meta.get("symops") or ("x,y,z",))
+        kinds = meta.get("symmetry_kinds")
+        asym = meta.get("asym_frac")
+        key = (id(obj), strings, tuple(sorted(kinds)) if kinds else None,
+               None if asym is None else np.asarray(asym).tobytes())
+        cached = getattr(self, "_sym_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        ops = [cif_mod.SymOp.from_xyz(t) for t in strings]
+        # ONE filtered list drives both pictures, so the glyphs and the
+        # ghosts can never disagree about which operations are in play.
+        active = sym_mod.filter_ops(ops, kinds)
+        plan = {
+            "elements": sym_mod.classify_all(active),
+            "ghosts": (sym_mod.images_of(np.asarray(asym, dtype=float), active)
+                       [:_MAX_GHOSTS] if asym is not None else None),
+        }
+        self._sym_cache = (key, plan)
+        return plan
 
     def _cell_fit(self, obj, cell):
         """The rigid transform carrying stored cell space to world space."""
@@ -2155,25 +2239,31 @@ class MolViewport(QOpenGLWidget):
                 return fit
         return np.eye(3), np.zeros(3)
 
-    def _paint_ghosts(self, p, meta, ops, to_world):
+    def _paint_ghosts(self, p, meta, images, to_world):
         """Ghosts are FRAGMENTS, not dots — a scatter of circles says nothing
         about what the copy IS, while a faint skeleton of the asymmetric unit
-        is instantly recognisable as the same thing moved."""
-        from ..core import symmetry as sym_mod
+        is instantly recognisable as the same thing moved.
+
+        Depth-cued like the glyphs: a dozen overlapping skeletons with no
+        ordering is a hairball, and the near/far split is most of what makes
+        it readable.
+        """
         base = np.asarray(meta["asym_frac"], dtype=float)
         bonds = self._ghost_bonds(meta, base)
         p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(_GHOST_COLOR, 1.1))
-        for image in sym_mod.images_of(base, ops)[:_MAX_GHOSTS]:
+        for image in images:
             world = to_world(image)
             xy, front = self._project(world)
             for i, j in bonds:
                 if not (front[i] and front[j]):
                     continue
+                p.setPen(self._cued_pen(_GHOST_COLOR,
+                                        (world[i] + world[j]) / 2.0, 1.3))
                 p.drawLine(int(xy[i, 0]), int(xy[i, 1]),
                            int(xy[j, 0]), int(xy[j, 1]))
             for k in range(len(xy)):
                 if front[k]:
+                    p.setPen(self._cued_pen(_GHOST_COLOR, world[k], 1.3))
                     p.drawEllipse(int(xy[k, 0]) - 2, int(xy[k, 1]) - 2, 4, 4)
 
     def _ghost_bonds(self, meta, frac):
@@ -2193,6 +2283,29 @@ class MolViewport(QOpenGLWidget):
         meta["_ghost_bonds"] = pairs
         return pairs
 
+    def _eye_position(self):
+        r = quat_to_mat3(self.camera.rotation)
+        return self.camera.center + r.T @ np.array(
+            [0.0, 0.0, self.camera.distance])
+
+    def set_depth_cue_extent(self, world_points):
+        """Calibrate the depth cue against the thing being drawn.
+
+        The cue used to be scaled by the CAMERA DISTANCE, which means a small
+        cell viewed from a normal distance occupies a sliver of the range and
+        every line comes out at nearly the same alpha — "the symmetry lines
+        still have no depth cues, not that I can see at least". Normalising
+        by the actual near-to-far spread of the overlay makes the nearest
+        line always full strength and the furthest always faint, at any zoom.
+        """
+        pts = np.asarray(world_points, dtype=float).reshape(-1, 3)
+        if len(pts) < 2:
+            self._cue_range = None
+            return
+        d = np.linalg.norm(pts - self._eye_position()[None, :], axis=1)
+        near, far = float(d.min()), float(d.max())
+        self._cue_range = (near, far) if far - near > 1e-6 else None
+
     def _depth_fade(self, world_point):
         """0 (far) .. 1 (near) for a world point, for depth cueing.
 
@@ -2202,10 +2315,13 @@ class MolViewport(QOpenGLWidget):
         far ends restores the ordering without a depth buffer or a real AO
         pass, both of which would be a lot of machinery for line art.
         """
-        r = quat_to_mat3(self.camera.rotation)
-        eye = self.camera.center + r.T @ np.array(
-            [0.0, 0.0, self.camera.distance])
-        dist = float(np.linalg.norm(np.asarray(world_point) - eye))
+        dist = float(np.linalg.norm(
+            np.asarray(world_point) - self._eye_position()))
+        cue = getattr(self, "_cue_range", None)
+        if cue is not None:
+            near, far = cue
+            t = (dist - near) / (far - near)
+            return float(np.clip(1.0 - t, 0.06, 1.0))
         span = max(self.camera.distance, 1e-6)
         return float(np.clip(1.0 - (dist - span * 0.4) / (span * 1.6),
                              0.12, 1.0))
@@ -2309,12 +2425,20 @@ class MolViewport(QOpenGLWidget):
         waiting for an axis key looked like nothing was happening at all.
         """
         if self._align_wait == "axis":
-            text = "ALIGN PAIR TO AXIS   X / Y / Z    (right-click or Esc: cancel)"
+            text = "ALIGN PAIR TO AXIS   X / Y / Z"
         elif self._align_wait == "plane":
             text = ("ALIGN PLANE   X / Y / Z = plane perpendicular to it, "
-                    "Shift+Z = XY    (right-click or Esc: cancel)")
+                    "Shift+Z = XY")
         else:
             return
+        # The tail changes once something is on screen, because that is when
+        # the question changes from "which axis?" to "keep this?".
+        if self._align_previewed is None:
+            text += "    (right-click or Esc: cancel)"
+        else:
+            text = "{}  =  {}   [left-click: KEEP    right-click / Esc: " \
+                   "revert    another key: try it]".format(
+                       text.split("  ")[0], "XYZ"[self._align_previewed])
         f = QFont()
         f.setPixelSize(13)
         f.setBold(True)
@@ -2722,10 +2846,12 @@ class MolViewport(QOpenGLWidget):
     def mousePressEvent(self, ev):
         pos = ev.position()
         if self._align_wait is not None:
-            # RMB cancels, matching G/R. LMB is ignored: there is nothing to
-            # confirm until an axis has been chosen.
+            # LMB confirms the preview, RMB reverts it — the same contract as
+            # G and R, which is the point of making this a preview at all.
             if ev.button() == Qt.RightButton:
-                self._end_align_wait("Align cancelled")
+                self._end_align_wait("Align cancelled", cancel=True)
+            elif ev.button() == Qt.LeftButton:
+                self._confirm_align()
             return
         if self._grab is not None:
             self._finish_grab(commit=ev.button() == Qt.LeftButton)
@@ -3565,13 +3691,18 @@ class MolViewport(QOpenGLWidget):
             if key in _MODIFIER_KEYS:
                 return
             if key in (Qt.Key_X, Qt.Key_Y, Qt.Key_Z):
-                kind = self._align_wait
+                # PREVIEW: apply it and stay armed, so another axis key
+                # simply replaces this one. The app re-applies from its own
+                # snapshot, so previews never compound.
                 axis = {Qt.Key_X: 0, Qt.Key_Y: 1, Qt.Key_Z: 2}[key]
-                self._end_align_wait()
+                self._align_previewed = axis
                 if self.on_align_key is not None:
-                    self.on_align_key(kind, axis)
+                    self.on_align_key(self._align_wait, axis)
+                self.update()
+            elif key in (Qt.Key_Return, Qt.Key_Enter):
+                self._confirm_align()
             elif key == Qt.Key_Escape:
-                self._end_align_wait("Align cancelled")
+                self._end_align_wait("Align cancelled", cancel=True)
             # ANY OTHER KEY IS IGNORED. It used to cancel, so one stray
             # keypress silently abandoned the operation — and since the
             # prompt lived in the status bar it had usually expired by then,

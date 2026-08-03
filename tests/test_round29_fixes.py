@@ -30,8 +30,8 @@ def test_symmetry_modifier_expands_without_touching_the_base():
     coords = data.frac @ data.cell.matrix()
     sym, xyz, bonds = mod.evaluate(list(data.symbols), coords, [])
     assert len(data.symbols) == 2          # untouched input
-    assert len(sym) == 8                   # 2 sites x 4 operations
-    assert xyz.shape == (8, 3)
+    assert len(sym) == 27                  # 2 sites x 4 ops, boundary completed
+    assert xyz.shape == (27, 3)
 
 
 def test_symmetry_modifier_can_pack():
@@ -39,7 +39,7 @@ def test_symmetry_modifier_can_pack():
     mod = mod_mod.SymmetryModifier(cell=cell, symops=ops, na=2, nb=2, nc=1)
     coords = data.frac @ data.cell.matrix()
     sym, _xyz, _b = mod.evaluate(list(data.symbols), coords, [])
-    assert len(sym) == 8 * 4
+    assert len(sym) == 27 * 4
 
 
 def test_symmetry_modifier_without_a_cell_is_a_no_op():
@@ -120,7 +120,10 @@ def test_escape_still_cancels_an_align(win):
     assert vp._align_wait is None
 
 
-def test_an_axis_key_completes_the_align(win):
+def test_an_axis_key_previews_the_align_and_keeps_waiting(win):
+    """Round 31 turned this into a preview modal: the axis key APPLIES the
+    alignment but the operation stays live until you confirm, so you can try
+    X, look at it, and press Y instead."""
     from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication
@@ -131,7 +134,12 @@ def test_an_axis_key_completes_the_align(win):
     QTest.keyClick(vp, Qt.Key_Y, Qt.NoModifier)
     QApplication.processEvents()
     assert got == [("axis", 1)]
-    assert vp._align_wait is None
+    assert vp._align_wait == "axis"          # still armed
+    assert vp._align_previewed == 1
+    QTest.keyClick(vp, Qt.Key_X, Qt.NoModifier)
+    QApplication.processEvents()
+    assert got == [("axis", 1), ("axis", 0)]
+    assert vp._align_previewed == 0
 
 
 def test_right_click_cancels_an_align(win):

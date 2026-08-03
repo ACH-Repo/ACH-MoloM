@@ -88,19 +88,32 @@ def test_a_scene_of_stills_has_no_duration():
     assert tl.seek(50.0) == 0.0
 
 
-def test_advance_uses_fps_to_step_scene_frames():
-    tl = timeline.Timeline(fps=10.0)
+def test_advance_uses_fps_and_smoothing_to_step_scene_frames():
+    """Round 30 changed what `fps` means: it is IMAGES per second, and
+    `smoothing` says how many images fill one source-frame interval. So half
+    a second at 10 images/s with 10 images per frame is half a frame."""
+    tl = timeline.Timeline(fps=10.0, smoothing=10)
     tl.set_track(1, 101)
     tl.advance(0.5)
-    assert tl.time == pytest.approx(5.0)
+    assert tl.time == pytest.approx(0.5)
+
+    plain = timeline.Timeline(fps=10.0, smoothing=1)   # no subdivision
+    plain.set_track(1, 101)
+    plain.advance(0.5)
+    assert plain.time == pytest.approx(5.0)
 
 
-def test_playhead_loops_over_the_whole_scene():
-    tl = timeline.Timeline()
+def test_playhead_loops_when_it_runs_off_the_end():
+    """Advancing wraps; SEEKING clamps. Dragging the playhead past a limit
+    should park on it, not teleport to the other end (round 30)."""
+    tl = timeline.Timeline(smoothing=1)
     tl.end = timeline.LOOP
     tl.set_track(1, 11)
-    assert tl.seek(10.0) == pytest.approx(0.0)
-    assert tl.seek(13.0) == pytest.approx(3.0)
+    assert tl.seek(10.0) == pytest.approx(10.0)
+    assert tl.seek(13.0) == pytest.approx(10.0)     # clamped, not wrapped
+    tl.seek(0.0)
+    assert tl.step_frames(10.0) == pytest.approx(0.0)
+    assert tl.step_frames(3.0) == pytest.approx(3.0)
 
 
 def test_sync_adds_and_drops_tracks_with_the_scene():

@@ -247,21 +247,61 @@ def _round_key(vec, places=3):
     return tuple(arr.tolist())
 
 
-def images_of(points, ops, keep_identity=False):
-    # type: (np.ndarray, list, bool) -> List[np.ndarray]
-    """Every symmetry image of a fractional point set — the "ghosts".
+def images_of(points, ops, keep_identity=False, lattice=True, tol=1e-4):
+    # type: (np.ndarray, list, bool, bool, float) -> List[np.ndarray]
+    """Every DISTINCT symmetry image of a fractional point set — the "ghosts".
 
     Showing where each copy of the asymmetric unit LANDS is often clearer
     than the formal glyphs: you see the pattern being built rather than the
     machinery that builds it.
+
+    Two things this has to get right, both of which rock salt gets wrong the
+    naive way:
+
+    * **Distinct images, not one per operator.** A 48-operator group maps a
+      site on a special position onto itself over and over; drawing one ghost
+      per operator stacks 47 identical skeletons on the original.
+    * **Lattice images.** In Pm-3m every operator maps Na(0,0,0)+Cl(½,½,½)
+      onto itself exactly, so after de-duplication there is nothing left and
+      the display goes blank — "ghost atoms don't work for NaCl at all".
+      The copies that actually exist there are the ones a lattice
+      translation away, so a point set touching the cell boundary also gets
+      its neighbouring-cell images. That is the same completion the drawn
+      unit cell does, and it is what makes the eight corner sodiums appear.
     """
     base = np.asarray(points, dtype=float).reshape(-1, 3)
+    wrapped = base - np.floor(base)
+    seen = [wrapped] if not keep_identity else []
     out = []
+
+    def add(candidate):
+        for other in seen:
+            if other.shape == candidate.shape and \
+                    np.allclose(other, candidate, atol=tol):
+                return
+        seen.append(candidate)
+        out.append(candidate)
+
     for op in ops:
         moved = op.apply(base)
-        moved = moved - np.floor(moved)
-        if not keep_identity and np.allclose(moved, base - np.floor(base),
-                                             atol=1e-9):
-            continue
-        out.append(moved)
+        add(moved - np.floor(moved))
+    if lattice:
+        # Which axes the SET as a whole sits against; only those give a
+        # neighbouring cell that still touches this one.
+        for image in [wrapped] + list(out):
+            options = []
+            for axis in range(3):
+                shifts = [0.0]
+                column = image[:, axis]
+                if np.any(np.abs(column) <= tol):
+                    shifts.append(1.0)
+                if np.any(np.abs(column - 1.0) <= tol):
+                    shifts.append(-1.0)
+                options.append(shifts)
+            for da in options[0]:
+                for db in options[1]:
+                    for dc in options[2]:
+                        if da == 0.0 and db == 0.0 and dc == 0.0:
+                            continue
+                        add(image + np.array([da, db, dc]))
     return out

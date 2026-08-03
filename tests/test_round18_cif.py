@@ -138,12 +138,25 @@ def test_parse_nacl():
 
 
 def test_expansion_applies_every_operator():
+    """The CONTENT of the cell: 2 sites x 4 centrings, no boundary copies."""
     d = cif.parse_cif(NACL_CIF)
-    symbols, coords = cif.expand(d)
+    symbols, coords = cif.expand(d, boundary=False)
     assert len(symbols) == 8                      # 2 sites x 4 centrings
     assert symbols.count("Na") == 4
     assert symbols.count("Cl") == 4
     assert coords.shape == (8, 3)
+
+
+def test_the_drawn_cell_completes_its_boundary():
+    """What a crystallographer expects to SEE (round 32): rock salt is 14 Na
+    (8 corners + 6 face centres) around 13 Cl (12 edge midpoints + the body
+    centre). Drawing one corner atom and calling it a unit cell is what made
+    Christian's NaCl look nothing like Mercury's."""
+    d = cif.parse_cif(NACL_CIF)
+    symbols, coords = cif.expand(d)
+    assert symbols.count("Na") == 14
+    assert symbols.count("Cl") == 13
+    assert coords.shape == (27, 3)
 
 
 def test_expansion_drops_duplicates_on_special_positions():
@@ -152,7 +165,7 @@ def test_expansion_drops_duplicates_on_special_positions():
     d = cif.parse_cif(NACL_CIF)
     d.symops.append(cif.IDENTITY)                 # a redundant operator
     d.symops.append(cif.SymOp.from_xyz("x,y,z"))
-    symbols, coords = cif.expand(d)
+    symbols, coords = cif.expand(d, boundary=False)
     assert len(symbols) == 8                      # still 8, not 16
     # ...and nothing is on top of anything else.
     for i in range(len(coords)):
@@ -248,9 +261,9 @@ def test_build_view_modes():
     pack, coords = cif.build_view(d.cell, d.symbols, d.frac, symops,
                                   mode="packing", na=2, nb=2, nc=1)
     assert len(asym) == 2                 # the asymmetric unit as listed
-    assert len(cell_syms) == 8            # one full cell
-    assert len(pack) == 8 * 4             # 2 x 2 x 1 blocks of it
-    assert coords.shape == (32, 3)
+    assert len(cell_syms) == 27           # one full cell, boundary completed
+    assert len(pack) == 27 * 4            # 2 x 2 x 1 blocks of it
+    assert coords.shape == (27 * 4, 3)
 
 
 def test_rigid_from_reference_recovers_a_translation():
@@ -288,7 +301,7 @@ def test_read_structures_keeps_the_crystallography(tmp_path):
     records = io.read_structures(str(path))
     assert len(records) == 1
     atoms, meta = records[0]
-    assert len(atoms) == 8
+    assert len(atoms) == 27               # the drawn cell, boundary completed
     assert meta["source"] == "cif"
     assert meta["cell"]["a"] == pytest.approx(5.6402)
     assert meta["spacegroup"] == "F m -3 m"

@@ -34,6 +34,7 @@ are the translations and rotations and come out at ~0 cm-1; they are kept but
 flagged, since seeing them is occasionally how you spot a bad optimisation.
 """
 
+import math
 import re
 from typing import List, Optional
 
@@ -109,12 +110,50 @@ def parse_orca_frequencies(text, n_atoms=None):
         raise VibrationError(
             "the file has {} atoms but the structure has {}".format(
                 count, n_atoms))
+    intensities = _parse_ir_intensities(lines)
     modes = []
     for k, freq in enumerate(freqs):
         if k >= vectors.shape[1]:
             break
-        modes.append(Mode(k, freq, vectors[:, k].reshape(count, 3)))
+        modes.append(Mode(k, freq, vectors[:, k].reshape(count, 3),
+                          intensity=intensities.get(k)))
     return modes
+
+
+_IR_HEADER = "IR SPECTRUM"
+_IR_LINE = re.compile(
+    r"^\s*(\d+):\s+(-?\d+\.\d+)\s+(-?\d+\.\d+(?:[eE][-+]?\d+)?)"
+    r"\s+(-?\d+\.\d+(?:[eE][-+]?\d+)?)")
+
+
+def _parse_ir_intensities(lines):
+    # type: (list) -> dict
+    """Mode index -> IR intensity in km/mol, from ORCA's IR SPECTRUM table.
+
+    Optional on purpose: a Raman-only or a plain Hessian job has no such
+    block, and the modes are still perfectly usable — `Mode.intensity` is
+    None and anything ranking by intensity has to cope. The table only lists
+    the non-trivial modes, so the translations and rotations simply never
+    appear as keys.
+
+    The columns are `Mode: freq eps Int T**2 (TX TY TZ)`; the third number is
+    the one spectroscopists mean by "intensity". Later blocks win, as
+    everywhere else in this module.
+    """
+    out = {}
+    for start, line in enumerate(lines):
+        if _IR_HEADER not in line:
+            continue
+        found = {}
+        for row in lines[start + 1:]:
+            match = _IR_LINE.match(row)
+            if match:
+                found[int(match.group(1))] = float(match.group(4))
+            elif found and row.strip() and not row.strip().startswith("-"):
+                break
+        if found:
+            out = found
+    return out
 
 
 _GEOM_HEADER = "CARTESIAN COORDINATES (ANGSTROEM)"
@@ -210,7 +249,31 @@ def _parse_normal_modes(lines, n_modes):
     return matrix if seen_any else None
 
 
-def mode_frames(coords, mode, amplitude=0.6, n_frames=20):
+DEFAULT_PERIOD_FRAMES = 20      # a multiple of 4 — see period_frames()
+
+
+def period_frames(n):
+    # type: (float) -> int
+    """Snap a requested frames-per-period to a multiple of four.
+
+    A mode is sampled as `sin(2*pi*k/n)`, so the turning points of the
+    oscillation sit at k = n/4 and k = 3n/4. Unless n divides by four those
+    indices are not integers and **the extremes are never sampled** — with
+    n = 6 the animation only ever reaches 0.87 of the amplitude, so the
+    highest and lowest points of the chemical coordinate, which are exactly
+    what you are looking at a mode to see, get cut off. Christian's point,
+    2026-08-03: fine sampling hides it, but sampling should always include
+    the extremes rather than nearly reach them.
+
+    Rounding to the NEAREST multiple of four (not up) keeps the default of 20
+    untouched and never silently doubles anyone's frame count. Half-way cases
+    round up explicitly rather than through `round()`, whose banker's
+    rounding would send 10 down to 8 but 14 up to 16.
+    """
+    return max(int(math.floor(float(n) / 4.0 + 0.5)), 1) * 4
+
+
+def mode_frames(coords, mode, amplitude=0.6, n_frames=DEFAULT_PERIOD_FRAMES):
     # type: (np.ndarray, Mode, float, int) -> List[np.ndarray]
     """One full period of a mode as a list of coordinate frames.
 
@@ -218,6 +281,10 @@ def mode_frames(coords, mode, amplitude=0.6, n_frames=20):
     most, so the animation reads the same whether the eigenvector happened to
     be normalised or mass-weighted. A whole period (not half) means the loop
     joins seamlessly and the timeline can simply set the track to LOOP.
+
+    `n_frames` is snapped by `period_frames` so both turning points are
+    sampled exactly; the player's own smoothing then subdivides between these
+    frames, which is why a fairly small count still looks continuous.
     """
     base = np.asarray(coords, dtype=float).reshape(-1, 3)
     vector = np.asarray(mode.displacements, dtype=float).reshape(-1, 3)
@@ -227,9 +294,10 @@ def mode_frames(coords, mode, amplitude=0.6, n_frames=20):
                                                          len(base)))
     peak = float(np.max(np.linalg.norm(vector, axis=1)))
     scale = (float(amplitude) / peak) if peak > 1e-12 else 0.0
+    count = period_frames(n_frames)
     frames = []
-    for k in range(int(max(n_frames, 2))):
-        phase = 2.0 * np.pi * k / float(n_frames)
+    for k in range(count):
+        phase = 2.0 * np.pi * k / float(count)
         frames.append(base + vector * (scale * np.sin(phase)))
     return frames
 
@@ -238,3 +306,52 @@ def describe(modes, include_trivial=False):
     # type: (List[Mode], bool) -> List[str]
     return [m.label() for m in modes
             if include_trivial or not m.is_trivial]
+
+
+# --------------------------------------------------------- picking a mode
+SORT_FREQUENCY = "frequency"
+SORT_INTENSITY = "intensity"
+SORT_KEYS = (SORT_FREQUENCY, SORT_INTENSITY)
+
+
+def sort_modes(modes, key=SORT_FREQUENCY):
+    # type: (List[Mode], str) -> List[Mode]
+    """Order modes for the list.
+
+    By frequency it is the spectrum, ascending — the order ORCA prints and
+    the order you read a spectrum in. By intensity it is strongest FIRST,
+    because the question that ordering answers is "which bands would I
+    actually see", and that is a descending question.
+
+    Modes with no intensity (the translations and rotations, which ORCA
+    leaves out of the IR table, and every mode of a job that produced no IR
+    block at all) sort to the end rather than being dropped: the list must
+    still show everything it was given.
+    """
+    if key == SORT_INTENSITY:
+        return sorted(modes,
+                      key=lambda m: (m.intensity is None,
+                                     -(m.intensity or 0.0), m.wavenumber))
+    return sorted(modes, key=lambda m: (m.wavenumber, m.index))
+
+
+def filter_modes(modes, low=None, high=None, include_trivial=False):
+    # type: (List[Mode], Optional[float], Optional[float], bool) -> List[Mode]
+    """Modes inside a wavenumber window. Either bound may be None.
+
+    Bounds are inclusive and order-insensitive, so a half-typed range never
+    empties the list in a way that looks like a crash — typing "1" while
+    aiming for "1000" simply shows everything from 1 cm-1 up.
+    """
+    if low is not None and high is not None and low > high:
+        low, high = high, low
+    out = []
+    for m in modes:
+        if not include_trivial and m.is_trivial:
+            continue
+        if low is not None and m.wavenumber < float(low):
+            continue
+        if high is not None and m.wavenumber > float(high):
+            continue
+        out.append(m)
+    return out
