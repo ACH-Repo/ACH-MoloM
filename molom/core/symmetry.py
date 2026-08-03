@@ -247,30 +247,44 @@ def _round_key(vec, places=3):
     return tuple(arr.tolist())
 
 
-def images_of(points, ops, keep_identity=False, lattice=True, tol=1e-4):
-    # type: (np.ndarray, list, bool, bool, float) -> List[np.ndarray]
+def images_of(points, ops, keep_identity=False, lattice=True, tol=1e-4,
+              normalize=None):
+    # type: (np.ndarray, list, bool, bool, float, Optional[object]) -> List[np.ndarray]
     """Every DISTINCT symmetry image of a fractional point set — the "ghosts".
 
     Showing where each copy of the asymmetric unit LANDS is often clearer
     than the formal glyphs: you see the pattern being built rather than the
     machinery that builds it.
 
-    Two things this has to get right, both of which rock salt gets wrong the
-    naive way:
+    Three things this has to get right, and each of them is a real bug that
+    was reported from a screenshot:
 
     * **Distinct images, not one per operator.** A 48-operator group maps a
       site on a special position onto itself over and over; drawing one ghost
       per operator stacks 47 identical skeletons on the original.
-    * **Lattice images.** In Pm-3m every operator maps Na(0,0,0)+Cl(½,½,½)
+    * **Lattice images.** In Pm-3m every operator maps Na(0,0,0)+Cl(1/2,1/2,1/2)
       onto itself exactly, so after de-duplication there is nothing left and
       the display goes blank — "ghost atoms don't work for NaCl at all".
       The copies that actually exist there are the ones a lattice
       translation away, so a point set touching the cell boundary also gets
       its neighbouring-cell images. That is the same completion the drawn
       unit cell does, and it is what makes the eight corner sodiums appear.
+    * **WHOLE MOLECULES.** The default `normalize` puts every atom into
+      [0, 1) on its own, which shreds any image straddling a cell face: half
+      the molecule reappears on the far side, and since the ghost's bonds come
+      from a minimum-image adjacency the skeleton is then drawn with lines
+      stretching clear across the box, pointing the wrong way — Christian's
+      "the ghost atoms are glitched" report, and exactly the same mistake the
+      round-19 unit cell made with real atoms. Pass
+      `normalize=lambda f: cif.unwrap_molecules(symbols, f, cell)` to wrap by
+      MOLECULE instead. It stays a parameter rather than a hard import because
+      `symmetry` knows nothing about elements or covalent radii, and the
+      caller already has both.
     """
     base = np.asarray(points, dtype=float).reshape(-1, 3)
-    wrapped = base - np.floor(base)
+    wrap = normalize if normalize is not None else \
+        (lambda f: np.asarray(f, dtype=float) - np.floor(f))
+    wrapped = np.asarray(wrap(base), dtype=float)
     seen = [wrapped] if not keep_identity else []
     out = []
 
@@ -283,8 +297,7 @@ def images_of(points, ops, keep_identity=False, lattice=True, tol=1e-4):
         out.append(candidate)
 
     for op in ops:
-        moved = op.apply(base)
-        add(moved - np.floor(moved))
+        add(np.asarray(wrap(op.apply(base)), dtype=float))
     if lattice:
         # Which axes the SET as a whole sits against; only those give a
         # neighbouring cell that still touches this one.

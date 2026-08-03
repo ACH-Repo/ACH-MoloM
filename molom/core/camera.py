@@ -236,6 +236,60 @@ class Camera:
         self.orthographic = True
         self.auto_ortho = True
 
+    # ------------------------------------------------------------- flying
+    def forward(self):
+        # type: () -> np.ndarray
+        """Unit world vector the camera is looking along."""
+        return quat_to_mat3(self.rotation).T @ np.array([0.0, 0.0, -1.0])
+
+    def basis_rows(self):
+        # type: () -> np.ndarray
+        """World (right, up, forward) as ROWS — what `flight.thrust_world`
+        wants. Note `up` is the camera's own up, not world Z: pressing E on a
+        pitched-down view should rise relative to the screen, which is what
+        every flight control does."""
+        r = quat_to_mat3(self.rotation)
+        return np.vstack([r.T @ np.array([1.0, 0.0, 0.0]),
+                          r.T @ np.array([0.0, 1.0, 0.0]),
+                          r.T @ np.array([0.0, 0.0, -1.0])])
+
+    def fly_look(self, d_yaw, d_pitch, pitch_limit_deg=88.0):
+        # type: (float, float, float) -> None
+        """Mouse-look by radians: +d_yaw turns LEFT, +d_pitch looks UP.
+
+        Rebuilt from an explicit (azimuth, elevation) pair rather than
+        composed as a quaternion delta. Composition accumulates floating-point
+        roll over a long flight — tiny per step, but a fly session is thousands
+        of steps and the horizon visibly creeps. Going through the angles makes
+        "no roll" a property of the construction (up is always world Z) rather
+        than something that merely starts true. Pitch is clamped just short of
+        vertical; over the pole the horizon inverts, which reads as roll.
+        """
+        f = self.forward()
+        azimuth = float(np.arctan2(f[1], f[0])) + float(d_yaw)
+        elevation = float(np.arcsin(np.clip(f[2], -1.0, 1.0))) + float(d_pitch)
+        limit = np.radians(float(pitch_limit_deg))
+        elevation = float(np.clip(elevation, -limit, limit))
+        cos_e = np.cos(elevation)
+        new_f = np.array([cos_e * np.cos(azimuth), cos_e * np.sin(azimuth),
+                          np.sin(elevation)])
+        right = np.cross(new_f, np.array([0.0, 0.0, 1.0]))
+        norm = float(np.linalg.norm(right))
+        if norm < 1e-9:                      # cannot happen under the clamp
+            return
+        right /= norm
+        true_up = np.cross(right, new_f)
+        self.rotation = quat_from_mat3(np.vstack([right, true_up, -new_f]))
+        if self.auto_ortho:                  # same rule as orbiting
+            self.orthographic = False
+            self.auto_ortho = False
+
+    def fly_move(self, delta_world):
+        # type: (np.ndarray) -> None
+        """Translate the whole camera (eye AND orbit centre) — flying keeps
+        the pivot in front of you, as Blender's fly mode and UE5 both do."""
+        self.center = self.center + np.asarray(delta_world, dtype=float)
+
     def orbit(self, dq_view, pivot=None):
         """Apply a view-space rotation about an arbitrary world-space pivot,
         keeping the pivot's SCREEN position invariant: with R' = dq (x) R,

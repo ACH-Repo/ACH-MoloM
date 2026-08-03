@@ -18,7 +18,7 @@ parser here means no new runtime dependency and offline tests.
 
 import math
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -646,6 +646,37 @@ def fragments(symbols, frac, cell):
                     group.append(j)
                     stack.append(j)
         out.append(sorted(group))
+    return out
+
+
+def direct_pairs(symbols, frac, cell, pairs, slack=0.45):
+    # type: (list, np.ndarray, Cell, Sequence, float) -> List[tuple]
+    """Which of `pairs` are adjacent AT THESE COORDINATES, no minimum image.
+
+    The companion to `periodic_neighbours`: that one answers "are these two
+    bonded in the crystal", this one answers "may I draw a straight line
+    between them right here". They differ for exactly the pairs that meet
+    only across a cell face, and drawing those is what put lines clean across
+    the box in the symmetry ghosts. `unwrap_molecules` removes the problem for
+    any FINITE fragment; a periodic one cannot be unwrapped at all (see
+    `fragment_info`), so the drawing side still needs to be able to ask.
+    """
+    from . import elements
+    frac = np.asarray(frac, dtype=float).reshape(-1, 3)
+    pairs = [(int(i), int(j)) for i, j in pairs]
+    if not pairs:
+        return []
+    cart = frac @ cell.matrix()
+    radii = np.array([elements.radius_covalent(elements.atomic_number(s))
+                      for s in symbols], dtype=float)
+    radii[radii <= 0] = 2.0
+    out = []
+    for i, j in pairs:
+        if not (0 <= i < len(cart) and 0 <= j < len(cart)):
+            continue
+        d = float(np.linalg.norm(cart[i] - cart[j]))
+        if 0.32 < d < radii[i] + radii[j] + slack:
+            out.append((i, j))
     return out
 
 

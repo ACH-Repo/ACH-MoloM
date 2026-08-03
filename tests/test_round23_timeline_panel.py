@@ -229,11 +229,26 @@ def test_the_crystal_page_has_no_apply_button(crystal_win):
     assert not hasattr(crystal_win.crystal_page, "apply_button")
 
 
-def test_the_crystal_tab_greys_out_without_a_cell(crystal_win):
+def test_the_crystal_tab_stays_clickable_and_greys_its_controls(crystal_win):
+    """Round 34 replaces round 23's greyed TAB with greyed CONTROLS.
+
+    A greyed tab cannot explain why it is greyed (the round-30 lesson from the
+    vibrations page), and this one greyed itself on whatever molecule happened
+    to be active — so clicking a solvent molecule made the page you were
+    reading disappear. Christian asked for the ∿ treatment: always clickable,
+    with the page saying what to select.
+    """
     tab = crystal_win.properties.buttons["crystal"][0]
+    page = crystal_win.crystal_page
     crystal_win._sync_crystal_page()
     assert tab.isEnabled()
+    assert page.cell_radio.isEnabled()
+
     plain = [o for o in crystal_win.scene.objects if o.name == "plain"][0]
     crystal_win.active_id = plain.id
     crystal_win._sync_crystal_page()
-    assert not tab.isEnabled()
+    assert tab.isEnabled()                    # still reachable...
+    assert not page.cell_radio.isEnabled()    # ...but nothing is live
+    assert not page.sym_check.isEnabled()
+    assert not page.ghost_check.isEnabled()
+    assert "cif" in page.summary.text().lower()   # and it says what to do

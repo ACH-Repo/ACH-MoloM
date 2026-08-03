@@ -49,11 +49,59 @@ fields, click-to-type with safe arithmetic eval, location + Euler-XYZ),
 **align-largest-planar-part to XY/XZ/YZ** (RANSAC plane clustering,
 core/align.py).
 
-## VERSION 0.2.0 (2026-08-03) — the line under this session
+## VERSION 0.2.0 (2026-08-03) — the line under the previous session
+(Round 34 sits above it, unreleased.)
 Everything below shipped between 0.1.0 and 0.2.0: the PC/mouse input preset,
 the operator key table, CIF reading with symmetry, coordination polyhedra,
 meta atoms, the scene clock with a multi-track timeline, vibrational modes,
 per-element display control, and the symmetry modifier. 512 tests.
+
+Round 34 (2026-08-04, geometry editing + flight + Blender selection):
+**internal coordinates are editable at last** (`core/internal.py`) — the one
+operation a purely Cartesian editor cannot fake. Select 2/3/4 atoms and the
+right-click menu offers bond length / angle / dihedral; the molecule is SPLIT
+at the coordinate's last bond and the whole trailing fragment follows
+rigidly, so every other length and angle is preserved exactly. A ring bond
+has no clean split (pulling the two apart would have to break a second bond),
+so only the picked atom moves and the modal says so rather than silently
+deforming the ring. Sign conventions are pinned by round-trip tests against
+`core.measure`, not argued in a comment. Driven by `manipulate.ScalarState`,
+a one-degree-of-freedom modal sharing the numeric-entry half of the G/R
+mixin (`_NumericEntry`) — drag, scroll, or type; LMB/Enter set, RMB/Esc
+cancel. **The right mouse button now FLIES** (`core/flight.py`): hold it and
+WASD/QE thrust a world-space velocity with real acceleration, exponential
+drag and a speed cap, Shift boosts, Ctrl creeps, scroll sets cruising speed,
+and letting go COASTS. Velocity is world-space on purpose — turning does not
+re-aim your momentum, which is the difference between flying and driving a
+camera. **Shuttle mode was rewritten onto the same model**, which is what
+fixes Christian's "it moved in a choppy way": the old one moved a fixed step
+per key PRESS, i.e. at Qt's auto-repeat rhythm. **No roll anywhere**:
+`Camera.fly_look` rebuilds the rotation from an explicit azimuth/elevation
+pair rather than composing quaternion deltas (composition accumulates
+floating-point roll over the thousands of steps a flight takes), and pitch
+clamps short of vertical because over the pole the horizon inverts, which is
+indistinguishable from roll. Ctrl+scroll roll in the shuttle is GONE for the
+same reason. **Selection is Blender's orange outline** instead of Avogadro's
+translucent blue bubble — an inverted hull (enlarged copy, front faces
+culled, flat colour via a `uFlat` shader uniform) so only a rim survives the
+depth test; bonds with both ends selected are outlined too, which is what
+makes a selected fragment read as one object. Width tracks camera distance so
+it stays constant on screen. **Ghosts were being shredded by the cell
+boundary** — `images_of` wrapped each atom into [0,1) independently, so a
+copy straddling a face came back in two halves still bonded across the box;
+images are now wrapped by MOLECULE and their bonds re-tested in place
+(`cif.direct_pairs`), which also handles the periodic component that cannot
+be unwrapped at all. **The ❖ tab is always clickable** (the round-30 lesson,
+applied: a greyed tab cannot explain itself, and this one greyed on whichever
+molecule happened to be active), with the controls greying instead and the
+page saying what to select — and `_sync_all` now refreshes the properties
+pages, without which importing a .cif left the page still saying "no unit
+cell" about the crystal that had just become active. **The symmetry arrow
+worked exactly once**: `QToolButton.clicked` carries the button's checked
+state and the button is not checkable, so it passed False — "collapse" —
+every time; expanding also ticks the Symmetry elements box now, per
+Christian. New file `beta_testers.md`, whose headline is that .cif import is
+the least trustworthy part of the program. 679 tests.
 
 Round 33 (2026-08-03, cell display researched properly): the round-32
 boundary completion was HALF the convention and the missing half is what made
@@ -652,7 +700,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 595 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 679 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -735,6 +783,16 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
 - `core/elements.py::from_text` — resolves a SYMBOL or a full NAME in any
   case ("fe", "IRON"). Everything user-typed should go through this, not
   `atomic_number`, which truncates and would read "iron" as iodine.
+- `core/internal.py` — INTERNAL COORDINATES: split the molecule at a bond and
+  set a distance / angle / dihedral so the trailing fragment follows rigidly.
+  `moving_group` returns `(indices, blocked)`; `blocked` covers both a ring
+  and a non-bonded pair inside one fragment, where "which half is the far
+  half" has no answer and only the picked atom may move.
+- `core/flight.py` — the flight model behind right-mouse fly AND shuttle mode.
+  World-space velocity, thrust, exponential drag (stable at any dt), speed
+  cap, scene-size scaling. No roll: pitch is clamped short of vertical and
+  `Camera.fly_look` rebuilds from azimuth/elevation rather than composing
+  quaternion deltas, so roll cannot accumulate over a long flight.
 - `core/manipulate.py` — G/R modal math (`GrabState`/`RotateState` on a
   shared constraint mixin: global/local axis+plane cycling, Shift-precision
   increment scaling, numeric buffers; ray-plane / ray-line solvers; the
@@ -829,6 +887,44 @@ independent cross-check inside a single fixture.
   vector then spin so the backbone points outward.
 
 ## Hard-won gotchas (don't re-learn these)
+- **Qt delivers events to a widget WHILE IT IS BEING CONSTRUCTED, and
+  `MolViewport.event()` is overridden** (round 34). Creating the flight
+  QTimer with `self` as parent sends a ChildAdded, the override runs
+  `_keyboard_captured()` -> `modal_active()`, and that read `self._internal`
+  before `__init__` had assigned it. The AttributeError happens inside a C++
+  callback, so it does NOT surface as itself — the next PySide call failed
+  with `SystemError: <class 'QTimer'> returned NULL without setting an
+  exception`, which points nowhere near the cause and cost 133 test errors to
+  chase. Every attribute `event()` can reach now has a CLASS-level default on
+  `MolViewport` (`_fly`, `_internal`, `_grab`, `_rotate`, `_shuttle`,
+  `_align_wait`, `_origin_active`, `_draw_drag`). Add to that list, not just
+  to `__init__`, whenever a new modal state joins `modal_active()`.
+- **`isVisible()` is False for anything on a non-current QStackedWidget page**
+  (round 34). `CrystalPage._toggle_kinds` used `not isVisible()` to decide
+  which way to toggle, so whenever the ❖ tab was not the page on screen the
+  arrow expanded every time and never collapsed. Use `isHidden()` — the
+  widget's OWN flag — for any "am I currently expanded?" test. The same trap
+  applies to `isEnabled()`, which also folds in every ancestor.
+- **`QToolButton.clicked` passes the button's CHECKED state** (round 34), and
+  a non-checkable button therefore passes `False` forever. Connected straight
+  to a `toggle(force=None)` handler that reads its first positional argument,
+  it means "collapse" on every click. Symptom: the arrow works once (because
+  something else opened the group) and then appears dead — Christian's
+  "you have to untick and retick to get control over the arrow back". Swallow
+  the argument: `lambda _checked=False: self._toggle()`.
+- **A modal state that is not G or R must not reach `_paint_modal_guides`**
+  (round 34). It reads `state.axis`, which `ScalarState` does not have — and
+  because the call sits inside `paintGL`, Qt PRINTS the traceback and carries
+  on, so the app looks fine while the overlays silently stop drawing. Found
+  by a scripted GUI run, invisible to every logic test. Two lessons: guard
+  the call site AND use `getattr` inside, and **run the GUI smoke script when
+  touching paint paths** — the offscreen platform returns a null framebuffer,
+  so pixel checks need a real window.
+- **The properties pages describe the ACTIVE molecule, so they belong in
+  `_sync_all`** (round 34). They were only refreshed by an outliner click or
+  by toggling the dock, so importing a .cif left the ❖ page still saying "no
+  unit cell" about the crystal that had just become active — which reads as
+  "the page is greyed out even though a cif IS selected".
 - **QPainter resets GL state.** Overlays (hint, compass, rubber band, grab
   guide) use QPainter every frame now; `paintGL` re-asserts
   `GL_DEPTH_TEST`/`GL_MULTISAMPLE`/blend-off EVERY frame. Symptom was bonds

@@ -98,6 +98,9 @@ drag that *starts on an atom* draws instead (see the mode table above).
 | Align 2 selected atoms to the X / Y / Z axis (smallest turn; whole molecule rotates rigidly about the pair's midpoint) | — (F3/menu) | exactly 2 atoms of one molecule |
 | Flip last axis alignment (180° — for when the molecule ends up the wrong way around) | — (F3/menu) | an axis alignment was made |
 | **Align (selection-aware)** — see the table below | **A** | selection not empty |
+| **Geometry: set bond length** — drag or type an exact value; the whole trailing FRAGMENT follows, so every other length and angle is preserved. LMB/Enter set, RMB/Esc cancel | right-click over the selection, or F3 | exactly 2 atoms of one molecule |
+| **Geometry: set angle** — the vertex is the **middle atom in pick order**; the far fragment swings about it | right-click over the selection, or F3 | exactly 3 atoms of one molecule |
+| **Geometry: set dihedral** — the two inner atoms in pick order are the axis; the far fragment spins about it | right-click over the selection, or F3 | exactly 4 atoms of one molecule |
 | Add atom... | **Shift+A** | — |
 
 ### A — selection-aware align
@@ -569,6 +572,18 @@ glyphs off.
   recognisable as the same fragment moved. For "how does this fill the cell"
   this is usually the faster read.
 
+**Ghosts are wrapped by MOLECULE, not by atom** (round 34). Putting each atom
+of an image into [0,1) on its own shreds any copy straddling a cell face:
+half of it reappears on the opposite side, and because the ghost's bonds come
+from a minimum-image adjacency the two halves stay connected and get drawn
+with lines reaching clear across the box. That is the "ghost atoms are
+glitched — bonds where there shouldn't be any, facing the wrong way and way
+too long" report, and it is the round-19 real-atom bug one level up. Each
+image now goes through `cif.unwrap_molecules`, and its bonds are re-tested at
+its own coordinates (`cif.direct_pairs`) so a contact that only exists across
+a face is not drawn at all — which also covers a PERIODIC component, since
+that one cannot be made contiguous by any amount of unwrapping.
+
 **Order does not matter.** Each operation is applied independently to the
 asymmetric unit, so the result is its orbit — a set, which has no ordering.
 (Composition *is* order-dependent, since space groups are generally
@@ -662,7 +677,8 @@ needs RDKit position constraints and is the next refinement.
 | MMB drag | orbit | orbit |
 | Shift / Ctrl + MMB drag | pan / zoom | pan / zoom |
 | Alt + LMB drag | orbit | orbit (for mice with a stiff wheel-click) |
-| RMB drag | pan | pan |
+| **RMB hold** | **fly** (see below) | **fly** |
+| **RMB click over the selection** | context menu | context menu |
 | LMB drag | box select | box select |
 
 **Auto** decides per event: a precision trackpad reports pixel deltas, a
@@ -690,6 +706,46 @@ jump, which reads as a broken viewport (`core/input_map.py`).
 - Compass: hover lights the labels; click any ball for that axis view. The
   grid is procedurally infinite with a distance fade. The whole UI uses a
   dark Fusion palette (menus included).
+
+### Flying (hold the right mouse button) — round 34
+UE5's right-mouse fly. Hold RMB and:
+
+| Input | Effect |
+|---|---|
+| move the mouse | look — yaw + pitch, **never roll**; pitch stops just short of vertical (over the pole the horizon inverts, which is indistinguishable from roll) |
+| **W / S** | forward / back |
+| **A / D** | strafe left / right |
+| **Q / E** | down / up |
+| **Shift** | boost (3x) |
+| **Ctrl** | creep (0.25x) |
+| scroll | set the cruising speed |
+| release RMB | stop thrusting — you **coast** to a stop |
+
+It is a real little physics model (`core/flight.py`), not a step per
+keypress: thrust accelerates a world-space velocity, drag is exponential (so
+it is stable at any frame time), and speed is capped. Velocity is kept in
+WORLD space deliberately — turning does not re-aim the momentum you already
+have, so you keep drifting the way you were going while you look elsewhere,
+which is what makes it feel like flying rather than like a camera. Speeds
+scale with the scene size, so a 3 Å cell and a 300 Å framework fly the same.
+
+**Shuttle / pilot mode uses the identical model**, with the molecule as the
+airframe instead of the camera — so there is one place to tune the feel and
+the two cannot drift apart. The round-8 version moved a fixed step on every
+key PRESS, which delivered Qt's auto-repeat rhythm and read as choppy.
+
+**RMB no longer pans.** Pan is on Shift+MMB and Shift+scroll, on both
+devices. Hanging pan off a modified right-drag was rejected because every
+modifier that could carry it already means something *inside* flight.
+
+### Right-click menu (over the selection)
+A right-CLICK — pressed and released without moving or thrusting, with the
+cursor **on a selected atom** — opens a small at-the-cursor menu
+(`ui/choice_popup.py`, the same widget J uses) instead of flying. It lists
+only what applies: the geometry edit that fits the selection size (with its
+CURRENT value, so the menu doubles as a readout), plus Hide and Delete. The
+entries run the registered operators, so the menu, the hotkey and F3 can
+never disagree.
 
 ## Settings
 **Pointing device (auto / trackpad / mouse)**, rotation sensitivity,

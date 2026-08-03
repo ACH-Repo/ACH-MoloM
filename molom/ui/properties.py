@@ -487,7 +487,14 @@ class CrystalPage(QWidget):
         lay.insertWidget(3, sym_holder)
         lay.insertWidget(4, self._kind_holder)
         lay.insertWidget(5, self.ghost_check)
-        self.sym_arrow.clicked.connect(self._toggle_kinds)
+        # `clicked` carries the button's CHECKED state, and this button is not
+        # checkable — so connecting it straight to `_toggle_kinds` passed
+        # force=False every time and the arrow could only ever COLLAPSE. That
+        # is Christian's "you have to untick and retick to get control over
+        # the arrow expansion back": ticking the box was the only thing left
+        # that could open the group. Swallow the argument so a click toggles.
+        self.sym_arrow.clicked.connect(lambda _checked=False:
+                                       self._toggle_kinds())
         self.sym_check.toggled.connect(
             lambda on: self._toggle_kinds(on) if on else None)
         self._kind_holder.setVisible(False)
@@ -502,9 +509,25 @@ class CrystalPage(QWidget):
         self.set_cell(None)
 
     def _toggle_kinds(self, force=None):
-        show = (not self._kind_holder.isVisible()) if force is None             else bool(force)
+        """Expand/collapse the per-kind filters — and TICK the box on the way.
+
+        Opening the group is a statement of intent: you are about to choose
+        which elements to draw, which is meaningless while none of them are
+        drawn at all. Christian asked for exactly this ("clicking the arrow
+        should also immediately tick the Symmetry Elements checkbox"), and it
+        removes the two-click dance of tick-then-expand.
+        """
+        # `isHidden`, NOT `isVisible`: a widget on a QStackedWidget page that
+        # is not the current one reports isVisible() == False no matter what
+        # its own flag says. Toggling off that would mean the arrow expands
+        # every time and never collapses whenever the ❖ tab is not the one on
+        # screen — which is most of the time, since the page is reached from
+        # the outliner's "Advanced...". `isHidden` is the widget's OWN flag.
+        show = self._kind_holder.isHidden() if force is None else bool(force)
         self._kind_holder.setVisible(show)
         self.sym_arrow.setText("▾" if show else "▸")
+        if show and self.sym_check.isEnabled() and not self.sym_check.isChecked():
+            self.sym_check.setChecked(True)      # emits toggled -> app redraws
 
     def enabled_kinds(self):
         """Which symmetry element kinds the user wants drawn."""
@@ -527,8 +550,15 @@ class CrystalPage(QWidget):
         self.view_changed.emit(mode, self.na.value(), self.nb.value(),
                                self.nc.value())
 
-    def set_cell(self, cell, spacegroup="", n_asym=0, n_atoms=0, mode="cell"):
-        """Refresh from the active molecule; None disables the whole page."""
+    def set_cell(self, cell, spacegroup="", n_asym=0, n_atoms=0, mode="cell",
+                 name=""):
+        """Refresh from the active molecule.
+
+        `cell=None` greys every CONTROL but leaves the page itself readable —
+        the tab stays clickable (see `MainWindow._sync_crystal_page`), so this
+        text is what the user gets when they open it on the wrong molecule and
+        it has to say which molecule to pick instead.
+        """
         has = cell is not None
         for w in (self.asym_radio, self.cell_radio, self.pack_radio,
                   self.box_check, self.poly_check, self.sym_check,
@@ -537,7 +567,10 @@ class CrystalPage(QWidget):
         self._sync_pack_enabled()
         if not has:
             self.summary.setText(
-                "No unit cell.\nImport a .cif to use this page.")
+                "<b>{}</b> has no unit cell, so there is nothing to show "
+                "here.<br><br>Select a molecule imported from a <b>.cif</b> — "
+                "in the viewport or in the outliner — and these controls "
+                "become live.".format(name or "This molecule"))
             return
         self.summary.setText(
             "a = {:.4f}  b = {:.4f}  c = {:.4f} A\n"

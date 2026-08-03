@@ -112,7 +112,130 @@ def axis_screen_drag(axis_world, view_rot3, dx_px, dy_px):
     return float(np.dot(drag, t))
 
 
-class _ConstraintMixin:
+class _NumericEntry:
+    """The type-a-number half of a modal: buffer, precision flag, parsing.
+
+    Split out of `_ConstraintMixin` so the internal-coordinate modal
+    (`ScalarState`) can reuse it. That modal has no axis or plane to lock —
+    a bond length has exactly one degree of freedom — but "drag roughly, then
+    type 1.54 and press Enter" is the whole reason to have a modal at all, and
+    that part is identical.
+    """
+
+    def _init_numeric(self):
+        self.precision = False
+        self.precision_factor = 0.5
+        self.number = ""
+
+    def type_char(self, ch):
+        # type: (str) -> bool
+        if ch in "0123456789":
+            self.number += ch
+            return True
+        if ch == "." and "." not in self.number:
+            self.number += ch
+            return True
+        if ch == "-":
+            self.number = self.number[1:] if self.number.startswith("-") \
+                else "-" + self.number
+            return True
+        return False
+
+    def backspace(self):
+        self.number = self.number[:-1]
+
+    def numeric_value(self):
+        # type: () -> Optional[float]
+        t = self.number
+        if t in ("", "-", ".", "-."):
+            return None
+        try:
+            return float(t)
+        except ValueError:
+            return None
+
+    def set_precision(self, on):
+        # type: (bool) -> None
+        self.precision = bool(on)
+
+
+class ScalarState(_NumericEntry):
+    """One-number modal: drag left/right to change it, or type it exactly.
+
+    Backs the internal-coordinate edits (bond length, angle, dihedral). Those
+    have a single degree of freedom, so the axis/plane machinery of G and R
+    would be noise — but everything else about the interaction is the same
+    contract the user already knows: move to preview, type digits to be exact,
+    Shift to creep, click or Enter to confirm, right-click or Esc to cancel.
+
+    Horizontal drag only. A number has one dimension and the pointer has two,
+    so binding both would make the value depend on a wobble the user did not
+    intend; picking the axis that matches the mental image of "wider apart"
+    is what makes a bond stretch feel direct.
+    """
+
+    def __init__(self, start, sensitivity, minimum=None, maximum=None,
+                 unit="", label=""):
+        # type: (float, float, Optional[float], Optional[float], str, str) -> None
+        self._init_numeric()
+        self.precision_factor = 0.1
+        self.start = float(start)
+        self.sensitivity = float(sensitivity)
+        self.minimum = minimum
+        self.maximum = maximum
+        self.unit = unit
+        self.label = label
+        self._accum = 0.0
+        self._ref = None            # type: Optional[float]
+
+    def update_mouse(self, x_px):
+        # type: (float) -> None
+        """Accumulate a horizontal drag.
+
+        The value is integrated from per-event DELTAS rather than measured
+        from the press position, which is what lets Shift change the rate
+        mid-drag without the number jumping, and lets `reseed` handle cursor
+        wrapping by simply forgetting where the pointer was.
+        """
+        x = float(x_px)
+        if self._ref is None:
+            self._ref = x
+            return
+        rate = self.sensitivity * (self.precision_factor if self.precision
+                                   else 1.0)
+        self._accum += (x - self._ref) * rate
+        self._ref = x
+
+    def reseed(self):
+        """Pointer teleported (edge wrap): re-anchor without accumulating."""
+        self._ref = None
+
+    def add_delta(self, amount):
+        # type: (float) -> None
+        """Nudge by an absolute amount — the scroll wheel's route in."""
+        self._accum += float(amount)
+
+    def value(self):
+        # type: () -> float
+        typed = self.numeric_value()
+        v = float(typed) if typed is not None else self.start + self._accum
+        if self.minimum is not None:
+            v = max(v, self.minimum)
+        if self.maximum is not None:
+            v = min(v, self.maximum)
+        return v
+
+    def status_text(self):
+        # type: () -> str
+        if self.number:
+            body = "{} [{}] {}".format(self.label, self.number, self.unit)
+        else:
+            body = "{} {:.3f} {}".format(self.label, self.value(), self.unit)
+        was = "  (was {:.3f})".format(self.start)
+        return body.strip() + was
+
+
+class _ConstraintMixin(_NumericEntry):
     """Shared axis/plane lock cycling + numeric buffer for G and R."""
 
     def _init_constraints(self, frame):
@@ -122,9 +245,8 @@ class _ConstraintMixin:
         self.axis_local = False
         self.plane_excl = None      # type: Optional[int]
         self.plane_local = False
-        self.precision = False
+        self._init_numeric()
         self.precision_factor = 0.5
-        self.number = ""
 
     # --------------------------------------------------------------- cycling
     def set_axis(self, axis):
@@ -180,36 +302,8 @@ class _ConstraintMixin:
         return self._free_label()
 
     # --------------------------------------------------------------- numeric
-    def type_char(self, ch):
-        # type: (str) -> bool
-        if ch in "0123456789":
-            self.number += ch
-            return True
-        if ch == "." and "." not in self.number:
-            self.number += ch
-            return True
-        if ch == "-":
-            self.number = self.number[1:] if self.number.startswith("-") \
-                else "-" + self.number
-            return True
-        return False
-
-    def backspace(self):
-        self.number = self.number[:-1]
-
-    def numeric_value(self):
-        # type: () -> Optional[float]
-        t = self.number
-        if t in ("", "-", ".", "-."):
-            return None
-        try:
-            return float(t)
-        except ValueError:
-            return None
-
-    def set_precision(self, on):
-        # type: (bool) -> None
-        self.precision = bool(on)
+    # (type_char / backspace / numeric_value / set_precision come from
+    # _NumericEntry, shared with ScalarState.)
 
     def reseed(self):
         """Tell the next `update_mouse` to re-anchor WITHOUT accumulating.

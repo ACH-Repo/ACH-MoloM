@@ -22,7 +22,8 @@ from .. import __version__
 from ..core import align as align_mod
 from ..core import build as build_mod
 from ..core import modifiers as modifiers_mod
-from ..core import bonding, edits, input_map, io, measure, project, rotations
+from ..core import (bonding, edits, input_map, internal, io, measure, project,
+                    rotations)
 from ..core import cif as cif_mod
 from ..core import templates as tpl_mod
 from ..core import vibrations as vib_mod
@@ -143,6 +144,10 @@ class MainWindow(QMainWindow):
         self.viewport.on_new_molecule = self.new_empty_molecule
         self.viewport.on_toggle_mode = \
             lambda: self.viewport.toggle_mode(self.active_id)
+        # The right-click menu runs REGISTERED OPERATORS rather than its own
+        # copies of hide/delete, so the menu, the hotkey and F3 can never
+        # disagree about what an entry does or when it is allowed.
+        self.viewport.on_context_op = self.run_op
         self.viewport.set_atom_scale(
             float(self.settings.value("atom_scale", 0.9)))
         self.viewport.label_scale = float(
@@ -534,6 +539,31 @@ class MainWindow(QMainWindow):
         r("remove_bond", "Remove bond between 2 selected",
           lambda c: c.on_remove_bond(), enabled=two_same, category="Edit",
           shortcut="Shift+B (object mode)", key="Shift+B")
+
+        # Internal coordinates: the one operation a Cartesian editor cannot
+        # fake. Enabled strictly on the selection SIZE, so F3 shows exactly
+        # the one that applies — the same rule the right-click menu uses.
+        def _n_picks(n):
+            return lambda c: (c.viewport.internal_picks() is not None
+                              and len(c.viewport.internal_picks()[1]) == n)
+
+        r("set_bond_length", "Geometry: set bond length (2 atoms)",
+          lambda c: c.viewport.start_internal(internal.DISTANCE),
+          enabled=_n_picks(2), category="Edit",
+          shortcut="right-click over the selection",
+          aliases=("distance", "bond", "stretch", "length", "internal",
+                   "z-matrix", "zmatrix"))
+        r("set_angle", "Geometry: set angle (3 atoms, vertex = the middle one)",
+          lambda c: c.viewport.start_internal(internal.ANGLE),
+          enabled=_n_picks(3), category="Edit",
+          shortcut="right-click over the selection",
+          aliases=("valence", "bend", "internal", "z-matrix", "zmatrix"))
+        r("set_dihedral", "Geometry: set dihedral (4 atoms, in pick order)",
+          lambda c: c.viewport.start_internal(internal.DIHEDRAL),
+          enabled=_n_picks(4), category="Edit",
+          shortcut="right-click over the selection",
+          aliases=("torsion", "twist", "rotamer", "conformer", "internal",
+                   "z-matrix", "zmatrix"))
 
         r("fit", "Fit view to scene", lambda c: c.viewport.fit_view(),
           enabled=has_obj, category="View", shortcut="F", key="F")
@@ -2031,6 +2061,13 @@ class MainWindow(QMainWindow):
         self._sync_traj_bar()
         self._update_counts()
         self._sync_transform_panel()
+        # The properties pages describe the ACTIVE molecule, so they are as
+        # much a part of "the scene changed" as the outliner is. Without this
+        # they were only refreshed by an outliner click or by toggling the
+        # dock: importing a .cif left the ❖ page still saying "no unit cell"
+        # about the crystal that had just become active, which is precisely
+        # the "greyed out even though a cif IS selected" complaint.
+        self._sync_modifier_page()
 
     @staticmethod
     def _perceive_fresh(s):
@@ -3467,17 +3504,21 @@ class MainWindow(QMainWindow):
     def _sync_crystal_page(self):
         obj = self._active_obj()
         cell = self._active_cell()
-        # Grey the ❖ tab itself when there is no crystal to talk about, so
-        # the page cannot be opened onto nothing.
+        # The ❖ TAB is always clickable, like ∿ (round 30's lesson: a greyed
+        # tab cannot explain why it is greyed, and this one greys itself on
+        # whichever molecule happens to be active — so the page you were just
+        # reading vanishes when you click a solvent molecule). The CONTROLS
+        # inside grey out instead, and the page says what to select.
         tab = self.properties.buttons.get("crystal")
         if tab is not None:
-            tab[0].setEnabled(cell is not None)
+            tab[0].setEnabled(True)
             tab[0].setToolTip(
                 "Unit cell / crystal — {}".format(
                     obj.name if cell is not None
-                    else "the active molecule has no unit cell"))
+                    else "select a molecule imported from a .cif"))
         if obj is None or cell is None:
-            self.crystal_page.set_cell(None)
+            self.crystal_page.set_cell(None, name="" if obj is None
+                                       else obj.name)
             return
         meta = obj.structure.metadata
         self.crystal_page.set_cell(
