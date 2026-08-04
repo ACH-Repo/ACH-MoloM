@@ -3,17 +3,19 @@
 All thin: values in, values out; persistence and side effects stay in app.py.
 """
 
+import re
 from typing import Optional
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog,
                                QDialogButtonBox, QDoubleSpinBox, QFormLayout,
-                               QHBoxLayout, QLabel, QLineEdit, QListWidget,
-                               QListWidgetItem, QPushButton, QSlider,
-                               QSpinBox, QVBoxLayout)
+                               QFrame, QHBoxLayout, QLabel, QLineEdit,
+                               QListWidget, QListWidgetItem, QPushButton,
+                               QScrollArea, QSlider, QSpinBox, QVBoxLayout,
+                               QWidget)
 
-from ..core import input_map
+from ..core import flight, input_map
 from ..core import resolve as resolve_mod
 
 
@@ -25,10 +27,38 @@ class SettingsDialog(QDialog):
                  atom_scale=1.0, render_scale=2, render_subdiv=2,
                  input_preset=input_map.PRESET_AUTO, label_scale=1.0,
                  on_speed_change=None, on_atom_scale_change=None,
-                 on_label_scale_change=None):
+                 on_label_scale_change=None, flight_tuning=None,
+                 on_flight_change=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        form = QFormLayout(self)
+        # The page outgrew the screen once Flight arrived, so it scrolls — and
+        # a scrolling page needs a way to get somewhere without scrolling, so
+        # there is a filter box in the top right. `form` still holds every
+        # row, exactly as before; only its container changed.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        head = QHBoxLayout()
+        head.setContentsMargins(8, 8, 8, 0)
+        head.addStretch(1)
+        self.filter_edit = QLineEdit(self)
+        self.filter_edit.setPlaceholderText("Filter settings…")
+        self.filter_edit.setClearButtonEnabled(True)
+        self.filter_edit.setFixedWidth(190)
+        self.filter_edit.setToolTip(
+            "Show only the settings whose name or description matches")
+        self.filter_edit.textChanged.connect(self._apply_filter)
+        head.addWidget(self.filter_edit)
+        outer.addLayout(head)
+
+        self._scroll = QScrollArea(self)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        body = QWidget(self._scroll)
+        self._scroll.setWidget(body)
+        outer.addWidget(self._scroll, 1)
+        form = QFormLayout(body)
+        self._form = form
         self._on_speed_change = on_speed_change
 
         self.input_combo = QComboBox()
@@ -113,6 +143,73 @@ class SettingsDialog(QDialog):
         form.addRow("", QLabel("Windowed start anchors to the upper-right\n"
                                "corner of the screen."))
 
+        # ------------------------------------------------------- flight
+        # The 6DoF handling model is a matter of taste and of what you are
+        # flying THROUGH — a tight cell wants a different feel from a big
+        # framework — so the constants are exposed rather than baked in.
+        form.addRow(QLabel("<b>Flight (right-drag / double-right-click)</b>"))
+        self._on_flight_change = on_flight_change
+        tuning = dict(flight_tuning or {})
+        self._flight_sliders = {}
+        for key, label, lo, hi, default, tip in (
+                ("accel", "Acceleration", 10, 300, flight.DEFAULT_ACCEL,
+                 "Thrust, in A/s^2. Higher gets you moving sooner."),
+                ("damping", "Drag", 10, 200, flight.DEFAULT_DAMPING,
+                 "How quickly speed bleeds off while thrusting. Higher is "
+                 "less floaty and lowers your top speed."),
+                ("brake_factor", "Auto-brake", 100, 400,
+                 flight.DEFAULT_BRAKE_FACTOR,
+                 "Extra drag applied the moment every thrust key is "
+                 "released, as a multiple of Drag. 1.0 disables auto-braking "
+                 "and you coast; 1.5-2.0 is the arcade band."),
+                ("strafe_factor", "Strafe response", 50, 300,
+                 flight.DEFAULT_STRAFE_FACTOR,
+                 "Sideways and vertical acceleration relative to forward. "
+                 "1.0 makes strafing exactly as responsive as flying "
+                 "forward."),
+                ("roll_rate", "Roll rate", 50, 600, flight.DEFAULT_ROLL_RATE,
+                 "Q/E manual roll speed, in radians per second."),
+                ("bank_angle", "Auto-bank", 0, 150,
+                 flight.DEFAULT_BANK_ANGLE,
+                 "How far the ship rolls into a turn, in radians at full "
+                 "stick. The bank holds while the reticle is off centre and "
+                 "eases back to level when you bring it home. 0 disables "
+                 "automatic banking."),
+                ("aim_expo", "Aim expo", 100, 400,
+                 flight.DEFAULT_AIM_EXPO,
+                 "Steering response curve. 1.00 is linear; higher makes the "
+                 "reticle less sensitive near the middle so small "
+                 "corrections are gentle, while full deflection still gives "
+                 "the full turn rate."),
+                ("turn_rate", "Turn rate", 20, 400, 1.0,
+                 "Mouse-look sensitivity while flying. The response is "
+                 "strictly 1:1 with the mouse; this only scales it.")):
+            # Acceleration is in whole A/s^2 (default 60); everything else is
+            # a small multiplier held to 2 dp. Getting this wrong silently
+            # CLAMPS the slider — the readout showed 60.00 while the slider
+            # sat pinned at its maximum of 30.
+            scale = 1.0 if key == "accel" else \
+                10.0 if key == "damping" else 100.0
+            value = float(tuning.get(key, default))
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(int(lo), int(hi))
+            slider.setValue(int(round(value * scale)))
+            readout = QLabel("{:.2f}".format(value))
+            slider.valueChanged.connect(
+                lambda v, k=key, s=scale, r=readout:
+                self._flight_changed(k, v / s, r))
+            slider.setToolTip(tip)
+            readout.setToolTip(tip)
+            frow = QHBoxLayout()
+            frow.addWidget(slider, 1)
+            frow.addWidget(readout)
+            form.addRow(label + ":", frow)
+            self._flight_sliders[key] = (slider, scale)
+        form.addRow("", QLabel(
+            "W/A/S/D thrust and strafe, Space/Ctrl up-down, Q/E roll.\n"
+            "Shift boosts, Alt creeps. Roll applies only while flying and\n"
+            "levels out when you land."))
+
         form.addRow(QLabel("<b>Image export</b>"))
         self.render_scale_spin = QSpinBox()
         self.render_scale_spin.setRange(1, 8)
@@ -132,10 +229,18 @@ class SettingsDialog(QDialog):
         form.addRow("", QLabel("Renders exclude the grid, compass, labels\n"
                                "and gizmos, on a transparent background."))
 
+        # OK/Cancel stay OUTSIDE the scroll area — buttons you have to scroll
+        # to find are buttons people think are missing.
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        form.addRow(buttons)
+        brow = QHBoxLayout()
+        brow.setContentsMargins(8, 0, 8, 8)
+        brow.addWidget(buttons)
+        outer.addLayout(brow)
+
+        self._index_rows()
+        self.resize(560, min(760, self.sizeHint().height()))
 
     def _speed_changed(self, value):
         speed = value / 10.0
@@ -148,6 +253,105 @@ class SettingsDialog(QDialog):
         self.scale_label.setText("{:.2f}x".format(scale))
         if self._on_atom_scale_change:
             self._on_atom_scale_change(scale)
+
+    # ------------------------------------------------------ filter/search
+    def _row_text(self, row):
+        """Everything about a form row that is worth matching against.
+
+        Deliberately includes TOOLTIPS: the tooltip is where the real
+        explanation lives for most of these controls, so "brake" should find
+        Auto-brake even though the word only appears in its tooltip.
+        """
+        bits = []
+        for role in (QFormLayout.LabelRole, QFormLayout.FieldRole,
+                     QFormLayout.SpanningRole):
+            item = self._form.itemAt(row, role)
+            if item is None:
+                continue
+            widgets = []
+            if item.widget() is not None:
+                widgets.append(item.widget())
+            elif item.layout() is not None:
+                lay = item.layout()
+                widgets = [lay.itemAt(i).widget()
+                           for i in range(lay.count())
+                           if lay.itemAt(i).widget() is not None]
+            for w in widgets:
+                if hasattr(w, "text"):
+                    try:
+                        bits.append(w.text())
+                    except TypeError:       # e.g. QComboBox has no text()
+                        pass
+                if isinstance(w, QComboBox):
+                    bits.extend(w.itemText(i) for i in range(w.count()))
+                bits.append(w.toolTip())
+        return " ".join(b for b in bits if b).lower()
+
+    def _index_rows(self):
+        """Group each row with the explanatory rows that follow it.
+
+        A control and the small grey paragraph under it are two separate form
+        rows, so filtering row-by-row would strip every explanation from the
+        controls that survived. A row with an empty label belongs to the last
+        NAMED row; a `<b>header</b>` row starts a section and is shown only
+        when something inside it matches.
+        """
+        self._groups = []       # [(is_header, [row indices], searchable text)]
+        for row in range(self._form.rowCount()):
+            spanning = self._form.itemAt(row, QFormLayout.SpanningRole)
+            label = self._form.itemAt(row, QFormLayout.LabelRole)
+            text = self._row_text(row)
+            header = spanning is not None and "<b>" in text
+            named = label is not None and label.widget() is not None \
+                and bool(getattr(label.widget(), "text", lambda: "")())
+            if header or named or not self._groups:
+                self._groups.append([header, [row], text])
+            else:
+                self._groups[-1][1].append(row)
+                self._groups[-1][2] += " " + text
+
+    def _apply_filter(self, text):
+        # Match at WORD BOUNDARIES, not anywhere in the string: a plain
+        # substring search has "roll" pulling up the pointing-device row
+        # because its description mentions scrolling. Prefixes still work, so
+        # typing "acce" finds Acceleration.
+        terms = [re.compile(r"\b" + re.escape(t))
+                 for t in str(text).strip().lower().split() if t]
+        shown_since_header = False
+        header_index = None
+        header_matched = False
+        for index, (header, rows, haystack) in enumerate(self._groups):
+            if header:
+                # Decided once its contents have been judged; park it.
+                if header_index is not None:
+                    self._set_group_visible(header_index, shown_since_header)
+                header_index = index
+                # Matching the SECTION NAME reveals everything under it —
+                # typing "flight" should give you the flight settings, not an
+                # empty page with a heading you cannot act on.
+                header_matched = bool(terms) and all(
+                    t.search(haystack) for t in terms)
+                shown_since_header = header_matched
+                continue
+            match = header_matched or all(t.search(haystack) for t in terms)
+            shown_since_header = shown_since_header or match
+            self._set_group_visible(index, match)
+        if header_index is not None:
+            self._set_group_visible(header_index, shown_since_header)
+
+    def _set_group_visible(self, index, visible):
+        for row in self._groups[index][1]:
+            self._form.setRowVisible(row, bool(visible))
+
+    def _flight_changed(self, key, value, readout):
+        readout.setText("{:.2f}".format(value))
+        if self._on_flight_change:
+            self._on_flight_change(key, value)
+
+    def flight_tuning(self):
+        # type: () -> dict
+        return {k: s.value() / scale
+                for k, (s, scale) in self._flight_sliders.items()}
 
     def _label_scale_changed(self, value):
         scale = value / 100.0

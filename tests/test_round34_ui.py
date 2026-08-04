@@ -421,13 +421,19 @@ def test_holding_w_moves_the_camera_and_letting_go_coasts(win):
     assert not vp.flying()                                # and then stopped
 
 
-def test_flying_never_rolls_the_horizon(win):
+def test_unrolled_flying_never_tilts_the_horizon(win):
+    """Round 35 note: flight CAN roll now (Q/E, plus automatic banking), so
+    this pins the weaker but still important guarantee — with no roll and no
+    bank commanded, yaw and pitch alone can never tilt the horizon, however
+    long you fly. That is what stops floating-point roll creeping in."""
     from molom.core.camera import quat_to_mat3
     vp = win.viewport
     vp.start_fly()
+    vp._fly["model"].bank_angle = 0.0        # no automatic banking
     rng = np.random.RandomState(3)
     for _ in range(120):
-        vp._fly_look(float(rng.uniform(-60, 60)), float(rng.uniform(-60, 60)))
+        vp._fly_turn(float(rng.uniform(-0.2, 0.2)),
+                     float(rng.uniform(-0.2, 0.2)))
         # World Z must stay in the screen's vertical plane: its VIEW-space x
         # component is exactly the roll, and it has to be zero every time.
         world_z_in_view = quat_to_mat3(vp.camera.rotation) @ np.array(
@@ -440,7 +446,7 @@ def test_the_camera_cannot_be_flown_over_the_pole(win):
     vp = win.viewport
     vp.start_fly()
     for _ in range(80):
-        vp._fly_look(0.0, -400.0)           # keep pushing "up"
+        vp._fly_turn(0.0, 1.2)              # keep pushing "up"
     assert vp.camera.forward()[2] < 0.9999
     vp.stop_fly(coast=False)
 

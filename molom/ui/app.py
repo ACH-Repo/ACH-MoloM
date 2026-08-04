@@ -39,6 +39,7 @@ from ..core.undo import UndoStack
 from .choice_popup import ChoicePopup
 from .dialogs import (MetaAtomDialog, OperatorSearchDialog, ResolveNameDialog,
                       SettingsDialog)
+from .crystal_ribbon import CrystalRibbon
 from .optimize_panel import OptimizeDock, OptimizeWorker, TASK_SELECTION
 from . import properties as properties_mod
 from .properties import (CrystalPage, ModifierPage,
@@ -154,6 +155,13 @@ class MainWindow(QMainWindow):
             self.settings.value("label_scale", 1.0))
         self.viewport.adjust_h = self.settings.value(
             "adjust_hydrogens", "true") in (True, "true")
+        for key, attr in self._FLIGHT_KEYS.items():
+            stored = self.settings.value("flight_" + key, None)
+            if stored is not None:
+                try:
+                    setattr(self.viewport, attr, float(stored))
+                except (TypeError, ValueError):
+                    pass
 
         # ONE clock for the whole scene: every trajectory runs off this
         # playhead, so several can play together.
@@ -190,6 +198,8 @@ class MainWindow(QMainWindow):
         self.outliner.crystal_box_toggled.connect(
             lambda _oid, on: self._set_cell_box(on))
         self.outliner.crystal_poly_toggled.connect(self._on_crystal_poly)
+        self.outliner.crystal_exterior_toggled.connect(
+            self._on_crystal_exterior)
         self.outliner.crystal_advanced.connect(self._on_crystal_advanced)
         self.outliner.objects_selected.connect(
             self.viewport.select_whole_molecules)
@@ -213,6 +223,8 @@ class MainWindow(QMainWindow):
         self.vibration_page.load_requested.connect(self.on_load_frequencies)
         self.crystal_page = CrystalPage()
         self.crystal_page.view_changed.connect(self.on_crystal_view)
+        self.crystal_page.exterior_toggled.connect(
+            lambda on: self._on_crystal_exterior(self.active_id, on))
         self.crystal_page.box_toggled.connect(self._set_cell_box)
         self.crystal_page.poly_check.toggled.connect(
             lambda on: self._set_obj_flag("polyhedra", on))
@@ -275,6 +287,18 @@ class MainWindow(QMainWindow):
         self.toolbar.show()
         self.viewport.on_tool_changed = self._on_draw_tool_changed
         self.viewport.on_measure_changed = self._on_measure_changed
+
+        # VESTA's orientation strip, along the top of the viewport. It pops
+        # in only when the object in focus is a crystal (`_sync_crystal_
+        # ribbon`), so an ordinary molecule never loses the space to it.
+        self.crystal_ribbon = CrystalRibbon(self.viewport)
+        self.crystal_ribbon.move(8, 6)
+        self.crystal_ribbon.axis_view.connect(self._on_ribbon_axis)
+        self.crystal_ribbon.standard_view.connect(self._on_ribbon_standard)
+        self.crystal_ribbon.rotate_view.connect(self._on_ribbon_rotate)
+        self.crystal_ribbon.pan_view.connect(self._on_ribbon_pan)
+        self.crystal_ribbon.zoom_view.connect(self._on_ribbon_zoom)
+        self.crystal_ribbon.fit_view.connect(self._on_ribbon_fit)
 
         # Avogadro's element picker, floating just right of the tool column.
         # Edit mode only, and only with the draw tool OFF — see _sync_ptable.
@@ -879,6 +903,9 @@ class MainWindow(QMainWindow):
                 # Picking a crystal in the VIEWPORT must unlock its unit-cell
                 # page too — the pane was only re-synced from outliner clicks.
                 self._sync_modifier_page()
+                # ...and bring in the orientation ribbon, which is what
+                # "selected in the viewport, or any part of a cif" means.
+                self._sync_crystal_ribbon()
 
     def _on_edit_committed(self):
         # A grab that a duplicate started makes "duplicate + this offset" the
@@ -2068,6 +2095,7 @@ class MainWindow(QMainWindow):
         # about the crystal that had just become active, which is precisely
         # the "greyed out even though a cif IS selected" complaint.
         self._sync_modifier_page()
+        self._sync_crystal_ribbon()
 
     @staticmethod
     def _perceive_fresh(s):
@@ -2276,6 +2304,7 @@ class MainWindow(QMainWindow):
         # active molecule — without this the page kept describing whichever
         # object happened to be active when the dock was last opened.
         self._sync_modifier_page()
+        self._sync_crystal_ribbon()
 
     # -------------------------------------------------------- trajectory bar
     def _build_trajectory_bar(self):
@@ -3478,6 +3507,24 @@ class MainWindow(QMainWindow):
         self.viewport.update()
         self._sync_crystal_page()
 
+    def _on_crystal_exterior(self, obj_id, on):
+        """VESTA's boundary search, per crystal.
+
+        Stored in metadata and then re-run through `on_crystal_view`, because
+        the exterior atoms are part of building the view — bolting them on
+        afterwards would leave them behind the moment the asym/cell/packing
+        switch rebuilt the atom list.
+        """
+        obj = self.scene.get(obj_id)
+        if obj is None:
+            return
+        if obj_id != self.active_id:
+            self.active_id = obj_id
+            self.outliner.highlight(obj_id)
+        meta = obj.structure.metadata
+        meta["cell_exterior"] = 1 if on else 0
+        self.on_crystal_view(meta.get("cell_view", "cell"))
+
     def _on_crystal_advanced(self, obj_id):
         """"Advanced..." hands off to the unit-cell page, keeping the crystal
         you came from active so the page is unambiguous about its subject."""
@@ -3500,6 +3547,120 @@ class MainWindow(QMainWindow):
         self.viewport.update()
         self.statusBar().showMessage(
             "Unit cell box {}".format("on" if on else "off"), 3000)
+
+    # -------------------------------------------------- crystal ribbon
+    def _sync_crystal_ribbon(self):
+        """Show the orientation strip when the object in focus is a crystal.
+
+        "In focus" is the ACTIVE object, which viewport picking already sets
+        — so clicking any part of a `.cif` in 3D brings the strip in, which
+        is what Christian asked for ("when cif is selected, or any part of a
+        cif"), and clicking a solvent molecule takes it away again.
+        """
+        obj = self._active_obj()
+        cell = self._active_cell()
+        self.crystal_ribbon.set_crystal(cell, "" if obj is None else obj.name)
+        if cell is None:
+            self._restore_toolbar_position()
+            return
+        self.crystal_ribbon.adjustSize()
+        # Below the edit-mode header band when there is one: at y = 6 the
+        # strip would sit ON TOP of "EDIT | <name>", which reads as clipped
+        # text rather than as two widgets overlapping (the round-18 lesson).
+        top = 6 if self.viewport.mode != MODE_EDIT else _VIEWPORT_HEADER_H + 6
+        self.crystal_ribbon.move(8, top)
+        # Nudge the tool column down so the two never overlap.
+        self.toolbar.move(8, top + self.crystal_ribbon.height() + 6)
+
+    def _restore_toolbar_position(self):
+        self.toolbar.move(8, _VIEWPORT_HEADER_H + 8)
+
+    def _ribbon_cell(self):
+        """The active cell, or None with a status line saying so."""
+        cell = self._active_cell()
+        if cell is None:
+            self.statusBar().showMessage(
+                "Select a crystal (a molecule imported from a .cif)", 4000)
+        return cell
+
+    def _on_ribbon_axis(self, key):
+        from ..core import orient
+        cell = self._ribbon_cell()
+        if cell is None:
+            return
+        cam = self.viewport.camera
+        # Clicking the SAME axis again views it from the other side, which is
+        # what Mercury spends a second row of x−/x+ buttons on. One button
+        # that alternates costs no width and is one less thing to find.
+        flip = (key == getattr(self, "_last_axis_view", None)
+                and not getattr(self, "_last_axis_flip", False))
+        self._last_axis_view, self._last_axis_flip = key, flip
+        try:
+            basis = orient.look_along(cell, key, flip=flip)
+        except (ValueError, np.linalg.LinAlgError):
+            self.statusBar().showMessage(
+                "That cell has no usable {} axis".format(key), 4000)
+            return
+        cam.rotation = quat_from_mat3(basis)
+        # Axis views go orthographic and pop back on the next orbit, exactly
+        # as the compass balls already do — a projected cell axis is only
+        # honestly "down the axis" without perspective convergence.
+        cam.orthographic = True
+        cam.auto_ortho = True
+        # The up vector here is a CELL axis, which the world-Z-up turntable
+        # cannot represent — so the next orbit levels back to the ordinary
+        # viewport alignment rather than starting from a pose it has no way
+        # to express (Christian: "if I exit view down b, naturally return to
+        # the default alignment").
+        cam.auto_level = True
+        self.viewport.update()
+        self.statusBar().showMessage(
+            "View along {}{}{} — click again to view from the other side"
+            .format("−" if flip else "", key,
+                    " (reciprocal — normal to the planes)"
+                    if key.endswith("*") else ""), 5000)
+
+    def _on_ribbon_standard(self):
+        from ..core import orient
+        cell = self._ribbon_cell()
+        if cell is None:
+            return
+        cam = self.viewport.camera
+        try:
+            basis = orient.clinographic(cell)
+        except (ValueError, np.linalg.LinAlgError):
+            self.statusBar().showMessage("That cell is degenerate", 4000)
+            return
+        cam.rotation = quat_from_mat3(basis)
+        cam.orthographic = True          # crystal drawings are orthographic
+        cam.auto_ortho = True
+        self.viewport.update()
+        self.statusBar().showMessage(
+            "Standard orientation — clinographic oblique projection", 5000)
+
+    def _on_ribbon_rotate(self, d_deg_x, d_deg_y):
+        """Stepped turntable rotation. Converted to the pixel units
+        `Camera.rotate` speaks so there is only ONE orbit implementation —
+        including the no-roll construction, which a second path would have
+        to re-earn."""
+        cam = self.viewport.camera
+        per_deg = cam.PX_PER_REV / 360.0 / max(cam.rotate_speed, 1e-6)
+        cam.rotate(float(d_deg_x) * per_deg, float(d_deg_y) * per_deg)
+        self.viewport.update()
+
+    def _on_ribbon_pan(self, dx_px, dy_px):
+        vp = self.viewport
+        vp.camera.pan(float(dx_px), float(dy_px),
+                      max(vp.width(), 1), max(vp.height(), 1))
+        vp.update()
+
+    def _on_ribbon_zoom(self, percent):
+        from ..core import orient
+        self.viewport.camera.zoom(orient.zoom_steps_for_percent(percent))
+        self.viewport.update()
+
+    def _on_ribbon_fit(self):
+        self.viewport.fit_view()
 
     def _sync_crystal_page(self):
         obj = self._active_obj()
@@ -3525,7 +3686,8 @@ class MainWindow(QMainWindow):
             cell, spacegroup=meta.get("spacegroup", ""),
             n_asym=len(meta.get("asym_symbols") or ()),
             n_atoms=obj.structure.n_atoms,
-            mode=meta.get("cell_view", "cell"))
+            mode=meta.get("cell_view", "cell"),
+            exterior=int(meta.get("cell_exterior", 0)))
 
     def on_meta_atom(self):
         """Configure the meta atom (the periodic table's ✳ button, and F3).
@@ -3582,7 +3744,9 @@ class MainWindow(QMainWindow):
             mod.na, mod.nb, mod.nc = int(na), int(nb), int(nc)
         else:
             mod.na = mod.nb = mod.nc = 1
-        (obj.structure.metadata or {})["cell_view"] = mode
+        meta = obj.structure.metadata or {}
+        mod.exterior = int(meta.get("cell_exterior", 0))
+        meta["cell_view"] = mode
         self._sync_modifier_page()
         self.viewport.refresh_geometry()
         self._update_counts()
@@ -3626,7 +3790,8 @@ class MainWindow(QMainWindow):
                   or ["x,y,z"]]
         symbols, coords = cif_mod.build_view(
             cell, asym_symbols, asym_frac, symops, mode=mode,
-            na=na, nb=nb, nc=nc)
+            na=na, nb=nb, nc=nc,
+            exterior=int(meta.get("cell_exterior", 0)))
         if not symbols:
             self.statusBar().showMessage("That view produced no atoms", 4000)
             return
@@ -3712,18 +3877,52 @@ class MainWindow(QMainWindow):
             on_speed_change=lambda v: setattr(self.viewport.camera,
                                               "rotate_speed", v),
             on_atom_scale_change=self.viewport.set_atom_scale,
-            on_label_scale_change=self._set_label_scale)
+            on_label_scale_change=self._set_label_scale,
+            flight_tuning=self._flight_tuning(),
+            on_flight_change=self._set_flight_tuning)
         old_speed = self.viewport.camera.rotate_speed
         old_scale = self.viewport.atom_scale
         old_labels = self.viewport.label_scale
+        old_flight = self._flight_tuning()
         self._settings_dlg = dlg
         dlg.setModal(False)
         dlg.finished.connect(
             lambda result: self._settings_closed(dlg, result, old_speed,
-                                                 old_scale, old_labels))
+                                                 old_scale, old_labels,
+                                                 old_flight))
         dlg.show()
 
-    def _settings_closed(self, dlg, result, old_speed, old_scale, old_labels):
+    #: Settings key <-> viewport attribute for the flight handling model.
+    _FLIGHT_KEYS = {"accel": "fly_accel", "damping": "fly_damping",
+                    "brake_factor": "fly_brake_factor",
+                    "strafe_factor": "fly_strafe_factor",
+                    "roll_rate": "fly_roll_rate", "turn_rate": "fly_turn_rate",
+                    "bank_angle": "fly_bank_angle",
+                    "aim_expo": "fly_aim_expo"}
+
+    def _flight_tuning(self):
+        # type: () -> dict
+        return {k: float(getattr(self.viewport, attr))
+                for k, attr in self._FLIGHT_KEYS.items()}
+
+    def _set_flight_tuning(self, key, value):
+        """Live-apply one flight constant, including to a flight IN PROGRESS
+        — the whole point of exposing them is judging the feel while flying,
+        which you cannot do if the change only lands on the next take-off."""
+        attr = self._FLIGHT_KEYS.get(key)
+        if attr is None:
+            return
+        setattr(self.viewport, attr, float(value))
+        fly = self.viewport._fly
+        if fly is None:
+            return
+        if key == "aim_expo":
+            fly["aim"].expo = max(float(value), 1.0)
+        elif key != "turn_rate":
+            setattr(fly["model"], key, float(value))
+
+    def _settings_closed(self, dlg, result, old_speed, old_scale, old_labels,
+                         old_flight=None):
         self._settings_dlg = None
         dlg.deleteLater()
         if result:
@@ -3750,10 +3949,15 @@ class MainWindow(QMainWindow):
             self.settings.setValue(
                 "start_maximized",
                 "true" if dlg.start_maximized() else "false")
+            for key, value in dlg.flight_tuning().items():
+                self._set_flight_tuning(key, value)
+                self.settings.setValue("flight_" + key, float(value))
         else:
             self.viewport.camera.rotate_speed = old_speed
             self.viewport.set_atom_scale(old_scale)
             self._set_label_scale(old_labels)
+            for key, value in (old_flight or {}).items():
+                self._set_flight_tuning(key, value)
 
     def _set_label_scale(self, scale):
         """Live-applies while the Settings slider moves."""

@@ -80,10 +80,11 @@ class CrystalControls(QWidget):
     view_changed = Signal(int, str)      # obj_id, mode
     box_toggled = Signal(int, bool)
     poly_toggled = Signal(int, bool)
+    exterior_toggled = Signal(int, bool)
     advanced = Signal(int)
 
     def __init__(self, obj_id, mode="cell", show_box=True, show_poly=False,
-                 parent=None):
+                 exterior=0, parent=None):
         super().__init__(parent)
         self.obj_id = int(obj_id)
         lay = QHBoxLayout(self)
@@ -133,8 +134,20 @@ class CrystalControls(QWidget):
         self.adv_button.clicked.connect(
             lambda: self.advanced.emit(self.obj_id))
 
+        self.ext_check = QCheckBox("Ext", self)
+        self.ext_check.setChecked(bool(exterior))
+        self.ext_check.setToolTip(
+            "Bonded atoms outside the cell — VESTA's boundary search. Draws "
+            "the atoms just beyond each face that are bonded to atoms "
+            "inside, so chains and frameworks run on instead of being cut "
+            "off at the wall. Adds atoms to the PICTURE only; the cell "
+            "content and Z are unchanged.")
+        self.ext_check.toggled.connect(
+            lambda v: None if self._loading
+            else self.exterior_toggled.emit(self.obj_id, bool(v)))
+
         for w in (self.box_check, self.poly_check, self.asym_check,
-                  self.full_check, self.adv_button):
+                  self.full_check, self.ext_check, self.adv_button):
             w.setStyleSheet("QCheckBox { spacing: 3px; }")
             lay.addWidget(w)
         lay.addStretch(1)
@@ -420,6 +433,7 @@ class OutlinerPanel(QWidget):
     crystal_view_changed = Signal(int, str)  # obj_id, 'asym' | 'cell'
     crystal_box_toggled = Signal(int, bool)
     crystal_poly_toggled = Signal(int, bool)
+    crystal_exterior_toggled = Signal(int, bool)
     crystal_advanced = Signal(int)           # open the unit-cell page
     objects_selected = Signal(list)          # every molecule row selected
 
@@ -575,10 +589,13 @@ class OutlinerPanel(QWidget):
             obj.id,
             mode=(obj.structure.metadata or {}).get("cell_view", "cell"),
             show_box=self.show_cell_box,
-            show_poly=bool((obj.structure.metadata or {}).get("polyhedra")))
+            show_poly=bool((obj.structure.metadata or {}).get("polyhedra")),
+            exterior=int((obj.structure.metadata or {}).get(
+                "cell_exterior", 0)))
         controls.view_changed.connect(self.crystal_view_changed)
         controls.box_toggled.connect(self.crystal_box_toggled)
         controls.poly_toggled.connect(self.crystal_poly_toggled)
+        controls.exterior_toggled.connect(self.crystal_exterior_toggled)
         controls.advanced.connect(self.crystal_advanced)
         # Spanned: these are wider than the name column.
         row.setFirstColumnSpanned(True)

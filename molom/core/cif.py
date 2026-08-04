@@ -406,8 +406,9 @@ def parse_cif(text):
 
 
 # -------------------------------------------------------------------- expansion
-def expand(data, tol=0.1, wrap=True, whole_molecules=True, boundary=True):
-    # type: (CifData, float, bool, bool, bool) -> Tuple[List[str], np.ndarray]
+def expand(data, tol=0.1, wrap=True, whole_molecules=True, boundary=True,
+           exterior=0):
+    # type: (CifData, float, bool, bool, bool, int) -> Tuple[List[str], np.ndarray]
     """Apply every symmetry op to every site -> (symbols, CARTESIAN coords).
 
     Copies that land on an existing atom (within `tol` Angstrom, measured
@@ -422,6 +423,12 @@ def expand(data, tol=0.1, wrap=True, whole_molecules=True, boundary=True):
     every equivalent corner, edge and face — see `boundary_images`. It is on
     by default because it is what every crystallography viewer draws, and
     without it rock salt shows a single sodium instead of eight corners.
+
+    `exterior` additionally carries out VESTA's boundary SEARCH for that many
+    shells — atoms beyond the box that are bonded to atoms inside it, so a
+    chain or a framework runs on instead of ending at the wall. Off by
+    default (Christian's call): it changes what an import looks like, and
+    nothing that counts cell content should ever see these atoms.
     """
     if data.n_sites == 0:
         return [], np.zeros((0, 3))
@@ -443,6 +450,10 @@ def expand(data, tol=0.1, wrap=True, whole_molecules=True, boundary=True):
     out = np.asarray(fracs)
     if wrap and whole_molecules:
         out = unwrap_molecules(symbols, out, data.cell)
+    # The boundary search runs on the CELL CONTENT, so capture it before the
+    # boundary copies go on the end — those are duplicates of atoms already
+    # present and would only have it search the same faces twice.
+    content_symbols, content_frac = list(symbols), out
     if wrap and boundary:
         groups = (fragment_info(symbols, out, data.cell) if whole_molecules
                   else None)
@@ -450,6 +461,12 @@ def expand(data, tol=0.1, wrap=True, whole_molecules=True, boundary=True):
         if extra_symbols:
             symbols = list(symbols) + extra_symbols
             out = np.vstack([out, extra_frac])
+    if wrap and int(exterior) > 0:
+        ext_symbols, ext_frac = bonded_exterior(
+            content_symbols, content_frac, data.cell, depth=int(exterior))
+        if ext_symbols:
+            symbols = list(symbols) + ext_symbols
+            out = np.vstack([out, ext_frac])
     return symbols, out @ matrix
 
 
@@ -752,6 +769,83 @@ def boundary_images(symbols, frac, groups=None, tol=1e-4):
     return out_symbols, np.asarray(out_frac)
 
 
+def bonded_exterior(symbols, frac, cell, depth=1, slack=0.45, tol=1e-3):
+    # type: (list, np.ndarray, Cell, int, float, float) -> Tuple[List[str], np.ndarray]
+    """Atoms OUTSIDE the cell that are bonded to atoms inside it.
+
+    This is VESTA's "search atoms bonded to atoms in the boundary", and it is
+    a different operation from `boundary_images`: that one repeats sites lying
+    exactly ON a face onto their equivalent faces, which completes the closed
+    box but adds nothing beyond it. A chain or a framework does not stop at
+    the face — it carries on into the next cell — so with the box alone the
+    picture is a set of stubs cut off at the boundary, with the bonds that
+    would explain them missing. Christian's side-by-side against VESTA is
+    exactly that: MoloM's chains ended at the wall, VESTA's ran on.
+
+    Each shell follows every bond that leaves the current set and materialises
+    the periodic image at the far end. `depth` shells are taken; one is enough
+    to close every bond that crosses a face, which is what makes the structure
+    read as continuous. Deeper is available because a framework's node can sit
+    a couple of bonds beyond the wall.
+
+    Returns the ADDED atoms, in fractional coordinates that deliberately lie
+    outside [0, 1) — that is the whole point of them. The cell CONTENT is
+    untouched, so anything counting Z must keep using `expand(boundary=False)`.
+    """
+    from . import elements
+    frac = np.asarray(frac, dtype=float).reshape(-1, 3)
+    n = len(symbols)
+    if n == 0 or int(depth) < 1:
+        return [], np.zeros((0, 3))
+    m = cell.matrix()
+    radii = np.array([elements.radius_covalent(elements.atomic_number(s))
+                      for s in symbols])
+    radii[radii <= 0] = 2.0
+    # The 27 neighbouring images; a bond can only ever reach an adjacent cell
+    # for any physical covalent radius against any physical cell edge.
+    shifts = np.array([[a, b, c] for a in (-1.0, 0.0, 1.0)
+                       for b in (-1.0, 0.0, 1.0) for c in (-1.0, 0.0, 1.0)])
+    # Keyed by (base site, integer image) so a copy reached from two different
+    # directions is added once. The base atoms are image (0,0,0) by
+    # construction — `frac` here is already the unwrapped cell content.
+    seen = set((i, 0, 0, 0) for i in range(n))
+    frontier = [(i, np.zeros(3)) for i in range(n)]
+    out_symbols = []          # type: List[str]
+    out_frac = []             # type: List[np.ndarray]
+    for _ in range(int(depth)):
+        nxt = []
+        for site, image in frontier:
+            here = frac[site] + image
+            # Every image of every base site, vectorised: (n, 27, 3).
+            deltas = (frac[:, None, :] + shifts[None, :, :]) - here[None, None, :]
+            dist = np.linalg.norm(deltas @ m, axis=2)
+            limit = (radii[:, None] + radii[site]) + slack
+            hits = np.argwhere((dist > 0.32) & (dist < limit))
+            for other, si in hits:
+                other = int(other)
+                new_image = image + shifts[si]
+                key = (other, int(round(new_image[0])),
+                       int(round(new_image[1])), int(round(new_image[2])))
+                if key in seen:
+                    continue
+                seen.add(key)
+                point = frac[other] + new_image
+                # Only atoms that actually left the box are "exterior"; an
+                # image landing back inside is a duplicate of something the
+                # cell already contains.
+                if np.all(point > -tol) and np.all(point < 1.0 + tol):
+                    continue
+                out_symbols.append(symbols[other])
+                out_frac.append(point)
+                nxt.append((other, new_image))
+        frontier = nxt
+        if not frontier:
+            break
+    if not out_frac:
+        return [], np.zeros((0, 3))
+    return out_symbols, np.asarray(out_frac)
+
+
 def rigid_from_reference(ref, cur):
     # type: (np.ndarray, np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]
     """Kabsch fit: the rotation+translation carrying `ref` onto `cur`.
@@ -798,18 +892,22 @@ def reference_sample(coords, limit=24):
 
 
 def build_view(cell, asym_symbols, asym_frac, symops, mode="cell",
-               na=1, nb=1, nc=1, tol=0.1):
-    # type: (Cell, list, list, list, str, int, int, int, float) -> Tuple[List[str], np.ndarray]
+               na=1, nb=1, nc=1, tol=0.1, exterior=0):
+    # type: (Cell, list, list, list, str, int, int, int, float, int) -> Tuple[List[str], np.ndarray]
     """The atoms for one crystal display mode, in CARTESIAN coordinates.
 
     - "asym"     the asymmetric unit exactly as the file lists it
     - "cell"     one full unit cell (every symmetry operator applied)
     - "packing"  an na x nb x nc block of full cells
+
+    `exterior` shells of VESTA-style bonded-outside-the-box atoms are added
+    to the cell and packing modes (never to "asym", which is by definition
+    the listed sites and nothing else).
     """
     data = CifData(cell, symops, asym_symbols, np.asarray(asym_frac, float))
     if mode == "asym":
         return list(data.symbols), data.frac @ cell.matrix()
-    symbols, coords = expand(data, tol=tol)
+    symbols, coords = expand(data, tol=tol, exterior=exterior)
     if mode != "packing":
         return symbols, coords
     offsets = supercell_offsets(cell, na, nb, nc)

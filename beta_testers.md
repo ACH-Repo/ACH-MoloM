@@ -21,6 +21,13 @@ Please throw structures at it, especially awkward ones, and tell me when the
 picture disagrees with Mercury, VESTA or Diamond. Known weak spots, roughly
 in order of how likely they are to bite:
 
+- **A file can simply be wrong, and MoloM will draw it faithfully.** One test
+  file here (an OpenBabel-converted `.cif`) has two atoms 0.75 Å apart, which
+  is not a distance chemistry allows — and **ASE reads exactly the same atoms
+  from it**, so the geometry really is broken in the file rather than in the
+  reader. If a structure looks impossible, it is worth opening it in a second
+  program before assuming MoloM mangled it. (Hydrogens are now capped at one
+  bond regardless, because an H with two sticks is never a useful picture.)
 - **Partial occupancies and disorder are read but IGNORED.** If a site is
   disordered, every alternative position is drawn at once, superimposed. It
   will look like atoms in impossible places, because they are. Fixing this
@@ -93,19 +100,52 @@ the rest.
 
 These landed in the current round and have had the least real-world use:
 
-- **The right mouse button now FLIES** (hold it, then WASD/QE, Shift to
-  boost). It used to pan. Pan moved to Shift+MMB and Shift+scroll — if that
-  costs you something important, say so and I will reconsider.
+- **The right mouse button FLIES**, and the controls are now full 6DoF:
+  **W/S** thrust, **A/D** strafe, **Space/Ctrl** up-down, **Q/E** roll,
+  Shift boosts, **Alt** creeps. Hold the button to fly for a moment, or
+  **double-click it to latch** — then a single right click or Esc lands you.
+  Letting go of the keys auto-brakes rather than drifting. Pan is on
+  Shift+MMB and Shift+scroll; if losing right-drag pan costs you something
+  important, say so.
+  **Steering is a virtual stick, not a mouse drag.** The mouse moves a
+  reticle; wherever you leave it, the ship keeps turning that way until you
+  bring it back to the middle. The ship banks into the turn automatically and
+  levels when the reticle comes home. The pointer is hidden and captured
+  while flying, so you can sweep as far as you like without hitting an edge.
+  The whole feel is tunable under **App > Settings > Flight**, live, even
+  while you are flying — if it is wrong for your hardware, that is the first
+  place to look, and I would like to know what you ended up with.
 - **A right CLICK over the selection opens a context menu** with bond
   length / angle / dihedral editing. Select 2, 3 or 4 atoms **in the order
   that defines the coordinate** (the middle atom of an angle is the vertex;
   the two inner atoms of a torsion are the axis), then right-click one of
-  them. The rest of the molecule follows the change rigidly.
-- **Selection is now an orange outline** instead of a translucent blue
-  bubble.
+  them. The rest of the molecule follows the change rigidly. Note the menu
+  now waits one double-click interval before appearing, so that a double
+  right-click can mean "fly" instead — that pause is deliberate.
+- **Selection is an orange outline** instead of a translucent blue bubble,
+  and it is much thinner than it was a round ago.
+- **Crystals get a VESTA-style orientation ribbon** along the top of the
+  viewport whenever one is selected: view down a, b, c or the reciprocal
+  a\*, b\*, c\*, drop into the standard clinographic projection, and
+  rotate/pan/zoom in fixed steps. The reciprocal axes are genuinely
+  different directions from the direct ones in a non-orthogonal cell — if
+  they ever look identical to you in a monoclinic or triclinic structure,
+  that is a bug worth reporting.
+- **"Ext" on a crystal's outliner row** draws bonded atoms just outside the
+  cell, so chains and frameworks run on instead of being cut off at the
+  faces. It is **off by default**. This partly addresses the "bonds across
+  cell faces" limitation listed above — the atoms and their bonds are now
+  drawn, though the perception behind them is still non-periodic.
 - **Ghost images of the asymmetric unit** were being torn apart at cell
   faces; that is fixed, but it is exactly the kind of fix that can be right
   on the structures I have and wrong on yours.
+
+There is also a **screen flicker** I have had one report of, on a desktop
+machine but never on the laptop. I found and fixed a genuine bug that would
+produce exactly that symptom — the selection outline could be drawn in place
+of the molecule for a single frame — but I could not reproduce the flicker
+itself, so I cannot promise it is gone. **If you still see flickering, please
+say so**, and mention your GPU: that is the variable I could not test.
 
 ## Reporting
 

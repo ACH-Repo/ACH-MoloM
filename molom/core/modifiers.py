@@ -101,11 +101,14 @@ class SymmetryModifier(Modifier):
     kind = "symmetry"
 
     def __init__(self, cell=None, symops=None, na=1, nb=1, nc=1,
-                 name="", enabled=True, origin=None):
+                 name="", enabled=True, origin=None, exterior=0):
         super().__init__(name or "Symmetry", enabled)
         self.cell = cell                 # dict, as stored in metadata
         self.symops = list(symops or [])
         self.na, self.nb, self.nc = int(na), int(nb), int(nc)
+        #: Shells of VESTA-style bonded-outside-the-cell atoms. 0 = off, the
+        #: default, so an existing structure never changes under you.
+        self.exterior = int(exterior)
         # WHERE the cell sits in world space. A CIF's cell starts at the
         # world origin and its atoms are already placed against it, so this
         # is zero there. It matters for a hand-built cell: a molecule sitting
@@ -128,7 +131,7 @@ class SymmetryModifier(Modifier):
         out_symbols, out_coords = cif_mod.build_view(
             cell, list(symbols), frac, ops,
             mode="packing" if max(self.na, self.nb, self.nc) > 1 else "cell",
-            na=self.na, nb=self.nb, nc=self.nc)
+            na=self.na, nb=self.nb, nc=self.nc, exterior=self.exterior)
         if not out_symbols:
             return symbols, coords, bonds
         # Bonds are NOT carried: the copies are new atoms whose connectivity
@@ -140,6 +143,7 @@ class SymmetryModifier(Modifier):
         d = super().to_dict()
         d.update({"cell": self.cell, "symops": list(self.symops),
                   "na": self.na, "nb": self.nb, "nc": self.nc,
+                  "exterior": int(self.exterior),
                   "origin": [float(v) for v in self.origin]})
         return d
 
@@ -161,7 +165,8 @@ def from_dict(d):
                                 d.get("na", 1), d.get("nb", 1),
                                 d.get("nc", 1), d.get("name", ""),
                                 d.get("enabled", True),
-                                d.get("origin"))
+                                d.get("origin"),
+                                d.get("exterior", 0))
     return None
 
 

@@ -393,6 +393,7 @@ class CrystalPage(QWidget):
     view_changed = Signal(str, int, int, int)   # mode, na, nb, nc
     box_toggled = Signal(bool)
     poly_toggled = Signal(bool)
+    exterior_toggled = Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -431,6 +432,20 @@ class CrystalPage(QWidget):
         row.addStretch(1)
         lay.addLayout(row)
         self._pack_row = row
+
+        # VESTA's boundary search. Sits under Contents because that is what
+        # it changes — what is DRAWN, not the cell itself.
+        self.ext_check = QCheckBox("Bonded atoms outside the cell")
+        self.ext_check.setToolTip(
+            "Draw the atoms just beyond each face that are bonded to atoms "
+            "inside the cell, so chains and frameworks run on instead of "
+            "being cut off at the boundary (VESTA does this by default). "
+            "The cell content is unchanged — these are extra atoms in the "
+            "picture only.")
+        self.ext_check.toggled.connect(
+            lambda v: None if self._loading
+            else self.exterior_toggled.emit(bool(v)))
+        lay.addWidget(self.ext_check)
         self._loading = False
 
         lay.addStretch(1)
@@ -551,7 +566,7 @@ class CrystalPage(QWidget):
                                self.nc.value())
 
     def set_cell(self, cell, spacegroup="", n_asym=0, n_atoms=0, mode="cell",
-                 name=""):
+                 name="", exterior=0):
         """Refresh from the active molecule.
 
         `cell=None` greys every CONTROL but leaves the page itself readable —
@@ -562,9 +577,15 @@ class CrystalPage(QWidget):
         has = cell is not None
         for w in (self.asym_radio, self.cell_radio, self.pack_radio,
                   self.box_check, self.poly_check, self.sym_check,
-                  self.ghost_check, self._kind_holder):
+                  self.ghost_check, self._kind_holder, self.ext_check):
             w.setEnabled(has)
         self._sync_pack_enabled()
+        # Guarded: writing a widget from sync fires its own valueChanged,
+        # which the app would read back as "the user asked for this" — the
+        # round-30 TimelinePanel bug in a different costume.
+        self._loading = True
+        self.ext_check.setChecked(bool(exterior))
+        self._loading = False
         if not has:
             self.summary.setText(
                 "<b>{}</b> has no unit cell, so there is nothing to show "

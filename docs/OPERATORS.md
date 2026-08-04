@@ -176,7 +176,7 @@ change only via the explicit operators above, the bond keys, or edit mode.
 |---|---|---|
 | Fit view — frames the **selection** when there is one, otherwise the whole scene | F / Home | scene not empty |
 | **Local view** — isolate the selected molecules and frame them; press again to restore what was visible | **/** | scene not empty |
-| **Shuttle mode** — UE5-style pilot for a whole molecule: the camera snaps into the molecule's origin and you fly it like a ship. **W/S** forward/back, **A/D** strafe, **Q/E** down/up, **scroll** steers (yaw + pitch), **Ctrl+scroll / pinch** rolls, **Esc** lands and keeps the new position (the camera returns to where it was). Geometry too close to the cockpit is hidden so it cannot clip. F3 only, deliberately no hotkey | — (F3) | active molecule exists |
+| **Shuttle mode** — UE5-style pilot for a whole molecule: the camera snaps into the molecule's origin and you fly it like a ship, on the same 6DoF model as right-mouse flight. **W/S** thrust, **A/D** strafe, **Space/Ctrl** up/down, **Q/E** roll, **scroll** steers (yaw + pitch), **Esc** lands and keeps the new position (the camera returns to where it was). Geometry too close to the cockpit is hidden so it cannot clip. F3 only, deliberately no hotkey | — (F3) | active molecule exists |
 | Toggle perspective / orthographic | **Shift+O** | — |
 | View along +X/−X/+Y/−Y/+Z/−Z | compass ball click, or F3/menu — switches to ortho, next orbit pops back to perspective (Blender auto-persp). Compass hover: letters glow white; negative balls are full-size and show their −X/−Y/−Z labels | — |
 | Force field: optimize geometry (panel) | Ctrl+R | — |
@@ -336,6 +336,65 @@ with no symmetry listed is treated as P1.
 The **unit cell box** draws as a viewport overlay — 12 clipped edges, with
 a/b/c from the origin corner in the axis colours (red/green/blue), the same
 convention as the compass. Toggle it from F3 ("Show unit cell box").
+
+### The orientation ribbon (round 35)
+Selecting a crystal — in the outliner, or any part of it **in the viewport** —
+pops a VESTA-style strip in along the top of the viewport. It hides again the
+moment a non-crystal is in focus, so an ordinary molecule never loses the
+space. Every button is a camera move; the maths is in `core/orient.py`.
+
+| Group | Buttons | What it does |
+|---|---|---|
+| axis views | **a b c a\* b\* c\*** | view along a direct or reciprocal cell axis — the axis points **at you**. Click the same button again to view from the other side. Switches to ortho, next orbit pops back |
+| standard | **◈** | the standard orientation of the crystal shape — the classical clinographic oblique projection (c vertical, turned arctan⅓ ≈ 18.4° and tipped arctan⅙ ≈ 9.5°) |
+| rotate | **↺ ↻ ⤴ ⤵** + `Step (°)` | turntable rotation by that many degrees per click |
+| pan | **⬅ ➡ ⬆ ⬇** + `Step (px)` | pan by that many pixels per click |
+| zoom | **+ − ⤢** + `Step (%)` | zoom by that percentage per click, plus fit |
+
+**The direct and reciprocal axes are different directions** in anything less
+symmetric than an orthorhombic cell — in the monoclinic β = 115° case a and a\*
+are 25° apart — which is exactly why VESTA offers both, and why `axis_vector`
+takes the reciprocal ones from the **inverse transpose** of the cell matrix. A
+plane normal is covariant; transporting it with the direct matrix is the same
+error as the round-26 mirror-plane bug, which came out 62° wrong.
+
+There is deliberately **no in-plane rotation button**: the camera is a
+turntable and a level horizon is an invariant the rest of the app depends on.
+Roll lives in flight mode, where it is explicit and zeroes on landing.
+
+**Which way round are the axes?** Two conventions have to be stated because
+programs genuinely differ and there is no universal answer:
+
+* **the chosen axis points INTO the screen** and the cell origin sits
+  top-left, as it does in Mercury;
+* **the other two are cyclic**: for axis *k*, the next axis goes RIGHT and the
+  one after it goes DOWN. So the **b** view has **c** across the top and
+  **a** running down the left edge.
+
+**Orbiting out of an axis view re-levels the viewport.** The up vector here is
+a cell axis, which the world-Z-up turntable has no way to express, so the
+first orbit restores the ordinary alignment before turning — the same contract
+`auto_ortho` has with perspective.
+
+Crystallographic axes themselves are conventionally **right-handed**
+(a × b · c > 0) and the origin sits at a cell corner; nothing is "flipped".
+What differs between viewers is purely presentational — which corner lands
+top-left, and whether +c is drawn up or down the page. That is why the axis
+buttons here alternate sides on a repeat click instead of asserting that one
+of them is correct.
+
+### Bonded atoms outside the cell (round 35)
+VESTA's *boundary search*, on the crystal's outliner row (**Ext**) and on the
+❖ page. It draws the atoms just beyond each face that are **bonded** to atoms
+inside, so a chain or a framework runs on instead of ending flat at the wall —
+which is what Christian's side-by-side against VESTA showed MoloM doing.
+
+This is a different operation from round 32's boundary completion: that
+repeats sites lying exactly ON a face onto their equivalent faces, and a bond
+crossing a face has nothing on the face to repeat. **Off by default**, so no
+existing structure changes on import. The cell CONTENT is untouched — anything
+counting Z keeps using `expand(boundary=False)`, and the exterior atoms are
+never part of it.
 
 **Molecules are kept whole.** Wrapping each atom into the cell on its own
 strands hydrogens on the far face; each bonded fragment is instead walked
@@ -707,19 +766,27 @@ jump, which reads as a broken viewport (`core/input_map.py`).
   grid is procedurally infinite with a distance fade. The whole UI uses a
   dark Fusion palette (menus included).
 
-### Flying (hold the right mouse button) — round 34
-UE5's right-mouse fly. Hold RMB and:
+### Flying — 6DoF arcade controls, round 35
+Everspace-style handling. **Hold RMB** to fly for a moment, or **double-click
+RMB to LATCH** it — then both hands are free and a **single right click or
+Esc** lands you.
 
 | Input | Effect |
 |---|---|
-| move the mouse | look — yaw + pitch, **never roll**; pitch stops just short of vertical (over the pole the horizon inverts, which is indistinguishable from roll) |
-| **W / S** | forward / back |
+| move the mouse | move the AIM RETICLE. It stays where you put it, and the ship keeps turning toward it until you bring it back to the middle — a virtual stick, not a delta. Pitch stops just short of vertical |
+| **W / S** | thrust forward / back |
 | **A / D** | strafe left / right |
-| **Q / E** | down / up |
+| **Space / Ctrl** | rise / descend |
+| **Q / E** | **roll** left / right |
 | **Shift** | boost (3x) |
-| **Ctrl** | creep (0.25x) |
+| **Alt** | creep (0.25x) |
 | scroll | set the cruising speed |
-| release RMB | stop thrusting — you **coast** to a stop |
+| release the keys | **auto-brake** — drag jumps to 1.8x, so you stop where you meant to |
+| turning | the ship **banks into the turn** automatically, holds the bank while the reticle is out, and levels when it comes home |
+
+Changes from round 34: Q/E gave up vertical thrust to **roll** and Space/Ctrl
+took it over; **creep moved from Ctrl to Alt**, because a key that both moves
+you and quarters your speed is unusable.
 
 It is a real little physics model (`core/flight.py`), not a step per
 keypress: thrust accelerates a world-space velocity, drag is exponential (so
@@ -729,10 +796,52 @@ have, so you keep drifting the way you were going while you look elsewhere,
 which is what makes it feel like flying rather than like a camera. Speeds
 scale with the scene size, so a 3 Å cell and a 300 Å framework fly the same.
 
+**Strafe primacy**: lateral and vertical acceleration match forward exactly,
+so sidestepping is a primary way to move rather than a nudge. The per-axis
+factors are applied to the ACCELERATION, not to the key vector — `thrust_world`
+normalises, so a weighting folded into the components would be divided
+straight back out.
+
+**Inertial dampening**: the drag coefficient is `damping` while a key is held
+and `damping * brake_factor` the moment they all come up. One symmetric
+coefficient cannot be both low enough to build speed against and high enough
+to park.
+
+**The reticle is a virtual stick.** The hull mark sits dead centre (where the
+nose points); the second mark is where you have pointed, drawn inside a faint
+ring showing its travel limit. Its offset is a sustained turn RATE, so the
+ship keeps coming round for as long as the mark is out there — it does not
+decay, and the turn does not stop just because you stopped moving the mouse.
+Bringing it back to the middle is what stops the turn.
+
+**The pointer is captured, not wrapped.** While flying it is hidden and held
+at the viewport centre, with each delta taken against that anchor. You can
+sweep as far as you like in any direction; there is no edge to hit, so nothing
+is interrupted by running into the properties dock or the top of the window.
+
+**Turning does not move you.** The camera is an orbit rig, so rotating it
+alone would swing the eye around the pivot — looking up would lift you. The
+eye is pinned during a turn and only thrust translates it.
+
+**Roll is scoped to flight and levels on landing.** `Camera.fly_look` takes it
+as an explicit absolute parameter applied last, never fed back into the
+azimuth/elevation pair — so it cannot accumulate, and passing 0.0 (what every
+non-flight caller does) gives bit-for-bit the round-34 camera. It has to level
+on exit because the orbit camera is a turntable with no way to represent a
+rolled pose.
+
+All of it is tunable live in **App > Settings > Flight** (acceleration, drag,
+auto-brake, strafe response, roll rate, turn rate), including while flying.
+
 **Shuttle / pilot mode uses the identical model**, with the molecule as the
 airframe instead of the camera — so there is one place to tune the feel and
 the two cannot drift apart. The round-8 version moved a fixed step on every
 key PRESS, which delivered Qt's auto-repeat rhythm and read as choppy.
+
+**Key conflicts:** none. Every flight key is read only while `_fly` is live,
+and `_keyboard_captured()` then makes the viewport `grabKeyboard()` and
+intercept `ShortcutOverride`, so W/A/S/D/Q/E/Space never reach the object- or
+edit-mode QActions that also claim those letters. A test pins this.
 
 **RMB no longer pans.** Pan is on Shift+MMB and Shift+scroll, on both
 devices. Hanging pan off a modified right-drag was rejected because every

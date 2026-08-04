@@ -66,7 +66,51 @@ def perceive_bonds(symbols, coords, tolerance=TOLERANCE, min_distance=MIN_DISTAN
         ok &= ~(hydrogen[bi] & hydrogen[bj])    # no H-H bonds
         for a, b in zip(bi[ok], bj[ok]):
             bonds.append((int(a), int(b), 1))
-    return bonds
+    return _cap_hydrogens(bonds, xyz, hydrogen)
+
+
+def _cap_hydrogens(bonds, xyz, hydrogen):
+    # type: (List[Tuple[int, int, int]], np.ndarray, np.ndarray) -> List[Tuple[int, int, int]]
+    """A hydrogen gets ONE bond — its nearest heavy neighbour.
+
+    Avogadro's `perceiveBondsSimple` is purely a distance test, so any atom
+    that strays inside H's covalent window becomes a bond. That is fine on a
+    clean molecule and wrong on a crystal: symmetry expansion routinely brings
+    a neighbouring molecule within 1.4 A of a hydrogen, and the picture then
+    shows an H with two sticks, which is not a thing chemistry allows. It
+    showed up on Christian's HpPyBz_th.cif as eight two-bonded hydrogens.
+
+    (Worth being clear about what this does NOT fix: that file has a genuine
+    0.75 A atom-atom contact, and ASE reads exactly the same 192 atoms and the
+    same clash, so the geometry really is broken in the file. Capping the
+    valence stops MoloM DRAWING an impossible bond; it cannot invent a
+    structure that is not there.)
+
+    Bridging hydrides — B-H-B in diboranes — are the one real exception, and
+    they are not something a distance-based perceiver ever got right anyway:
+    it would need the electron count, not the geometry. Ctrl+P after adding
+    the second bond by hand keeps it, since perception is never automatic.
+    """
+    if not bonds or not hydrogen.any():
+        return bonds
+    best = {}
+    for index, (i, j, _o) in enumerate(bonds):
+        for h, other in ((i, j), (j, i)):
+            if not hydrogen[h]:
+                continue
+            d = float(np.linalg.norm(xyz[h] - xyz[other]))
+            if h not in best or d < best[h][0]:
+                best[h] = (d, index)
+    if not best:
+        return bonds
+    keep = {index for _d, index in best.values()}
+    out = []
+    for index, bond in enumerate(bonds):
+        i, j, _o = bond
+        if (hydrogen[i] or hydrogen[j]) and index not in keep:
+            continue
+        out.append(bond)
+    return out
 
 
 def perceive_structure_bonds(structure, tolerance=TOLERANCE,

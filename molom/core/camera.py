@@ -154,6 +154,13 @@ class Camera:
         self.rotation = self.default_orientation()
         self.orthographic = False
         self.auto_ortho = False     # ortho came from an axis-view snap
+        #: The current pose has an up vector the TURNTABLE cannot represent —
+        #: a crystallographic axis view, whose up is a cell axis rather than
+        #: world Z. The next orbit levels the horizon first, the same way
+        #: `auto_ortho` pops back to perspective. Without it, orbiting out of
+        #: a b-axis view starts from a pose the yaw/pitch pair cannot express
+        #: and the view lurches.
+        self.auto_level = False
         self.rotate_speed = 1.0
 
     @staticmethod
@@ -203,6 +210,12 @@ class Camera:
         """Turntable-orbit by a pixel delta about `pivot` (world coords;
         default = self.center): yaw about world Z, pitch about view X."""
         rate = self.rotate_speed * 2.0 * np.pi / self.PX_PER_REV
+        if self.auto_level:
+            # Coming out of a crystallographic axis view: restore the ordinary
+            # world-Z-up pose FIRST, so the turntable starts from something it
+            # can express. Blender does the same thing with auto-perspective.
+            self.level_horizon()
+            self.auto_level = False
         # Sign convention: dragging the scene right/down spins it that way
         # (same feel as the round-2 trackball); flip here if it feels wrong.
         q_yaw = quat_from_axis_angle([0.0, 0.0, 1.0], dx_px * rate)
@@ -215,6 +228,26 @@ class Camera:
         if self.auto_ortho:            # Blender: orbiting an axis view
             self.orthographic = False  # pops back to perspective
             self.auto_ortho = False
+
+    def level_horizon(self):
+        # type: () -> None
+        """Put world +Z back on screen-up, keeping the view DIRECTION.
+
+        Restores the turntable's `(R @ e_z).x == 0` invariant from any rolled
+        pose — an axis view whose up is a cell axis, or a flight that landed
+        banked. Looking straight up or down is left alone: Z-up is undefined
+        at the pole, and a top view is a legitimate turntable pose anyway.
+        """
+        f = self.forward()
+        if abs(float(f[2])) > 0.999:
+            return
+        right = np.cross(f, np.array([0.0, 0.0, 1.0]))
+        norm = float(np.linalg.norm(right))
+        if norm < 1e-9:
+            return
+        right /= norm
+        true_up = np.cross(right, f)
+        self.rotation = quat_from_mat3(np.vstack([right, true_up, -f]))
 
     def align_view(self, axis, sign=1):
         # type: (int, int) -> None
@@ -253,17 +286,23 @@ class Camera:
                           r.T @ np.array([0.0, 1.0, 0.0]),
                           r.T @ np.array([0.0, 0.0, -1.0])])
 
-    def fly_look(self, d_yaw, d_pitch, pitch_limit_deg=88.0):
-        # type: (float, float, float) -> None
+    def fly_look(self, d_yaw, d_pitch, pitch_limit_deg=88.0, roll=0.0):
+        # type: (float, float, float, float) -> None
         """Mouse-look by radians: +d_yaw turns LEFT, +d_pitch looks UP.
 
         Rebuilt from an explicit (azimuth, elevation) pair rather than
         composed as a quaternion delta. Composition accumulates floating-point
         roll over a long flight — tiny per step, but a fly session is thousands
         of steps and the horizon visibly creeps. Going through the angles makes
-        "no roll" a property of the construction (up is always world Z) rather
+        the absence of *accidental* roll a property of the construction rather
         than something that merely starts true. Pitch is clamped just short of
-        vertical; over the pole the horizon inverts, which reads as roll.
+        vertical; over the pole the azimuth flips, which reads as a lurch.
+
+        `roll` is the ABSOLUTE twist about the view axis, applied last and
+        never fed back into the angles above (round 35, for 6DoF flight). It
+        is a parameter rather than accumulated state precisely so that the
+        no-drift guarantee survives: pass 0.0 — the default, and what every
+        non-flight caller does — and this is bit-for-bit the round-34 camera.
         """
         f = self.forward()
         azimuth = float(np.arctan2(f[1], f[0])) + float(d_yaw)
@@ -279,6 +318,9 @@ class Camera:
             return
         right /= norm
         true_up = np.cross(right, new_f)
+        if roll:
+            c, s = np.cos(float(roll)), np.sin(float(roll))
+            right, true_up = right * c + true_up * s, true_up * c - right * s
         self.rotation = quat_from_mat3(np.vstack([right, true_up, -new_f]))
         if self.auto_ortho:                  # same rule as orbiting
             self.orthographic = False

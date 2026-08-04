@@ -28,6 +28,7 @@ Input map (device-aware — see core/input_map.py and docs/OPERATORS.md):
 - O persp/ortho, F/Home fit
 """
 
+import math
 import time
 from typing import List, Optional, Tuple
 
@@ -60,8 +61,12 @@ _OUTLINE_COLOR = (1.0, 0.588, 0.157, 1.0)
 #: Outline thickness as a fraction of the camera distance, so it stays roughly
 #: constant ON SCREEN instead of ballooning as you zoom in. Clamped, or a
 #: far-away view draws an outline fatter than the molecule.
-_OUTLINE_WIDTH_FRAC = 0.006
-_OUTLINE_WIDTH_RANGE = (0.02, 0.22)
+#: Round 35: divided by FIVE. The round-34 values drew a rim thick enough to
+#: merge between neighbouring atoms — on cubane the eight carbons came out as
+#: one orange blob with the hydrogens welded to it, which is the opposite of
+#: what an outline is for. Blender's is a hairline; so is this now.
+_OUTLINE_WIDTH_FRAC = 0.0012
+_OUTLINE_WIDTH_RANGE = (0.004, 0.044)
 _CLICK_SLOP_PX = 4
 _MIN_PICK_RADIUS = 0.35
 _WHEEL_TO_PX = 0.6      # legacy scale, kept for callers passing raw units
@@ -552,6 +557,16 @@ class MolViewport(QOpenGLWidget):
         self._pick_dirty = True
         self._sphere = None
         self._cylinder = None
+        # Overlay passes get their OWN instance buffers (round 35). They used
+        # to borrow the scene's and set `_needs_rebuild` so the NEXT frame put
+        # the real geometry back — which means the scene buffer only holds the
+        # molecule between `_rebuild()` and the first overlay. Any frame that
+        # reaches `_sphere.draw()` without a rebuild first therefore draws the
+        # selection hull or the glow shells IN PLACE OF the molecule: one
+        # frame of orange blobs, i.e. a flicker. See `_paint_selection`.
+        self._hull_sphere = None
+        self._hull_cylinder = None
+        self._glow_sphere = None
         self._prog = None
         self._line_prog = None
         self._grid_prog = None
@@ -626,6 +641,27 @@ class MolViewport(QOpenGLWidget):
         self._compass_hits = []          # [(x, y, axis, sign)] per paint
         self._compass_hover = False
         self._fly = None                 # right-mouse flight state
+        # Flight tuning, live-editable from Settings and persisted there.
+        # Kept on the viewport rather than baked into core/flight.py defaults
+        # so a session's feel can be adjusted without a restart.
+        self.fly_accel = flight.DEFAULT_ACCEL
+        self.fly_damping = flight.DEFAULT_DAMPING
+        self.fly_brake_factor = flight.DEFAULT_BRAKE_FACTOR
+        self.fly_strafe_factor = flight.DEFAULT_STRAFE_FACTOR
+        self.fly_roll_rate = flight.DEFAULT_ROLL_RATE
+        self.fly_bank_angle = flight.DEFAULT_BANK_ANGLE
+        self.fly_aim_expo = flight.DEFAULT_AIM_EXPO
+        self.fly_turn_rate = 1.0
+        self._fly_anchor = QPoint(0, 0)   # captured pointer home, global px
+        self._cam_key = None              # see _camera_frame
+        self._cam_frame = None
+        self._cue_range = None            # depth-cue near/far, per overlay
+        self._cue_eye = None              # eye pinned for an overlay pass
+        self._pen_cache = {}              # see _cued_pen
+        self._fly_menu_timer = QTimer(self)   # deferred right-click menu
+        self._fly_menu_timer.setSingleShot(True)
+        self._fly_menu_timer.timeout.connect(self._fire_deferred_menu)
+        self._fly_menu_pos = None
         self._fly_timer = QTimer(self)
         self._fly_timer.setInterval(_FLY_TICK_MS)
         self._fly_timer.timeout.connect(self._fly_tick)
@@ -797,11 +833,20 @@ class MolViewport(QOpenGLWidget):
     # ------------------------------------------------------------- flying
     #: WASD + Q/E as (right, up, forward), the layout UE5, Unity and Blender's
     #: own fly mode all share — muscle memory nobody should have to relearn.
+    #: 6DoF thrust (round 35). Q/E gave up vertical thrust to ROLL, and
+    #: Space/Ctrl took over elevate — the standard arcade space-sim layout
+    #: Christian asked for. These are only ever read while `_fly` is live and
+    #: the viewport holds the keyboard, so none of them collide with the
+    #: object- or edit-mode bindings for the same letters (S, D, A and E are
+    #: all bound elsewhere); see `_keyboard_captured`.
     _FLY_KEYS = {
         Qt.Key_W: (0.0, 0.0, 1.0), Qt.Key_S: (0.0, 0.0, -1.0),
         Qt.Key_D: (1.0, 0.0, 0.0), Qt.Key_A: (-1.0, 0.0, 0.0),
-        Qt.Key_E: (0.0, 1.0, 0.0), Qt.Key_Q: (0.0, -1.0, 0.0),
+        Qt.Key_Space: (0.0, 1.0, 0.0), Qt.Key_Control: (0.0, -1.0, 0.0),
     }
+    #: Roll about the view axis. +1 rolls LEFT (the horizon swings clockwise
+    #: on screen), matching every flight sim's Q.
+    _ROLL_KEYS = {Qt.Key_Q: 1.0, Qt.Key_E: -1.0}
 
     def flying(self):
         # type: () -> bool
@@ -816,8 +861,8 @@ class MolViewport(QOpenGLWidget):
                 radius = max(radius, float(obj.structure.bounding_radius()))
         return max(radius, self.camera.distance * 0.5, 1.0) / 6.0
 
-    def start_fly(self, obj_id=None):
-        # type: (Optional[int]) -> None
+    def start_fly(self, obj_id=None, latched=False):
+        # type: (Optional[int], bool) -> None
         """Begin flying. `obj_id` None flies the CAMERA (right-mouse); an id
         flies that molecule instead, which is what shuttle/pilot mode is.
 
@@ -826,18 +871,51 @@ class MolViewport(QOpenGLWidget):
         moved a fixed step per key PRESS, so holding W delivered Qt's
         auto-repeat rhythm — a jump, a pause, then a stutter — which is the
         "choppy" Christian reported.
+
+        `latched` flight survives the right button coming up — that is the
+        round-35 double-click mode, where you fly with both hands free until
+        a single right click or Esc lands you.
         """
         if self._fly is not None:
+            if latched:                   # promote a held flight to latched
+                self._fly["latched"] = True
             return
+        model = flight.FlightModel(scale=self._scene_scale())
+        model.accel = float(self.fly_accel)
+        model.damping = float(self.fly_damping)
+        model.brake_factor = float(self.fly_brake_factor)
+        model.strafe_factor = float(self.fly_strafe_factor)
+        model.roll_rate = float(self.fly_roll_rate)
+        model.bank_angle = float(self.fly_bank_angle)
         self._fly = {
-            "model": flight.FlightModel(scale=self._scene_scale()),
+            "model": model,
+            "aim": flight.AimReticle(expo=self.fly_aim_expo),
             "keys": set(),
+            "roll_keys": set(),
             "obj_id": obj_id,
             "last": time.monotonic(),
             "released": False,
+            "latched": bool(latched),
         }
         self._fly_timer.start()
         self.grabKeyboard()
+        # The pointer is CAPTURED, not merely followed: it is hidden, held at
+        # the viewport centre and re-seeded after every move, so it can never
+        # reach an edge. That is what fixes steering dying against the
+        # properties dock on the right and against the top and bottom — the
+        # old cursor WRAP could only work where there was screen to wrap to,
+        # and a wrap is visible anyway. With the reticle carrying the aim
+        # there is nothing the real cursor needs to be doing.
+        self.grabMouse()
+        self.setCursor(Qt.BlankCursor)
+        self._recentre_pointer()
+
+    def _recentre_pointer(self):
+        """Park the (hidden) OS pointer in the middle of the viewport."""
+        centre = self.mapToGlobal(QPoint(self.width() // 2,
+                                         self.height() // 2))
+        self._fly_anchor = centre
+        QCursor.setPos(centre)
 
     def _fly_tick(self, dt=None):
         """One integration step. Runs at ~60 Hz while flying AND while the
@@ -862,18 +940,62 @@ class MolViewport(QOpenGLWidget):
         keys = (flight.keys_from_set(fly["keys"], self._FLY_KEYS)
                 if not fly["released"] else (0.0, 0.0, 0.0))
         mods = QApplication.keyboardModifiers()
+        # Shift boosts, ALT creeps. Ctrl used to creep and is now DESCEND
+        # (Christian's call), so it must not also scale the thrust — a key
+        # that both moves you and quarters your speed is unusable.
         boost = flight.BOOST_FACTOR if mods & Qt.ShiftModifier else \
-            flight.PRECISION_FACTOR if mods & Qt.ControlModifier else 1.0
+            flight.PRECISION_FACTOR if mods & Qt.AltModifier else 1.0
         delta = fly["model"].step(dt, keys, self.camera.basis_rows(), boost)
         if np.any(delta):
             if fly["obj_id"] is None:
                 self.camera.fly_move(delta)
             else:
                 self._fly_object(fly["obj_id"], delta)
+        # STEERING. The reticle is a virtual stick: its offset from centre is
+        # a sustained turn RATE, so the ship keeps turning for as long as the
+        # mark is out there and only stops when it is brought back. Nothing
+        # here is driven by this tick's mouse delta — that is the whole
+        # difference from the first cut, which stopped turning the instant
+        # the mouse stopped moving.
+        short = min(self.width(), self.height())
+        defl = fly["aim"].deflection(short) if not fly["released"] \
+            else np.zeros(2)
+        rate = flight.DEFAULT_TURN_RATE * self.fly_turn_rate \
+            * self.camera.rotate_speed
+        d_yaw = -float(defl[0]) * rate * dt
+        d_pitch = -float(defl[1]) * rate * dt
+        # Automatic banking rolls into the turn and HOLDS while the reticle
+        # stays out, easing back to level when it comes home.
+        roll_dir = sum(self._ROLL_KEYS[k] for k in fly["roll_keys"]) \
+            if not fly["released"] else 0.0
+        if roll_dir:
+            fly["model"].step_roll(dt, roll_dir, boost)
+        fly["model"].step_bank(dt, float(defl[0]))
+        if d_yaw or d_pitch or roll_dir or abs(fly["model"].bank) > 1e-6:
+            self._fly_turn(d_yaw, d_pitch)
         if fly["released"] and not fly["model"].moving:
-            self._fly = None
-            self._fly_timer.stop()
-            self.releaseKeyboard()
+            self._end_fly()
+        self.update()
+
+    def _end_fly(self):
+        """Tear down a flight session and level the horizon.
+
+        Levelling is not a preference: the orbit camera you land back into is
+        a turntable (yaw + pitch only), so a rolled pose has no representation
+        there at all. Leaving the roll on would mean the next orbit silently
+        snapped it away, which looks like a glitch.
+        """
+        if self._fly is None:
+            return
+        rolled = abs(self._fly["model"].roll) > 1e-9
+        self._fly["model"].level()
+        self._fly = None
+        self._fly_timer.stop()
+        self.releaseKeyboard()
+        self.releaseMouse()
+        self.unsetCursor()
+        if rolled:
+            self.camera.fly_look(0.0, 0.0, roll=0.0)
         self.update()
 
     def _fly_object(self, obj_id, delta):
@@ -888,25 +1010,41 @@ class MolViewport(QOpenGLWidget):
         self.camera.center = obj.origin.copy()
         self.refresh_geometry()
 
-    def _fly_look(self, dx_px, dy_px):
-        """Mouse-look while flying: yaw + pitch only, never roll.
+    def _fly_eye(self):
+        """Where the camera actually is — `center` is only the orbit pivot."""
+        r = quat_to_mat3(self.camera.rotation)
+        return self.camera.center + r.T @ np.array(
+            [0.0, 0.0, self.camera.distance])
+
+    def _fly_turn(self, d_yaw, d_pitch):
+        """Turn while flying, by RADIANS (the aim reticle drives this).
 
         In shuttle mode the SHIP turns rather than the camera, so the same
-        gesture has to be re-expressed as a rigid rotation of the molecule —
-        but the yaw/pitch decision is still the camera's, which keeps the
-        no-roll invariant in exactly one place.
+        rotation has to be re-expressed as a rigid rotation of the molecule —
+        but the yaw/pitch/roll decision is still the camera's, which keeps the
+        construction in exactly one place.
         """
         fly = self._fly
         if fly is None:
             return
-        d_yaw = -float(dx_px) * _FLY_LOOK_RATE * self.camera.rotate_speed
-        d_pitch = -float(dy_px) * _FLY_LOOK_RATE * self.camera.rotate_speed
+        roll = fly["model"].roll
         if fly["obj_id"] is None:
-            self.camera.fly_look(d_yaw, d_pitch)
+            # KEEP THE EYE WHERE IT IS. The camera is an orbit rig — the eye
+            # sits `distance` behind `center` — so changing only the rotation
+            # swings the eye around the pivot on an arc. In flight that reads
+            # as looking up bodily lifting you, which is Christian's "moving
+            # the cursor up and down moves the camera by a lot". A pilot's
+            # head turns; it does not orbit a point in front of them. So the
+            # eye is captured first and `center` is rebuilt behind it.
+            eye = self._fly_eye()
+            self.camera.fly_look(d_yaw, d_pitch, roll=roll)
+            r = quat_to_mat3(self.camera.rotation)
+            self.camera.center = eye - r.T @ np.array(
+                [0.0, 0.0, self.camera.distance])
             self.update()
             return
         before = quat_to_mat3(self.camera.rotation)
-        self.camera.fly_look(d_yaw, d_pitch)
+        self.camera.fly_look(d_yaw, d_pitch, roll=roll)
         after = quat_to_mat3(self.camera.rotation)
         # The molecule takes the rotation the camera just made, about its own
         # origin, and the camera is put back — the cockpit view is unchanged
@@ -929,13 +1067,13 @@ class MolViewport(QOpenGLWidget):
         if fly is None:
             return
         fly["keys"].clear()
+        fly["roll_keys"].clear()
         fly["released"] = True
+        fly["latched"] = False
+        fly["aim"].recentre()
         if not coast:
             fly["model"].stop()
-            self._fly = None
-            self._fly_timer.stop()
-            self.releaseKeyboard()
-            self.update()
+            self._end_fly()
 
     # ---------------------------------------------------------- shuttle mode
     def _shuttle_eye(self):
@@ -979,8 +1117,9 @@ class MolViewport(QOpenGLWidget):
         # same acceleration, same coast — only the thing being moved differs.
         self.start_fly(obj_id=obj.id)
         self.status_message.emit(
-            "SHUTTLE {} — hold W/S/A/D/Q/E to fly (Shift boost, Ctrl creep), "
-            "drag or scroll to steer, Esc to land".format(obj.name))
+            "SHUTTLE {} — W/A/S/D thrust, Space/Ctrl up-down, Q/E roll "
+            "(Shift boost, Alt creep), drag or scroll to steer, Esc to "
+            "land".format(obj.name))
         self.refresh_geometry()
 
     # (`_shuttle_apply` is gone: translation and rotation both go through the
@@ -994,13 +1133,19 @@ class MolViewport(QOpenGLWidget):
         auto-repeat, which is the whole difference between "moved in a choppy
         way" and flying.
         """
-        if key not in self._FLY_KEYS or self._fly is None:
+        if self._fly is None:
+            return False
+        if key in self._FLY_KEYS:
+            bucket = self._fly["keys"]
+        elif key in self._ROLL_KEYS:
+            bucket = self._fly["roll_keys"]
+        else:
             return False
         if down:
-            self._fly["keys"].add(key)
+            bucket.add(key)
             self._fly["released"] = False
         else:
-            self._fly["keys"].discard(key)
+            bucket.discard(key)
         return True
 
     def stop_shuttle(self, restore_camera=True):
@@ -1385,21 +1530,47 @@ class MolViewport(QOpenGLWidget):
         proj = self.camera.projection_matrix(w, h)
         return picking.ray_from_screen(qpos.x(), qpos.y(), w, h, view, proj)
 
-    def _project(self, world_pts):
+    def _camera_frame(self):
+        """Eye position and view/projection matrices, CACHED on the camera.
+
+        None of these depends on what is being drawn, but they were being
+        rebuilt per PRIMITIVE: `_eye_position` runs `quat_to_mat3` and
+        `_project`/`_segment_screen` rebuild both matrices, and the symmetry
+        overlay calls them through `_cued_pen` once per line segment — around
+        400 times a frame on a Pbca cell. That is what made switching ghosts
+        or symmetry elements on drop the framerate; it is not the drawing.
+
+        Keyed on the camera state rather than cleared per frame, so every
+        caller is safe including the picking paths that run outside paintGL.
+        """
+        cam = self.camera
         w, h = max(self.width(), 1), max(self.height(), 1)
+        key = (cam.rotation.tobytes(), cam.center.tobytes(),
+               float(cam.distance), bool(cam.orthographic), w, h)
+        if self._cam_key != key:
+            r = quat_to_mat3(cam.rotation)
+            self._cam_frame = {
+                "eye": cam.center + r.T @ np.array([0.0, 0.0, cam.distance]),
+                "view": cam.view_matrix().astype(float),
+                "proj": cam.projection_matrix(w, h).astype(float),
+                "w": w, "h": h,
+            }
+            self._cam_key = key
+        return self._cam_frame
+
+    def _project(self, world_pts):
+        f = self._camera_frame()
         return selection2d.project_points(
             np.asarray(world_pts, dtype=float).reshape(-1, 3),
-            self.camera.view_matrix(), self.camera.projection_matrix(w, h),
-            w, h)
+            f["view"], f["proj"], f["w"], f["h"])
 
     def _segment_screen(self, a, b):
         """Project a world segment with NEAR-PLANE CLIPPING: the part in
         front of the camera still draws when the other end is behind it.
         (The old front.all() skip silently hid every long guide line in
         perspective.) Returns ((x0,y0),(x1,y1)) or None."""
-        w, h = max(self.width(), 1), max(self.height(), 1)
-        view = self.camera.view_matrix().astype(float)
-        proj = self.camera.projection_matrix(w, h).astype(float)
+        f = self._camera_frame()
+        w, h, view, proj = f["w"], f["h"], f["view"], f["proj"]
         va = view @ np.append(np.asarray(a, dtype=float), 1.0)
         vb = view @ np.append(np.asarray(b, dtype=float), 1.0)
         z_clip = -max(self.camera.distance * 0.01, 0.01) * 1.5
@@ -1594,6 +1765,44 @@ class MolViewport(QOpenGLWidget):
                             "Delete the selected atoms and their terminal "
                             "hydrogens"))
         return entries
+
+    def _defer_context_menu(self, pos):
+        """Hold the context menu back by one double-click interval.
+
+        The right button now carries two meanings — click for the menu,
+        double-click to latch flight — and Qt fires the first click's action
+        before it can know a second is coming (the round-8 gotcha). Opening
+        the menu immediately would mean every attempt to double-click into
+        flight popped a menu first.
+
+        The delay is paid ONLY where a menu would actually appear, which is a
+        right-click landing on an already-selected atom; `open_context_menu`
+        refuses everywhere else, so double-clicking into flight over empty
+        space — the normal case — costs nothing and is not deferred.
+        """
+        if not self._context_menu_would_open(pos):
+            return
+        from PySide6.QtWidgets import QApplication as _QApp
+        self._fly_menu_pos = pos
+        self._fly_menu_timer.start(max(_QApp.doubleClickInterval(), 150))
+
+    def _cancel_deferred_menu(self):
+        self._fly_menu_timer.stop()
+        self._fly_menu_pos = None
+
+    def _fire_deferred_menu(self):
+        pos, self._fly_menu_pos = self._fly_menu_pos, None
+        if pos is not None and self._fly is None:
+            self.open_context_menu(pos)
+
+    def _context_menu_would_open(self, pos):
+        # type: (object) -> bool
+        """Cheap version of `open_context_menu`'s own guards, so the deferral
+        is not paid for a click that was never going to show anything."""
+        if not self.selection:
+            return False
+        hit = self._pick_at(pos)
+        return hit is not None and self._atom_map[hit] in self.selection
 
     def open_context_menu(self, pos):
         """Right-CLICK over the selection: whatever fits what is picked.
@@ -1954,21 +2163,13 @@ class MolViewport(QOpenGLWidget):
             return self._internal["state"]
         return None
 
-    def _wrap_fly_cursor(self, pos, margin=6):
-        """Edge-wrap the pointer while flying, so a turn never runs out of
-        desk. Same trick as the modals, but the reference is `_drag_last`
-        (mouse-look integrates per-event deltas), so the teleport has to move
-        that rather than reseed a modal state."""
-        x, y = pos.x(), pos.y()
-        w, h = self.width(), self.height()
-        new_x = w - margin - 2 if x <= margin else \
-            margin + 2 if x >= w - margin else x
-        new_y = h - margin - 2 if y <= margin else \
-            margin + 2 if y >= h - margin else y
-        if new_x == x and new_y == y:
-            return
-        QCursor.setPos(self.mapToGlobal(QPoint(int(new_x), int(new_y))))
-        self._drag_last = QPointF(new_x, new_y)
+    # (`_wrap_fly_cursor` is GONE, round 35. Edge-wrapping the pointer only
+    # works where there is screen left to wrap TO, so it failed against the
+    # properties dock on the right and against the top and bottom of the
+    # window — steering simply stopped there. Flight now CAPTURES the pointer
+    # instead: hidden, held at the viewport centre, re-seeded after every
+    # move. There is no edge left to reach, so there is nothing to wrap, and
+    # the visible teleport is gone with it.)
 
     def snap_origin_to_selection(self):
         """Put the edited molecule's origin on the centroid of its selected
@@ -1991,6 +2192,12 @@ class MolViewport(QOpenGLWidget):
         self._grid_prog = _program(_GRID_VERT, _GRID_FRAG)
         self._sphere = _InstancedMesh(*meshes.icosphere(2))
         self._cylinder = _InstancedMesh(*meshes.cylinder(24))
+        # Same meshes, separate instance buffers — a few KB of duplicated
+        # static vertex data buys immunity from the ordering bug above, and
+        # stops a selection forcing a whole-scene rebuild every frame.
+        self._hull_sphere = _InstancedMesh(*meshes.icosphere(2))
+        self._hull_cylinder = _InstancedMesh(*meshes.cylinder(24))
+        self._glow_sphere = _InstancedMesh(*meshes.icosphere(2))
         self._wire_lines = _LineBuffer()
         self._poly_tris = _LineBuffer()   # same layout, GL_TRIANGLES
         self._grid_quad = _GridQuad()
@@ -2295,12 +2502,11 @@ class MolViewport(QOpenGLWidget):
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE)      # additive = emissive
         GL.glDepthMask(GL.GL_FALSE)
         GL.glUseProgram(self._prog)
-        self._sphere.upload(np.array(mats), np.array(rgba))
-        self._sphere.draw()
+        self._glow_sphere.upload(np.array(mats), np.array(rgba))
+        self._glow_sphere.draw()
         GL.glDepthMask(GL.GL_TRUE)
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
         GL.glDisable(GL.GL_BLEND)
-        self._needs_rebuild = True   # sphere instances were overwritten
 
     def outline_width(self):
         # type: () -> float
@@ -2383,24 +2589,22 @@ class MolViewport(QOpenGLWidget):
         flat = GL.glGetUniformLocation(self._prog, "uFlat")
         GL.glUniform1f(flat, 1.0)
         if spheres:
-            self._sphere.upload(
+            self._hull_sphere.upload(
                 np.array(spheres),
                 np.tile(np.array(_OUTLINE_COLOR), (len(spheres), 1)))
-            self._sphere.draw()
+            self._hull_sphere.draw()
         if cylinders:
             mats = meshes.cylinder_transforms(
                 np.array([c[0] for c in cylinders]),
                 np.array([c[1] for c in cylinders]),
                 np.array([c[2] for c in cylinders]))
-            self._cylinder.upload(
+            self._hull_cylinder.upload(
                 mats, np.tile(np.array(_OUTLINE_COLOR), (len(cylinders), 1)))
-            self._cylinder.draw()
+            self._hull_cylinder.draw()
         GL.glUniform1f(flat, 0.0)
         GL.glCullFace(GL.GL_BACK)
         GL.glDisable(GL.GL_CULL_FACE)
         GL.glDepthMask(GL.GL_TRUE)
-        # both instance buffers were overwritten by the hull
-        self._needs_rebuild = True
 
     # ------------------------------------------------------------ 2D overlays
     def _paint_overlays(self, view, proj, empty):
@@ -2465,16 +2669,47 @@ class MolViewport(QOpenGLWidget):
                           _FLY_COLOR.blue(), alpha), 1.3)
         p.setPen(pen)
         p.setBrush(Qt.NoBrush)
+        # The HULL mark sits dead centre and is where the nose actually
+        # points; the RETICLE drifts behind it under turn. Separating the two
+        # is what makes the rate of turn readable — one mark can only tell
+        # you where you are aimed, never how hard you are pulling.
         p.drawEllipse(cx - 9, cy - 9, 18, 18)
         for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
             p.drawLine(cx + dx * 13, cy + dy * 13, cx + dx * 19, cy + dy * 19)
+        # The aim reticle: a virtual stick, so where it sits IS the turn you
+        # have commanded. Its travel limit is drawn as a faint ring, because
+        # a stick you cannot see the extent of is one you cannot centre.
+        short = min(self.width(), self.height())
+        limit = fly["aim"].limit(short)
+        dx_r, dy_r = fly["aim"].offset
+        faint = QColor(_FLY_COLOR.red(), _FLY_COLOR.green(),
+                       _FLY_COLOR.blue(), int(alpha * 0.28))
+        p.setPen(QPen(faint, 1.0))
+        p.drawEllipse(int(cx - limit), int(cy - limit),
+                      int(limit * 2), int(limit * 2))
+        if abs(dx_r) + abs(dy_r) > 1.0:
+            rx, ry = int(cx + dx_r), int(cy + dy_r)
+            p.setPen(QPen(QColor(_FLY_COLOR.red(), _FLY_COLOR.green(),
+                                 _FLY_COLOR.blue(), int(alpha * 0.85)), 1.4))
+            p.drawEllipse(rx - 6, ry - 6, 12, 12)
+            p.drawLine(cx, cy, rx, ry)
+        p.setPen(pen)
+        # Roll: a tick on the reticle ring showing which way is up, so a
+        # rolled horizon is readable even against an empty background.
+        roll = float(fly["model"].roll)
+        if abs(roll) > 1e-3:
+            ux, uy = np.sin(roll), -np.cos(roll)
+            p.drawLine(int(cx + ux * 9), int(cy + uy * 9),
+                       int(cx + ux * 15), int(cy + uy * 15))
         if fly["released"]:
             return
         f = QFont()
         f.setPixelSize(11)
         p.setFont(f)
-        text = "FLY  W/A/S/D + Q/E   Shift boost   Ctrl creep   " \
-               "scroll = speed   {:.1f} A/s".format(speed)
+        text = ("FLY{}  W/A/S/D  Space/Ctrl up-down  Q/E roll   "
+                "Shift boost   Alt creep   {:.1f} A/s").format(
+                    " [latched — right click or Esc to land]"
+                    if fly.get("latched") else "", speed)
         fm = p.fontMetrics()
         rect = QRect(10, self.height() - fm.height() - 18,
                      fm.horizontalAdvance(text) + 16, fm.height() + 8)
@@ -2700,7 +2935,7 @@ class MolViewport(QOpenGLWidget):
             if meta.get("show_symmetry"):
                 for element in plan["elements"]:
                     self._paint_symmetry_element(p, element, cell, to_world)
-            self._cue_range = None
+            self._cue_range = self._cue_eye = None
 
     def _symmetry_plan(self, obj, meta):
         """Parsed operators, classified elements and ghost images, CACHED.
@@ -2818,9 +3053,7 @@ class MolViewport(QOpenGLWidget):
                     p.drawEllipse(int(xy[k, 0]) - 2, int(xy[k, 1]) - 2, 4, 4)
 
     def _eye_position(self):
-        r = quat_to_mat3(self.camera.rotation)
-        return self.camera.center + r.T @ np.array(
-            [0.0, 0.0, self.camera.distance])
+        return self._camera_frame()["eye"]
 
     def set_depth_cue_extent(self, world_points):
         """Calibrate the depth cue against the thing being drawn.
@@ -2833,10 +3066,15 @@ class MolViewport(QOpenGLWidget):
         line always full strength and the furthest always faint, at any zoom.
         """
         pts = np.asarray(world_points, dtype=float).reshape(-1, 3)
+        # Pin the eye for the whole overlay pass. `_depth_fade` needs it once
+        # per segment, and going back through `_camera_frame` each time was
+        # another few hundred dict lookups and key builds per frame.
+        eye = self._eye_position()
+        self._cue_eye = (float(eye[0]), float(eye[1]), float(eye[2]))
         if len(pts) < 2:
             self._cue_range = None
             return
-        d = np.linalg.norm(pts - self._eye_position()[None, :], axis=1)
+        d = np.linalg.norm(pts - eye[None, :], axis=1)
         near, far = float(d.min()), float(d.max())
         self._cue_range = (near, far) if far - near > 1e-6 else None
 
@@ -2849,22 +3087,42 @@ class MolViewport(QOpenGLWidget):
         far ends restores the ordering without a depth buffer or a real AO
         pass, both of which would be a lot of machinery for line art.
         """
-        dist = float(np.linalg.norm(
-            np.asarray(world_point) - self._eye_position()))
-        cue = getattr(self, "_cue_range", None)
+        # Plain scalar arithmetic, NOT numpy: this runs once per drawn
+        # segment — a few hundred times a frame on a crystal — and at that
+        # size the array allocation costs several times the maths itself.
+        eye = self._cue_eye or self._eye_position()
+        dx = float(world_point[0]) - eye[0]
+        dy = float(world_point[1]) - eye[1]
+        dz = float(world_point[2]) - eye[2]
+        dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+        cue = self._cue_range
         if cue is not None:
             near, far = cue
             t = (dist - near) / (far - near)
-            return float(np.clip(1.0 - t, 0.06, 1.0))
+            return min(max(1.0 - t, 0.06), 1.0)
         span = max(self.camera.distance, 1e-6)
-        return float(np.clip(1.0 - (dist - span * 0.4) / (span * 1.6),
-                             0.12, 1.0))
+        return min(max(1.0 - (dist - span * 0.4) / (span * 1.6), 0.12), 1.0)
 
     def _cued_pen(self, colour, world_point, width=1.6, style=Qt.SolidLine):
+        """A depth-faded pen, MEMOISED on its quantised appearance.
+
+        Constructing a QColor and a QPen per line segment was the other half
+        of the symmetry overlay's cost. The fade is quantised to 64 steps —
+        far finer than the eye can resolve in an alpha ramp — so a few hundred
+        segments a frame collapse to a handful of distinct pens that are then
+        reused for the life of the widget.
+        """
         near = self._depth_fade(world_point)
-        faded = QColor(colour)
-        faded.setAlpha(int(70 + 185 * near))
-        return QPen(faded, max(width * (0.45 + 0.55 * near), 0.7), style)
+        key = (colour.rgba(), int(near * 64.0), round(float(width), 2), style)
+        pen = self._pen_cache.get(key)
+        if pen is None:
+            faded = QColor(colour)
+            faded.setAlpha(int(70 + 185 * near))
+            pen = QPen(faded, max(width * (0.45 + 0.55 * near), 0.7), style)
+            if len(self._pen_cache) > 4096:      # paranoia, never reached
+                self._pen_cache.clear()
+            self._pen_cache[key] = pen
+        return pen
 
     def _paint_symmetry_element(self, p, element, cell, to_world):
         from ..core import symmetry as sym_mod
@@ -3433,6 +3691,14 @@ class MolViewport(QOpenGLWidget):
         # and the click case simply never travels anywhere.
         if ev.button() == Qt.RightButton and self._shuttle is None \
                 and not self.modal_active():
+            # A right press while ALREADY latched is the land gesture, not
+            # the start of another flight (Christian: "cancel flight again
+            # with a single right click or Esc").
+            if self._fly is not None and self._fly.get("latched"):
+                self._cancel_deferred_menu()
+                self.stop_fly(coast=False)
+                self.status_message.emit("Landed")
+                return
             self.start_fly()
             return
         self._nav_drag = self._nav_drag_kind(ev.button(), ev.modifiers())
@@ -3479,6 +3745,23 @@ class MolViewport(QOpenGLWidget):
         return None
 
     def mouseDoubleClickEvent(self, ev):
+        # RIGHT double-click LATCHES flight: you fly with both hands free
+        # until a single right click or Esc lands you, instead of holding the
+        # button down. The first click of the pair already started an
+        # ordinary held flight (see mousePressEvent), so this only has to
+        # promote it — and cancel the context menu that first click deferred.
+        if ev.button() == Qt.RightButton:
+            if self._shuttle is not None or self.modal_active():
+                return
+            self._cancel_deferred_menu()
+            self.start_fly(latched=True)
+            self._fly["released"] = False
+            self._drag_last = ev.position()
+            self._press_pos = ev.position()
+            self.status_message.emit(
+                "FLY (latched) — W/A/S/D thrust, Space/Ctrl up-down, Q/E "
+                "roll, Shift boost, Alt creep; right click or Esc to land")
+            return
         if ev.button() != Qt.LeftButton or self.modal_active():
             return
         if self._nav_drag_kind(ev.button(), ev.modifiers()) is not None:
@@ -3505,15 +3788,20 @@ class MolViewport(QOpenGLWidget):
     def mouseMoveEvent(self, ev):
         pos = ev.position()
         if self._fly is not None and not self._fly["released"]:
-            if self._drag_last is not None:
-                self._fly_look(pos.x() - self._drag_last.x(),
-                               pos.y() - self._drag_last.y())
-            if self._press_pos is not None and \
-                    (abs(pos.x() - self._press_pos.x())
-                     + abs(pos.y() - self._press_pos.y())) > _CLICK_SLOP_PX:
+            # The delta is taken against the CAPTURED anchor (the viewport
+            # centre), not against the previous position, and the pointer is
+            # put straight back there. So the mouse can be swept as far as you
+            # like in any direction without ever reaching an edge — no wrap,
+            # nothing to snag on the properties dock, and steering that cannot
+            # be interrupted by running out of screen.
+            anchor = self.mapFromGlobal(self._fly_anchor)
+            dx = pos.x() - anchor.x()
+            dy = pos.y() - anchor.y()
+            if dx or dy:
+                self._fly["aim"].move(dx, dy,
+                                      min(self.width(), self.height()))
                 self._drag_moved = True
-            self._drag_last = pos
-            self._wrap_fly_cursor(pos)
+                QCursor.setPos(self._fly_anchor)
             return
         if self._internal is not None:
             self._internal["state"].set_precision(
@@ -3868,6 +4156,11 @@ class MolViewport(QOpenGLWidget):
     def mouseReleaseEvent(self, ev):
         if self._fly is not None and ev.button() == Qt.RightButton \
                 and self._shuttle is None:
+            # Latched flight ignores the button coming up — that is the whole
+            # point of it. Landing is a fresh right PRESS, handled above.
+            if self._fly.get("latched"):
+                self._drag_button = None
+                return
             was_click = not self._drag_moved and not self._fly["keys"] \
                 and not self._fly["model"].moving
             self.stop_fly()
@@ -3875,7 +4168,7 @@ class MolViewport(QOpenGLWidget):
             self._drag_button = None
             self._press_pos = None
             if was_click:
-                self.open_context_menu(ev.position())
+                self._defer_context_menu(ev.position())
             return
         if self._draw_drag is not None:
             self._finish_draw_drag(ev.position())
@@ -3934,14 +4227,15 @@ class MolViewport(QOpenGLWidget):
             ctrl=bool(mods & Qt.ControlModifier),
             shift=bool(mods & Qt.ShiftModifier))
         if self._shuttle is not None:
-            # Steering by scroll, for the trackpad. Roll used to live on
-            # Ctrl+scroll and is GONE: the whole camera is now no-roll by
-            # construction (Camera.fly_look rebuilds from azimuth/elevation),
-            # so a roll term would have nothing to write itself into and no
-            # way back to level. If it is ever wanted it needs an explicit
-            # term plus a one-key "level out", which is a design decision, not
-            # a leftover gesture.
-            self._fly_look(dx * _WHEEL_STEER_PX, dy * _WHEEL_STEER_PX)
+            # Steering by scroll, for the trackpad. Roll is NOT here: it used
+            # to sit on Ctrl+scroll, was removed in round 34 because the
+            # camera had no way back to level, and came back in round 35 on
+            # Q/E as an explicit `FlightModel.roll` that zeroes on landing.
+            # Scroll stays pure steering — one gesture, one meaning.
+            if self._fly is not None:
+                self._fly["aim"].move(dx * _WHEEL_STEER_PX,
+                                      dy * _WHEEL_STEER_PX,
+                                      min(self.width(), self.height()))
             return
         if self._fly is not None:
             # Scroll while the right button is down sets the CRUISING SPEED,
@@ -4310,6 +4604,16 @@ class MolViewport(QOpenGLWidget):
                 self._fly["keys"].add(key)
                 self._fly["released"] = False
             return
+        if self._fly is not None and key in self._ROLL_KEYS:
+            if not ev.isAutoRepeat():
+                self._fly["roll_keys"].add(key)
+                self._fly["released"] = False
+            return
+        # Esc lands a latched flight (a held one ends with the button).
+        if self._fly is not None and key == Qt.Key_Escape:
+            self.stop_fly(coast=False)
+            self.status_message.emit("Landed")
+            return
         if self._internal is not None:
             state = self._internal["state"]
             if key == Qt.Key_Escape:
@@ -4441,6 +4745,10 @@ class MolViewport(QOpenGLWidget):
             # leaving it — acting on it would cut thrust 30 times a second.
             if not ev.isAutoRepeat():
                 self._fly["keys"].discard(ev.key())
+            return
+        if self._fly is not None and ev.key() in self._ROLL_KEYS:
+            if not ev.isAutoRepeat():
+                self._fly["roll_keys"].discard(ev.key())
             return
         state = self._active_modal_state()
         if state is not None and ev.key() == Qt.Key_Shift:

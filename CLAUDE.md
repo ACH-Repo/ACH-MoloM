@@ -56,6 +56,117 @@ the operator key table, CIF reading with symmetry, coordination polyhedra,
 meta atoms, the scene clock with a multi-track timeline, vibrational modes,
 per-element display control, and the symmetry modifier. 512 tests.
 
+Round 35 (2026-08-04, 6DoF flight + VESTA crystal controls): **the selection
+outline was five times too fat** — on cubane the eight carbons merged into one
+orange blob with the hydrogens welded on, which is the opposite of what an
+outline is for; `_OUTLINE_WIDTH_FRAC` and its clamp are divided by 5 and it is
+a hairline now, as Blender's is. **The desktop-only flicker** was almost
+certainly the overlay passes BORROWING the scene's instance buffers:
+`_paint_meta_glow` and `_paint_selection` uploaded into `_sphere`/`_cylinder`
+and set `_needs_rebuild` so the NEXT frame would put the molecule back, which
+means the scene buffer only holds the molecule between `_rebuild()` and the
+first overlay. Any frame reaching `_sphere.draw()` without a rebuild first
+draws the selection HULL in place of the molecule — one frame of orange blobs.
+It is timing- and driver-dependent, which is why the laptop never showed it.
+Fixed by giving the hull and glow their own buffers (a few KB of duplicated
+static mesh data), which also stops a selection forcing a whole-scene rebuild
++ `glBufferData` every single frame. NOT reproduced here, so it is the most
+likely cause rather than a confirmed one — but it is a real bug either way.
+**Flight is now Everspace-style 6DoF**: strafe primacy (lateral/vertical
+acceleration equal to forward — applied to the ACCELERATION, since
+`thrust_world` normalises and a weighting on the components would divide
+straight back out), **auto-braking** (drag jumps to 1.8x the moment every key
+comes up; one symmetric coefficient cannot be both low enough to build speed
+against and high enough to park), 1:1 mouse look with no smoothing, and
+**dynamic reticle drift** — a second mark that LAGS the hull under turn, so
+the rate of turn is readable, which one centred crosshair can never be.
+**Q/E now ROLL** and Space/Ctrl took over up/down; **creep moved from Ctrl to
+Alt**, because a key that both moves you and quarters your speed is unusable.
+Roll is an explicit absolute parameter on `Camera.fly_look`, applied last and
+never fed back into the azimuth/elevation pair — so it cannot accumulate,
+roll=0.0 is bit-for-bit the round-34 camera, and it **levels on landing**
+because the orbit camera is a turntable that cannot represent a rolled pose.
+**Right DOUBLE-click latches flight** (single right click or Esc lands);
+holding still works. The context menu is deferred by one double-click interval
+— but only where a menu would actually open, i.e. a right-click on an
+already-selected atom, so double-clicking into flight over empty space costs
+nothing. Every flight key is read only while `_fly` is live and the viewport
+holds the keyboard, so **there are no conflicts** with the object/edit-mode
+bindings for the same letters; a test pins it. All the constants are live in
+Settings > Flight. **VESTA's orientation ribbon** (`ui/crystal_ribbon.py` +
+`core/orient.py`) pops in when a crystal is in focus — a/b/c/a*/b*/c* axis
+views, the standard clinographic oblique projection, and stepped
+rotate/pan/zoom. The reciprocal axes come from the **inverse transpose**
+(a plane normal is covariant — the round-26 lesson), and in a monoclinic
+β=115° cell a and a* really are 25° apart, which is the whole reason VESTA
+offers both. **Bonded atoms outside the cell** (`cif.bonded_exterior`) is
+VESTA's boundary SEARCH, off by default: a different operation from round 32's
+boundary completion, because a bond crossing a face has nothing ON the face to
+repeat. 734 tests.
+
+Round 35c (2026-08-04, third pass): **the symmetry/ghost overlay was 25 ms a
+frame** — Christian's "choppy" was not a silly request, it was
+`_eye_position()` rebuilding the rotation matrix from the quaternion, and
+`_project`/`_segment_screen` rebuilding view AND projection, once per DRAWN
+SEGMENT (~400 a frame on Pbca). Three fixes: `_camera_frame()` caches all
+three on the camera state, `_depth_fade` uses scalar maths instead of
+allocating a numpy array per segment, and `_cued_pen` memoises on the
+quantised fade so a few hundred segments collapse to a handful of QPens.
+25.1 -> 9.6 ms. **Leaving an axis view now re-levels**: `Camera.auto_level`
+mirrors `auto_ortho`, so the first orbit out of a crystallographic axis view
+restores world-Z-up first — the axis view's up is a CELL axis, which the
+turntable cannot represent, so orbiting from it lurched. **Reticle expo**
+(`AimReticle.expo`, default 2.0): the curve is applied to the MAGNITUDE, not
+per axis, so the stick direction is never bent. A power curve, not the scaled
+softplus Christian asked about — softplus's slope at the origin is already
+half its asymptotic slope (so it barely softens the centre, which is the
+whole point) and it is asymptotically linear rather than bounded (so full
+stick would not mean full rate without renormalising). **The axis views were
+mirrored, not rotated**: Mercury puts the origin TOP-LEFT with axis k+1
+running right and k+2 running DOWN, and the chosen axis pointing AWAY. He
+spotted it as "exactly mirrored around the red a axis" — and a mirror is not
+achievable by any camera rotation, which is what made it diagnosable. 764
+tests.
+
+Round 35b (2026-08-04, flight feel + CIF correctness, from Christian's two
+annotated images): **steering is a VIRTUAL STICK, not a mouse delta.** The
+first cut had the reticle chase the angular rate and ease home, so a turn
+stopped the instant the mouse stopped — his spec is "if my mouse points right,
+the right turn should continue indefinitely until I have moved it back to the
+centre". `flight.AimReticle` now holds a PERSISTENT offset (clamped to a disc,
+with a rescaled dead zone) whose deflection is a sustained turn rate. Nothing
+decays on its own. **Automatic banking**: `step_bank` eases the roll into the
+turn proportionally to the horizontal deflection, HOLDS it while the stick is
+out, and levels when it comes home — exactly as he described, and it is most
+of what makes a turn read as a turn. Manual Q/E roll is a separate summed
+term (`manual_roll` + `bank`), so neither eats the other. **Mouse-look was
+translating the camera**: the rig is an ORBIT camera, eye = center + R^T·[0,0,
+distance], so changing only the rotation swings the eye around the pivot on an
+arc — "moving the cursor up and down moves the camera by a lot". `_fly_turn`
+captures the eye and rebuilds `center` behind it; a pilot's head turns, it
+does not orbit a point in front of them. **The cursor is CAPTURED, not
+wrapped**: hidden, held at the viewport centre, re-seeded after every move,
+with the delta taken against that anchor. Edge-wrapping could only work where
+there was screen to wrap to, which is why steering died against the properties
+dock on the right and at the top and bottom. **CIF**: `perceive_bonds` now
+CAPS hydrogen at one bond (nearest heavy neighbour) — HpPyBz_th.cif drew eight
+two-bonded hydrogens. Worth knowing that file is genuinely broken and MoloM is
+not: **ASE reads exactly the same 192 atoms and the same 0.7533 A contact**, so
+the clash is in the file; capping stops us DRAWING an impossible bond, it
+cannot invent a structure. **The oblique view came from below** — the
+elevation was added to the forward vector instead of subtracted, putting the
+camera under the floor grid looking up through it. **Axis views were the
+mirror of Mercury's**: "view along b" means b points AT you, not away, and the
+up axis is CYCLIC (right = next, up = the one after), so the b view has c
+across and a up. That is why his Mercury screenshot was wide where MoloM's was
+tall. A second click on the same axis button flips to the other side, which is
+what Mercury spends a whole extra row of x−/x+ buttons on. **Settings scrolls**
+and has a filter box top-right, matching at word boundaries over labels AND
+tooltips (a plain substring search had "roll" dragging in the pointing-device
+row via "scroll"); a section name reveals its whole section, and OK/Cancel sit
+outside the scroll area. The filter also caught a real bug: the Acceleration
+slider was clamping at 30 while its readout claimed 60. 759 tests.
+
 Round 34 (2026-08-04, geometry editing + flight + Blender selection):
 **internal coordinates are editable at last** (`core/internal.py`) — the one
 operation a purely Cartesian editor cannot fake. Select 2/3/4 atoms and the
@@ -700,7 +811,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 679 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 764 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -788,11 +899,20 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   `moving_group` returns `(indices, blocked)`; `blocked` covers both a ring
   and a non-bonded pair inside one fragment, where "which half is the far
   half" has no answer and only the picked atom may move.
-- `core/flight.py` — the flight model behind right-mouse fly AND shuttle mode.
+- `core/flight.py` — the 6DoF model behind right-mouse fly AND shuttle mode.
+  `AimReticle` is the VIRTUAL STICK: a persistent offset whose deflection is a
+  sustained turn rate, with a rescaled dead zone. It never decays — that is
+  the point. `step_bank` rolls into the turn and levels when it centres.
   World-space velocity, thrust, exponential drag (stable at any dt), speed
-  cap, scene-size scaling. No roll: pitch is clamped short of vertical and
-  `Camera.fly_look` rebuilds from azimuth/elevation rather than composing
-  quaternion deltas, so roll cannot accumulate over a long flight.
+  cap, scene-size scaling, per-axis acceleration (strafe primacy) and an
+  auto-brake coefficient that only applies with no key held. `ReticleDrift`
+  is the separated aiming mark. Roll is an explicit angle here and an explicit
+  PARAMETER on `Camera.fly_look`, applied after the azimuth/elevation rebuild
+  so it can never accumulate; pitch is still clamped short of vertical.
+- `core/orient.py` — crystallographic view orientations for the ❖ ribbon:
+  direct and RECIPROCAL axis directions (the latter from the inverse
+  transpose — a normal is covariant), `look_along`, and the classical
+  clinographic oblique projection. UI-free, so the whole ribbon is testable.
 - `core/manipulate.py` — G/R modal math (`GrabState`/`RotateState` on a
   shared constraint mixin: global/local axis+plane cycling, Shift-precision
   increment scaling, numeric buffers; ray-plane / ray-line solvers; the
@@ -887,6 +1007,97 @@ independent cross-check inside a single fixture.
   vector then spin so the backbone points outward.
 
 ## Hard-won gotchas (don't re-learn these)
+- **Nothing camera-constant may be computed per PRIMITIVE** (round 35c). The
+  round-33 lesson was "not in a paint path"; this is the sharper version. The
+  symmetry overlay called `_eye_position()` once per line segment, and each
+  call rebuilt the rotation matrix from the quaternion — 400 times a frame.
+  `_camera_frame()` caches eye + view + projection keyed on the camera state
+  (safe for the picking paths too, which run outside paintGL). Also: for a
+  single 3-vector, plain scalar arithmetic beats numpy several times over,
+  because the array allocation dominates. And memoise QPen/QColor — building
+  them per segment was the other half.
+- **An axis view's up vector is a pose the turntable cannot hold** (round
+  35c). Any view whose up is a CELL axis rather than world Z is "rolled" as
+  far as the yaw/pitch orbit is concerned, so orbiting out of it lurches.
+  `Camera.auto_level` re-levels on the first orbit, exactly as `auto_ortho`
+  pops back to perspective. Set it wherever a non-Z-up pose is imposed.
+- **Softplus is the wrong curve for a stick** (round 35c). It is smooth and
+  monotone, but its slope at the origin is already half its asymptotic slope,
+  so it barely softens the centre — which is the entire reason to reach for a
+  curve — and being asymptotically linear rather than bounded it needs
+  renormalising for full stick to mean full rate. `x**expo` gives f(0)=0 and
+  f(1)=1 exactly and puts all its flattening where small corrections happen.
+  Apply it to the MAGNITUDE, never per axis, or a diagonal stick turns in the
+  wrong direction.
+- **Rotating an ORBIT camera moves the eye** (round 35b). `eye = center +
+  R^T·[0,0,distance]`, so changing only `rotation` swings the eye around the
+  pivot on an arc of radius `distance`. Fine for orbiting — that IS orbiting —
+  and completely wrong for flying, where it reads as looking up bodily lifting
+  you off the ground. Any first-person turn must capture the eye first and
+  rebuild `center` behind it (`_fly_turn`).
+- **Edge-wrapping a cursor only works where there is screen to wrap TO**
+  (round 35b). The flight wrap died against the properties dock on the right
+  and against the top and bottom of the window, so steering just stopped in
+  those directions. For a first-person mode, CAPTURE instead: hide the
+  pointer, hold it at a fixed anchor, take the delta against that anchor and
+  put it straight back. There is then no edge to reach and no visible
+  teleport.
+- **A camera-relative aim must not decay if it is a CONTROL** (round 35b).
+  A reticle that eases back to centre is a readout; one that stays put is a
+  stick. Christian wanted the stick — the turn continues until the mark is
+  brought home. If a UI element both displays state and commands it, decide
+  which, because the two want opposite behaviour.
+- **Our CIF reader agreeing with ASE is the fastest way to blame the file**
+  (round 35b). HpPyBz_th.cif draws hydrogens with two bonds and has a 0.75 A
+  atom-atom contact; ASE reads exactly the same 192 atoms and the same
+  contact, which settles "is this us?" in one command. Do that check before
+  touching the parser. Capping H at one bond is still right — a hydrogen with
+  two sticks is never a picture worth drawing — but it fixes the DRAWING, not
+  the geometry.
+- **"View along an axis" means the axis points AT you** (round 35b), and the
+  up axis is CYCLIC: right = next axis, up = the one after. So the b view has
+  c across and a up. Both halves were backwards in the first cut, which made
+  MoloM's b view the 90°-rotated mirror of Mercury's on the same file. There
+  is no universal convention here — Mercury, VESTA and Diamond differ — so the
+  axis buttons also flip on a second click rather than pretending one is
+  canonical.
+- **A slider whose scale disagrees with its range clamps silently** (round
+  35b), and the readout keeps showing the value you asked for because the
+  label is set from the input, not from the slider. Acceleration defaulted to
+  60 into a 10..300 range read at ÷10, so it pinned at 30 and said "60.00".
+  Set the label from the slider, or test the round trip.
+- **An overlay pass must NOT borrow the scene's GPU buffers** (round 35).
+  `_paint_selection` and `_paint_meta_glow` uploaded their instances into
+  `_sphere`/`_cylinder` and set `_needs_rebuild` so the next frame would put
+  the real geometry back. That makes the scene buffer's correctness depend on
+  paint ORDER plus a flag: any frame that reaches `_sphere.draw()` without a
+  rebuild first draws the enlarged orange hull INSTEAD of the molecule, which
+  is a one-frame flash — driver- and timing-dependent, so it showed on the
+  desktop and never on the laptop. It also forced a full CPU rebuild and
+  `glBufferData` every frame whenever anything was selected. Give a new
+  overlay its OWN `_InstancedMesh`; the duplicated static mesh data is a few
+  KB and buys immunity from the whole class.
+- **A per-axis weight in front of a NORMALISED vector does nothing** (round
+  35). `flight.thrust_world` divides by the length, so scaling the key
+  components to make strafing snappier is divided straight back out and the
+  tuning silently has no effect. Weight the ACCELERATION instead
+  (`FlightModel.accel_for` blends the per-axis figures by how much of the
+  input is on each axis). A test pins it, because the failure is invisible.
+- **`QToolButton.clicked` passes the checked state — swallow it** (round 34,
+  re-learned in round 35's ribbon). Every slot connected to a button here
+  takes `_c=False` as its first default argument so the boolean can never be
+  read as a real parameter. Non-checkable buttons pass `False` forever.
+- **A plain `QWidget` ignores its own stylesheet background** (round 35)
+  unless `WA_StyledBackground` is set — Qt only paints backgrounds for
+  subclasses it knows. The crystal ribbon came out as loose controls floating
+  on the bare viewport instead of a panel. Applies to any new floating strip.
+- **Overloading single- and double-click on one button costs a delay**
+  (round 35). Right-click opens the context menu and right-DOUBLE-click
+  latches flight, and Qt fires the first click's action before it can know a
+  second is coming (the round-8 gotcha). The menu is therefore deferred by
+  `doubleClickInterval()` — but ONLY when a menu would actually open, which
+  `open_context_menu` already restricts to a click on an already-selected
+  atom. Scope any such deferral the same way, or every gesture pays for it.
 - **Qt delivers events to a widget WHILE IT IS BEING CONSTRUCTED, and
   `MolViewport.event()` is overridden** (round 34). Creating the flight
   QTimer with `self` as parent sends a ChildAdded, the override runs
@@ -1336,7 +1547,7 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 595 offline tests. `tests/conftest.py`
+1. `python -m pytest tests/ -q` — 764 offline tests. `tests/conftest.py`
    sandboxes QSettings, so a GUI test can drive a real control without
    writing into your own MoloM configuration.
 2. `python -m molom --selftest` — headless core sanity.
