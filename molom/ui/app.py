@@ -163,6 +163,16 @@ class MainWindow(QMainWindow):
                                      cif_mod.POLICY_DOMINANT)
         self.disorder_policy = (policy if policy in cif_mod.DISORDER_POLICIES
                                 else cif_mod.POLICY_DOMINANT)
+        #: How a space group is NAMED on the crystal page. Hermann-Mauguin by
+        #: default because that is what chemists read and publish; the file's
+        #: own spelling is inconsistent between programs and Hall is exact but
+        #: unreadable. Purely a display choice — it never changes the
+        #: operators, which always come from the file or from its symbol.
+        from ..core import spacegroups as _sg
+        convention = self.settings.value("sg_convention", _sg.CONVENTION_HM)
+        valid = [key for key, _label in _sg.CONVENTIONS]
+        self.sg_convention = (convention if convention in valid
+                              else _sg.CONVENTION_HM)
         for key, attr in self._FLIGHT_KEYS.items():
             stored = self.settings.value("flight_" + key, None)
             if stored is not None:
@@ -231,6 +241,8 @@ class MainWindow(QMainWindow):
         self.vibration_page.load_requested.connect(self.on_load_frequencies)
         self.crystal_page = CrystalPage()
         self.crystal_page.view_changed.connect(self.on_crystal_view)
+        self.crystal_page.occupancy_toggled.connect(
+            self._on_occupancy_display)
         self.crystal_page.exterior_toggled.connect(
             lambda on: self._on_crystal_exterior(self.active_id, on))
         self.crystal_page.box_toggled.connect(self._set_cell_box)
@@ -2291,7 +2303,8 @@ class MainWindow(QMainWindow):
                 "atoms, drawn only)".format(
                     s.metadata.get("boundary_bonds", 0),
                     s.metadata.get("boundary_atoms", 0))) if n])
-        note = ", ".join([n for n in (note, chem) if n]) or None
+        note = ", ".join([n for n in (note, self.symmetry_note(s), chem)
+                          if n]) or None
         self.statusBar().showMessage(
             "Added {}{}".format(obj.name,
                                 " ({})".format(note) if note else ""), 6000)
@@ -2319,6 +2332,57 @@ class MainWindow(QMainWindow):
                         if short else
                         "{} over-valence bond(s) dropped".format(len(dropped)))
         return "; ".join(bits) or None
+
+    @staticmethod
+    def space_group_naming(structure, cell=None):
+        # type: (Structure, object) -> object
+        """This crystal's space group under every name it answers to.
+
+        Resolved for EVERY crystal, not only the ones whose operators had to
+        be derived: the ❖ page has to be able to print the group in whichever
+        convention the user picked, and a file that wrote `p21/n` in lower
+        case still deserves a properly typeset `P2_1/n`.
+        """
+        from ..core import spacegroups
+        meta = getattr(structure, "metadata", None) or {}
+        if not meta.get("cell"):
+            return None
+        rhombohedral = bool(cell is not None and cell.looks_rhombohedral())
+        return spacegroups.identify(meta.get("spacegroup", ""),
+                                    number=int(meta.get("it_number", 0) or 0),
+                                    hall=meta.get("hall", ""),
+                                    rhombohedral=rhombohedral)
+
+    @staticmethod
+    def _calculated_density(info, cell):
+        # type: (dict, object) -> Optional[float]
+        """Dcalc = formula weight x Z / (V x N_A), the crystallographer's own
+        cross-check. Computed rather than read, so it can be compared with the
+        file's reported value — and it is the fastest way to notice that a
+        structure has been expanded wrongly."""
+        try:
+            weight = float(str(info.get("formula_weight", "")).split("(")[0])
+            z = float(str(info.get("z", "")).split("(")[0])
+            volume = float(cell.volume())
+        except (TypeError, ValueError, AttributeError):
+            return None
+        if weight <= 0 or z <= 0 or volume <= 0:
+            return None
+        return weight * z / (volume * 0.6022140857)
+
+    @staticmethod
+    def symmetry_note(structure):
+        # type: (Structure) -> Optional[str]
+        """What the reader did about a missing symmetry loop (round 40).
+
+        Separate from `chemistry_note` because it is a different kind of
+        statement: that one is about atoms and bonds REFUSED, this one is
+        about symmetry INVENTED (or admittedly not invented). Both end up in
+        the same two places -- the import message and the crystal page --
+        because both answer "why does the cell look like that?".
+        """
+        meta = getattr(structure, "metadata", None) or {}
+        return meta.get("symmetry_note") or None
 
     # ------------------------------------------------------------ vibrations
     _FREQ_SUFFIXES = (".out", ".log", ".txt", ".orca", ".output")
@@ -3717,27 +3781,96 @@ class MainWindow(QMainWindow):
             self.outliner.highlight(obj_id)
         meta = obj.structure.metadata
         meta["cell_exterior"] = 1 if on else 0
-        # Round 39: this is a MODIFIER now, not a rebuild. The old path baked
-        # the exterior atoms into the atom list, which changed the cell's atom
-        # count — so "show me the bonds across the faces" quietly stopped the
-        # molecule being the unit cell. Non-destructive keeps both.
+        # TWO mechanisms answer to this one control, and round 39 left only
+        # the first of them wired — which is why Christian reported that
+        # ticking it "does nothing" on three different files:
+        #
+        #  * the BOUNDARY MODIFIER closes covalent bonds that cross a face.
+        #    A framework needs it; a molecular crystal has no such bonds once
+        #    its molecules are unwrapped, and an ionic lattice's are not
+        #    covalent — so for most files it correctly adds nothing at all.
+        #  * the EXTERIOR SEARCH brings in the neighbouring cells' molecules
+        #    that reach into this one. That is the part you can see, and it is
+        #    what VESTA's default picture is made of.
+        #
+        # The modifier is non-destructive; the search rebuilds the view, so it
+        # goes through the same path the asym/cell/packing switch uses and
+        # cannot drift from it.
+        self.push_undo()
         mod = self._boundary_modifier(obj)
         if mod is None:
-            if not on:
-                return
-            self.push_undo()
-            obj.modifiers.append(self._new_boundary_modifier(obj))
+            if on:
+                obj.modifiers.append(self._new_boundary_modifier(obj))
         else:
-            self.push_undo()
             mod.enabled = bool(on)
+        self._rebuild_exterior(obj)
         self._sync_modifier_page()
         self.viewport.refresh_geometry()
         self._update_counts()
         self.statusBar().showMessage(
-            "{}: bonds across the cell faces {} ({} atoms drawn from a "
-            "{}-atom cell)".format(obj.name, "closed" if on else "left open",
+            "{}: atoms outside the cell {} ({} atoms drawn from a "
+            "{}-atom cell)".format(obj.name, "shown" if on else "hidden",
                                    len(obj.evaluated()[0]),
                                    obj.structure.n_atoms), 7000)
+
+    def _on_occupancy_display(self, on):
+        """VESTA's pie spheres for sites shared by several species."""
+        self.viewport.show_occupancy = bool(on)
+        self.viewport.refresh_geometry()
+
+    def _rebuild_exterior(self, obj):
+        """Re-expand this crystal with the current `cell_exterior` setting.
+
+        Regenerated from the stored asymmetric unit, like every other crystal
+        view, so turning the option off restores exactly the previous atoms
+        rather than trying to subtract them again.
+        """
+        meta = obj.structure.metadata
+        asym_symbols = meta.get("asym_symbols")
+        asym_frac = meta.get("asym_frac")
+        cell = cell_of(obj)
+        if not asym_symbols or not asym_frac or cell is None:
+            return
+        if any(getattr(m, "kind", "") == "symmetry" for m in obj.modifiers):
+            # A symmetry modifier is generating the cell from the base; it
+            # owns the expansion and carries its own exterior setting.
+            for m in obj.modifiers:
+                if getattr(m, "kind", "") == "symmetry":
+                    m.exterior = int(meta.get("cell_exterior", 0))
+            return
+        symops = [cif_mod.SymOp.from_xyz(t) for t in meta.get("symops") or ()
+                  if t]
+        report = {}
+        symbols, coords = cif_mod.build_view(
+            cell, asym_symbols, asym_frac, symops,
+            mode=meta.get("cell_view", "cell"),
+            na=int(meta.get("cell_na", 1)), nb=int(meta.get("cell_nb", 1)),
+            nc=int(meta.get("cell_nc", 1)),
+            # The checkbox means VESTA's default picture — the neighbouring
+            # molecules that reach into this cell — NOT round 35's bonded
+            # shell, which on a lattice buries the cell (see `expand`).
+            exterior=0,
+            shell_molecules=bool(meta.get("cell_exterior", 0)),
+            occupancy=meta.get("asym_occupancy"),
+            disorder=meta.get("disorder_policy") or self.disorder_policy,
+            report=report)
+        if not symbols:
+            return
+        meta.pop("site_occupancy", None)
+        if report.get("site_occupancy"):
+            meta["site_occupancy"] = dict(report["site_occupancy"])
+        s = obj.structure
+        s.symbols = list(symbols)
+        s.frames = [np.asarray(coords, dtype=float)]
+        s.set_frame(0)
+        s.bonds = []
+        # Per-atom display overrides indexed the OLD atom list.
+        obj.atom_colors, obj.atom_labels = {}, set()
+        obj.atom_label_text, obj.atom_label_colors = {}, {}
+        obj.atom_label_modes = {}
+        obj.atom_hidden, obj.atom_scales = set(), {}
+        self._perceive_fresh(s)
+        self.viewport.set_selection([])
 
     @staticmethod
     def _new_boundary_modifier(obj, shells=1):
@@ -3964,13 +4097,24 @@ class MainWindow(QMainWindow):
                                        else obj.name)
             return
         meta = obj.structure.metadata
+        info = meta.get("cif_info") or {}
+        naming = self.space_group_naming(obj.structure, cell)
+        shown = (naming.text(self.sg_convention) if naming is not None
+                 else meta.get("spacegroup", ""))
         self.crystal_page.set_cell(
-            cell, spacegroup=meta.get("spacegroup", ""),
+            cell, spacegroup=shown,
             n_asym=len(meta.get("asym_symbols") or ()),
             n_atoms=obj.structure.n_atoms,
             mode=meta.get("cell_view", "cell"),
             exterior=int(meta.get("cell_exterior", 0)),
-            chemistry=self.chemistry_note(obj.structure) or "")
+            chemistry=self.chemistry_note(obj.structure) or "",
+            symmetry=self.symmetry_note(obj.structure) or "",
+            naming=naming,
+            bravais=(naming.bravais if naming is not None else ""),
+            density=self._calculated_density(info, cell),
+            name=obj.name)
+        self.crystal_page.set_detail(
+            info, naming=naming, site_occupancy=meta.get("site_occupancy"))
 
     def on_meta_atom(self):
         """Configure the meta atom (the periodic table's ✳ button, and F3).
@@ -4086,6 +4230,12 @@ class MainWindow(QMainWindow):
             report=report)
         if report.get("disorder"):
             meta["disorder"] = dict(report["disorder"])
+        # Rebuilt views renumber the atoms, so the shared-site map has to be
+        # replaced (or cleared) with them — a stale one would paint the pie
+        # slices onto whichever atom happens to hold that index now.
+        meta.pop("site_occupancy", None)
+        if report.get("site_occupancy"):
+            meta["site_occupancy"] = dict(report["site_occupancy"])
         if not symbols:
             self.statusBar().showMessage("That view produced no atoms", 4000)
             return
@@ -4169,6 +4319,7 @@ class MainWindow(QMainWindow):
             input_preset=self.viewport.input_preset,
             label_scale=self.viewport.label_scale,
             disorder_policy=self.disorder_policy,
+            sg_convention=self.sg_convention,
             on_speed_change=lambda v: setattr(self.viewport.camera,
                                               "rotate_speed", v),
             on_atom_scale_change=self.viewport.set_atom_scale,
@@ -4230,6 +4381,8 @@ class MainWindow(QMainWindow):
             self.viewport.adjust_h = dlg.adjust_hydrogens()
             self.disorder_policy = dlg.disorder_policy()
             self.settings.setValue("disorder_policy", self.disorder_policy)
+            self.sg_convention = dlg.sg_convention()
+            self.settings.setValue("sg_convention", self.sg_convention)
             self.undo.set_limit(dlg.undo_limit())
             self.viewport.set_atom_scale(dlg.atom_scale())
             self._set_label_scale(dlg.label_scale())

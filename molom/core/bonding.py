@@ -119,6 +119,47 @@ MAX_COVALENT = {
 IMPOSSIBLE_FACTOR = 0.65
 
 
+def _removal_order(symbols, pairs, distances):
+    # type: (List[str], List[tuple], np.ndarray) -> List[int]
+    """The order in which over-valence bonds are sacrificed.
+
+    Longest first is right when the excess comes from an over-generous
+    distance cutoff -- a spurious long contact really is the least likely
+    bond. It is exactly WRONG when the excess comes from DUPLICATE atoms,
+    because every real C-C (~1.5 A) is longer than every real C-H (~1.0 A),
+    so the skeleton bond is sacrificed to keep the duplicates.
+
+    Round 40, on Christian's `4-ABA-oxime.cif`: a methyl disordered over two
+    orientations is written at FULL occupancy, so one carbon carries four to
+    six hydrogens at 0.88-1.04 A plus its ring carbon at 1.497 A. Longest
+    first drops the C-C -- a textbook single bond -- and the methyl becomes a
+    loose fragment. It then sits inside the cell as its own "molecule", so
+    whole-molecule boundary completion never carries it out with the rest,
+    which is the visible difference from VESTA.
+
+    So a bond that is some atom's LAST link to the heavy-atom skeleton goes
+    last. Nothing else changes: a spurious long C...C on a carbon that has
+    other heavy neighbours is not a last link, and is still dropped first.
+    """
+    count = len(pairs)
+    if not count:
+        return []
+    heavy_degree = {}
+    for i, j in pairs:
+        if symbols[i] != "H" and symbols[j] != "H":
+            heavy_degree[i] = heavy_degree.get(i, 0) + 1
+            heavy_degree[j] = heavy_degree.get(j, 0) + 1
+    dist = np.asarray(distances, dtype=float)
+    keys = []
+    for k, (i, j) in enumerate(pairs):
+        strands = (symbols[i] != "H" and symbols[j] != "H"
+                   and (heavy_degree.get(i, 0) <= 1
+                        or heavy_degree.get(j, 0) <= 1))
+        keys.append((1 if strands else 0, -float(dist[k]), k))
+    keys.sort()
+    return [k for _, _, k in keys]
+
+
 def prune_pairs(symbols, pairs, distances, impossible=True, valence=True):
     # type: (List[str], List[tuple], np.ndarray, bool, bool) -> Tuple[List[int], List[tuple]]
     """Which of these candidate bonds survive the chemistry.
@@ -135,8 +176,7 @@ def prune_pairs(symbols, pairs, distances, impossible=True, valence=True):
     radii = covalent_radii(symbols)
     dropped = []
     alive = [True] * len(pairs)
-    order = np.argsort(-np.asarray(distances, dtype=float)) \
-        if len(pairs) else []
+    order = _removal_order(symbols, pairs, distances)
     if impossible:
         for k, (i, j) in enumerate(pairs):
             if not (0 <= i < n and 0 <= j < n):

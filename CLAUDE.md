@@ -56,6 +56,237 @@ the operator key table, CIF reading with symmetry, coordination polyhedra,
 meta atoms, the scene clock with a multi-track timeline, vibrational modes,
 per-element display control, and the symmetry modifier. 512 tests.
 
+Round 42 (2026-08-05, VESTA's occupancy pie spheres): a correctness fix with a
+rendering feature on top. `1547149.cif` puts **Nb 0.50, Ti 0.25, Ni 0.15 and
+Co 0.10 on ONE position** — a substitutional solid solution, and the file
+names itself `Ni0.15Co0.1Ti0.25Nb0.5O2`. MoloM drew pure Nb, and not by
+policy: all four sit at (0,0,0), so `expand`'s minimum-image de-duplication
+threw three of them away **before occupancy was ever consulted** (`POLICY_ALL`
+gave the same six atoms, which is what proves it was the dedup and not the
+round-38 disorder resolution). A rendered composition the file never claimed,
+with nothing anywhere to say so. `cif.shared_sites` / `site_composition` keep
+the group — grouped at the SAME tolerance the de-duplication uses, so it
+describes exactly the atoms that merging would otherwise discard — and
+`expand` reports `site_occupancy` keyed by DRAWN atom index. Two things that
+had to be right: the mapping is built at the very END (everything above drops
+atoms and renumbers), and boundary/exterior copies **inherit** their source's
+composition by matching fractional coordinates modulo 1, or the cell shows one
+pie sphere at the centre and eight plain ones at the corners. `style.
+occupancy_wedges` turns a composition into cumulative boundaries, normalised
+against the site's OWN total (a site refined to 0.97 is rounding, not 3%
+vacancy) and always padded to a fixed four so the instance stride is constant.
+Rendering is a **second pass at `GL_LEQUAL`** over the ordinary spheres: same
+mesh, same model matrix, so every fragment lands at exactly the same depth and
+the wedges win on equality — no polygon offset, no z-fighting, and the atom
+stays an ordinary atom to picking, selection and the selection hull. Its own
+program and its own buffer, never the scene's (the round-35 flicker bug).
+**Christian's precedence rule**: a colour set in the outliner WINS and the
+atom draws solid, because painting an atom yourself is a deliberate statement
+about that atom while the wedges are derived from the file. The ❖ page gets an
+"Occupancy pie spheres" checkbox and prints the composition as a Shared site
+row — one line per DISTINCT composition, not one per symmetry image. 909 tests.
+
+Round 42d (2026-08-05, group by GEOMETRY, draw by CHEMISTRY): Christian read
+VESTA's behaviour off its own outliner and got it exactly right — "VESTA
+acknowledges these bonds between partial occupancy positions and uses them for
+visualisation/connectivity, while not listing them as atom types". Our own ❖
+page was already saying the same thing from the other side: **474 impossible
+bond(s) dropped** on `2240539.cif`. Round 38's sanity filters reject a contact
+shorter than 0.65x the covalent radii, and the alternatives of a disordered
+site are by definition closer than that — so the chemistry graph shattered
+that structure into 134 loose atoms and 73 pairs, nothing could be completed
+at a cell face, and the corners showed fragments where VESTA shows a
+polyhedral ball. Measured: the SAME atoms grouped on raw proximity give
+exactly **4 components of 70 atoms**, which is the four F-centred lattice
+points of Fm-3m — VESTA's picture precisely. Hence the rule: **the sanity
+filters decide what to DRAW, never what belongs TOGETHER.** `fragment_info`
+and `unwrap_molecules` take `geometric=`, and `expand` turns it on for the
+wholly disordered case. It is NOT the default, and the discriminator is
+occupancy: round 38's HpPyBz fault is a spurious 0.75 A contact between two
+FULLY occupied molecules, and grouping geometrically there re-fuses two
+separate molecules — the suite caught exactly that regression when the change
+was first made unconditionally, which is why it is narrowed. Christian also
+found that **2240539 breaks Mercury outright** (it will not open the file),
+which retrospectively justifies picking VESTA as the ground truth. STILL OPEN
+on that file: VESTA also DRAWS those contacts, so its cages read as solid
+polyhedra while ours are clouds of spheres in the right places.
+
+Round 42c (2026-08-05, the sweep's second pass — Christian's screenshots):
+the first sweep framed every render on the CELL BOX, which cropped exactly the
+atoms that were the bug. Christian spotted triazoles floating a cell away from
+`Cu_trz_tet`, magnesiums above `H2Mg2O8P2` **with completion switched off**,
+and a unit cell that FLIPPED when he deleted them. Re-rendered with `fit_view`
+(his suggestion: press F), an objective test — "does any bonded fragment lie
+entirely outside the cell?" — found **9 of the 37 files** drawing orphans.
+Four faults, each fixed at its own level. (1) `boundary_images` carries an
+atom's whole MOLECULE (round 33), so a molecule stored SPLIT across a face
+gets translated bodily and its far half lands a full cell further out — that
+is round 39's "walk it contiguous first" lesson in a new place, and it put two
+Mg at z = 1.94. Rather than patch each producer, `_reaches_into_cell` applies
+the rule both reference viewers state outright — Mercury includes a molecule
+when ANY of its atoms is in the cell — as a final filter over COPIES only, so
+Z and the ❖ count are untouched. It must **iterate to a fixed point**: removing
+a fragment orphans whatever hung off it, and 2240539 still had 12 lone
+hydrogens after one pass. (2) **The cell box flipped on deletion** because it
+is carried by a Kabsch fit from reference atoms held as INDICES, and
+`delete_atoms` renumbers: the indices stayed valid and quietly came to mean
+different atoms, so the guard for out-of-RANGE indices never fired.
+`edits._remap_cell_reference` remaps them like the bonds, and clears the
+reference below three points rather than fitting an under-determined rotation.
+(3) **Disorder resolution was splitting symmetry orbits.** Two overlapping
+atoms from the same site are images of one another under the space group, so
+keeping some and dropping others leaves a structure that does not obey its own
+symmetry; `resolve_disorder` now takes `sites` and never separates them.
+(4) `2240539.cif` — Christian's blocker — is a **plastic crystal**, one
+molecule smeared over 192 operations of Fm-3m with all five sites at occupancy
+0.21-0.43. With no fully occupied site there is no ordered skeleton to resolve
+against, nothing is dominant, and greedy resolution produced a 184-of-280
+chimera that rendered as a blob where VESTA shows a neat array of cages.
+`expand` now detects the wholly-disordered case and draws the smear, which is
+what VESTA, pymatgen and ASE all do: 280 atoms, exact. Afterwards **no file
+draws an orphan fragment in either mode**, and cell content is unchanged
+everywhere. NOTE ON FIXTURES: Christian's set is largely CCDC data and may not
+be redistributed — two COD files are vendored, the rest of this round is tested
+as rules rather than files. 918 tests.
+
+Round 42b (2026-08-05, the 37-file VESTA sweep): Christian exported all 37
+test CIFs from VESTA down every cell axis and asked for every discrepancy
+addressed. Two sweeps were run. **Numerically**, against pymatgen, ASE and
+each file's own formula x Z: every count difference from the two reference
+readers is OUR DISORDER POLICY and nothing else — `POLICY_ALL` reproduces
+pymatgen and ASE atom-for-atom on all six files that differ (2240539 280,
+4118335 74, ZIF-62 368, 2370019 20, ZIF-7 585, ZIF-67 348), and on ZIF-67
+formula x Z agrees with US rather than with them. **Visually**, all 99 views
+were re-rendered from MoloM at the same axes and composited side by side,
+which found three real faults. (1) The occupancy wedges split around the
+world Y axis, so from exactly the axis views a crystallographer uses they
+showed edge-on as slivers; the pie now faces the CAMERA (`atan` of the
+view-space normal's x/y), which is what VESTA does and where the composition
+most needs to be legible. (2) A one-atom component was being completed as if
+it were a molecule, so BaLiF3 grew 15 -> 25 atoms — round 33's NaCl lesson one
+function further out, now guarded in `exterior_molecules`. (3) The exterior
+shell followed metal-to-metal bonds, which `bond_kind` calls COVALENT on
+purpose (round 38, so an SBU is not dissected) — right for typing a bond and
+wrong for growing a shell, because an intermetallic is metal-bonded in every
+direction: Ni6Sn8 went 28 -> 55 atoms and buried a cell VESTA draws bare. The
+shell now follows covalent bonds **involving a non-metal**, which is what
+separates a ZIF linker from an intermetallic. The checkbox also stopped
+conflating two mechanisms: `shell_molecules` (VESTA's default picture) is now
+a separate parameter from `exterior` (round 35's explicit bonded shell), which
+is why the round-35 tests kept passing throughout. Result per structure type,
+measured: lattices and perovskites unchanged, molecular crystals x1.98,
+frameworks x1.09-1.28. **Still open**: on a few files (4118335, Cu_trz_cub,
+2240539) the molecule completion is more generous than VESTA's, because VESTA
+wraps atoms individually and we wrap by molecule, so "which copies reach in"
+is not the same question in the two programs.
+
+Round 41 (2026-08-05, VESTA comparison + the crystal page grows up): Christian
+exported all 37 test CIFs from VESTA down every cell axis and annotated three
+against MoloM. **His diagnosis of `4-ABA-oxime.cif` was exactly right.** The
+file writes a methyl DISORDERED OVER TWO ORIENTATIONS at full occupancy —
+occupancy 1.0 on every site, no disorder group, no `_atom_site_occupancy`
+column worth the name — so one carbon carries four to six hydrogens at
+0.88-1.04 A plus its ring carbon at 1.497 A. Round 38's valence cap then has
+to drop something, and it dropped **LONGEST FIRST**, which is the C-C: a
+textbook single bond sacrificed to keep a fourth hydrogen. The methyl became a
+loose fragment sitting inside the cell, so round 33's whole-molecule boundary
+completion treated it as its own complete molecule and never carried it out —
+which is precisely the visible difference from VESTA, where the molecules run
+past the cell edge. `bonding._removal_order` now sends a bond that is some
+atom's LAST link to the heavy-atom skeleton to the BACK of the queue. Nothing
+else changes: a spurious long C...C on a carbon with other heavy neighbours is
+not a last link and is still dropped first. Methyls come back as 3 H + the
+ring bond, molecules complete across the boundary again. **Still open there**:
+the surplus disorder hydrogens are now bonded to nothing and float as loose
+white spheres (36 of them in that cell), because dropping the BOND does not
+drop the ATOM. Resolving undeclared disorder geometrically would fix it — and
+measured across all 37 files, `4-ABA-oxime.cif` is the ONLY one with
+same-element atoms inside `DISORDER_RADIUS` that the file does not declare, so
+the blast radius is one file — but on that carbon only two of its four H pairs
+overlap, so a naive sweep leaves a 2-hydrogen methyl. Needs a decision, not a
+patch. **The "bonded atoms outside the cell" tick really did nothing** on all three
+of his files. Round 39 had repointed the checkbox from round 35's
+`cif.bonded_exterior` to the `BoundaryModifier`, which by design closes only
+COVALENT bonds crossing a face — a molecular crystal has none once it is
+unwrapped and an oxide's are ionic, so the modifier was right and the control
+was dead. But the deeper reason the picture differed is that **VESTA wraps
+atoms INDIVIDUALLY and completes each molecule outwards, while MoloM wraps by
+MOLECULE** (round 19, so a fragment is never cut in half) — which pulls a
+straddling molecule bodily inside instead of drawing it half out, and leaves
+the box with no context around it. `cif.exterior_molecules` states Mercury's
+packing rule directly: draw a molecule if ANY of its atoms falls inside the
+closed cell, including its copies in the 26 surrounding cells. Periodic
+components are skipped (every shell of a framework looks as unfinished as the
+last — that is the modifier's job). The checkbox now drives both mechanisms
+and rebuilds through the same path the asym/cell/packing switch uses, so
+turning it off restores exactly the previous atoms: 4-ABA 200 -> 404,
+242083 510 -> 876, 1547149 15 -> 23, and the render matches Christian's VESTA
+export of the same file. **VESTA also settles the 4-ABA question**: its
+methyls carry every disorder hydrogen AND keep the C-C bond, which is what
+MoloM now draws — the only remaining difference is that we do not draw sticks
+to the fifth and sixth H, because carbon does not have six bonds. **The crystal
+page was one long `\n`-joined string** and is now a two-column table: cell,
+volume, Bravais lattice (`oP - orthorhombic, primitive`, from the IT number
+plus the lattice letter), space group with its number, asymmetric-unit and
+drawn atom counts, and a CALCULATED density — which on ZIF-8 comes out at
+0.925 g/cm3 against the file's own reported 0.925, i.e. a free check that the
+expansion is right. Under it a collapsible **File details** block carries the
+names, formulae, weight, Z, temperature, radiation, wavelength, R factors,
+colour, habit and provenance (DOI as a link, CCDC/COD codes) — every row
+present only if that tag was, because CIFs carry wildly different subsets.
+`_publ_section_title` and friends need `;`-block reading, which the parser did
+not do. **Space groups are named in Hermann-Mauguin by default**, with a
+Settings choice of short/full/standard-setting/Hall/as-written. The short form
+used is the SETTING-PRESERVING one (`P2_1/n`, not `P2_1/c`): the standard
+short symbol is identical for all nine settings of number 14, so printing it
+for a P2_1/n file reads as an outright error to anyone who knows their own
+compound. Also fixed: `CrystalPage` positioned three widgets by literal layout
+INDEX (`insertWidget(2, ...)`), which this round's two new widgets silently
+invalidated — the polyhedra checkbox landed in the middle of the details
+block. They are placed relative to a named widget now. 898 tests.
+
+Round 40 (2026-08-05, the space group a file NAMES instead of spelling out):
+the last big correctness gap in the CIF reader, and the quietest.
+`_symmetry_space_group_name_H-M 'P 21/c'` with no operator loop fell back to
+P1, so MoloM drew the **asymmetric unit** — a quarter of the structure, with
+no error, no warning, and a picture tidy enough to believe. On Christian's
+`2101932.cif` (ferrocene) that is 11 atoms where there are 42, and the render
+shows every iron carrying ONE cyclopentadienyl ring: half a sandwich, neatly
+packed. New `core/spacegroups.py` resolves symbol → operators through
+**spglib's Hall database** (pymatgen as a backstop), and the reason it is the
+Hall database and not the 230 group numbers is **settings**: `P 21/c`,
+`P 21/n` and `P 21/a` are all number 14 with DIFFERENT operators, so expanding
+one file's coordinates with another's produces a confident, entirely wrong
+structure. Measured, not assumed: across Christian's 37-file test set, **35 of
+35 files that list their own operators have those operators reproduced exactly
+from their symbol** — including Fd-3m origin choice 2, I4_1/amd, R-3
+hexagonal, P6_122 and Im-3m's 96. The other two are the ones the round
+rescues: ferrocene (via its Hall symbol `-P 2yab`; formula x Z = 42 exactly,
+pymatgen agrees, **ASE refuses the file outright**) and `H2adp.cif`, whose
+operator loop is three literal `?` marks (40 atoms, density 1.406 g/cm3 for
+adipic acid — pymatgen returns 3 atoms for this file). Matching what CIFs
+actually WRITE is the whole difficulty and is why this is not four lines
+calling pymatgen: `P 21/c` is the commonest spelling on earth and
+`SpaceGroup("P 21/c")` raises. Symbols are compared on a canonical key
+(letters and digits only), full symbols also register their short forms
+(`P 1 2_1/n 1` → `P 2_1/n`, without which `P 21/n` matches nothing), the
+pre-1992 double-glide names are aliased (`Cmca` → `Cmce`, which is ZIF-L),
+and the pre-1990 bar-less spellings resolve (`F d 3 m` → `Fd-3m`). Every
+derivation is REPORTED in the import message and on the ❖ page — including
+"setting b2 assumed" where a choice was genuinely open, and NOT where
+convention settles it, because a warning that fires always is a warning nobody
+reads. Two rules that keep it honest: **the file's own loop always wins** (a
+program that writes P1 coordinates under the parent group's name would have
+its structure DOUBLED otherwise — an identity-only loop is reported, never
+acted on), and **an unresolvable symbol is stated** rather than silently
+becoming P1. Also fixed en route: a **double-spaced loop header** (blank line
+between every tag, which is legal CIF) made the tag scan stop at the first
+blank and discard the entire atom-site loop — `H7Mg2O10P2.cif` was rejected as
+"no fractional atom sites" and now reads 58 atoms, matching pymatgen exactly.
+spglib is a HARD dependency now, not an optional tier: rdkit/openbabel degrade
+to "cannot read this format", which is visible, while this degrades to a
+structure a quarter of its true size. 898 tests.
+
 Round 39 (2026-08-05, bonds across the cell faces — the ZIF batch): Christian
 downloaded a set of new files and "molom fails on almost all of them".
 Measured first, against ASE, pymatgen AND each file's own formula x Z: **six
@@ -935,7 +1166,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 764 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 918 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -1020,6 +1251,15 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   minimum-image bond list, valence-sanitised), and `fragment_info` cutting a
   PERIODIC component at its coordination bonds — which is what makes a
   framework's linkers finite and completable at the boundary.
+- `core/spacegroups.py` — space-group SYMBOL -> operators, for the CIFs that
+  name their group and omit the loop. spglib's **Hall database** (530
+  settings) first, pymatgen second, both optional-at-runtime and both
+  degraded gracefully. Returns `x,y,z` STRINGS so the caller feeds them
+  through the same `SymOp.from_xyz` a file-supplied loop takes — one code
+  path, and the metadata round-trip is identical. The matching, not the
+  operators, is the hard part: see `canonical_key`, `_short_forms` and
+  `_e_glide_aliases`. `Symmetry.ambiguous` says whether a setting was really
+  CHOSEN, which is what stops the report crying wolf on every P2_1/c file.
 - `core/ptable.py` — where each element sits in the 18-column chart (f-block
   detached on rows 9/10) + the black-or-white text rule for a cell painted in
   the element's colour. Drawn by `ui/periodic_table.py`.
@@ -1152,6 +1392,82 @@ independent cross-check inside a single fixture.
   vector then spin so the backbone points outward.
 
 ## Hard-won gotchas (don't re-learn these)
+- **De-duplication runs BEFORE occupancy, so a shared site loses its species**
+  (round 42). Several elements on one crystallographic position are identical
+  coordinates, which `expand`'s minimum-image merge discards on sight — the
+  disorder policy never sees them, and `POLICY_ALL` returns the same atoms,
+  which is how to tell this apart from a round-38 disorder decision. Anything
+  that needs to know what a merge threw away has to be computed from the
+  ASYMMETRIC UNIT, not from the expanded atoms.
+- **A per-atom map must be built after everything that renumbers** (round 42),
+  and copies must inherit it. `site_occupancy` is keyed by drawn index, so
+  resolving disorder, wrapping, boundary completion and the exterior search
+  all invalidate it; and a boundary copy of a shared site is still that site.
+  Match copies to their source on the fractional coordinate modulo 1 rather
+  than threading site indices through every function that appends atoms.
+- **`GL_LEQUAL` is how you redraw the same geometry with a different shader**
+  (round 42). Identical mesh and identical model matrix give bit-identical
+  depth, so the second pass wins on equality with no polygon offset and no
+  z-fighting — and the atom stays an ordinary atom to picking, the selection
+  hull and every other pass, which is what makes the pie spheres additive
+  instead of a special case threaded through `_rebuild`.
+- **"Longest first" is the wrong way to cull an over-valence atom when the
+  excess is DUPLICATE ATOMS** (round 41). Every real C-C (~1.5 A) is longer
+  than every real C-H (~1.0 A), so a carbon carrying a disordered methyl's six
+  hydrogens loses its bond to the molecule and becomes a loose fragment —
+  which then defeats whole-molecule boundary completion, because a fragment
+  that is already inside the cell has nothing to complete. A bond that is some
+  atom's LAST link to the heavy-atom skeleton must be sacrificed last.
+- **A disordered site is not always DECLARED** (round 41). `4-ABA-oxime.cif`
+  writes a methyl over two orientations with `_atom_site_occupancy` 1.0
+  throughout, so `is_disordered` is False and `resolve_disorder` never runs.
+  Occupancy is evidence of disorder; geometry (two same-element atoms 0.69 A
+  apart) is proof of it, and the two do not always agree.
+- **Never position a widget by literal layout INDEX** (round 41).
+  `CrystalPage` used `insertWidget(2, ...)` and `insertWidget(5, ...)`; adding
+  two widgets higher up moved the polyhedra checkbox into the middle of an
+  unrelated block, with nothing failing and no error. Use
+  `lay.indexOf(anchor) + 1` so the position survives the next addition.
+- **The standard short H-M symbol does not name a SETTING** (round 41). All
+  nine settings of number 14 are `P2_1/c`, so displaying it for a file that
+  says `P 21/n` looks like a bug to the person who made the compound. Show the
+  setting-preserving short form (derived from the full symbol by dropping its
+  `1`s) — which is also what CIFs themselves write.
+- **A space-group SYMBOL is not a space-group NUMBER** (round 40). `P 21/c`,
+  `P 21/n` and `P 21/a` are all number 14; their operators differ, and the
+  file's coordinates are in one specific setting. Resolving a symbol via its
+  IT number therefore silently produces a wrong structure for two of the
+  three — which is why the resolver goes through spglib's 530-entry HALL
+  database (one entry per setting) and why an IT number, which carries no
+  setting at all, is the last route tried and is reported as such.
+- **pymatgen rejects the commonest spelling of the commonest space group**
+  (round 40). `SpaceGroup("P 21/c")` raises `Bad international symbol`; it
+  wants `P2_1/c`. Since `P 21/c` is exactly what CIFs write, any symbol
+  lookup needs its own normalisation before it reaches a library — compare on
+  a canonical key (letters and digits, case-folded), and register each full
+  symbol's short form too, because `P 1 2_1/n 1` is how the database spells
+  what the file calls `P 21/n`.
+- **Space groups were RENAMED and old files still use the old names**
+  (round 40). The 1992 edition of International Tables introduced the double
+  glide `e`: Abm2/Aba2/Cmca/Cmma/Ccca became Aem2/Aea2/Cmce/Cmme/Ccce, and
+  ZIF-L.cif says `Cmca`. Older files also drop the bar (`F d 3 m` for
+  `Fd-3m`). Both are matched by GENERATING candidate modern spellings and
+  checking them against the database, never by trusting the transformation:
+  the e-glide aliases are accepted only if they land on one of the five
+  groups that can have an e-glide.
+- **A warning that fires every time is a warning nobody reads** (round 40).
+  The first cut reported "setting b1 assumed" on every ordinary P2_1/c file,
+  because the symbol technically matches nine Hall settings. `Symmetry.
+  ambiguous` distinguishes "the input left a choice open" (P 21/n, an origin
+  choice, R axes) from "convention settles it", and only the former is
+  mentioned. Same discipline as round 38's chemistry notes: report what was
+  actually decided, not what could theoretically have been.
+- **Blank lines inside a loop header are legal CIF** (round 40). The tag scan
+  stopped at the first non-`_` line, so a double-spaced file lost its ENTIRE
+  atom-site loop and was rejected as "no fractional atom sites" — a good file,
+  refused, with a message pointing at the wrong thing. `H7Mg2O10P2.cif` is the
+  regression case. Skip blanks and comments while collecting tags; stop only
+  at a non-blank line that is not a tag.
 - **Measure before believing "it fails on almost all of them"** (round 39).
   Nine files, three independent references (ASE, pymatgen, and each file's own
   `_chemical_formula_sum` x `_cell_formula_units_Z`): six were already exact,
@@ -1799,7 +2115,7 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 764 offline tests. `tests/conftest.py`
+1. `python -m pytest tests/ -q` — 918 offline tests. `tests/conftest.py`
    sandboxes QSettings, so a GUI test can drive a real control without
    writing into your own MoloM configuration.
 2. `python -m molom --selftest` — headless core sanity.
@@ -1863,13 +2179,17 @@ batches. Known next items, rough order:
 1b. **Crystallography / CIF.** Reader + cell box round 18; correct placement,
    live-tracking box, whole-molecule wrapping and asym/cell/packing switching
    round 19. Still open, in order:
-   - **pymatgen** — Christian OK'd it as a dependency (2026-08-02) and it is
-     NOT yet used. Worth it for: CIFs that give only a space-group SYMBOL and
-     no symop loop (our reader falls back to P1 and then silently shows just
-     the asymmetric unit — the biggest correctness gap left), disorder groups
-     and partial occupancies, and `.cif` EXPORT with a space group re-derived
-     by spglib. Keep our zero-dependency reader as the bottom tier and put
-     pymatgen above it, mirroring the rdkit/openbabel tiering.
+   - ~~**the P1-fallback gap**~~ **DELIVERED round 40**
+     (`core/spacegroups.py`): a CIF naming its group without listing the
+     operators is expanded, via **spglib's Hall database** rather than
+     pymatgen — settings are the whole problem and pymatgen exposes standard
+     settings only (it is kept as a backstop tier). spglib is a hard
+     dependency; pymatgen still is not. Verified on Christian's 37-file set:
+     35/35 files with their own loop reproduce it exactly from their symbol.
+     Still open from the original scoping: **`.cif` EXPORT with a space group
+     re-derived by spglib** — and note there is no CIF writer at all today,
+     `io.write_structure_file` hands OpenBabel an xyz block, so a written
+     `.cif` loses the cell, the symmetry AND the occupancies together.
    - ~~**BOND TYPING is the missing hierarchy**~~ **DELIVERED round 38**, all
      three parts (kinds, valence sanity, occupancy). The scoping is kept
      below because the reasoning is what matters, and because the two files

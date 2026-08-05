@@ -225,6 +225,68 @@ void main() {
 }
 """
 
+#: A sphere divided into occupancy WEDGES, VESTA's way of drawing a site that
+#: several species share (a substitutional solid solution: Nb 0.50 / Ti 0.25 /
+#: Ni 0.15 / Co 0.10 on one position). Its own program and its own buffer
+#: rather than extra attributes on the main one — an overlay that borrows the
+#: scene's instance buffers is the round-35 flicker bug, and mixed sites are
+#: rare enough that a second small pass costs nothing.
+_SPLIT_VERT = """
+#version 330 core
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aNormal;
+layout(location = 2) in mat4 aModel;    // locations 2,3,4,5
+layout(location = 6) in vec4 aSeg0;     // rgb = colour, a = cumulative end
+layout(location = 7) in vec4 aSeg1;
+layout(location = 8) in vec4 aSeg2;
+layout(location = 9) in vec4 aSeg3;
+uniform mat4 uView;
+uniform mat4 uProj;
+out vec3 vNormalView;
+out vec3 vLocal;
+out vec4 vSeg0;
+out vec4 vSeg1;
+out vec4 vSeg2;
+out vec4 vSeg3;
+void main() {
+    vec4 world = aModel * vec4(aPos, 1.0);
+    gl_Position = uProj * uView * world;
+    vNormalView = mat3(uView) * mat3(aModel) * aNormal;
+    vLocal = aPos;
+    vSeg0 = aSeg0; vSeg1 = aSeg1; vSeg2 = aSeg2; vSeg3 = aSeg3;
+}
+"""
+
+_SPLIT_FRAG = """
+#version 330 core
+in vec3 vNormalView;
+in vec3 vLocal;
+in vec4 vSeg0;
+in vec4 vSeg1;
+in vec4 vSeg2;
+in vec4 vSeg3;
+out vec4 fragColor;
+void main() {
+    // The pie faces the CAMERA, as VESTA's does: a sphere's normal is its
+    // radial direction, so the view-space normal's x/y is the angle round the
+    // view axis. Splitting in object space instead (the first attempt) shows
+    // an edge-on sliver from exactly the axis views a crystallographer uses,
+    // which is where the composition most needs to be legible.
+    float t = atan(vNormalView.x, vNormalView.y) * 0.15915494 + 0.5;
+    t = clamp(t, 0.0, 0.999999);
+    vec3 c = vSeg0.rgb;
+    if (t >= vSeg0.a) c = vSeg1.rgb;
+    if (t >= vSeg1.a) c = vSeg2.rgb;
+    if (t >= vSeg2.a) c = vSeg3.rgb;
+    vec3 n = normalize(vNormalView);
+    vec3 lightDir = normalize(vec3(0.4, 0.5, 1.0));
+    float diff = max(dot(n, lightDir), 0.0);
+    vec3 halfway = normalize(lightDir + vec3(0.0, 0.0, 1.0));
+    float spec = pow(max(dot(n, halfway), 0.0), 32.0) * 0.35;
+    fragColor = vec4(c * (0.35 + 0.65 * diff) + vec3(spec), 1.0);
+}
+"""
+
 _LINE_VERT = """
 #version 330 core
 layout(location = 0) in vec3 aPos;
@@ -450,6 +512,78 @@ class _InstancedMesh:
         GL.glBindVertexArray(0)
 
 
+class _SplitMesh:
+    """A mesh whose instances carry FOUR colours and their wedge boundaries.
+
+    Same geometry and same model matrices as `_InstancedMesh`; the difference
+    is 4 vec4 of segment data per instance instead of one colour. Four is
+    enough for every solid solution anyone draws, and a site with more species
+    than that keeps its three biggest and merges the tail.
+    """
+
+    SEGMENTS = 4
+
+    def __init__(self, verts, normals, indices):
+        self.n_indices = int(indices.size)
+        self.n_instances = 0
+        self.vao = GL.glGenVertexArrays(1)
+        GL.glBindVertexArray(self.vao)
+        self.vbo = GL.glGenBuffers(1)
+        inter = np.hstack([verts, normals]).astype(np.float32)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.vbo)
+        GL.glBufferData(GL.GL_ARRAY_BUFFER, inter.nbytes, inter,
+                        GL.GL_STATIC_DRAW)
+        stride = 6 * 4
+        GL.glVertexAttribPointer(0, 3, GL.GL_FLOAT, GL.GL_FALSE, stride,
+                                 GL.GLvoidp(0))
+        GL.glEnableVertexAttribArray(0)
+        GL.glVertexAttribPointer(1, 3, GL.GL_FLOAT, GL.GL_FALSE, stride,
+                                 GL.GLvoidp(12))
+        GL.glEnableVertexAttribArray(1)
+        self.ebo = GL.glGenBuffers(1)
+        GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, self.ebo)
+        GL.glBufferData(GL.GL_ELEMENT_ARRAY_BUFFER, indices.nbytes,
+                        indices.astype(np.uint32), GL.GL_STATIC_DRAW)
+        self.ibo = GL.glGenBuffers(1)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.ibo)
+        istride = (16 + 4 * self.SEGMENTS) * 4
+        for k in range(4):
+            loc = 2 + k
+            GL.glVertexAttribPointer(loc, 4, GL.GL_FLOAT, GL.GL_FALSE, istride,
+                                     GL.GLvoidp(16 * k))
+            GL.glEnableVertexAttribArray(loc)
+            GL.glVertexAttribDivisor(loc, 1)
+        for k in range(self.SEGMENTS):
+            loc = 6 + k
+            GL.glVertexAttribPointer(loc, 4, GL.GL_FLOAT, GL.GL_FALSE, istride,
+                                     GL.GLvoidp(64 + 16 * k))
+            GL.glEnableVertexAttribArray(loc)
+            GL.glVertexAttribDivisor(loc, 1)
+        GL.glBindVertexArray(0)
+
+    def upload(self, mats, segments):
+        # type: (np.ndarray, np.ndarray) -> None
+        n = mats.shape[0]
+        self.n_instances = n
+        if n == 0:
+            return
+        cols = np.ascontiguousarray(np.transpose(mats, (0, 2, 1))) \
+            .reshape(n, 16).astype(np.float32)
+        data = np.hstack([cols, segments.reshape(n, 4 * self.SEGMENTS)
+                          .astype(np.float32)])
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.ibo)
+        GL.glBufferData(GL.GL_ARRAY_BUFFER, data.nbytes, data,
+                        GL.GL_DYNAMIC_DRAW)
+
+    def draw(self):
+        if self.n_instances == 0:
+            return
+        GL.glBindVertexArray(self.vao)
+        GL.glDrawElementsInstanced(GL.GL_TRIANGLES, self.n_indices,
+                                   GL.GL_UNSIGNED_INT, None, self.n_instances)
+        GL.glBindVertexArray(0)
+
+
 class _LineBuffer:
     """A VAO/VBO for GL_LINES with per-vertex colour (wireframe bonds)."""
 
@@ -568,6 +702,8 @@ class MolViewport(QOpenGLWidget):
         self._hull_sphere = None
         self._hull_cylinder = None
         self._glow_sphere = None
+        self._split_sphere = None
+        self._split_prog = None
         self._prog = None
         self._line_prog = None
         self._grid_prog = None
@@ -614,6 +750,11 @@ class MolViewport(QOpenGLWidget):
         self._dbl_empty = False
         self.show_hbonds = False         # suspected H-bond overlay
         self.show_cell = True            # unit-cell box for CIF imports
+        #: VESTA's pie-slice spheres for sites shared by several species. On
+        #: by default: a solid solution drawn as its majority element is a
+        #: composition the file never claimed, and the wedges are the only
+        #: thing on screen that says otherwise.
+        self.show_occupancy = True
         self.polyhedra_alpha = 0.55      # coordination-solid opacity
         self.render_subdiv_bonus = 2     # extra sphere subdivisions on render
         self.render_scale = 2            # resolution multiplier on render
@@ -2292,6 +2433,8 @@ class MolViewport(QOpenGLWidget):
         self._hull_sphere = _InstancedMesh(*meshes.icosphere(2))
         self._hull_cylinder = _InstancedMesh(*meshes.cylinder(24))
         self._glow_sphere = _InstancedMesh(*meshes.icosphere(2))
+        self._split_prog = _program(_SPLIT_VERT, _SPLIT_FRAG)
+        self._split_sphere = _SplitMesh(*meshes.icosphere(2))
         self._wire_lines = _LineBuffer()
         self._poly_tris = _LineBuffer()   # same layout, GL_TRIANGLES
         self._grid_quad = _GridQuad()
@@ -2342,8 +2485,49 @@ class MolViewport(QOpenGLWidget):
         self._draw_radii = (np.array(drawn) if drawn else np.zeros(0))
         self._pick_dirty = False
 
+    def _occupancy_wedges(self, obj, n_drawn, n_base):
+        # type: (object, int, int) -> Optional[dict]
+        """`{drawn atom index: wedge array}` for this object, or None.
+
+        **An outliner colour wins.** Painting an atom in the outliner is a
+        deliberate statement about that atom, while the wedges are derived
+        from the file — so a hand-set colour suppresses the split and the atom
+        draws solid, which is the only way "I made this one orange" can keep
+        meaning what it says. Christian's call, and it also keeps the two
+        systems from fighting over one sphere.
+
+        Modifier and boundary copies follow their base atom (`idx % n_base`),
+        the same rule the colours and radii already use.
+        """
+        if not self.show_occupancy:
+            return None
+        meta = getattr(obj.structure, "metadata", None) or {}
+        table = meta.get("site_occupancy") or {}
+        if not table:
+            return None
+        base_n = max(n_base, 1)
+        colour_of = lambda sym: elements.color_f(elements.atomic_number(sym))
+        cache = {}
+        out = {}
+        for i in range(n_drawn):
+            base_i = i % base_n
+            if obj.atom_colors and obj.atom_colors.get(base_i) is not None:
+                continue                      # hand-painted: leave it solid
+            composition = table.get(str(base_i))
+            if not composition:
+                continue
+            key = tuple((str(sym), round(float(occ), 6))
+                        for sym, occ in composition)
+            if key not in cache:
+                wedges = style_mod.occupancy_wedges(composition, colour_of)
+                cache[key] = np.array(wedges, dtype=float) if wedges else None
+            if cache[key] is not None:
+                out[i] = cache[key]
+        return out or None
+
     def _rebuild(self):
         sphere_mats, sphere_cols = [], []
+        split_mats, split_segs = [], []
         cyl_starts, cyl_ends, cyl_rads, cyl_cols = [], [], [], []
         wire_rows = []
         self._ensure_pick_data()
@@ -2392,6 +2576,7 @@ class MolViewport(QOpenGLWidget):
                     else:
                         radii[i] *= obj.atom_scale_for(base_i)
             hide = self._shuttle_hidden(coords)
+            wedges = self._occupancy_wedges(obj, len(sym_e), s.n_atoms)
             for i in range(len(sym_e)):
                 if hide is not None and hide[i]:
                     continue        # too close to the cockpit — would clip
@@ -2403,6 +2588,14 @@ class MolViewport(QOpenGLWidget):
                     sphere_mats.append(m)
                     sphere_cols.append((colors[i][0], colors[i][1],
                                         colors[i][2], 1.0))
+                    if wedges is not None and i in wedges:
+                        # Drawn TWICE on purpose: once in the ordinary pass so
+                        # every other effect (picking radius, selection hull,
+                        # depth) sees a normal atom, then again with the
+                        # wedges at GL_LEQUAL. Same mesh and same matrix, so
+                        # the second pass lands on exactly the same depth.
+                        split_mats.append(m)
+                        split_segs.append(wedges[i])
             if st.show_bonds:
                 base_n = max(s.n_atoms, 1)
                 for i, j, order in bonds_e:
@@ -2430,6 +2623,10 @@ class MolViewport(QOpenGLWidget):
         self._sphere.upload(
             np.array(sphere_mats) if sphere_mats else np.zeros((0, 4, 4)),
             np.array(sphere_cols) if sphere_cols else np.zeros((0, 4)))
+        self._split_sphere.upload(
+            np.array(split_mats) if split_mats else np.zeros((0, 4, 4)),
+            np.array(split_segs) if split_segs
+            else np.zeros((0, _SplitMesh.SEGMENTS, 4)))
         if cyl_starts:
             mats_c = meshes.cylinder_transforms(
                 np.array(cyl_starts), np.array(cyl_ends), np.array(cyl_rads))
@@ -2467,6 +2664,7 @@ class MolViewport(QOpenGLWidget):
                                   1, GL.GL_TRUE, proj)
             self._sphere.draw()
             self._cylinder.draw()
+            self._draw_occupancy(view, proj)
             self._draw_lines(self._wire_lines, view, proj)
         if not empty:
             self._draw_polyhedra(view, proj)
@@ -2476,6 +2674,31 @@ class MolViewport(QOpenGLWidget):
             self._paint_meta_glow(view, proj)
             self._paint_selection(view, proj)
         self._paint_overlays(view, proj, empty)
+
+    def _draw_occupancy(self, view, proj):
+        """Re-draw the shared sites as pie spheres, over their solid selves.
+
+        `GL_LEQUAL` is what makes this work: the geometry and the model matrix
+        are identical to the ordinary pass, so every fragment lands at exactly
+        the same depth and the second draw wins on equality. No offset, no
+        z-fighting, and the atom stays a normal atom to picking, selection and
+        every other pass.
+        """
+        if getattr(self, "_split_sphere", None) is None:
+            return
+        if self._split_sphere.n_instances == 0:
+            return
+        GL.glUseProgram(self._split_prog)
+        GL.glUniformMatrix4fv(
+            GL.glGetUniformLocation(self._split_prog, "uView"), 1,
+            GL.GL_TRUE, view)
+        GL.glUniformMatrix4fv(
+            GL.glGetUniformLocation(self._split_prog, "uProj"), 1,
+            GL.GL_TRUE, proj)
+        GL.glDepthFunc(GL.GL_LEQUAL)
+        self._split_sphere.draw()
+        GL.glDepthFunc(GL.GL_LESS)
+        GL.glUseProgram(self._prog)
 
     def _draw_grid(self, view, proj):
         """After opaque geometry: depth-TESTED so molecules occlude it, but

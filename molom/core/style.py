@@ -117,3 +117,56 @@ def _rotate_about(vec, axis, angle_rad):
     c, s = np.cos(angle_rad), np.sin(angle_rad)
     return (vec * c + np.cross(axis, vec) * s
             + axis * np.dot(axis, vec) * (1.0 - c))
+
+
+#: How many occupancy wedges one sphere can show. Four covers every solid
+#: solution anyone actually draws; a site with more species keeps its three
+#: largest and merges the rest into a final "other" wedge, which is honest
+#: about there being more without turning the atom into a colour wheel.
+MAX_OCCUPANCY_WEDGES = 4
+
+
+def occupancy_wedges(composition, colour_of, max_wedges=MAX_OCCUPANCY_WEDGES):
+    # type: (list, object, int) -> list
+    """`[(element, occupancy), ...]` -> `[(r, g, b, cumulative_end), ...]`.
+
+    VESTA draws a site shared by several species as a pie: each wedge is one
+    element, sized by its occupancy. The renderer wants cumulative BOUNDARIES
+    rather than fractions, because a fragment shader picks its wedge by asking
+    which boundary its angle falls under.
+
+    Occupancies are normalised against their own total, not against 1.0: a
+    site refined to 0.97 in total is a rounding artefact, not 3% vacancy, and
+    scaling to the total is what keeps the last wedge from being a sliver of
+    the wrong colour. A genuinely partly-vacant site is still drawn full —
+    a hole has no colour, and the number is on the crystal page.
+
+    Always returns exactly `max_wedges` entries so the instance data is a
+    fixed stride; the padding repeats the last colour and cannot be reached,
+    since the real final boundary is 1.0.
+    """
+    parts = [(str(sym), float(occ)) for sym, occ in composition
+             if float(occ) > 0.0]
+    parts.sort(key=lambda p: -p[1])
+    if not parts:
+        return []
+    if len(parts) > max_wedges:
+        head = parts[:max_wedges - 1]
+        tail_total = sum(o for _s, o in parts[max_wedges - 1:])
+        # The merged remainder takes the largest of the species it stands for,
+        # so the colour still means something.
+        head.append((parts[max_wedges - 1][0], tail_total))
+        parts = head
+    total = sum(o for _s, o in parts)
+    if total <= 0.0:
+        return []
+    wedges = []
+    running = 0.0
+    for sym, occ in parts:
+        running += occ / total
+        r, g, b = colour_of(sym)
+        wedges.append((float(r), float(g), float(b), float(min(running, 1.0))))
+    wedges[-1] = wedges[-1][:3] + (1.0,)
+    while len(wedges) < max_wedges:
+        wedges.append(wedges[-1])
+    return wedges

@@ -418,6 +418,22 @@ class ModifierPage(QWidget):
             self.changed.emit()
 
 
+def _unique_compositions(site_occupancy):
+    """The DISTINCT compositions in a shared-site map, in file order.
+
+    Every symmetry image of one site repeats its composition, so listing them
+    per atom would print the same line eight times for a cubic cell.
+    """
+    seen, out = set(), []
+    for _key, parts in sorted(site_occupancy.items(),
+                              key=lambda kv: int(kv[0])):
+        norm = tuple((str(sym), round(float(occ), 4)) for sym, occ in parts)
+        if norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return out
+
+
 class CrystalPage(QWidget):
     """Unit-cell controls for a CIF import — the page the module docstring
     always promised.
@@ -431,6 +447,7 @@ class CrystalPage(QWidget):
     box_toggled = Signal(bool)
     poly_toggled = Signal(bool)
     exterior_toggled = Signal(bool)
+    occupancy_toggled = Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -440,7 +457,36 @@ class CrystalPage(QWidget):
 
         self.summary = QLabel("No unit cell.\nImport a .cif to use this page.")
         self.summary.setWordWrap(True)
+        self.summary.setTextFormat(Qt.RichText)
+        # A DOI or a long systematic name should be selectable — it is the
+        # sort of thing you want to paste into a reference manager.
+        self.summary.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self.summary.setOpenExternalLinks(True)
         lay.addWidget(self.summary)
+
+        # Everything the file said about itself BEYOND the crystallography.
+        # Collapsed, because it is reference material rather than a control —
+        # but with a visible arrow, or nobody would ever find it.
+        self._detail_arrow = QToolButton()
+        self._detail_arrow.setArrowType(Qt.RightArrow)
+        self._detail_arrow.setAutoRaise(True)
+        self._detail_arrow.setText("File details")
+        self._detail_arrow.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._detail_arrow.setToolTip(
+            "Names, formulae, measurement conditions and provenance, as far "
+            "as this particular .cif carries them")
+        # QToolButton.clicked passes the CHECKED state, which is False forever
+        # on a non-checkable button — swallow it (the round-34 gotcha).
+        self._detail_arrow.clicked.connect(lambda _c=False: self._toggle_detail())
+        lay.addWidget(self._detail_arrow)
+
+        self.detail = QLabel("")
+        self.detail.setWordWrap(True)
+        self.detail.setTextFormat(Qt.RichText)
+        self.detail.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self.detail.setOpenExternalLinks(True)
+        self.detail.hide()
+        lay.addWidget(self.detail)
 
         self.box_check = QCheckBox("Show unit cell box")
         self.box_check.setChecked(True)
@@ -536,9 +582,15 @@ class CrystalPage(QWidget):
         sym_row.addWidget(self.sym_check, 1)
         sym_holder = QWidget()
         sym_holder.setLayout(sym_row)
-        lay.insertWidget(3, sym_holder)
-        lay.insertWidget(4, self._kind_holder)
-        lay.insertWidget(5, self.ghost_check)
+        # Positioned RELATIVE to a named widget, not at literal indices 3/4/5:
+        # those were silently invalidated the moment round 40 added two
+        # widgets above them, which dropped the polyhedra checkbox into the
+        # middle of the file-details block. An index into a layout is a magic
+        # number that breaks at a distance.
+        at = lay.indexOf(self.box_check) + 1
+        lay.insertWidget(at, sym_holder)
+        lay.insertWidget(at + 1, self._kind_holder)
+        lay.insertWidget(at + 2, self.ghost_check)
         # `clicked` carries the button's CHECKED state, and this button is not
         # checkable — so connecting it straight to `_toggle_kinds` passed
         # force=False every time and the arrow could only ever COLLAPSE. That
@@ -557,7 +609,20 @@ class CrystalPage(QWidget):
             "Draw a translucent solid through the donor atoms around each "
             "metal centre — how MOFs and framework structures are usually "
             "shown")
-        lay.insertWidget(2, self.poly_check)
+        lay.insertWidget(lay.indexOf(self.box_check) + 1, self.poly_check)
+
+        self.occupancy_check = QCheckBox("Occupancy pie spheres")
+        self.occupancy_check.setChecked(True)
+        self.occupancy_check.setToolTip(
+            "Where several elements share one crystallographic site (a solid "
+            "solution), draw the sphere as VESTA does — one wedge per "
+            "element, sized by its occupancy.\n\n"
+            "A colour you set yourself in the outliner always wins: that atom "
+            "stays solid in your colour.")
+        self.occupancy_check.toggled.connect(self.occupancy_toggled.emit)
+        lay.insertWidget(lay.indexOf(self.poly_check) + 1,
+                         self.occupancy_check)
+        dragcheck.install(self)
         self.set_cell(None)
 
     def _toggle_kinds(self, force=None):
@@ -602,8 +667,102 @@ class CrystalPage(QWidget):
         self.view_changed.emit(mode, self.na.value(), self.nb.value(),
                                self.nc.value())
 
+    def _toggle_detail(self, force=None):
+        """Expand/collapse the file-details block.
+
+        Uses `isHidden()`, the widget's OWN flag, not `isVisible()` — which is
+        False for everything on a non-current QStackedWidget page and would
+        make the arrow expand every time whenever ❖ was not the page on
+        screen (the round-34 gotcha).
+        """
+        show = (not self.detail.isHidden()) is False if force is None else force
+        self.detail.setVisible(bool(show))
+        self._detail_arrow.setArrowType(Qt.DownArrow if show else Qt.RightArrow)
+
+    @staticmethod
+    def _rows(pairs):
+        """Label/value pairs as an aligned two-column table.
+
+        The page used to be one long `\\n`-joined string, which put the cell
+        lengths, the space group and the atom count in one undifferentiated
+        block. A table is what this data is.
+        """
+        cells = "".join(
+            "<tr><td style='padding-right:10px; color:#9a9a9a; "
+            "white-space:nowrap'>{}</td><td>{}</td></tr>".format(k, v)
+            for k, v in pairs if v not in ("", None))
+        return "<table cellspacing='0' cellpadding='0'>{}</table>".format(cells)
+
+    def set_detail(self, info, naming=None, site_occupancy=None):
+        # type: (dict, object, Optional[dict]) -> None
+        """Fill the collapsible block from the file's descriptive tags.
+
+        Every one of these is optional and real CIFs carry wildly different
+        subsets, so each row appears only if that tag was present — a page of
+        "not stated" tells the user nothing they cannot see.
+        """
+        info = dict(info or {})
+        rows = []
+        for key, label in (("name_systematic", "Systematic name"),
+                           ("name_common", "Common name"),
+                           ("name_mineral", "Mineral"),
+                           ("formula_sum", "Formula (sum)"),
+                           ("formula_moiety", "Formula (moiety)"),
+                           ("formula_structural", "Formula (structural)"),
+                           ("formula_weight", "Formula weight"),
+                           ("z", "Z (formula units)"),
+                           ("density_reported", "Density (reported)"),
+                           ("temperature", "Temperature"),
+                           ("radiation", "Radiation"),
+                           ("wavelength", "Wavelength"),
+                           ("r_factor", "R factor"),
+                           ("wr_factor", "wR factor"),
+                           ("goodness_of_fit", "Goodness of fit"),
+                           ("colour", "Crystal colour"),
+                           ("habit", "Crystal habit")):
+            value = info.get(key)
+            if not value:
+                continue
+            if key == "formula_weight":
+                value += " g/mol"
+            elif key == "density_reported":
+                value += " g/cm<sup>3</sup>"
+            elif key in ("temperature",):
+                value += " K"
+            elif key == "wavelength":
+                value += " A"
+            rows.append((label, value))
+        provenance = []
+        if info.get("title"):
+            provenance.append(("Publication", info["title"]))
+        journal = " ".join(x for x in (info.get("journal", ""),
+                                       info.get("journal_year", "")) if x)
+        if journal:
+            provenance.append(("Journal", journal))
+        if info.get("doi"):
+            provenance.append(("DOI", "<a href='https://doi.org/{0}'>{0}</a>"
+                               .format(info["doi"])))
+        for key, label in (("ccdc", "CCDC"), ("cod", "COD entry")):
+            if info.get(key):
+                provenance.append((label, info[key]))
+        if naming is not None and getattr(naming, "number", 0):
+            rows.append(("Space group no.", "{} (IT)".format(naming.number)))
+        # A site shared by several species is the thing most worth SAYING:
+        # drawn as its majority element it is a composition the file never
+        # claimed, and until round 42 nothing on screen said otherwise.
+        shared = []
+        for parts in _unique_compositions(site_occupancy or {}):
+            shared.append(("Shared site", " / ".join(
+                "{} {:.3f}".format(sym, occ) for sym, occ in parts)))
+        html = self._rows(rows + shared + provenance)
+        self.detail.setText(html or
+                            "<i>This file carries no descriptive tags beyond "
+                            "the cell and the atom sites.</i>")
+        self._detail_arrow.setEnabled(bool(rows or shared or provenance))
+
     def set_cell(self, cell, spacegroup="", n_asym=0, n_atoms=0, mode="cell",
-                 name="", exterior=0, chemistry=""):
+                 name="", exterior=0, chemistry="", symmetry="", naming=None,
+                 bravais="", density=None):
         """Refresh from the active molecule.
 
         `cell=None` greys every CONTROL but leaves the page itself readable —
@@ -614,7 +773,8 @@ class CrystalPage(QWidget):
         has = cell is not None
         for w in (self.asym_radio, self.cell_radio, self.pack_radio,
                   self.box_check, self.poly_check, self.sym_check,
-                  self.ghost_check, self._kind_holder, self.ext_check):
+                  self.ghost_check, self._kind_holder, self.ext_check,
+                  self.occupancy_check):
             w.setEnabled(has)
         self._sync_pack_enabled()
         # Guarded: writing a widget from sync fires its own valueChanged,
@@ -630,17 +790,49 @@ class CrystalPage(QWidget):
                 "in the viewport or in the outliner — and these controls "
                 "become live.".format(name or "This molecule"))
             return
-        self.summary.setText(
-            "a = {:.4f}  b = {:.4f}  c = {:.4f} A\n"
-            "alpha = {:.2f}  beta = {:.2f}  gamma = {:.2f}\n"
-            "Space group: {}\nAsymmetric unit: {} site(s)\n"
-            "Showing: {} atoms{}".format(
-                cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma,
-                spacegroup or "not stated", n_asym, n_atoms,
-                # What the reader REFUSED to draw. A silently dropped atom or
-                # bond is indistinguishable from a bug, and this page is where
-                # someone comes to ask why the cell looks like that.
-                "\n" + chemistry if chemistry else ""))
+        lengths = ("<b>a</b> {:.4f} &nbsp; <b>b</b> {:.4f} &nbsp; "
+                   "<b>c</b> {:.4f} A".format(cell.a, cell.b, cell.c))
+        angles = ("<b>&alpha;</b> {:.3f} &nbsp; <b>&beta;</b> {:.3f} &nbsp; "
+                  "<b>&gamma;</b> {:.3f}&deg;".format(
+                      cell.alpha, cell.beta, cell.gamma))
+        group = spacegroup or "not stated"
+        if naming is not None and getattr(naming, "number", 0):
+            group = "{} &nbsp;<span style='color:#9a9a9a'>(no. {})</span>".format(
+                group, naming.number)
+        lattice = bravais or ""
+        if naming is not None:
+            system = getattr(naming, "system", "")
+            centring = getattr(naming, "centring", "")
+            if system or centring:
+                lattice = "{}{}{}".format(
+                    bravais + " &mdash; " if bravais else "",
+                    system, ", " + centring if centring else "")
+        rows = [("Cell", lengths), ("", angles),
+                ("Volume", "{:.2f} A<sup>3</sup>".format(cell.volume())),
+                ("Lattice", lattice),
+                ("Space group", group),
+                ("Asymmetric unit", "{} site(s)".format(n_asym)),
+                ("Showing", "{} atoms".format(n_atoms))]
+        if density:
+            rows.append(("Density (calc.)",
+                         "{:.3f} g/cm<sup>3</sup>".format(density)))
+        notes = ""
+        if symmetry:
+            # Where the SYMMETRY came from when the file left its operator
+            # loop out (round 40) — an expansion the reader performed, or one
+            # it could not.
+            notes += ("<p style='color:#c8a45a; margin:6px 0 0 0'>"
+                      "<b>Symmetry:</b> {}</p>".format(symmetry))
+        if chemistry:
+            # What the reader REFUSED to draw. A silently dropped atom or bond
+            # is indistinguishable from a bug, and this page is where someone
+            # comes to ask why the cell looks like that.
+            notes += ("<p style='color:#c8a45a; margin:6px 0 0 0'>"
+                      "<b>Chemistry:</b> {}</p>".format(chemistry))
+        title = ""
+        if name:
+            title = "<p style='margin:0 0 4px 0'><b>{}</b></p>".format(name)
+        self.summary.setText(title + self._rows(rows) + notes)
         chosen = {"asym": self.asym_radio,
                   "packing": self.pack_radio}.get(mode, self.cell_radio)
         self._loading = True

@@ -32,6 +32,12 @@ dependencies = [
     # Animation export. Ships a STATIC ffmpeg binary, so there is no system
     # install and no PATH hunting; a system ffmpeg is used if present.
     "imageio-ffmpeg",
+    # Space-group symbol -> symmetry operations, for the CIFs that name their
+    # group and leave the operator loop out. NOT optional like rdkit and
+    # openbabel: those degrade to "cannot read this format", which is visible,
+    # while this one degrades to a structure a QUARTER of its true size. It is
+    # a small wheel and pymatgen (already approved) depends on it anyway.
+    "spglib",
 ]
 
 [project.optional-dependencies]

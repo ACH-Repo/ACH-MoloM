@@ -757,7 +757,25 @@ def _read_cif(path, disorder=None):
         "asym_frac": [[float(v) for v in row] for row in data.frac],
         "asym_occupancy": [float(o) for o in data.occupancy],
         "disorder_policy": disorder,
+        # Where `symops` came from. "file" is the file's own loop; anything
+        # else means the reader derived them from the named group, and
+        # `symmetry_note` is the sentence the UI has to show for it.
+        "symmetry_source": data.symmetry_source,
     }
+    if report.get("site_occupancy"):
+        # {drawn atom index (as a STRING, so it survives the JSON savepoint):
+        #  [(element, occupancy), ...]} for sites shared by several species.
+        meta["site_occupancy"] = dict(report["site_occupancy"])
+    if data.info:
+        # Descriptive tags (names, formulae, temperature, R factors ...) for
+        # the crystal page. Optional to a fault: never assume a key is there.
+        meta["cif_info"] = dict(data.info)
+    if data.symmetry_note:
+        meta["symmetry_note"] = data.symmetry_note
+    if data.it_number:
+        meta["it_number"] = data.it_number
+    if data.hall:
+        meta["hall"] = data.hall
     if report.get("disorder"):
         meta["disorder"] = dict(report["disorder"])
     if data.name:

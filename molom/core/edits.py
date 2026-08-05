@@ -66,7 +66,43 @@ def delete_atoms(structure, indices, with_hydrogens=False):
         structure.frames[k] = np.delete(structure.frames[k], doomed, axis=0)
     structure.bonds = [(remap[i], remap[j], o) for i, j, o in structure.bonds
                        if i not in doomed_set and j not in doomed_set]
+    _remap_cell_reference(structure, remap, doomed_set)
     return structure
+
+
+def _remap_cell_reference(structure, remap, doomed_set):
+    """Keep the unit-cell box's reference atoms pointing at the same atoms.
+
+    The box does not have a transform of its own: it is carried by a Kabsch
+    fit from a handful of REFERENCE ATOMS recorded at import (round 19), held
+    as indices. Deleting an atom renumbers everything after it, so those
+    indices silently come to mean different atoms and the fit maps the box
+    onto an unrelated set — which is Christian's "when I delete them the unit
+    cell boundary flips". The out-of-range guard in `cell_corners_world` never
+    fired, because the indices stayed perfectly valid; they just stopped
+    meaning what they said.
+
+    Reference atoms that were themselves deleted are dropped. Below three
+    points a rigid fit is not determined, so the reference is cleared and the
+    box falls back to its stored frame rather than to a wrong one.
+    """
+    meta = getattr(structure, "metadata", None)
+    if not meta or not meta.get("cell_ref_idx"):
+        return
+    idx = list(meta.get("cell_ref_idx") or ())
+    xyz = list(meta.get("cell_ref_xyz") or ())
+    if len(xyz) != len(idx):
+        meta.pop("cell_ref_idx", None)
+        meta.pop("cell_ref_xyz", None)
+        return
+    kept = [(remap[i], p) for i, p in zip(idx, xyz)
+            if i not in doomed_set and i in remap]
+    if len(kept) < 3:
+        meta.pop("cell_ref_idx", None)
+        meta.pop("cell_ref_xyz", None)
+        return
+    meta["cell_ref_idx"] = [int(i) for i, _p in kept]
+    meta["cell_ref_xyz"] = [list(p) for _i, p in kept]
 
 
 def set_element(structure, indices, symbol):

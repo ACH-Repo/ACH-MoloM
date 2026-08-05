@@ -29,7 +29,7 @@ class SettingsDialog(QDialog):
                  precision_factor=0.5, undo_limit=30, adjust_h=True,
                  atom_scale=1.0, render_scale=2, render_subdiv=2,
                  input_preset=input_map.PRESET_AUTO, label_scale=1.0,
-                 disorder_policy=None,
+                 disorder_policy=None, sg_convention=None,
                  on_speed_change=None, on_atom_scale_change=None,
                  on_label_scale_change=None, flight_tuning=None,
                  on_flight_change=None):
@@ -160,6 +160,22 @@ class SettingsDialog(QDialog):
             "which usually means a framework without its disordered guest. "
             "Applies to the NEXT file opened.")
         form.addRow("CIF disorder:", self.disorder_combo)
+
+        from ..core import spacegroups as _sg
+        self.sg_convention_combo = QComboBox()
+        for key, label in _sg.CONVENTIONS:
+            self.sg_convention_combo.addItem(label, key)
+        idx = self.sg_convention_combo.findData(sg_convention
+                                                or _sg.CONVENTION_HM)
+        self.sg_convention_combo.setCurrentIndex(max(idx, 0))
+        self.sg_convention_combo.setToolTip(
+            "How the space group is NAMED on the crystal page. This is a "
+            "display choice only — the symmetry operations always come from "
+            "the file, or from the group it names.\n\n"
+            "Short Hermann-Mauguin keeps the SETTING (P2_1/n stays P2_1/n); "
+            "the standard-setting form reports every setting of a group under "
+            "its standard symbol, so a P2_1/n file reads as P2_1/c there.")
+        form.addRow("Space group names:", self.sg_convention_combo)
 
         self.maximized_check = QCheckBox("Start maximized (fit to screen)")
         self.maximized_check.setChecked(start_maximized)
@@ -433,6 +449,9 @@ class SettingsDialog(QDialog):
 
     def disorder_policy(self):
         return self.disorder_combo.currentData()
+
+    def sg_convention(self):
+        return self.sg_convention_combo.currentData()
 
     def start_maximized(self):
         return self.maximized_check.isChecked()

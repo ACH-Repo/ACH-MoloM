@@ -22,6 +22,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from . import spacegroups
+
 
 class CifError(ValueError):
     """Raised when a file is not usable CIF (no cell, no sites, ...)."""
@@ -93,6 +95,24 @@ class Cell(object):
     def to_fractional(self, cart):
         # type: (np.ndarray) -> np.ndarray
         return np.asarray(cart, dtype=float) @ np.linalg.inv(self.matrix())
+
+    def looks_rhombohedral(self):
+        # type: () -> bool
+        """Is this cell on RHOMBOHEDRAL axes rather than hexagonal ones?
+
+        The R groups have two settings whose operators differ, and the symbol
+        (`R -3 c`) is spelled the same for both -- so when a file leaves the
+        operator loop out, the cell SHAPE is the only evidence of which was
+        meant: rhombohedral axes give a = b = c with three equal angles that
+        are not 90 degrees, hexagonal axes give gamma = 120.
+        """
+        lengths = (self.a, self.b, self.c)
+        angles = (self.alpha, self.beta, self.gamma)
+        if max(lengths) - min(lengths) > 1e-3 * max(lengths):
+            return False
+        if max(angles) - min(angles) > 0.1:
+            return False
+        return abs(angles[0] - 90.0) > 0.1
 
     def corners(self):
         # type: () -> np.ndarray
@@ -215,13 +235,29 @@ class CifData(object):
 
     def __init__(self, cell, symops, symbols, frac, name="",
                  spacegroup="", labels=None, occupancy=None,
-                 disorder_groups=None, disorder_assemblies=None):
+                 disorder_groups=None, disorder_assemblies=None,
+                 it_number=0, hall="", symmetry_source="",
+                 symmetry_note="", info=None):
         self.cell = cell
         self.symops = list(symops)
         self.symbols = list(symbols)
         self.frac = np.asarray(frac, dtype=float).reshape(-1, 3)
         self.name = name
         self.spacegroup = spacegroup
+        #: International Tables number and Hall symbol, where the file gave
+        #: them. Both are routes to the operators when the loop is missing,
+        #: and the Hall symbol is the only one that names a SETTING exactly.
+        self.it_number = int(it_number or 0)
+        self.hall = hall
+        #: How `symops` was arrived at -- `spacegroups.SOURCE_*`. Anything
+        #: other than "file" means we derived them, and `symmetry_note` says
+        #: so in words: a structure quietly expanded (or quietly NOT expanded)
+        #: by the reader is exactly the kind of wrongness that looks right.
+        self.symmetry_source = symmetry_source or spacegroups.SOURCE_FILE
+        self.symmetry_note = symmetry_note
+        #: Descriptive tags the file happened to carry (`_INFO_TAGS`). Every
+        #: one is optional, so treat a missing key as normal, never an error.
+        self.info = dict(info or {})
         self.labels = list(labels or symbols)
         #: Site occupancies, 1.0 where the file said nothing. READ and now
         #: also USED (round 38): a disordered structure lists every
@@ -324,17 +360,92 @@ _SYMOP_TAGS = ("_symmetry_equiv_pos_as_xyz",
                "_symmetry_equiv_pos_as_xyz_")
 _SPACEGROUP_TAGS = ("_symmetry_space_group_name_h-m",
                     "_space_group_name_h-m_alt",
-                    "_symmetry_space_group_name_hall")
+                    "_space_group_name_h-m_full")
+#: Kept SEPARATE from the H-M tags (they used to share a tuple, so a file
+#: carrying only a Hall symbol reported "-P 2ybc" as its space group). A Hall
+#: symbol names one setting unambiguously, which makes it the BEST route to
+#: the operators and the worst thing to show a chemist.
+_HALL_TAGS = ("_symmetry_space_group_name_hall", "_space_group_name_hall")
+_ITNUM_TAGS = ("_symmetry_int_tables_number", "_space_group_it_number")
+
+#: Descriptive single-value tags worth keeping for the crystal page, mapped to
+#: the short key it displays them under. NONE of these is guaranteed to be
+#: present -- CIFs are wildly inconsistent about what they carry beyond the
+#: cell and the sites -- so everything downstream shows a row only when the
+#: file actually had one, and nothing here may ever become required.
+_INFO_TAGS = {
+    "_chemical_name_systematic": "name_systematic",
+    "_chemical_name_common": "name_common",
+    "_chemical_name_mineral": "name_mineral",
+    "_chemical_formula_moiety": "formula_moiety",
+    "_chemical_formula_sum": "formula_sum",
+    "_chemical_formula_structural": "formula_structural",
+    "_chemical_formula_weight": "formula_weight",
+    "_cell_formula_units_z": "z",
+    "_cell_volume": "volume",
+    "_cell_measurement_temperature": "temperature_cell",
+    "_diffrn_ambient_temperature": "temperature",
+    "_diffrn_radiation_wavelength": "wavelength",
+    "_diffrn_radiation_type": "radiation",
+    "_exptl_crystal_density_diffrn": "density_reported",
+    "_exptl_crystal_colour": "colour",
+    "_exptl_crystal_description": "habit",
+    "_refine_ls_r_factor_gt": "r_factor",
+    "_refine_ls_wr_factor_ref": "wr_factor",
+    "_refine_ls_goodness_of_fit_ref": "goodness_of_fit",
+    "_symmetry_cell_setting": "cell_setting",
+    "_publ_section_title": "title",
+    "_journal_name_full": "journal",
+    "_journal_year": "journal_year",
+    "_journal_paper_doi": "doi",
+    "_database_code_depnum_ccdc_archive": "ccdc",
+    "_cod_database_code": "cod",
+}
 
 
-def parse_cif(text):
-    # type: (str) -> CifData
-    """Parse the first data block of a CIF. Raises CifError if unusable."""
+def _read_text_block(lines, start):
+    # type: (List[str], int) -> Tuple[str, int]
+    """A tag's value when it is on the FOLLOWING lines -> (text, next index).
+
+    CIF puts long values in a `;`-delimited block on its own lines, which is
+    how `_publ_section_title` and often `_chemical_name_systematic` are
+    written. Reading only `_tag value` misses every one of them.
+    """
+    i = start
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    if i >= len(lines):
+        return "", start
+    first = lines[i].strip()
+    if not first.startswith(";"):
+        # A plain value wrapped onto the next line.
+        return ("", start) if first.startswith("_") else (_tag_value(first),
+                                                          i + 1)
+    body = [first[1:].strip()]
+    i += 1
+    while i < len(lines) and not lines[i].strip().startswith(";"):
+        body.append(lines[i].strip())
+        i += 1
+    return " ".join(p for p in body if p).strip(), i + 1
+
+
+def parse_cif(text, derive_symmetry=True):
+    # type: (str, bool) -> CifData
+    """Parse the first data block of a CIF. Raises CifError if unusable.
+
+    `derive_symmetry` allows a file that NAMES its space group without
+    listing the operators to be expanded anyway (see `_derive_symmetry`).
+    Pass False to get literally what the file said, which is what a test of
+    the parsing itself wants.
+    """
     lines = str(text).splitlines()
     cell_vals = {}          # type: Dict[str, float]
     symop_texts = []        # type: List[str]
     spacegroup = ""
+    hall = ""
+    it_number = 0
     name = ""
+    info = {}              # type: Dict[str, str]
     site_cols = {}          # type: Dict[str, List[str]]
 
     i = 0
@@ -351,8 +462,19 @@ def parse_cif(text):
         if low.startswith("loop_"):
             tags = []
             i += 1
-            while i < len(lines) and lines[i].strip().startswith("_"):
-                tags.append(lines[i].strip().split()[0].lower())
+            # Blank and comment lines BETWEEN the tags are legal and some
+            # writers double-space the whole file. Stopping at the first one
+            # (as this did until round 40) discards the entire loop -- on a
+            # double-spaced file that means the atom sites, and the reader
+            # then reports a perfectly good CIF as having no atoms at all.
+            while i < len(lines):
+                probe = lines[i].strip()
+                if not probe or probe.startswith("#"):
+                    i += 1
+                    continue
+                if not probe.startswith("_"):
+                    break
+                tags.append(probe.split()[0].lower())
                 i += 1
             values, i = _tokenize_loop_values(lines, i)
             if not tags:
@@ -380,9 +502,24 @@ def parse_cif(text):
             except (CifError, ValueError):
                 pass
         elif tag in _SPACEGROUP_TAGS and not spacegroup:
-            spacegroup = value.strip("'\"")
+            spacegroup = _tag_value(value)
+        elif tag in _HALL_TAGS and not hall:
+            hall = _tag_value(value)
+        elif tag in _ITNUM_TAGS and not it_number:
+            try:
+                it_number = int(_strip_esd(value))
+            except (CifError, ValueError):
+                it_number = 0
         elif tag in _SYMOP_TAGS and value:
             symop_texts.append(value)
+        elif tag in _INFO_TAGS and _INFO_TAGS[tag] not in info:
+            text_value = _tag_value(value)
+            if not text_value:
+                text_value, i = _read_text_block(lines, i + 1)
+                if text_value:
+                    info[_INFO_TAGS[tag]] = text_value
+                continue
+            info[_INFO_TAGS[tag]] = text_value
         i += 1
 
     missing = [k for k in ("a", "b", "c") if k not in cell_vals]
@@ -438,13 +575,91 @@ def parse_cif(text):
             symops.append(SymOp.from_xyz(t))
         except (CifError, ValueError):
             continue
-    if not symops:
-        # No symmetry listed = P1: the file already holds every atom.
-        symops = [IDENTITY]
+    symops, spacegroup, source, note = _derive_symmetry(
+        symops, cell, spacegroup, it_number, hall, derive_symmetry)
     return CifData(cell, symops, symbols, np.array(frac), name=name,
                    spacegroup=spacegroup, labels=kept_labels,
                    occupancy=occupancy, disorder_groups=groups,
-                   disorder_assemblies=assemblies)
+                   disorder_assemblies=assemblies, it_number=it_number,
+                   hall=hall, symmetry_source=source, symmetry_note=note,
+                   info=info)
+
+
+def _derive_symmetry(symops, cell, spacegroup, it_number, hall, enabled):
+    # type: (List[SymOp], Cell, str, int, str, bool) -> Tuple[List[SymOp], str, str, str]
+    """Settle what operators to use, and what to SAY about them.
+
+    Until round 40 a missing operator loop meant P1 -- "the file already holds
+    every atom" -- which is true of the files that omit the loop because they
+    are P1, and false of the ones that omit it because they named the group
+    instead. In the second case MoloM drew the asymmetric unit: a quarter of a
+    P2_1/c structure, with no error, no warning and a perfectly plausible
+    picture. Deriving the operators fixes that; SAYING which ones were derived
+    is what keeps the fix honest, because a group has settings and only the
+    file's coordinates know which one was meant.
+
+    The file's own loop always wins. Some programs write coordinates already
+    expanded to P1 while still naming the parent group in the header, so
+    re-applying that group's operators would DOUBLE the structure -- one op in
+    the loop means one op, and the mismatch is reported rather than acted on.
+    """
+    named = bool(spacegroup or hall or it_number)
+    if symops:
+        note = ""
+        if len(symops) == 1 and named and not spacegroups.is_p1(spacegroup,
+                                                               it_number):
+            note = ("the file lists only the identity though it names {}; "
+                    "showing the coordinates as given".format(
+                        spacegroup or hall or "#{}".format(it_number)))
+        return symops, spacegroup, spacegroups.SOURCE_FILE, note
+
+    if not named or spacegroups.is_p1(spacegroup, it_number):
+        # Genuinely P1 (or nothing said at all): every atom is in the file.
+        return [IDENTITY], spacegroup, spacegroups.SOURCE_P1, ""
+
+    resolved = spacegroups.operators_for(
+        spacegroup, number=it_number, hall=hall,
+        rhombohedral=cell.looks_rhombohedral()) if enabled else None
+    named_as = spacegroup or hall or "space group #{}".format(it_number)
+    if resolved is None:
+        missing = enabled and not spacegroups.available()
+        note = ("the file names {} but lists no symmetry operations{} - "
+                "showing the asymmetric unit only".format(
+                    named_as,
+                    ", and neither spglib nor pymatgen is installed to "
+                    "expand it" if missing else ""))
+        return [IDENTITY], spacegroup, spacegroups.SOURCE_UNRESOLVED, note
+
+    ops = []
+    for text in resolved.xyz:
+        try:
+            ops.append(SymOp.from_xyz(text))
+        except (CifError, ValueError):
+            continue
+    if not ops:
+        return [IDENTITY], spacegroup, spacegroups.SOURCE_UNRESOLVED, ""
+    route = {
+        spacegroups.SOURCE_HALL: "the Hall symbol {}".format(hall),
+        spacegroups.SOURCE_NUMBER: "space group number {}".format(it_number),
+    }.get(resolved.source, "the space group {}".format(spacegroup))
+    bits = ["no symmetry operations in the file: {} generated from "
+            "{}".format(len(ops), route)]
+    if resolved.source == spacegroups.SOURCE_NUMBER:
+        # A number names a group but never a setting, so this is the one
+        # route with nothing in the file to check the choice against.
+        bits.append("an IT number carries no setting - verify the cell")
+    elif resolved.ambiguous and resolved.is_alternate_setting:
+        # Only where a choice was genuinely left open: saying "setting b1
+        # assumed" about every ordinary P2_1/c file would be noise, and a
+        # warning that fires always is a warning nobody reads.
+        bits.append("setting {} assumed".format(resolved.setting))
+    if resolved.backend == "pymatgen":
+        bits.append("standard setting (pymatgen; install spglib for the "
+                    "alternative settings)")
+    # Showing the file's own spelling is right when it has one; a file that
+    # gave only a Hall symbol or a number now gets a readable H-M symbol
+    # instead of the blank the crystal page used to show.
+    return ops, spacegroup or resolved.symbol, resolved.source, "; ".join(bits)
 
 
 # -------------------------------------------------------------------- disorder
@@ -472,7 +687,8 @@ MAJOR_THRESHOLD = 0.5
 
 def resolve_disorder(symbols, frac, cell, occupancy, groups=None,
                      assemblies=None, policy=POLICY_DOMINANT,
-                     radius=DISORDER_RADIUS, threshold=MAJOR_THRESHOLD):
+                     radius=DISORDER_RADIUS, threshold=MAJOR_THRESHOLD,
+                     sites=None):
     # type: (list, np.ndarray, Cell, Sequence, Optional[Sequence], Optional[Sequence], str, float, float) -> Tuple[np.ndarray, dict]
     """Which atoms of a DISORDERED structure to actually draw.
 
@@ -533,6 +749,8 @@ def resolve_disorder(symbols, frac, cell, occupancy, groups=None,
     # 3) whatever still overlaps. Highest occupancy first, so the winner of
     # each cluster is picked before it can be dropped by a weaker neighbour.
     if float(radius) > 0 and np.any(occ < 1.0 - 1e-6):
+        site_of = (np.asarray(sites) if sites is not None
+                   else np.arange(n))
         m = cell.matrix()
         frac = np.asarray(frac, dtype=float).reshape(-1, 3)
         for i in np.argsort(-occ, kind="stable"):
@@ -547,6 +765,17 @@ def resolve_disorder(symbols, frac, cell, occupancy, groups=None,
             # those overlap the file is broken in a way this cannot fix, and
             # valence sanity will report it instead.
             close &= occ < 1.0 - 1e-6
+            if sites is not None:
+                # NEVER break a symmetry orbit. Two overlapping atoms that
+                # came from the SAME site are images of one another under the
+                # space group, so keeping some and dropping others leaves a
+                # structure that no longer obeys its own symmetry -- which is
+                # exactly what turned `2240539.cif` (a plastic crystal, one
+                # molecule smeared over 192 operations of Fm-3m) from VESTA's
+                # neat array of cages into a chaotic blob of 184 atoms out of
+                # 280. Orientational disorder is kept whole or not at all;
+                # the honest picture of a smeared molecule IS the smear.
+                close &= site_of != site_of[i]
             if np.any(close):
                 keep &= ~close
                 report["by_overlap"] += int(close.sum())
@@ -557,7 +786,8 @@ def resolve_disorder(symbols, frac, cell, occupancy, groups=None,
 
 # -------------------------------------------------------------------- expansion
 def expand(data, tol=0.1, wrap=True, whole_molecules=True, boundary=True,
-           exterior=0, disorder=POLICY_DOMINANT, report=None):
+           exterior=0, disorder=POLICY_DOMINANT, report=None,
+           shell_molecules=False):
     # type: (CifData, float, bool, bool, bool, int) -> Tuple[List[str], np.ndarray]
     """Apply every symmetry op to every site -> (symbols, CARTESIAN coords).
 
@@ -606,13 +836,28 @@ def expand(data, tol=0.1, wrap=True, whole_molecules=True, boundary=True,
     if not fracs:
         return [], np.zeros((0, 3))
     out = np.asarray(fracs)
-    if disorder != POLICY_ALL and data.is_disordered:
+    # A structure in which NO site is fully occupied has no ordered skeleton
+    # to resolve against: every atom is an alternative, nothing is dominant,
+    # and picking greedily by occupancy produces a chimera that obeys neither
+    # the chemistry nor the space group. `2240539.cif` is the case -- a
+    # plastic crystal, one molecule smeared over 192 operations of Fm-3m, all
+    # five sites at occupancy 0.21-0.43 -- where resolving turned VESTA's neat
+    # array of cages into a blob of 184 atoms out of 280. The honest picture
+    # of a smeared molecule IS the smear, which is what VESTA, pymatgen and
+    # ASE all draw.
+    wholly_disordered = bool(data.occupancy) and all(
+        o < 1.0 - 1e-6 for o in data.occupancy)
+    if wholly_disordered and report is not None:
+        report["disorder"] = {"policy": disorder, "sites": data.n_sites,
+                              "dropped": 0, "kept": len(symbols),
+                              "wholly_disordered": True}
+    if disorder != POLICY_ALL and data.is_disordered and not wholly_disordered:
         keep, info = resolve_disorder(
             symbols, out, data.cell,
             [data.occupancy[s] for s in sites],
             [data.disorder_groups[s] for s in sites],
             [data.disorder_assemblies[s] for s in sites],
-            policy=disorder)
+            policy=disorder, sites=sites)
         if report is not None:
             report["disorder"] = info
         if not keep.all():
@@ -622,7 +867,8 @@ def expand(data, tol=0.1, wrap=True, whole_molecules=True, boundary=True,
         if not symbols:
             return [], np.zeros((0, 3))
     if wrap and whole_molecules:
-        out = unwrap_molecules(symbols, out, data.cell)
+        out = unwrap_molecules(symbols, out, data.cell,
+                               geometric=wholly_disordered)
     # The boundary search runs on the CELL CONTENT, so capture it before the
     # boundary copies go on the end — those are duplicates of atoms already
     # present and would only have it search the same faces twice.
@@ -634,13 +880,166 @@ def expand(data, tol=0.1, wrap=True, whole_molecules=True, boundary=True,
         if extra_symbols:
             symbols = list(symbols) + extra_symbols
             out = np.vstack([out, extra_frac])
+    if wrap and shell_molecules:
+        # VESTA's DEFAULT picture, and the whole of it: the neighbouring
+        # cells' MOLECULES that reach into this one. Deliberately NOT combined
+        # with `exterior` below — the 37-file sweep against Christian's VESTA
+        # exports is what settled that. A bonded shell grown off every atom is
+        # right for a covalent chain (round 35's case) and catastrophic on a
+        # perovskite or an intermetallic, where every atom has 6-12 neighbours
+        # just outside the box: BaLiF3 went 15 -> 25 atoms and Ni6Sn8 28 -> 55,
+        # burying cells that VESTA draws bare. Chains and frameworks get their
+        # continuity from `BoundaryModifier` (round 39) instead, which is
+        # automatic and restricted to covalent bonds crossing a face.
+        groups = (fragment_info(content_symbols, content_frac, data.cell,
+                                geometric=wholly_disordered)
+                  if whole_molecules else None)
+        add_symbols, add_frac = exterior_molecules(
+            content_symbols, content_frac, groups)
+        # A FRAMEWORK has no finite molecules to copy, and VESTA still draws
+        # it running past the cell — so the covalent skeleton is followed one
+        # shell outwards as well. Restricted to bonds involving a non-metal,
+        # which is what separates a ZIF linker from an intermetallic.
+        ext_symbols, ext_frac = bonded_exterior(
+            content_symbols, content_frac, data.cell, depth=1,
+            covalent_only=True)
+        if ext_symbols:
+            add_symbols = list(add_symbols) + list(ext_symbols)
+            add_frac = (np.vstack([add_frac, ext_frac]) if len(add_frac)
+                        else np.asarray(ext_frac))
+        if len(add_symbols):
+            keep = _unseen(add_symbols, add_frac, symbols, out)
+            if keep.any():
+                symbols = list(symbols) + [s for s, k in zip(add_symbols, keep)
+                                           if k]
+                out = np.vstack([out, np.asarray(add_frac)[keep]])
     if wrap and int(exterior) > 0:
+        # Round 35's explicit "one more shell" operator, untouched: follow
+        # every bond that leaves the cell and materialise the far end.
         ext_symbols, ext_frac = bonded_exterior(
             content_symbols, content_frac, data.cell, depth=int(exterior))
         if ext_symbols:
-            symbols = list(symbols) + ext_symbols
-            out = np.vstack([out, ext_frac])
+            keep = _unseen(ext_symbols, ext_frac, symbols, out)
+            if keep.any():
+                symbols = list(symbols) + [s for s, k in zip(ext_symbols, keep)
+                                           if k]
+                out = np.vstack([out, np.asarray(ext_frac)[keep]])
+    if wrap and len(symbols) > len(sites):
+        # Iterated to a FIXED POINT: removing a fragment can orphan whatever
+        # was hanging off it, so one pass leaves a second generation behind
+        # (2240539 went 388 -> 334 on the first sweep and still had 12 lone
+        # hydrogens whose partner had just gone). Bounded, because each pass
+        # must remove at least one atom to continue.
+        for _pass in range(8):
+            keep = _reaches_into_cell(symbols, out, matrix, len(sites))
+            if keep.all():
+                break
+            symbols = [s for s, k in zip(symbols, keep) if k]
+            out = out[keep]
+    if report is not None:
+        # Which DRAWN atoms stand for a site shared by several species. Done
+        # LAST, because everything above may have dropped atoms, renumbered
+        # them, or appended copies — and a boundary copy of a solid-solution
+        # site is still that site, so it has to inherit the composition or the
+        # cell shows one pie sphere at the centre and eight plain ones at the
+        # corners.
+        composition = site_composition(data, tol=tol)
+        if composition:
+            table = {k: composition[s] for k, s in enumerate(sites)
+                     if s in composition}
+            table.update(_inherit_composition(
+                out[:len(sites)], out[len(sites):], table, data.cell,
+                offset=len(sites), tol=tol))
+            if table:
+                report["site_occupancy"] = {str(k): v
+                                            for k, v in table.items()}
     return symbols, out @ matrix
+
+
+def _inherit_composition(content, extra, table, cell, offset, tol=0.1):
+    # type: (np.ndarray, np.ndarray, dict, Cell, int, float) -> dict
+    """Give each appended copy the composition of the site it repeats.
+
+    A boundary or exterior atom is an exact LATTICE TRANSLATE of one of the
+    cell's own atoms, so matching on the fractional coordinate modulo 1
+    identifies its source without having to thread site indices through every
+    function that appends atoms.
+    """
+    if not len(extra) or not table:
+        return {}
+    matrix = cell.matrix()
+    sources = sorted(table)
+    ref = np.asarray(content, dtype=float)[sources]
+    out = {}
+    for k, row in enumerate(np.asarray(extra, dtype=float)):
+        d = ref - row
+        d = d - np.round(d)                      # minimum image
+        near = np.linalg.norm(d @ matrix, axis=1)
+        hit = int(np.argmin(near))
+        if near[hit] <= tol:
+            out[offset + k] = table[sources[hit]]
+    return out
+
+
+def shared_sites(data, tol=0.1):
+    # type: (CifData, float) -> Dict[int, List[int]]
+    """Sites that sit on TOP of each other -> {site index: its whole group}.
+
+    A substitutional solid solution puts several elements on one
+    crystallographic site, each with a fractional occupancy that sums to about
+    one: `1547149.cif` has Nb 0.50, Ti 0.25, Ni 0.15 and Co 0.10 all at
+    (0,0,0). Those are not disorder ALTERNATIVES in the round-38 sense (two
+    positions for one atom); they are one position shared by four species, and
+    it is what VESTA draws as a pie-slice sphere.
+
+    Until round 42 they were lost in `expand`'s minimum-image de-duplication
+    before occupancy was ever consulted, so MoloM drew that structure as pure
+    NbO2 -- a composition the file never claimed, with nothing on screen or on
+    the crystal page to say so.
+
+    Grouped at the SAME tolerance the de-duplication uses, so this describes
+    exactly the atoms that merging would otherwise silently discard.
+    """
+    frac = np.asarray(data.frac, dtype=float).reshape(-1, 3)
+    n = len(frac)
+    if n < 2:
+        return {}
+    matrix = data.cell.matrix()
+    groups = {}               # type: Dict[int, List[int]]
+    for i in range(n):
+        if i in groups:
+            continue
+        d = frac - frac[i]
+        d = d - np.round(d)                      # minimum image
+        close = np.where(np.linalg.norm(d @ matrix, axis=1) <= tol)[0]
+        if len(close) < 2:
+            continue
+        members = [int(k) for k in close]
+        for k in members:
+            groups[k] = members
+    return groups
+
+
+def site_composition(data, tol=0.1):
+    # type: (CifData, float) -> Dict[int, List[Tuple[str, float]]]
+    """`{site: [(element, occupancy), ...]}` for every SHARED site.
+
+    Only sites genuinely shared by more than one species are returned, and
+    only when their occupancies are fractional -- two symmetry-redundant rows
+    for the same atom (the round-33 urea case, where pymatgen invents
+    occupancy 2) are a duplicate, not a solid solution.
+    """
+    out = {}                  # type: Dict[int, List[Tuple[str, float]]]
+    for site, members in shared_sites(data, tol=tol).items():
+        parts = [(data.symbols[k], float(data.occupancy[k])) for k in members]
+        elements_present = {sym for sym, _ in parts}
+        if len(elements_present) < 2 and all(o >= 1.0 - 1e-6
+                                             for _s, o in parts):
+            continue
+        if all(o >= 1.0 - 1e-6 for _s, o in parts):
+            continue
+        out[site] = sorted(parts, key=lambda p: -p[1])
+    return out
 
 
 def _is_new(f, fracs, matrix, tol, wrap):
@@ -716,7 +1115,7 @@ def periodic_neighbours(symbols, frac, cell, slack=0.45, covalent_only=False,
     return adj
 
 
-def unwrap_molecules(symbols, frac, cell, tol=1e-3):
+def unwrap_molecules(symbols, frac, cell, tol=1e-3, geometric=False):
     # type: (list, np.ndarray, Cell, float) -> np.ndarray
     """Make every bonded fragment CONTIGUOUS across the cell boundary —
     unless that fragment is a PERIODIC NETWORK, which cannot be.
@@ -736,7 +1135,10 @@ def unwrap_molecules(symbols, frac, cell, tol=1e-3):
     n = len(symbols)
     if n == 0:
         return frac
-    adj = periodic_neighbours(symbols, frac, cell)
+    # `geometric` groups on proximity rather than chemistry, for the wholly
+    # disordered case — see `fragment_info`. A smeared molecule has to be made
+    # contiguous as ONE entity or the boundary cannot carry it whole.
+    adj = periodic_neighbours(symbols, frac, cell, sanity=not geometric)
     wrapped = np.array(frac, dtype=float)
     out = np.array(frac, dtype=float)
     seen = np.zeros(n, dtype=bool)
@@ -811,7 +1213,8 @@ def _walk_components(indices, adj, frac, matrix, radii, shifts, tol):
     return out
 
 
-def fragment_info(symbols, frac, cell, tol=1e-3, split_coordination=True):
+def fragment_info(symbols, frac, cell, tol=1e-3, split_coordination=True,
+                  geometric=False):
     # type: (list, np.ndarray, Cell, float, bool) -> List[tuple]
     """[(indices, is_periodic), ...] for each bonded component.
 
@@ -858,7 +1261,24 @@ def fragment_info(symbols, frac, cell, tol=1e-3, split_coordination=True):
     shifts = np.array([[a, b, c] for a in (-1, 0, 1) for b in (-1, 0, 1)
                        for c in (-1, 0, 1)
                        if (a, b, c) != (0, 0, 0)], dtype=float)
-    adj = periodic_neighbours(symbols, frac, cell)
+    # `geometric=True` groups on PROXIMITY instead of chemistry (round 42d,
+    # from Christian's reading of VESTA). The sanity filters exist to stop us
+    # DRAWING bonds that cannot exist, and they are right for that; they are
+    # wrong for deciding what belongs TOGETHER, because a disorder alternative
+    # half an Angstrom from its partner is part of the same molecular entity
+    # precisely BECAUSE it is too close to be bonded to it. On `2240539.cif`
+    # (cyclohexane smeared over Fm-3m) the chemistry graph calls 474 contacts
+    # impossible and shatters the molecule into 134 loose atoms and 73 pairs,
+    # so nothing could be completed at the boundary; the geometric graph gives
+    # exactly 4 components of 70 atoms — the four F-centred lattice points,
+    # i.e. VESTA's polyhedral ball at every corner and face centre.
+    #
+    # It is NOT the default, and the discriminator is occupancy: round 38's
+    # HpPyBz case is a spurious 0.75 A contact between two FULLY occupied
+    # molecules, and grouping those together fuses two molecules that are
+    # genuinely separate (a test pins it). Only a wholly disordered structure,
+    # where every site is partial, gets the geometric graph.
+    adj = periodic_neighbours(symbols, frac, cell, sanity=not geometric)
     whole = _walk_components(range(n), adj, frac, matrix, radii, shifts, tol)
     if not split_coordination or not any(p for _g, p in whole):
         return whole
@@ -938,6 +1358,149 @@ def direct_pairs(symbols, frac, cell, pairs, slack=0.45):
         if 0.32 < d < radii[i] + radii[j] + slack:
             out.append((i, j))
     return out
+
+
+def _reaches_into_cell(symbols, frac, matrix, n_content, tol=0.02):
+    # type: (list, np.ndarray, np.ndarray, int, float) -> np.ndarray
+    """Mask dropping any COPY whose whole fragment lies outside the cell.
+
+    The final honesty check on the picture, and the one rule both reference
+    viewers state outright: Mercury includes a molecule when ANY of its atoms
+    falls in the cell, and VESTA searches outward from atoms that are inside.
+    A fragment with nothing inside is therefore not part of this cell's
+    picture at all — it is a copy that some earlier step placed and then had
+    no reason to keep.
+
+    Round 42b: several mechanisms can produce one, which is exactly why the
+    check belongs here rather than in each of them. `boundary_images` carries
+    an atom's whole MOLECULE (round 33), so when that molecule straddles a
+    face — stored split because it could not be unwrapped — translating it
+    bodily throws its far half a full cell further out (H2Mg2O8P2's two Mg
+    landed at z = 1.94, and the boundary modifier then made eleven of them).
+    Christian saw the same thing as triazoles floating a cell away from
+    Cu_trz_tet, and as 12 loose atoms round 2240539.
+
+    Only COPIES are considered: the cell CONTENT is never touched, so Z, the
+    ❖ page's count and anything counting formula units stay exactly as they
+    were.
+    """
+    from . import bonding
+    n = len(symbols)
+    keep = np.ones(n, dtype=bool)
+    if n <= n_content:
+        return keep
+    # Bonds are perceived in CARTESIAN space, like everywhere else.
+    cart = np.asarray(frac, dtype=float) @ matrix
+    inside = np.all((frac > -tol) & (frac < 1.0 + tol), axis=1)
+    if inside.all():
+        return keep
+    bonds = bonding.perceive_bonds(list(symbols), cart)
+    adj = {}
+    for i, j, _order in bonds:
+        adj.setdefault(i, []).append(j)
+        adj.setdefault(j, []).append(i)
+    seen = set()
+    for start in range(n):
+        if start in seen:
+            continue
+        stack, comp = [start], []
+        seen.add(start)
+        while stack:
+            x = stack.pop()
+            comp.append(x)
+            for y in adj.get(x, ()):
+                if y not in seen:
+                    seen.add(y)
+                    stack.append(y)
+        if any(inside[i] for i in comp):
+            continue
+        for i in comp:
+            if i >= n_content:
+                keep[i] = False
+    return keep
+
+
+def _unseen(new_symbols, new_frac, symbols, frac, tol=1e-3):
+    # type: (list, np.ndarray, list, np.ndarray, float) -> np.ndarray
+    """Boolean mask of the candidates not already drawn, compared on POSITION.
+
+    Keyed on where an atom IS, never on `(site, image)`: that key assumes
+    every input atom is the (0,0,0) image of its site, which stops being true
+    the moment the input carries boundary copies (round 39's lesson, which
+    cost a structure 6389 atoms).
+    """
+    new_frac = np.asarray(new_frac, dtype=float).reshape(-1, 3)
+    if not len(new_frac):
+        return np.zeros(0, dtype=bool)
+    seen = set()
+    quant = 1.0 / max(tol, 1e-9)
+    for sym, row in zip(symbols, np.asarray(frac, dtype=float).reshape(-1, 3)):
+        seen.add((sym,) + tuple(np.round(row * quant).astype(np.int64)))
+    keep = np.zeros(len(new_frac), dtype=bool)
+    for i, (sym, row) in enumerate(zip(new_symbols, new_frac)):
+        key = (sym,) + tuple(np.round(row * quant).astype(np.int64))
+        if key not in seen:
+            seen.add(key)
+            keep[i] = True
+    return keep
+
+
+def exterior_molecules(symbols, frac, groups=None, tol=1e-4, span=1):
+    # type: (list, np.ndarray, Optional[list], float, int) -> Tuple[List[str], np.ndarray]
+    """Every neighbouring-cell copy of a molecule that REACHES INTO the cell.
+
+    This is what VESTA and Mercury actually draw, and it is the reason their
+    pictures are ringed with molecules while ours stopped at the box. The two
+    viewers wrap atoms INDIVIDUALLY into the cell and then complete each
+    molecule outwards, so a molecule straddling a face is drawn whole, sitting
+    half outside. MoloM instead wraps by MOLECULE (round 19, so a fragment is
+    never cut in half), which pulls that same molecule bodily inside — correct
+    cell CONTENT, but a picture with no context around it.
+
+    So the rule here is Mercury's packing rule stated directly: **draw a
+    molecule if any of its atoms falls inside the closed cell**, including the
+    copies of it that live in the 26 surrounding cells. `boundary_images`
+    already does this for molecules sitting exactly ON the boundary; this is
+    the same idea with the criterion loosened from "on the face" to "reaches
+    in at all".
+
+    A PERIODIC component is infinite and is skipped: every shell of a
+    framework looks as unfinished as the last, and `BoundaryModifier` is what
+    closes those bonds. Returns the ADDED atoms.
+    """
+    frac = np.asarray(frac, dtype=float).reshape(-1, 3)
+    if not len(frac):
+        return [], np.zeros((0, 3))
+    if groups is None:
+        groups = [([i], True) for i in range(len(frac))]
+    lo, hi = -tol, 1.0 + tol
+    shifts = [np.array((dx, dy, dz), dtype=float)
+              for dx in range(-span, span + 1)
+              for dy in range(-span, span + 1)
+              for dz in range(-span, span + 1)
+              if (dx, dy, dz) != (0, 0, 0)]
+    out_symbols = []          # type: List[str]
+    out_frac = []             # type: List[np.ndarray]
+    for indices, periodic in groups:
+        # A one-atom component is not a molecule to complete. Repeating a
+        # lone ion into its neighbouring cells just duplicates lattice sites
+        # -- which is `boundary_images`' job, done there only for atoms that
+        # actually lie ON a face -- and it is round 33's NaCl lesson turning
+        # up one function further out: BaLiF3 grew from 15 atoms to 25.
+        if periodic or len(indices) < 2:
+            continue
+        block = frac[list(indices)]
+        for shift in shifts:
+            moved = block + shift
+            inside = np.all((moved > lo) & (moved < hi), axis=1)
+            if not inside.any():
+                continue
+            for k, idx in enumerate(indices):
+                out_symbols.append(symbols[idx])
+                out_frac.append(moved[k])
+    if not out_frac:
+        return [], np.zeros((0, 3))
+    return out_symbols, np.asarray(out_frac)
 
 
 def boundary_images(symbols, frac, groups=None, tol=1e-4):
@@ -1098,6 +1661,17 @@ def bonded_exterior(symbols, frac, cell, depth=1, slack=0.45, tol=1e-3,
             hits = np.argwhere((dist > 0.32) & (dist < limit))
             for other, si in hits:
                 other = int(other)
+                if covalent_only and (
+                        bonding.is_metal(symbols[site])
+                        and bonding.is_metal(symbols[other])):
+                    # Metal-to-metal is COVALENT by `bond_kind`, deliberately,
+                    # so an SBU is not dissected (round 38). For growing a
+                    # shell it is the wrong answer: an intermetallic is metal
+                    # bonded to metal in every direction, and following it
+                    # buried Ni6Sn8's 28-atom cell under 55 (round 42, against
+                    # VESTA). Following the covalent skeleton means following
+                    # bonds that involve a NON-metal.
+                    continue
                 if covalent_only and bonding.bond_kind(
                         symbols[site], symbols[other]) != bonding.COVALENT:
                     # A MOLECULE cut by a cell face is the thing that needs
@@ -1261,7 +1835,7 @@ def reference_sample(coords, limit=24):
 
 def build_view(cell, asym_symbols, asym_frac, symops, mode="cell",
                na=1, nb=1, nc=1, tol=0.1, exterior=0, occupancy=None,
-               disorder=POLICY_DOMINANT, report=None):
+               disorder=POLICY_DOMINANT, report=None, shell_molecules=False):
     # type: (Cell, list, list, list, str, int, int, int, float, int, Optional[Sequence], str, Optional[dict]) -> Tuple[List[str], np.ndarray]
     """The atoms for one crystal display mode, in CARTESIAN coordinates.
 
@@ -1281,7 +1855,8 @@ def build_view(cell, asym_symbols, asym_frac, symops, mode="cell",
         # someone switches to when the cell looks wrong.
         return list(data.symbols), data.frac @ cell.matrix()
     symbols, coords = expand(data, tol=tol, exterior=exterior,
-                             disorder=disorder, report=report)
+                             disorder=disorder, report=report,
+                             shell_molecules=shell_molecules)
     if mode != "packing":
         return symbols, coords
     offsets = supercell_offsets(cell, na, nb, nc)
@@ -1290,6 +1865,15 @@ def build_view(cell, asym_symbols, asym_frac, symops, mode="cell",
     for off in offsets:
         out_syms.extend(symbols)
         blocks.append(coords + off[None, :])
+    if report is not None and report.get("site_occupancy"):
+        # Every copy of the cell repeats the shared sites, so the index map
+        # has to be repeated with it or only the first cell would be drawn
+        # with its true composition.
+        base = report["site_occupancy"]
+        stride = len(symbols)
+        report["site_occupancy"] = {
+            str(int(k) + n * stride): v
+            for n in range(len(offsets)) for k, v in base.items()}
     return out_syms, (np.vstack(blocks) if blocks
                       else np.zeros((0, 3)))
 
