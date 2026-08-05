@@ -218,12 +218,16 @@ def test_molecules_are_reassembled_across_the_boundary():
     straddles a face — the stray hydrogens Christian saw against the CCDC
     reference. A bonded fragment must come out contiguous."""
     cell = cif.Cell(10.0, 10.0, 10.0)
-    # An O-H sitting across the z face: 0.98 and 1.02 -> wraps to 0.02.
+    # An O-H sitting across the z face: 0.98 and 1.076 -> wraps to 0.076.
+    # The separation is a REAL 0.96 A O-H, not the 0.4 A this fixture used
+    # before round 38: valence sanity now refuses a contact that short (it is
+    # well inside any possible bond), so an impossible fixture would test
+    # nothing but the new rule.
     symbols = ["O", "H"]
-    frac = np.array([[0.5, 0.5, 0.98], [0.5, 0.5, 0.02]])
+    frac = np.array([[0.5, 0.5, 0.98], [0.5, 0.5, 0.076]])
     out = cif.unwrap_molecules(symbols, frac, cell)
     cart = out @ cell.matrix()
-    assert np.linalg.norm(cart[0] - cart[1]) == pytest.approx(0.4, abs=1e-6)
+    assert np.linalg.norm(cart[0] - cart[1]) == pytest.approx(0.96, abs=1e-6)
 
 
 def test_unwrapping_leaves_a_compact_molecule_alone():

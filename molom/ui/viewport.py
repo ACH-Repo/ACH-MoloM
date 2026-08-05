@@ -528,6 +528,7 @@ class MolViewport(QOpenGLWidget):
     # exception", which points nowhere near the real cause. Defaults on the
     # class mean the attributes exist from the first instant the object does.
     _fly = None
+    _fly_pending = None
     _internal = None
     _grab = None
     _rotate = None
@@ -652,16 +653,19 @@ class MolViewport(QOpenGLWidget):
         self.fly_bank_angle = flight.DEFAULT_BANK_ANGLE
         self.fly_aim_expo = flight.DEFAULT_AIM_EXPO
         self.fly_turn_rate = 1.0
+        self.fly_hold_ms = flight.DEFAULT_HOLD_MS
         self._fly_anchor = QPoint(0, 0)   # captured pointer home, global px
         self._cam_key = None              # see _camera_frame
         self._cam_frame = None
         self._cue_range = None            # depth-cue near/far, per overlay
         self._cue_eye = None              # eye pinned for an overlay pass
         self._pen_cache = {}              # see _cued_pen
-        self._fly_menu_timer = QTimer(self)   # deferred right-click menu
-        self._fly_menu_timer.setSingleShot(True)
-        self._fly_menu_timer.timeout.connect(self._fire_deferred_menu)
-        self._fly_menu_pos = None
+        # A right press ARMS flight; it does not start it (round 36). See
+        # `_arm_fly` for why starting on the press cost the context menu.
+        self._fly_pending = None          # press position while armed
+        self._fly_hold_timer = QTimer(self)
+        self._fly_hold_timer.setSingleShot(True)
+        self._fly_hold_timer.timeout.connect(self._fly_hold_elapsed)
         self._fly_timer = QTimer(self)
         self._fly_timer.setInterval(_FLY_TICK_MS)
         self._fly_timer.timeout.connect(self._fly_tick)
@@ -755,6 +759,9 @@ class MolViewport(QOpenGLWidget):
 
     def cancel_modes(self):
         """Esc hook: cancel any modal first, then an armed select tool."""
+        # An armed-but-not-yet-flying right press is never worth reporting,
+        # but it must not survive whatever comes next and take off later.
+        self._cancel_fly_arm()
         if self.measure_active:
             self.set_measure_tool(False)
             return True
@@ -909,6 +916,49 @@ class MolViewport(QOpenGLWidget):
         self.grabMouse()
         self.setCursor(Qt.BlankCursor)
         self._recentre_pointer()
+
+    # ------------------------------------------------------ arming the button
+    # The right button carries two meanings and round 35 got the arbitration
+    # wrong: flight started on the PRESS, "optimistically", on the theory that
+    # a click simply never travels anywhere. It does not work, because taking
+    # off CAPTURES the pointer — hides it and parks it at the viewport centre.
+    # By the time the button came up, the release position was the centre of
+    # the screen and picked nothing, and any hand tremor in between had set
+    # `_drag_moved`, so the click was not even recognised as one. The geometry
+    # menu (bond length / angle / dihedral) was unreachable.
+    #
+    # So a press now ARMS and waits. Three ways out, and they cannot collide:
+    #   * released quickly -> an ordinary right CLICK, menu if one applies;
+    #   * held past `fly_hold_ms`, or dragged past the click slop -> fly;
+    #   * double-clicked -> latched flight (`mouseDoubleClickEvent`).
+    # That also retires the deferred context menu: nothing is opened on the
+    # first click of a double-click any more, because the first click of a
+    # double-click is too short to be anything.
+    def _arm_fly(self, pos):
+        # type: (object) -> None
+        self._fly_pending = QPointF(pos.x(), pos.y())
+        hold = int(max(float(self.fly_hold_ms), 0.0))
+        if hold > 0:
+            self._fly_hold_timer.start(hold)
+
+    def _cancel_fly_arm(self):
+        self._fly_hold_timer.stop()
+        self._fly_pending = None
+
+    def _fly_hold_elapsed(self):
+        """The hold threshold passed with the button still down. (A release
+        cancels the arm, so reaching here means it never came.)"""
+        if self._fly_pending is None or self._fly is not None:
+            return
+        self._fly_pending = None
+        self._begin_held_fly()
+
+    def _begin_held_fly(self):
+        self._cancel_fly_arm()
+        self.start_fly()
+        self.status_message.emit(
+            "FLY — W/A/S/D thrust, Space/Ctrl up-down, Q/E roll, Shift boost, "
+            "Alt creep; let go to land (double-click to latch)")
 
     def _recentre_pointer(self):
         """Park the (hidden) OS pointer in the middle of the viewport."""
@@ -1758,6 +1808,7 @@ class MolViewport(QOpenGLWidget):
                     "Set {} for {} — drag or type an exact value. The rest "
                     "of the molecule follows.".format(
                         internal.label_for(kind).lower(), names)))
+            self._twist_entry(obj_id, rows, entries)
         if self.selection:
             entries.append(("op:hide_selected", "Hide  (H)",
                             "Hide the selected atoms; Alt+H shows them again"))
@@ -1766,43 +1817,31 @@ class MolViewport(QOpenGLWidget):
                             "hydrogens"))
         return entries
 
-    def _defer_context_menu(self, pos):
-        """Hold the context menu back by one double-click interval.
+    def _twist_entry(self, obj_id, rows, entries):
+        """Offer the rotor, if this selection has one.
 
-        The right button now carries two meanings — click for the menu,
-        double-click to latch flight — and Qt fires the first click's action
-        before it can know a second is coming (the round-8 gotcha). Opening
-        the menu immediately would mean every attempt to double-click into
-        flight popped a menu first.
-
-        The delay is paid ONLY where a menu would actually appear, which is a
-        right-click landing on an already-selected atom; `open_context_menu`
-        refuses everywhere else, so double-clicking into flight over empty
-        space — the normal case — costs nothing and is not deferred.
+        It goes UNDER the length/angle/dihedral entry, which is chosen by the
+        pick count and is therefore the more specific answer to "what did you
+        select". The twist works from any number of picks, so on a two-atom
+        selection it sits below "Bond length" and on a seven-atom one it is
+        the only geometry entry there is.
         """
-        if not self._context_menu_would_open(pos):
+        obj = self.scene.get(obj_id) if self.scene else None
+        if obj is None:
             return
-        from PySide6.QtWidgets import QApplication as _QApp
-        self._fly_menu_pos = pos
-        self._fly_menu_timer.start(max(_QApp.doubleClickInterval(), 150))
-
-    def _cancel_deferred_menu(self):
-        self._fly_menu_timer.stop()
-        self._fly_menu_pos = None
-
-    def _fire_deferred_menu(self):
-        pos, self._fly_menu_pos = self._fly_menu_pos, None
-        if pos is not None and self._fly is None:
-            self.open_context_menu(pos)
-
-    def _context_menu_would_open(self, pos):
-        # type: (object) -> bool
-        """Cheap version of `open_context_menu`'s own guards, so the deferral
-        is not paid for a click that was never going to show anything."""
-        if not self.selection:
-            return False
-        hit = self._pick_at(pos)
-        return hit is not None and self._atom_map[hit] in self.selection
+        s = obj.structure
+        split = internal.torsion_split(s.n_atoms, s.bonds, rows)
+        if split is None:
+            return
+        moving, anchor, pivot = split
+        about = "{} - {}".format(self.scene.pick_label((obj_id, anchor)),
+                                 self.scene.pick_label((obj_id, pivot)))
+        entries.append((
+            "internal:" + internal.TWIST,
+            "Twist about {}   (T)".format(about),
+            "Spin the {}-atom group about the {} bond axis — drag, scroll or "
+            "type an angle. Everything else stays exactly where it is."
+            .format(len(moving), about)))
 
     def open_context_menu(self, pos):
         """Right-CLICK over the selection: whatever fits what is picked.
@@ -1853,6 +1892,9 @@ class MolViewport(QOpenGLWidget):
         """
         if self.modal_active() or self.scene is None:
             return
+        if kind == internal.TWIST:
+            self.start_twist()
+            return
         found = self.internal_picks()
         if found is None:
             self.status_message.emit(
@@ -1892,6 +1934,58 @@ class MolViewport(QOpenGLWidget):
             self.status_message.emit(
                 "No clean split (ring, or the atoms are not simply bonded) — "
                 "only the last atom moves")
+        self._apply_internal()
+
+    def start_twist(self):
+        """Spin a terminal group about the bond that holds it on.
+
+        The rotor a methyl needs, and the one internal coordinate the existing
+        modal could not express without four picks in the right order: here
+        the SELECTION says which group, `internal.torsion_split` works out the
+        axis, and the whole group turns rigidly about it.
+
+        Deliberately NOT an axis lock inside R. R rotates the selection about
+        the object origin; this rotates a fragment the selection only points
+        AT, about an axis that belongs to the molecule rather than to the
+        object or the world. Pressing X twice in R cycles to the OBJECT's
+        local frame, which a C-R bond is no part of.
+        """
+        if self.modal_active() or self.scene is None:
+            return
+        found = self.internal_picks()
+        if found is None:
+            self.status_message.emit(
+                "Select atoms of ONE molecule to twist")
+            return
+        obj_id, rows = found
+        obj = self.scene.get(obj_id)
+        s = obj.structure
+        split = internal.torsion_split(s.n_atoms, s.bonds, rows)
+        if split is None:
+            self.status_message.emit(
+                "No single bond frees that selection — pick a terminal group "
+                "(a methyl, an OH, a substituent). A ring atom or a whole "
+                "molecule has no rotor.")
+            return
+        moving, anchor, pivot = split
+        moving = sorted(moving)
+        about = "{} - {}".format(self.scene.pick_label((obj_id, anchor)),
+                                 self.scene.pick_label((obj_id, pivot)))
+        # A full turn per window width: the useful range of a rotor IS 360
+        # degrees, unlike a bond length where most of the travel is nonsense.
+        state = manipulate.ScalarState(
+            0.0, 360.0 / max(self.width(), 1), unit=internal.unit_for(
+                internal.TWIST), label=internal.label_for(internal.TWIST))
+        state.show_start = False         # a relative angle starts at 0 always
+        self._begin_model_edit()
+        self._internal = {
+            "kind": internal.TWIST, "obj_id": obj_id,
+            "picks": [anchor, pivot], "rows": moving, "state": state,
+            "blocked": False, "about": about,
+            "frames": [f[moving].copy() for f in s.frames],
+        }
+        self.grabKeyboard()
+        self.grabMouse()
         self._apply_internal()
 
     def _apply_internal(self):
@@ -2628,6 +2722,9 @@ class MolViewport(QOpenGLWidget):
         # frame and a viewport that simply stopped updating its overlays.
         if state is not None and self._internal is None:
             self._paint_modal_guides(p, state)
+        if self._internal is not None \
+                and self._internal["kind"] == internal.TWIST:
+            self._paint_twist_axis(p)
         if self.show_hbonds:
             self._paint_hbonds(p)
         self._paint_anchor(p)
@@ -3209,6 +3306,42 @@ class MolViewport(QOpenGLWidget):
             pts.append(QPoint(int(x + r * np.cos(a)), int(y + r * np.sin(a))))
         p.drawPolygon(QPolygon(pts))
 
+    def _paint_twist_axis(self, p):
+        """The rotor's axis, drawn through the bond and out past both atoms.
+
+        Without it the modal is a number and a molecule that moves: which bond
+        it is turning about — and therefore which way the number goes — is
+        exactly the thing that needs saying, and saying it in the viewport
+        rather than in a banner is the round-21 lesson.
+        """
+        it = self._internal
+        obj = self.scene.get(it["obj_id"]) if self.scene else None
+        if obj is None:
+            return
+        c = obj.structure.coords
+        anchor, pivot = it["picks"]
+        if max(anchor, pivot) >= len(c):
+            return
+        a, b = np.asarray(c[anchor], dtype=float), np.asarray(c[pivot],
+                                                              dtype=float)
+        d = b - a
+        n = float(np.linalg.norm(d))
+        if n < 1e-9:
+            return
+        d = d / n
+        seg = self._segment_screen(a - d * 2.5, b + d * 2.5)
+        if seg is None:
+            return
+        (x0, y0), (x1, y1) = seg
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(_ANCHOR_COLOR, 1.4, Qt.DashLine))
+        p.drawLine(int(x0), int(y0), int(x1), int(y1))
+        # A ring on the anchor: the end that does NOT move.
+        xy, front = self._project(np.array([a]))
+        if bool(front[0]):
+            p.setPen(QPen(_ANCHOR_COLOR, 1.6))
+            p.drawEllipse(int(xy[0, 0]) - 7, int(xy[0, 1]) - 7, 14, 14)
+
     def _paint_modal_prompt(self, p):
         """The active modal's instructions, drawn IN the viewport.
 
@@ -3221,6 +3354,10 @@ class MolViewport(QOpenGLWidget):
             text = "{}   [drag / scroll, type a number]   {}".format(
                 it["state"].status_text().upper(),
                 "left-click: SET    right-click / Esc: cancel")
+            if it.get("about"):
+                text = "{} ABOUT {}   —   {}".format(
+                    it["state"].status_text().upper(), it["about"],
+                    "left-click: SET    right-click / Esc: cancel")
             if it["blocked"]:
                 text += "   — ring: only the last atom moves"
             self._draw_prompt(p, text)
@@ -3684,22 +3821,20 @@ class MolViewport(QOpenGLWidget):
         self._drag_moved = False
         self._press_pos = pos
         self._draw_from = None
-        # RIGHT BUTTON = fly (UE5). Held down it looks with the mouse and
-        # flies with WASD/QE; released without having moved or thrust, it is
-        # an ordinary right-CLICK and opens the context menu instead. The two
-        # cannot be told apart at press time, so flight starts optimistically
-        # and the click case simply never travels anywhere.
+        # RIGHT BUTTON = fly (UE5), but only once the press has PROVED it is
+        # not a click — see `_arm_fly`.
         if ev.button() == Qt.RightButton and self._shuttle is None \
                 and not self.modal_active():
-            # A right press while ALREADY latched is the land gesture, not
-            # the start of another flight (Christian: "cancel flight again
-            # with a single right click or Esc").
-            if self._fly is not None and self._fly.get("latched"):
-                self._cancel_deferred_menu()
+            # A right press while already flying is the land gesture, whether
+            # the flight is latched or still coasting after a release
+            # (Christian: "cancel flight again with a single right click or
+            # Esc").
+            if self._fly is not None:
+                self._cancel_fly_arm()
                 self.stop_fly(coast=False)
                 self.status_message.emit("Landed")
                 return
-            self.start_fly()
+            self._arm_fly(pos)
             return
         self._nav_drag = self._nav_drag_kind(ev.button(), ev.modifiers())
         if self._nav_drag is not None:
@@ -3753,7 +3888,7 @@ class MolViewport(QOpenGLWidget):
         if ev.button() == Qt.RightButton:
             if self._shuttle is not None or self.modal_active():
                 return
-            self._cancel_deferred_menu()
+            self._cancel_fly_arm()
             self.start_fly(latched=True)
             self._fly["released"] = False
             self._drag_last = ev.position()
@@ -3787,6 +3922,17 @@ class MolViewport(QOpenGLWidget):
 
     def mouseMoveEvent(self, ev):
         pos = ev.position()
+        if self._fly_pending is not None:
+            # Armed but not yet flying. Dragging is as clear a statement of
+            # intent as waiting out the hold, so it takes off immediately —
+            # otherwise a flick-and-fly would stall for a quarter second with
+            # the mouse already moving.
+            if self.fly_hold_ms > 0 \
+                    and (abs(pos.x() - self._fly_pending.x())
+                         + abs(pos.y() - self._fly_pending.y())) \
+                    > _CLICK_SLOP_PX:
+                self._begin_held_fly()
+            return
         if self._fly is not None and not self._fly["released"]:
             # The delta is taken against the CAPTURED anchor (the viewport
             # centre), not against the previous position, and the pointer is
@@ -4154,6 +4300,18 @@ class MolViewport(QOpenGLWidget):
         self.refresh_geometry()
 
     def mouseReleaseEvent(self, ev):
+        if self._fly_pending is not None and ev.button() == Qt.RightButton:
+            # Came up before the hold elapsed and without travelling: an
+            # ordinary right CLICK. It opens the geometry menu straight away —
+            # nothing is waiting on a possible double-click any more, because
+            # flight is no longer something a single press can start.
+            pos = self._fly_pending
+            self._cancel_fly_arm()
+            self._drag_last = None
+            self._drag_button = None
+            self._press_pos = None
+            self.open_context_menu(pos)
+            return
         if self._fly is not None and ev.button() == Qt.RightButton \
                 and self._shuttle is None:
             # Latched flight ignores the button coming up — that is the whole
@@ -4161,14 +4319,10 @@ class MolViewport(QOpenGLWidget):
             if self._fly.get("latched"):
                 self._drag_button = None
                 return
-            was_click = not self._drag_moved and not self._fly["keys"] \
-                and not self._fly["model"].moving
             self.stop_fly()
             self._drag_last = None
             self._drag_button = None
             self._press_pos = None
-            if was_click:
-                self._defer_context_menu(ev.position())
             return
         if self._draw_drag is not None:
             self._finish_draw_drag(ev.position())

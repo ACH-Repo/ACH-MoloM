@@ -60,7 +60,7 @@ def test_symmetry_modifier_round_trips_through_a_dict():
 
 
 def test_the_registry_knows_both_kinds():
-    assert set(mod_mod._KINDS) == {"array", "symmetry"}
+    assert set(mod_mod._KINDS) == {"array", "symmetry", "boundary"}
 
 
 # --------------------------------------------------------- ORCA geometry

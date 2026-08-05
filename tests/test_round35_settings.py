@@ -102,9 +102,10 @@ def test_the_flight_tuning_round_trips_every_key(dlg):
     tuning = dlg.flight_tuning()
     assert set(tuning) == {"accel", "damping", "brake_factor",
                            "strafe_factor", "roll_rate", "bank_angle",
-                           "aim_expo", "turn_rate"}
+                           "aim_expo", "turn_rate", "hold_ms"}
     assert tuning["accel"] == pytest.approx(flight.DEFAULT_ACCEL)
     assert tuning["bank_angle"] == pytest.approx(flight.DEFAULT_BANK_ANGLE)
+    assert tuning["hold_ms"] == pytest.approx(flight.DEFAULT_HOLD_MS)
 
 
 def test_hidden_rows_still_report_their_values(dlg):

@@ -148,7 +148,99 @@ class SymmetryModifier(Modifier):
         return d
 
 
-_KINDS = {"array": ArrayModifier, "symmetry": SymmetryModifier}
+class BoundaryModifier(Modifier):
+    """Close the bonds that cross a cell face — the periodic display bonds.
+
+    Bond perception measures straight lines, so a bond whose partner is in the
+    next cell is simply not drawn: a ZIF's imidazolate linkers come out severed
+    at every face and the framework reads as a heap of loose fragments. On
+    Christian's `2130205.cif` the connectivity really has 224 bonds and only
+    196 of them were drawable; VESTA shows the same file as 276 atoms and 324
+    bonds precisely because it materialises the partners.
+
+    That is what this does, via `cif.bonded_exterior`: follow every bond that
+    leaves the cell and add the periodic IMAGE at the far end, then bond to it.
+    As a MODIFIER rather than a rebuild, the base structure stays exactly the
+    cell content — so Z, the ❖ page's atom count, editing and export of the
+    unit cell are all untouched — while the viewport (and the Blender export,
+    which reads `evaluated()`) see a continuous framework.
+
+    `shells` is how far to follow: 1 closes every bond that crosses a face,
+    which is the honest minimum and matches VESTA's default. 2 also completes
+    the group on the far side, which looks tidier on a linker.
+    """
+
+    kind = "boundary"
+
+    def __init__(self, cell=None, shells=1, name="", enabled=True,
+                 covalent_only=True, whole_molecules=True):
+        super().__init__(name or "Boundary bonds", enabled)
+        self.cell = cell                 # dict, as stored in metadata
+        self.shells = max(1, int(shells))
+        #: Follow COVALENT bonds only. A molecule cut by a cell face is what
+        #: needs closing; a coordination bond is where a framework is meant to
+        #: be cut, and following those as well turns rock salt's 9-atom cell
+        #: into 59 without telling anyone anything new.
+        self.covalent_only = bool(covalent_only)
+        #: Bring the WHOLE molecule on the far side of a cut bond, not just
+        #: the one atom that closes it. Half an imidazolate ring is not a
+        #: thing that exists (the round-33 rule for boundary copies, applied
+        #: to the same question one step further out).
+        self.whole_molecules = bool(whole_molecules)
+        self._cache_key = None
+        self._cache = None
+
+    def evaluate(self, symbols, coords, bonds):
+        from . import bonding
+        from . import cif as cif_mod
+        if not self.cell or not len(symbols):
+            return symbols, coords, bonds
+        xyz = np.asarray(coords, dtype=float).reshape(len(symbols), 3)
+        # Cached on the GEOMETRY, not per call: `evaluated()` runs on every
+        # viewport rebuild, and re-deriving a framework's boundary each frame
+        # is the round-33 mistake in a new place.
+        key = (xyz.tobytes(), tuple(symbols), self.shells,
+               self.covalent_only, self.whole_molecules,
+               tuple(sorted(self.cell.items())))
+        if key == self._cache_key:
+            return self._cache[0], self._cache[1].copy(), list(self._cache[2])
+        try:
+            cell = cif_mod.Cell.from_dict(self.cell)
+        except (KeyError, TypeError, ValueError, cif_mod.CifError):
+            return symbols, coords, bonds
+        frac = cell.to_fractional(xyz)
+        if self.whole_molecules:
+            ex_symbols, ex_frac = cif_mod.crossing_fragments(
+                list(symbols), frac, cell)
+        else:
+            ex_symbols, ex_frac = cif_mod.bonded_exterior(
+                list(symbols), frac, cell, depth=self.shells,
+                covalent_only=self.covalent_only, finite_only=True)
+        if not ex_symbols:
+            return symbols, coords, bonds
+        n = len(symbols)
+        out_symbols = list(symbols) + list(ex_symbols)
+        out_xyz = np.vstack([xyz, np.asarray(ex_frac) @ cell.matrix()])
+        # The incoming bonds are kept EXACTLY as they are — they may carry
+        # orders the user drew — and only the pairs that touch a new atom are
+        # perceived. Re-perceiving everything would quietly undo bond edits.
+        fresh = bonding.perceive_bonds(out_symbols, out_xyz)
+        out_bonds = list(bonds) + [(i, j, o) for i, j, o in fresh
+                                   if i >= n or j >= n]
+        self._cache_key = key
+        self._cache = (out_symbols, out_xyz, out_bonds)
+        return out_symbols, out_xyz.copy(), list(out_bonds)
+
+    def to_dict(self):
+        d = super().to_dict()
+        d.update({"cell": self.cell, "shells": int(self.shells),
+                  "covalent_only": bool(self.covalent_only),
+                  "whole_molecules": bool(self.whole_molecules)})
+        return d
+
+
+_KINDS = {"array": ArrayModifier, "symmetry": SymmetryModifier,
+          "boundary": BoundaryModifier}
 
 
 def from_dict(d):
@@ -167,6 +259,11 @@ def from_dict(d):
                                 d.get("enabled", True),
                                 d.get("origin"),
                                 d.get("exterior", 0))
+    if cls is BoundaryModifier:
+        return BoundaryModifier(d.get("cell"), d.get("shells", 1),
+                                d.get("name", ""), d.get("enabled", True),
+                                d.get("covalent_only", True),
+                                d.get("whole_molecules", True))
     return None
 
 

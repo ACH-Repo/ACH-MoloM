@@ -214,7 +214,8 @@ class CifData(object):
     """What a CIF told us: a cell, the symmetry ops, the asymmetric unit."""
 
     def __init__(self, cell, symops, symbols, frac, name="",
-                 spacegroup="", labels=None):
+                 spacegroup="", labels=None, occupancy=None,
+                 disorder_groups=None, disorder_assemblies=None):
         self.cell = cell
         self.symops = list(symops)
         self.symbols = list(symbols)
@@ -222,6 +223,26 @@ class CifData(object):
         self.name = name
         self.spacegroup = spacegroup
         self.labels = list(labels or symbols)
+        #: Site occupancies, 1.0 where the file said nothing. READ and now
+        #: also USED (round 38): a disordered structure lists every
+        #: alternative, and drawing them all at once superimposes atoms that
+        #: are never present together — which then perceives bonds that cannot
+        #: exist and makes the whole cell read as a framework.
+        self.occupancy = ([float(o) for o in occupancy] if occupancy
+                          is not None else [1.0] * len(self.symbols))
+        #: `_atom_site_disorder_group` / `_atom_site_disorder_assembly`: the
+        #: crystallographer's OWN statement of which alternatives go together.
+        #: Believe it when it is there; fall back on geometry when it is not.
+        self.disorder_groups = list(disorder_groups
+                                    or [""] * len(self.symbols))
+        self.disorder_assemblies = list(disorder_assemblies
+                                        or [""] * len(self.symbols))
+
+    @property
+    def is_disordered(self):
+        # type: () -> bool
+        return (any(o < 1.0 - 1e-6 for o in self.occupancy)
+                or any(g for g in self.disorder_groups))
 
     @property
     def n_sites(self):
@@ -240,6 +261,13 @@ def _strip_esd(value):
     if s in ("", ".", "?"):
         raise CifError("missing numeric value")
     return float(s)
+
+
+def _tag_value(value):
+    # type: (str) -> str
+    """A CIF text field, with the two "no value" markers folded to empty."""
+    s = str(value).strip().strip("'\"")
+    return "" if s in (".", "?") else s
 
 
 def _element_from_label(label, type_symbol=None):
@@ -372,8 +400,12 @@ def parse_cif(text):
         raise CifError("no fractional atom sites (_atom_site_fract_x/y/z)")
     labels = site_cols.get("_atom_site_label", [""] * len(fx))
     types = site_cols.get("_atom_site_type_symbol", [None] * len(fx))
+    occ_col = site_cols.get("_atom_site_occupancy", [])
+    group_col = site_cols.get("_atom_site_disorder_group", [])
+    assembly_col = site_cols.get("_atom_site_disorder_assembly", [])
 
     symbols, frac, kept_labels = [], [], []
+    occupancy, groups, assemblies = [], [], []
     for k in range(min(len(fx), len(fy), len(fz))):
         try:
             xyz = (_strip_esd(fx[k]), _strip_esd(fy[k]), _strip_esd(fz[k]))
@@ -386,6 +418,14 @@ def parse_cif(text):
         symbols.append(sym)
         frac.append(xyz)
         kept_labels.append(labels[k] if k < len(labels) else sym)
+        try:
+            occupancy.append(_strip_esd(occ_col[k]) if k < len(occ_col)
+                             else 1.0)
+        except (CifError, ValueError):
+            occupancy.append(1.0)          # "." / "?" means "assume full"
+        groups.append(_tag_value(group_col[k]) if k < len(group_col) else "")
+        assemblies.append(_tag_value(assembly_col[k])
+                          if k < len(assembly_col) else "")
     if not symbols:
         raise CifError("no usable atom sites in this CIF")
 
@@ -402,12 +442,122 @@ def parse_cif(text):
         # No symmetry listed = P1: the file already holds every atom.
         symops = [IDENTITY]
     return CifData(cell, symops, symbols, np.array(frac), name=name,
-                   spacegroup=spacegroup, labels=kept_labels)
+                   spacegroup=spacegroup, labels=kept_labels,
+                   occupancy=occupancy, disorder_groups=groups,
+                   disorder_assemblies=assemblies)
+
+
+# -------------------------------------------------------------------- disorder
+#: Draw every alternative at once (what MoloM did until round 38).
+POLICY_ALL = "all"
+#: Resolve OVERLAPS only: where alternatives sit on top of each other, keep
+#: the most occupied one. Everything else is left alone, so a partially
+#: occupied guest that overlaps nothing still shows.
+POLICY_DOMINANT = "dominant"
+#: Dominant, plus drop anything below `MAJOR_THRESHOLD` — "show me the ordered
+#: structure", which for a MOF usually means the framework without its
+#: disordered guest.
+POLICY_MAJOR = "major"
+DISORDER_POLICIES = (POLICY_DOMINANT, POLICY_MAJOR, POLICY_ALL)
+
+#: Two atoms closer than this are not both really there. Chosen below every
+#: real interatomic distance — the shortest bonds in chemistry are H-F at
+#: 0.92 A and an X-ray riding C-H at 0.93 — and above the 0.1 A tolerance the
+#: symmetry de-duplication already uses. Alternatives further apart than this
+#: are the crystallographer's business to tag, which is what the disorder
+#: GROUP columns are for.
+DISORDER_RADIUS = 0.8
+MAJOR_THRESHOLD = 0.5
+
+
+def resolve_disorder(symbols, frac, cell, occupancy, groups=None,
+                     assemblies=None, policy=POLICY_DOMINANT,
+                     radius=DISORDER_RADIUS, threshold=MAJOR_THRESHOLD):
+    # type: (list, np.ndarray, Cell, Sequence, Optional[Sequence], Optional[Sequence], str, float, float) -> Tuple[np.ndarray, dict]
+    """Which atoms of a DISORDERED structure to actually draw.
+
+    Returns `(keep_mask, report)`. A disordered CIF lists every alternative
+    position, so drawing them all superimposes atoms that are never present
+    together: `MIL-53-lp.cif` comes out with carbons carrying NINE neighbours
+    at 0.11 A, which then perceives bonds that cannot exist and makes the
+    whole cell read as one percolating framework. This is the third leg of
+    round 38 — bond kinds say where a molecule ENDS, valence sanity says which
+    bonds cannot BE, and this says which atoms are not simultaneously there.
+
+    Two mechanisms, deliberately both:
+
+    * the **disorder GROUP** columns, which is the crystallographer's own
+      statement of which alternatives belong together — believed when present,
+      per assembly, keeping the group carrying the most occupancy;
+    * **geometric overlap**, for the (very common) files that carry occupancies
+      and no grouping at all. Only a site that overlaps another one is ever
+      dropped: a lone partially-occupied site is a real partial site, and a
+      half-occupied atom sitting ON a symmetry element is a special position,
+      not an alternative.
+    """
+    n = len(symbols)
+    occ = np.asarray([float(o) for o in occupancy], dtype=float) \
+        if occupancy is not None else np.ones(n)
+    if occ.size != n:
+        occ = np.ones(n)
+    keep = np.ones(n, dtype=bool)
+    report = {"policy": policy, "sites": n, "by_group": 0, "by_overlap": 0,
+              "by_threshold": 0, "dropped": 0}
+    if policy == POLICY_ALL or n == 0:
+        return keep, report
+    groups = list(groups or [""] * n)
+    assemblies = list(assemblies or [""] * n)
+
+    # 1) the file's own grouping, per assembly
+    tagged = [i for i in range(n) if groups[i]]
+    if tagged:
+        by_assembly = {}
+        for i in tagged:
+            by_assembly.setdefault(assemblies[i], []).append(i)
+        for members in by_assembly.values():
+            totals = {}
+            for i in members:
+                totals[groups[i]] = totals.get(groups[i], 0.0) + occ[i]
+            best = max(sorted(totals), key=lambda g: totals[g])
+            for i in members:
+                if groups[i] != best:
+                    keep[i] = False
+                    report["by_group"] += 1
+
+    # 2) below the threshold, if asked
+    if policy == POLICY_MAJOR:
+        low = keep & (occ < float(threshold) - 1e-9)
+        report["by_threshold"] = int(low.sum())
+        keep &= ~low
+
+    # 3) whatever still overlaps. Highest occupancy first, so the winner of
+    # each cluster is picked before it can be dropped by a weaker neighbour.
+    if float(radius) > 0 and np.any(occ < 1.0 - 1e-6):
+        m = cell.matrix()
+        frac = np.asarray(frac, dtype=float).reshape(-1, 3)
+        for i in np.argsort(-occ, kind="stable"):
+            if not keep[i]:
+                continue
+            d = frac - frac[i]
+            d = d - np.round(d)                     # minimum image
+            dist = np.linalg.norm(d @ m, axis=1)
+            close = (dist < float(radius)) & keep
+            close[i] = False
+            # A fully occupied atom is never an "alternative" — if two of
+            # those overlap the file is broken in a way this cannot fix, and
+            # valence sanity will report it instead.
+            close &= occ < 1.0 - 1e-6
+            if np.any(close):
+                keep &= ~close
+                report["by_overlap"] += int(close.sum())
+    report["dropped"] = int((~keep).sum())
+    report["kept"] = int(keep.sum())
+    return keep, report
 
 
 # -------------------------------------------------------------------- expansion
 def expand(data, tol=0.1, wrap=True, whole_molecules=True, boundary=True,
-           exterior=0):
+           exterior=0, disorder=POLICY_DOMINANT, report=None):
     # type: (CifData, float, bool, bool, bool, int) -> Tuple[List[str], np.ndarray]
     """Apply every symmetry op to every site -> (symbols, CARTESIAN coords).
 
@@ -429,12 +579,19 @@ def expand(data, tol=0.1, wrap=True, whole_molecules=True, boundary=True,
     chain or a framework runs on instead of ending at the wall. Off by
     default (Christian's call): it changes what an import looks like, and
     nothing that counts cell content should ever see these atoms.
+
+    `disorder` decides what to do with partially occupied sites — see
+    `resolve_disorder`. It runs on the EXPANDED atoms, not on the sites,
+    because the alternatives are routinely symmetry images of one another
+    rather than separate rows in the file. Pass a dict as `report` to be told
+    what it did.
     """
     if data.n_sites == 0:
         return [], np.zeros((0, 3))
     matrix = data.cell.matrix()
     symbols = []            # type: List[str]
     fracs = []              # type: List[np.ndarray]
+    sites = []              # type: List[int]
     for site in range(data.n_sites):
         base = data.frac[site]
         for op in data.symops:
@@ -445,9 +602,25 @@ def expand(data, tol=0.1, wrap=True, whole_molecules=True, boundary=True,
                 continue
             fracs.append(f)
             symbols.append(data.symbols[site])
+            sites.append(site)
     if not fracs:
         return [], np.zeros((0, 3))
     out = np.asarray(fracs)
+    if disorder != POLICY_ALL and data.is_disordered:
+        keep, info = resolve_disorder(
+            symbols, out, data.cell,
+            [data.occupancy[s] for s in sites],
+            [data.disorder_groups[s] for s in sites],
+            [data.disorder_assemblies[s] for s in sites],
+            policy=disorder)
+        if report is not None:
+            report["disorder"] = info
+        if not keep.all():
+            symbols = [s for s, k in zip(symbols, keep) if k]
+            out = out[keep]
+            sites = [s for s, k in zip(sites, keep) if k]
+        if not symbols:
+            return [], np.zeros((0, 3))
     if wrap and whole_molecules:
         out = unwrap_molecules(symbols, out, data.cell)
     # The boundary search runs on the CELL CONTENT, so capture it before the
@@ -480,32 +653,66 @@ def _is_new(f, fracs, matrix, tol, wrap):
     return bool(np.min(np.linalg.norm(d @ matrix, axis=1)) > tol)
 
 
-def periodic_neighbours(symbols, frac, cell, slack=0.45):
-    # type: (list, np.ndarray, Cell, float) -> List[List[int]]
-    """Adjacency using the MINIMUM IMAGE convention.
+def periodic_pairs(symbols, frac, cell, slack=0.45, sanity=True, report=None):
+    # type: (list, np.ndarray, Cell, float, bool, Optional[dict]) -> Tuple[List[tuple], np.ndarray]
+    """Bonded pairs under the MINIMUM IMAGE convention, plus their distances.
 
     Ordinary bond perception measures straight-line distances, so a molecule
     straddling a cell face comes out cut in half. Here the shortest periodic
-    image of each pair is used instead, with Avogadro's covalent criterion.
+    image of each pair is used instead, with Avogadro's covalent criterion —
+    and then the same VALENCE SANITY the molecular path applies, because a
+    crystal is where impossible contacts actually turn up (a superimposed
+    disorder alternative, a badly refined hydrogen, a file with a 0.75 A
+    clash). Without it one bad contact fuses four molecules into a chain that
+    percolates, and the whole cell then reads as a framework.
     """
-    from . import elements
+    from . import bonding, elements
     n = len(symbols)
     if n == 0:
-        return []
+        return [], np.zeros(0)
     m = cell.matrix()
     radii = np.array([elements.radius_covalent(elements.atomic_number(s))
                       for s in symbols])
     radii[radii <= 0] = 2.0
-    adj = [[] for _ in range(n)]
+    pairs, dists = [], []
     for i in range(n):
         d = frac[i + 1:] - frac[i]
         d = d - np.round(d)                        # minimum image
         dist = np.linalg.norm(d @ m, axis=1)
         limit = radii[i + 1:] + radii[i] + slack
         for off in np.nonzero((dist > 0.32) & (dist < limit))[0]:
-            j = i + 1 + int(off)
-            adj[i].append(j)
-            adj[j].append(i)
+            pairs.append((i, i + 1 + int(off)))
+            dists.append(float(dist[off]))
+    dists = np.asarray(dists, dtype=float)
+    if sanity and pairs:
+        keep, dropped = bonding.prune_pairs(symbols, pairs, dists)
+        if report is not None:
+            report.setdefault("dropped_bonds", []).extend(dropped)
+        pairs = [pairs[k] for k in keep]
+        dists = dists[keep] if len(keep) else np.zeros(0)
+    return pairs, dists
+
+
+def periodic_neighbours(symbols, frac, cell, slack=0.45, covalent_only=False,
+                        sanity=True):
+    # type: (list, np.ndarray, Cell, float, bool, bool) -> List[List[int]]
+    """`periodic_pairs` as adjacency lists.
+
+    `covalent_only` drops the metal-ligand bonds, which is how an infinite
+    framework becomes a set of finite molecules — see `bonding.bond_kind`.
+    Use it for the question "what is a molecule here"; use the full graph for
+    "what should be drawn joined", which is not the same question.
+    """
+    from . import bonding
+    n = len(symbols)
+    adj = [[] for _ in range(n)]
+    pairs, _dists = periodic_pairs(symbols, frac, cell, slack, sanity=sanity)
+    for i, j in pairs:
+        if covalent_only and bonding.bond_kind(symbols[i],
+                                               symbols[j]) != bonding.COVALENT:
+            continue
+        adj[i].append(j)
+        adj[j].append(i)
     return adj
 
 
@@ -569,9 +776,59 @@ def unwrap_molecules(symbols, frac, cell, tol=1e-3):
     return out
 
 
-def fragment_info(symbols, frac, cell, tol=1e-3):
-    # type: (list, np.ndarray, Cell, float) -> List[tuple]
+def _walk_components(indices, adj, frac, matrix, radii, shifts, tol):
+    # type: (Sequence, list, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float) -> List[tuple]
+    """[(group, is_periodic), ...] for the components of `indices` under
+    `adj`. Shared by the full-connectivity pass and the covalent-only one."""
+    wanted = set(int(i) for i in indices)
+    placed = np.array(frac, dtype=float)
+    seen = set()
+    out = []
+    for seed in sorted(wanted):
+        if seed in seen:
+            continue
+        seen.add(seed)
+        group, stack, periodic = [seed], [seed], False
+        while stack:
+            i = stack.pop()
+            for j in adj[i]:
+                if j not in wanted:
+                    continue
+                d = frac[j] - frac[i]
+                target = placed[i] + (d - np.round(d))
+                if j not in seen:
+                    seen.add(j)
+                    placed[j] = target
+                    group.append(j)
+                    stack.append(j)
+                elif np.any(np.abs(placed[j] - target) > tol):
+                    periodic = True
+        group = sorted(group)
+        if not periodic:
+            periodic = _touches_own_image(placed[group], radii[group],
+                                          matrix, shifts)
+        out.append((group, periodic))
+    return out
+
+
+def fragment_info(symbols, frac, cell, tol=1e-3, split_coordination=True):
+    # type: (list, np.ndarray, Cell, float, bool) -> List[tuple]
     """[(indices, is_periodic), ...] for each bonded component.
+
+    **A periodic component is then cut at its COORDINATION bonds** (round 38,
+    Christian's diagnosis). Mercury knows to stop after the carboxylate
+    because a Zn-O bond is coordinative and that is the logical place to cut;
+    doing the same here turns MIL-53's one 152-atom infinite component into 8
+    linkers, 8 hydroxide bridges, 8 waters and 8 aluminium centres — every one
+    finite, and therefore completable at the cell boundary. Rock salt cuts the
+    same way into single ions, which is exactly the per-atom completion the
+    boundary already wanted.
+
+    The cut is applied ONLY to components that came back periodic. A finite
+    metal complex — ferrocene, a paddlewheel with its ligands — is already a
+    molecule, and dissecting it would strand the ligands from their metal at
+    the boundary. Cut where it is infinite, nowhere else: that is the whole
+    hierarchy.
 
     `is_periodic` marks a component that is INFINITE — a framework, or an
     ionic lattice like rock salt where Na and Cl fall inside the covalent
@@ -596,37 +853,23 @@ def fragment_info(symbols, frac, cell, tol=1e-3):
     if n == 0:
         return []
     matrix = cell.matrix()
-    adj = periodic_neighbours(symbols, frac, cell)
-    placed = np.array(frac, dtype=float)
-    seen = np.zeros(n, dtype=bool)
     radii = np.array([elements.radius_covalent(elements.atomic_number(s))
                       or 2.0 for s in symbols])
     shifts = np.array([[a, b, c] for a in (-1, 0, 1) for b in (-1, 0, 1)
                        for c in (-1, 0, 1)
                        if (a, b, c) != (0, 0, 0)], dtype=float)
+    adj = periodic_neighbours(symbols, frac, cell)
+    whole = _walk_components(range(n), adj, frac, matrix, radii, shifts, tol)
+    if not split_coordination or not any(p for _g, p in whole):
+        return whole
+    cov_adj = periodic_neighbours(symbols, frac, cell, covalent_only=True)
     out = []
-    for seed in range(n):
-        if seen[seed]:
-            continue
-        seen[seed] = True
-        group, stack, periodic = [seed], [seed], False
-        while stack:
-            i = stack.pop()
-            for j in adj[i]:
-                d = frac[j] - frac[i]
-                target = placed[i] + (d - np.round(d))
-                if not seen[j]:
-                    seen[j] = True
-                    placed[j] = target
-                    group.append(j)
-                    stack.append(j)
-                elif np.any(np.abs(placed[j] - target) > tol):
-                    periodic = True
-        group = sorted(group)
+    for group, periodic in whole:
         if not periodic:
-            periodic = _touches_own_image(placed[group], radii[group],
-                                          matrix, shifts)
-        out.append((group, periodic))
+            out.append((group, periodic))
+            continue
+        out.extend(_walk_components(group, cov_adj, frac, matrix, radii,
+                                    shifts, tol))
     return out
 
 
@@ -769,7 +1012,9 @@ def boundary_images(symbols, frac, groups=None, tol=1e-4):
     return out_symbols, np.asarray(out_frac)
 
 
-def bonded_exterior(symbols, frac, cell, depth=1, slack=0.45, tol=1e-3):
+def bonded_exterior(symbols, frac, cell, depth=1, slack=0.45, tol=1e-3,
+                    dup_tol=0.1, covalent_only=False,
+                    finite_only=False):
     # type: (list, np.ndarray, Cell, int, float, float) -> Tuple[List[str], np.ndarray]
     """Atoms OUTSIDE the cell that are bonded to atoms inside it.
 
@@ -791,8 +1036,15 @@ def bonded_exterior(symbols, frac, cell, depth=1, slack=0.45, tol=1e-3):
     Returns the ADDED atoms, in fractional coordinates that deliberately lie
     outside [0, 1) — that is the whole point of them. The cell CONTENT is
     untouched, so anything counting Z must keep using `expand(boundary=False)`.
+
+    `covalent_only` and `finite_only` default OFF here, which keeps this the
+    round-35 operation: an explicit "show me one more shell", valid on a chain
+    or a framework that runs on forever. `BoundaryModifier` turns both ON,
+    because an AUTOMATIC closure has a narrower job — completing a molecule
+    that a cell face happened to cut — and drawing endless shells of a lattice
+    nobody asked about is not that.
     """
-    from . import elements
+    from . import bonding, elements
     frac = np.asarray(frac, dtype=float).reshape(-1, 3)
     n = len(symbols)
     if n == 0 or int(depth) < 1:
@@ -809,9 +1061,32 @@ def bonded_exterior(symbols, frac, cell, depth=1, slack=0.45, tol=1e-3):
     # directions is added once. The base atoms are image (0,0,0) by
     # construction — `frac` here is already the unwrapped cell content.
     seen = set((i, 0, 0, 0) for i in range(n))
-    frontier = [(i, np.zeros(3)) for i in range(n)]
+    start = range(n)
+    if finite_only:
+        # Only a FINITE fragment can be completed. A periodic component is
+        # infinite by definition — a metal lattice, an intermetallic, graphite
+        # — so following it outward just draws one more shell of something
+        # that never ends, and every shell looks as unfinished as the last.
+        # The severed-linker problem is a MOLECULE cut by a face, and this is
+        # the same "molecule, unless that is impossible" hierarchy round 38
+        # uses everywhere else.
+        infinite = set()
+        for group, periodic in fragment_info(symbols, frac, cell):
+            if periodic:
+                infinite.update(group)
+        start = [i for i in range(n) if i not in infinite]
+        if not start:
+            return [], np.zeros((0, 3))
+    frontier = [(i, np.zeros(3)) for i in start]
     out_symbols = []          # type: List[str]
     out_frac = []             # type: List[np.ndarray]
+    # Positions that already exist, to dedupe against. The (site, image) key
+    # above is NOT enough: it assumes every input atom is the (0,0,0) image of
+    # its site, which is false the moment the input carries BOUNDARY COPIES —
+    # `expand(boundary=True)` puts atoms outside [0,1) by design. Without this
+    # a structure with 777 boundary copies grew to 6389 atoms, each copy
+    # sprouting its own duplicate shell.
+    placed = np.array(frac, dtype=float)
     for _ in range(int(depth)):
         nxt = []
         for site, image in frontier:
@@ -823,6 +1098,17 @@ def bonded_exterior(symbols, frac, cell, depth=1, slack=0.45, tol=1e-3):
             hits = np.argwhere((dist > 0.32) & (dist < limit))
             for other, si in hits:
                 other = int(other)
+                if covalent_only and bonding.bond_kind(
+                        symbols[site], symbols[other]) != bonding.COVALENT:
+                    # A MOLECULE cut by a cell face is the thing that needs
+                    # closing; a coordination bond is where a framework is
+                    # SUPPOSED to be cut (round 38). Following those too turns
+                    # rock salt's 9-atom cell into 59 and an intermetallic
+                    # into a solid shell, for no gain: measured on the real
+                    # files, every one of MOF-5's 24 cross-face bonds is a
+                    # covalent C-C inside a linker, and every one of NaCl's is
+                    # ionic.
+                    continue
                 new_image = image + shifts[si]
                 key = (other, int(round(new_image[0])),
                        int(round(new_image[1])), int(round(new_image[2])))
@@ -835,12 +1121,94 @@ def bonded_exterior(symbols, frac, cell, depth=1, slack=0.45, tol=1e-3):
                 # cell already contains.
                 if np.all(point > -tol) and np.all(point < 1.0 + tol):
                     continue
+                if float(np.min(np.linalg.norm(
+                        (placed - point) @ m, axis=1))) < dup_tol:
+                    continue          # something is already drawn right here
+                placed = np.vstack([placed, point])
                 out_symbols.append(symbols[other])
                 out_frac.append(point)
                 nxt.append((other, new_image))
         frontier = nxt
         if not frontier:
             break
+    if not out_frac:
+        return [], np.zeros((0, 3))
+    return out_symbols, np.asarray(out_frac)
+
+
+def _contiguous(frac, adj, group, seed):
+    # type: (np.ndarray, list, Sequence, int) -> dict
+    """{atom: position} for one fragment, walked out from `seed` by the
+    minimum image so the piece is whole wherever the cell faces fall."""
+    members = set(int(k) for k in group)
+    pos = {int(seed): np.array(frac[int(seed)], dtype=float)}
+    stack = [int(seed)]
+    while stack:
+        i = stack.pop()
+        for j in adj[i]:
+            if j in pos or j not in members:
+                continue
+            d = frac[j] - frac[i]
+            pos[j] = pos[i] + (d - np.round(d))
+            stack.append(j)
+    return pos
+
+
+def crossing_fragments(symbols, frac, cell, slack=0.45, dup_tol=0.1):
+    # type: (list, np.ndarray, Cell, float, float) -> Tuple[List[str], np.ndarray]
+    """Whole MOLECULES on the far side of every bond that crosses a face.
+
+    The shell walk in `bonded_exterior` closes each cut bond with a single
+    atom, which leaves a ZIF's imidazolate hanging off the face as three atoms
+    of a five-ring — better than a severed stub, still not a molecule. Round
+    33 settled this for the boundary copies and the same answer applies here:
+    a copy carries its whole fragment, because half a ring is not a thing that
+    exists.
+
+    Only FINITE covalent fragments travel (see `fragment_info`): a lattice or
+    a covalently infinite chain has no "whole molecule" to bring, and trying
+    would just draw another shell of something endless.
+    """
+    from . import bonding
+    frac = np.asarray(frac, dtype=float).reshape(-1, 3)
+    n = len(symbols)
+    if n == 0:
+        return [], np.zeros((0, 3))
+    m = cell.matrix()
+    owner = {}
+    for group, periodic in fragment_info(symbols, frac, cell):
+        if not periodic:
+            for i in group:
+                owner[i] = group
+    if not owner:
+        return [], np.zeros((0, 3))
+    adj = periodic_neighbours(symbols, frac, cell, slack=slack,
+                              covalent_only=True)
+    placed = np.array(frac, dtype=float)
+    out_symbols, out_frac = [], []
+    for i in sorted(owner):
+        for j in adj[i]:
+            if j not in owner:
+                continue
+            d = frac[j] - frac[i]
+            shift = -np.round(d)
+            if not np.any(shift):
+                continue              # same cell: this bond is already drawn
+            # ASSEMBLE THE FRAGMENT AROUND j FIRST. A fragment that itself
+            # straddles the face is stored in pieces — it could not be
+            # unwrapped, because the component it belongs to percolates — so
+            # translating it rigidly keeps it in pieces and throws the far
+            # half TWO cells out, where it hangs in space bonded to nothing.
+            local = _contiguous(frac, adj, owner[j], j)
+            offset = (frac[j] + shift) - local[j]
+            for k, point in local.items():
+                point = point + offset
+                if float(np.min(np.linalg.norm(
+                        (placed - point) @ m, axis=1))) < dup_tol:
+                    continue
+                placed = np.vstack([placed, point])
+                out_symbols.append(symbols[k])
+                out_frac.append(point)
     if not out_frac:
         return [], np.zeros((0, 3))
     return out_symbols, np.asarray(out_frac)
@@ -892,8 +1260,9 @@ def reference_sample(coords, limit=24):
 
 
 def build_view(cell, asym_symbols, asym_frac, symops, mode="cell",
-               na=1, nb=1, nc=1, tol=0.1, exterior=0):
-    # type: (Cell, list, list, list, str, int, int, int, float, int) -> Tuple[List[str], np.ndarray]
+               na=1, nb=1, nc=1, tol=0.1, exterior=0, occupancy=None,
+               disorder=POLICY_DOMINANT, report=None):
+    # type: (Cell, list, list, list, str, int, int, int, float, int, Optional[Sequence], str, Optional[dict]) -> Tuple[List[str], np.ndarray]
     """The atoms for one crystal display mode, in CARTESIAN coordinates.
 
     - "asym"     the asymmetric unit exactly as the file lists it
@@ -904,10 +1273,15 @@ def build_view(cell, asym_symbols, asym_frac, symops, mode="cell",
     to the cell and packing modes (never to "asym", which is by definition
     the listed sites and nothing else).
     """
-    data = CifData(cell, symops, asym_symbols, np.asarray(asym_frac, float))
+    data = CifData(cell, symops, asym_symbols, np.asarray(asym_frac, float),
+                   occupancy=occupancy)
     if mode == "asym":
+        # The asymmetric unit is BY DEFINITION the listed sites, so no
+        # disorder resolution here — but say so, since "asym" is also the mode
+        # someone switches to when the cell looks wrong.
         return list(data.symbols), data.frac @ cell.matrix()
-    symbols, coords = expand(data, tol=tol, exterior=exterior)
+    symbols, coords = expand(data, tol=tol, exterior=exterior,
+                             disorder=disorder, report=report)
     if mode != "packing":
         return symbols, coords
     offsets = supercell_offsets(cell, na, nb, nc)

@@ -91,6 +91,18 @@ _REST_SPEED = 2e-2
 #: How far short of straight up/down the pitch is allowed to go, in degrees.
 PITCH_LIMIT_DEG = 88.0
 
+#: How long the right button must be HELD before flight starts, milliseconds.
+#: The right button carries two meanings — a click opens the geometry menu on
+#: a selected atom, a hold flies — and starting flight on the press made the
+#: click case unreachable: the pointer is captured and re-centred the instant
+#: flight begins, so by the time the button came up the release was at the
+#: viewport centre and had picked nothing. A press shorter than this is
+#: therefore an ordinary click and nothing takes the mouse. Dragging past a
+#: few pixels starts flight immediately regardless, so a flick-and-fly does
+#: not have to wait. 0 disables hold-to-fly entirely, leaving right
+#: DOUBLE-click (which latches) as the only way in.
+DEFAULT_HOLD_MS = 250.0
+
 
 class FlightModel(object):
     """World-space velocity with thrust, drag and a speed cap.

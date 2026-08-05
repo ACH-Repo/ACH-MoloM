@@ -15,8 +15,11 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog,
                                QScrollArea, QSlider, QSpinBox, QVBoxLayout,
                                QWidget)
 
+from ..core import blender_export as bx
+from ..core import cif as cif_mod
 from ..core import flight, input_map
 from ..core import resolve as resolve_mod
+from ..core import style as style_mod
 
 
 class SettingsDialog(QDialog):
@@ -26,6 +29,7 @@ class SettingsDialog(QDialog):
                  precision_factor=0.5, undo_limit=30, adjust_h=True,
                  atom_scale=1.0, render_scale=2, render_subdiv=2,
                  input_preset=input_map.PRESET_AUTO, label_scale=1.0,
+                 disorder_policy=None,
                  on_speed_change=None, on_atom_scale_change=None,
                  on_label_scale_change=None, flight_tuning=None,
                  on_flight_change=None):
@@ -137,6 +141,26 @@ class SettingsDialog(QDialog):
             "hydrogens to the typical valence")
         form.addRow("", self.adjust_h_check)
 
+        # ---------------------------------------------------- crystallography
+        self.disorder_combo = QComboBox()
+        self.disorder_combo.addItem("Resolve superimposed alternatives",
+                                    cif_mod.POLICY_DOMINANT)
+        self.disorder_combo.addItem("Only the major component (drop < 50%)",
+                                    cif_mod.POLICY_MAJOR)
+        self.disorder_combo.addItem("Draw every alternative (raw file)",
+                                    cif_mod.POLICY_ALL)
+        idx = self.disorder_combo.findData(disorder_policy)
+        self.disorder_combo.setCurrentIndex(max(idx, 0))
+        self.disorder_combo.setToolTip(
+            "A disordered CIF lists every alternative position for a site. "
+            "Drawing them all superimposes atoms that are never present "
+            "together, which then perceives bonds that cannot exist. "
+            "'Resolve' keeps the most occupied of each overlapping set; "
+            "'major component' also drops everything under half occupancy, "
+            "which usually means a framework without its disordered guest. "
+            "Applies to the NEXT file opened.")
+        form.addRow("CIF disorder:", self.disorder_combo)
+
         self.maximized_check = QCheckBox("Start maximized (fit to screen)")
         self.maximized_check.setChecked(start_maximized)
         form.addRow("", self.maximized_check)
@@ -205,6 +229,27 @@ class SettingsDialog(QDialog):
             frow.addWidget(readout)
             form.addRow(label + ":", frow)
             self._flight_sliders[key] = (slider, scale)
+        # Not a feel constant like the rest: this is the ARBITRATION between
+        # the right button's two meanings, and it is here because the only way
+        # to judge it is to try both gestures.
+        self.fly_hold_spin = QSpinBox()
+        self.fly_hold_spin.setRange(0, 1200)
+        self.fly_hold_spin.setSingleStep(50)
+        self.fly_hold_spin.setSuffix(" ms")
+        self.fly_hold_spin.setValue(
+            int(tuning.get("hold_ms", flight.DEFAULT_HOLD_MS)))
+        self.fly_hold_spin.setToolTip(
+            "How long the right button must be held before flight starts. A "
+            "shorter press is an ordinary right-click, which is what opens "
+            "the geometry menu (bond length / angle / dihedral / twist) on a "
+            "selected atom. Dragging takes off at once whatever this says. "
+            "Set 0 to switch hold-to-fly off entirely, leaving right "
+            "DOUBLE-click as the only way into flight.")
+        self.fly_hold_spin.valueChanged.connect(
+            lambda v: self._on_flight_change
+            and self._on_flight_change("hold_ms", float(v)))
+        form.addRow("Hold to fly:", self.fly_hold_spin)
+        self._flight_sliders["hold_ms"] = (self.fly_hold_spin, 1.0)
         form.addRow("", QLabel(
             "W/A/S/D thrust and strafe, Space/Ctrl up-down, Q/E roll.\n"
             "Shift boosts, Alt creeps. Roll applies only while flying and\n"
@@ -386,8 +431,330 @@ class SettingsDialog(QDialog):
     def adjust_hydrogens(self):
         return self.adjust_h_check.isChecked()
 
+    def disorder_policy(self):
+        return self.disorder_combo.currentData()
+
     def start_maximized(self):
         return self.maximized_check.isChecked()
+
+
+class BlenderExportDialog(QDialog):
+    """Pre-configure the Blender scene before writing the script.
+
+    A render is a dozen decisions — HDRI, lamps, engine, samples, how smooth
+    the spheres are — and every one of them is quicker to make here than to
+    hunt for in Blender afterwards. The defaults are chosen to give something
+    worth looking at on the first run (Blender's own `forest` HDRI, a
+    three-point rig at half power under it, Cycles at 128 samples, the camera
+    exactly where the viewport is), so "just press OK" is a real option.
+
+    Values in, values out: it owns no scene and writes no file. `options()`
+    hands back a `core.blender_export.ExportOptions`.
+    """
+
+    _HDRI_NONE = "None (solid colour)"
+    _HDRI_CUSTOM = "Custom file..."
+    _LIGHT_LABELS = (("three_point", "Three-point studio (key + fill + rim)"),
+                     ("key", "Key light only"),
+                     ("none", "None - the world lights it"),
+                     ("sun", "Sun (hard shadows)"))
+    _STYLE_FOLLOW = "Follow the viewport"
+
+    def __init__(self, parent, options=None, summary="", viewport_size=None):
+        super().__init__(parent)
+        self.setWindowTitle("Export to Blender")
+        opts = options or bx.ExportOptions()
+        self._custom_hdri = ""
+        self._background = QColor.fromRgbF(*opts.background)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        area = QScrollArea(self)
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.NoFrame)
+        body = QWidget()
+        form = QFormLayout(body)
+        form.setContentsMargins(12, 12, 12, 8)
+        area.setWidget(body)
+        outer.addWidget(area, 1)
+
+        head = QLabel("Writes a Blender <b>Python script</b>. Open it in "
+                      "Blender's Scripting workspace and press Run, or "
+                      "<tt>blender --python &lt;file&gt;</tt>.")
+        head.setWordWrap(True)
+        form.addRow(head)
+        if summary:
+            note = QLabel(summary)
+            note.setWordWrap(True)
+            form.addRow("", note)
+
+        # ------------------------------------------------------------ world
+        form.addRow(QLabel("<b>World</b>"))
+        self.hdri_combo = QComboBox()
+        for name in bx.STUDIO_HDRIS:
+            self.hdri_combo.addItem(name)
+        self.hdri_combo.addItem(self._HDRI_NONE)
+        self.hdri_combo.addItem(self._HDRI_CUSTOM)
+        self.hdri_combo.setToolTip(
+            "Blender's own material-preview HDRIs, found on YOUR machine when "
+            "the script runs - nothing is copied and no path is baked in. An "
+            "environment is worth more to a molecule than any lamp: shiny "
+            "spheres are mostly reflection.")
+        self._select_hdri(opts.hdri)
+        self.hdri_combo.currentIndexChanged.connect(self._hdri_changed)
+        form.addRow("Environment (HDRI):", self.hdri_combo)
+
+        self.hdri_strength = QDoubleSpinBox()
+        self.hdri_strength.setRange(0.0, 20.0)
+        self.hdri_strength.setSingleStep(0.1)
+        self.hdri_strength.setValue(float(opts.hdri_strength))
+        self.hdri_strength.setToolTip("World lighting multiplier.")
+        form.addRow("HDRI strength:", self.hdri_strength)
+
+        self.hdri_rotation = QDoubleSpinBox()
+        self.hdri_rotation.setRange(-360.0, 360.0)
+        self.hdri_rotation.setSuffix(" deg")
+        self.hdri_rotation.setValue(float(opts.hdri_rotation))
+        self.hdri_rotation.setToolTip(
+            "Spin the environment about Z - the cheapest way to move a "
+            "highlight off an atom you want to read.")
+        form.addRow("HDRI rotation:", self.hdri_rotation)
+
+        self.hdri_visible = QCheckBox("Show the environment behind the "
+                                      "molecule")
+        self.hdri_visible.setChecked(bool(opts.hdri_visible))
+        self.hdri_visible.setToolTip(
+            "Off renders on a TRANSPARENT background (alpha PNG) while still "
+            "lighting with the HDRI - what a figure usually wants.")
+        form.addRow("", self.hdri_visible)
+
+        self.bg_button = QPushButton()
+        self.bg_button.setToolTip("Background colour when no HDRI is used.")
+        self.bg_button.clicked.connect(lambda _c=False: self._pick_colour())
+        self._paint_bg_button()
+        form.addRow("Background colour:", self.bg_button)
+
+        # ----------------------------------------------------- camera/render
+        form.addRow(QLabel("<b>Camera and render</b>"))
+        self.match_camera = QCheckBox("Place the camera exactly where the "
+                                      "MoloM viewport is")
+        self.match_camera.setChecked(bool(opts.match_viewport))
+        self.match_camera.setToolTip(
+            "Same position, same aim, same field of view - and orthographic "
+            "if the viewport is. Turn it off to keep Blender's own camera.")
+        form.addRow("", self.match_camera)
+
+        res = QHBoxLayout()
+        self.res_x = QSpinBox()
+        self.res_x.setRange(64, 16384)
+        self.res_y = QSpinBox()
+        self.res_y.setRange(64, 16384)
+        w, h = (viewport_size or opts.resolution)
+        self.res_x.setValue(int(w))
+        self.res_y.setValue(int(h))
+        for box in (self.res_x, self.res_y):
+            box.setToolTip(
+                "Defaults to the viewport's own size, so the framing you see "
+                "is the framing you render. A different ASPECT re-frames the "
+                "shot vertically, since the field of view is vertical.")
+        res.addWidget(self.res_x)
+        res.addWidget(QLabel("x"))
+        res.addWidget(self.res_y)
+        form.addRow("Resolution:", res)
+
+        self.engine_combo = QComboBox()
+        self.engine_combo.addItem("Cycles (path tracing)", "CYCLES")
+        self.engine_combo.addItem("EEVEE (fast raster)", "BLENDER_EEVEE_NEXT")
+        self.engine_combo.setCurrentIndex(
+            1 if opts.engine != "CYCLES" else 0)
+        self.engine_combo.setToolTip(
+            "The script falls back gracefully if the build does not have the "
+            "one you pick (EEVEE was renamed twice, Cycles is an add-on).")
+        form.addRow("Render engine:", self.engine_combo)
+
+        self.samples = QSpinBox()
+        self.samples.setRange(1, 8192)
+        self.samples.setValue(int(opts.samples))
+        form.addRow("Samples:", self.samples)
+
+        self.view_transform = QComboBox()
+        for name in bx.VIEW_TRANSFORMS:
+            self.view_transform.addItem(name)
+        idx = self.view_transform.findText(opts.view_transform)
+        self.view_transform.setCurrentIndex(max(idx, 0))
+        self.view_transform.setToolTip(
+            "Standard keeps the viewport's colours literally; AgX and Filmic "
+            "roll the highlights off, which stops white hydrogens clipping in "
+            "a bright scene.")
+        form.addRow("View transform:", self.view_transform)
+
+        # ----------------------------------------------------------- lights
+        form.addRow(QLabel("<b>Lights</b>"))
+        self.light_combo = QComboBox()
+        for key, label in self._LIGHT_LABELS:
+            self.light_combo.addItem(label, key)
+        self._select_data(self.light_combo, opts.lights)
+        self.light_combo.setToolTip(
+            "Lamps are placed in the CAMERA's frame, so the rig follows the "
+            "shot, and their power scales with the scene size. With an HDRI "
+            "they run at half strength - both at once blows the highlights.")
+        form.addRow("Lamp rig:", self.light_combo)
+
+        self.light_strength = QDoubleSpinBox()
+        self.light_strength.setRange(0.0, 10.0)
+        self.light_strength.setSingleStep(0.1)
+        self.light_strength.setValue(float(opts.light_strength))
+        form.addRow("Lamp strength:", self.light_strength)
+
+        # ------------------------------------------------- materials/geometry
+        form.addRow(QLabel("<b>Materials and geometry</b>"))
+        self.style_combo = QComboBox()
+        self.style_combo.addItem(self._STYLE_FOLLOW, None)
+        for st in style_mod.STYLES:
+            self.style_combo.addItem(st.label, st.key)
+        self._select_data(self.style_combo, opts.style_key)
+        form.addRow("Style:", self.style_combo)
+
+        self.roughness = QDoubleSpinBox()
+        self.roughness.setRange(0.0, 1.0)
+        self.roughness.setSingleStep(0.05)
+        self.roughness.setValue(float(opts.roughness))
+        self.roughness.setToolTip(
+            "0 is a mirror, 1 is chalk. Around 0.35 reads as the glossy "
+            "plastic every textbook figure uses.")
+        form.addRow("Roughness:", self.roughness)
+
+        self.metallic = QCheckBox("Metals get a metallic shader")
+        self.metallic.setChecked(bool(opts.metallic_metals))
+        form.addRow("", self.metallic)
+
+        self.subdiv = QSpinBox()
+        self.subdiv.setRange(1, 5)
+        self.subdiv.setValue(int(opts.sphere_subdivisions))
+        self.subdiv.setToolTip(
+            "Icosphere subdivisions. 3 (1280 faces) is smooth at any "
+            "sensible size; 5 is 20k faces PER ATOM and will hurt.")
+        form.addRow("Sphere subdivisions:", self.subdiv)
+
+        self.bond_sides = QSpinBox()
+        self.bond_sides.setRange(6, 128)
+        self.bond_sides.setValue(int(opts.bond_sides))
+        form.addRow("Bond sides:", self.bond_sides)
+
+        self.shade_smooth = QCheckBox("Shade smooth")
+        self.shade_smooth.setChecked(bool(opts.shade_smooth))
+        form.addRow("", self.shade_smooth)
+
+        self.unit_cell = QCheckBox("Unit cell box (as cylinders, a/b/c "
+                                   "coloured)")
+        self.unit_cell.setChecked(bool(opts.unit_cell))
+        form.addRow("", self.unit_cell)
+
+        self.clear_scene = QCheckBox("Clear the Blender scene first (removes "
+                                     "the default cube)")
+        self.clear_scene.setChecked(bool(opts.clear_scene))
+        form.addRow("", self.clear_scene)
+
+        self.collection = QLineEdit(opts.collection)
+        self.collection.setToolTip(
+            "Everything lands in this collection, with atoms, bonds and the "
+            "camera/lights in sub-collections - so re-running the script "
+            "cannot lose your own objects.")
+        form.addRow("Collection:", self.collection)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok
+                                   | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Choose file...")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        brow = QHBoxLayout()
+        brow.setContentsMargins(8, 0, 8, 8)
+        brow.addWidget(buttons)
+        outer.addLayout(brow)
+        self._hdri_changed()
+        self.resize(560, min(720, self.sizeHint().height() + 40))
+
+    # ------------------------------------------------------------- helpers
+    @staticmethod
+    def _select_data(combo, value):
+        idx = combo.findData(value)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+    def _select_hdri(self, value):
+        if not value:
+            self.hdri_combo.setCurrentText(self._HDRI_NONE)
+            return
+        idx = self.hdri_combo.findText(value)
+        if idx >= 0:
+            self.hdri_combo.setCurrentIndex(idx)
+            return
+        self._custom_hdri = value
+        self.hdri_combo.insertItem(0, value)
+        self.hdri_combo.setCurrentIndex(0)
+
+    def _hdri_changed(self, _index=0):
+        text = self.hdri_combo.currentText()
+        if text == self._HDRI_CUSTOM:
+            from PySide6.QtWidgets import QFileDialog
+            path, _f = QFileDialog.getOpenFileName(
+                self, "Environment image", "",
+                "HDR images (*.exr *.hdr);;All files (*)")
+            if path:
+                self._custom_hdri = path
+                self.hdri_combo.insertItem(0, path)
+                self.hdri_combo.setCurrentIndex(0)
+            else:
+                self._select_hdri(bx.STUDIO_HDRIS[0])
+            text = self.hdri_combo.currentText()
+        none = text == self._HDRI_NONE
+        self.hdri_strength.setEnabled(not none)
+        self.hdri_rotation.setEnabled(not none)
+        self.hdri_visible.setEnabled(not none)
+        self.bg_button.setEnabled(none or self.hdri_visible.isChecked())
+
+    def _pick_colour(self):
+        from PySide6.QtWidgets import QColorDialog
+        c = QColorDialog.getColor(self._background, self, "Background colour")
+        if c.isValid():
+            self._background = c
+            self._paint_bg_button()
+
+    def _paint_bg_button(self):
+        c = self._background
+        self.bg_button.setText(c.name())
+        self.bg_button.setStyleSheet(
+            "background: {}; color: {};".format(
+                c.name(), "#000" if c.lightnessF() > 0.5 else "#fff"))
+
+    # -------------------------------------------------------------- output
+    def options(self):
+        # type: () -> bx.ExportOptions
+        text = self.hdri_combo.currentText()
+        hdri = "" if text in (self._HDRI_NONE, self._HDRI_CUSTOM) else text
+        return bx.ExportOptions(
+            hdri=hdri,
+            hdri_strength=self.hdri_strength.value(),
+            hdri_rotation=self.hdri_rotation.value(),
+            hdri_visible=self.hdri_visible.isChecked(),
+            background=(self._background.redF(), self._background.greenF(),
+                        self._background.blueF()),
+            transparent=not self.hdri_visible.isChecked(),
+            match_viewport=self.match_camera.isChecked(),
+            resolution=(self.res_x.value(), self.res_y.value()),
+            lights=self.light_combo.currentData(),
+            light_strength=self.light_strength.value(),
+            roughness=self.roughness.value(),
+            metallic_metals=self.metallic.isChecked(),
+            style_key=self.style_combo.currentData(),
+            sphere_subdivisions=self.subdiv.value(),
+            bond_sides=self.bond_sides.value(),
+            shade_smooth=self.shade_smooth.isChecked(),
+            unit_cell=self.unit_cell.isChecked(),
+            engine=self.engine_combo.currentData(),
+            samples=self.samples.value(),
+            view_transform=self.view_transform.currentText(),
+            clear_scene=self.clear_scene.isChecked(),
+            collection=self.collection.text().strip() or "MoloM",
+        )
 
 
 class MetaAtomDialog(QDialog):

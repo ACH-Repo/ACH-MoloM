@@ -18,20 +18,18 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from . import elements
+from . import bonding, elements
 
 # Elements that get a polyhedron by default: the d/f block plus the metals
 # and metalloids that actually sit at framework nodes (Al, Ga, In, Sn, Bi...).
-_NON_METALS = set("H He B C N O F Ne Si P S Cl Ar As Se Br Kr Te I Xe At Rn"
-                  .split())
+# The list itself moved to `bonding` in round 38, where bond KINDS need the
+# same question answered — one definition of "metal" for the whole package.
+_NON_METALS = bonding.NON_METALS
 
 
 def is_metal(symbol):
     # type: (str) -> bool
-    z = elements.atomic_number(symbol)
-    if z <= 0:
-        return False
-    return elements.symbol(z) not in _NON_METALS and z > 2
+    return bonding.is_metal(symbol)
 
 
 def find_centres(symbols, bonds, min_donors=3):

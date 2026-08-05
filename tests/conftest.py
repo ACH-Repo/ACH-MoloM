@@ -16,7 +16,31 @@ which is why it lives at import time in conftest rather than in a fixture.
 import os
 import tempfile
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+
+@pytest.fixture(autouse=True)
+def _fresh_resolver_state():
+    """Forget any recorded service outage between tests.
+
+    The resolver's circuit breaker (round 37) is module-global by design — it
+    exists so a session does not pay a dead service's timeout twice. That
+    makes it shared state across the suite: anything that reaches the real
+    network once (a resolver dialog, a live probe) marks OPSIN down, and every
+    later test that expects OPSIN to be TRIED then fails, in a different file,
+    with no obvious connection. It presented as two round-37 tests failing in
+    the full run and passing alone, which is the signature of exactly this.
+    """
+    try:
+        from molom.core import resolve
+    except ImportError:
+        yield
+        return
+    resolve.reset_service_state()
+    yield
+    resolve.reset_service_state()
 
 try:
     from PySide6.QtCore import QSettings

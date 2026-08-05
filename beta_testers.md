@@ -21,19 +21,21 @@ Please throw structures at it, especially awkward ones, and tell me when the
 picture disagrees with Mercury, VESTA or Diamond. Known weak spots, roughly
 in order of how likely they are to bite:
 
-- **A file can simply be wrong, and MoloM will draw it faithfully.** One test
-  file here (an OpenBabel-converted `.cif`) has two atoms 0.75 Å apart, which
-  is not a distance chemistry allows — and **ASE reads exactly the same atoms
-  from it**, so the geometry really is broken in the file rather than in the
-  reader. If a structure looks impossible, it is worth opening it in a second
-  program before assuming MoloM mangled it. (Hydrogens are now capped at one
-  bond regardless, because an H with two sticks is never a useful picture.)
-- **Partial occupancies and disorder are read but IGNORED.** If a site is
-  disordered, every alternative position is drawn at once, superimposed. It
-  will look like atoms in impossible places, because they are. Fixing this
-  properly needs a display policy (dominant component by default, with a way
-  to see the others), and I want a decent set of real disordered files first
-  — so **please send me disordered CIFs**, they are exactly what is missing.
+- **A file can simply be wrong, and MoloM will now say so rather than draw
+  it.** One test file here (an OpenBabel-converted `.cif`) has two atoms
+  0.75 Å apart, which is not a distance chemistry allows — and **ASE reads
+  exactly the same atoms from it**, so the geometry really is broken in the
+  file rather than in the reader. MoloM refuses bonds that are impossibly
+  short or that push an atom past its valence, and **tells you in the status
+  bar how many it dropped**. If a structure looks impossible, it is still
+  worth opening it in a second program before assuming MoloM mangled it.
+- **Partial occupancies and disorder are now handled** — see *Settings ▸ CIF
+  disorder*. By default MoloM keeps the most occupied of each set of
+  superimposed alternatives; "only the major component" additionally drops
+  everything under half occupancy, which for a MOF usually means the
+  framework without its disordered guest; "draw every alternative" gets the
+  old raw behaviour back. **I still want disordered CIFs**: the policy is
+  only as good as the files it has been tried on, and I have two.
 - **A space-group SYMBOL with no symmetry-operator loop falls back to P1**,
   which silently shows you only the asymmetric unit. If a structure looks
   like a fraction of what it should be, this is the first thing to suspect.

@@ -108,7 +108,9 @@ def test_the_b_view_is_wide_when_c_is_the_long_axis():
     cell = Cell(7.137, 14.438, 16.11, 90.0, 90.0, 90.0)
     basis = orient.look_along(cell, "b")
     corners = cell.corners()
-    assert (corners @ basis[0]).ptp() > (corners @ basis[1]).ptp()
+    # np.ptp(), not arr.ptp(): the method was removed in NumPy 2.0, and the
+    # desktop runs 2.x while the laptop did not — the test failed only here.
+    assert np.ptp(corners @ basis[0]) > np.ptp(corners @ basis[1])
 
 
 def test_looking_down_c_does_not_blow_up_on_the_parallel_up_vector():
@@ -138,7 +140,7 @@ def test_the_standard_orientation_shows_all_three_axes():
         # The cell must project to a real 2-D outline, not a line.
         corners = cell.corners()
         xs, ys = corners @ basis[0], corners @ basis[1]
-        assert xs.ptp() > 0.1 * cell.a and ys.ptp() > 0.1 * cell.c
+        assert np.ptp(xs) > 0.1 * cell.a and np.ptp(ys) > 0.1 * cell.c
 
 
 def test_the_standard_orientation_looks_DOWN_on_the_crystal():

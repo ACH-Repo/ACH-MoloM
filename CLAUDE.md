@@ -56,6 +56,130 @@ the operator key table, CIF reading with symmetry, coordination polyhedra,
 meta atoms, the scene clock with a multi-track timeline, vibrational modes,
 per-element display control, and the symmetry modifier. 512 tests.
 
+Round 39 (2026-08-05, bonds across the cell faces — the ZIF batch): Christian
+downloaded a set of new files and "molom fails on almost all of them".
+Measured first, against ASE, pymatgen AND each file's own formula x Z: **six
+of nine were already exact**, one was not a structure at all (`iq4001img1.cif`
+is an imgCIF — detector axes, PILATUS geometry, no `_cell_length_*`), and the
+real failures were three. The big one: **display bonds are perceived from
+Cartesian coordinates with no minimum image**, so on his `2130205.cif` the
+connectivity has 224 bonds and only 196 were DRAWABLE — 48 atoms were drawn a
+bond short and every imidazolate at a face came out severed. VESTA shows the
+same file as 276 atoms / 324 bonds because it materialises the partners.
+Fixed with a **`BoundaryModifier`** (`kind="boundary"`), so the base structure
+stays exactly the cell contents — Z, the ❖ count, editing and unit-cell export
+untouched — while the viewport and the Blender export see a continuous
+framework. Auto-added at import when a crystal actually needs one, and driven
+by the ❖ page's existing checkbox, which is no longer a destructive rebuild.
+Four rules earned by measurement, each of which stopped something exploding:
+**covalent bonds only** (every one of MOF-5's 24 cross-face bonds is a
+covalent C-C inside a linker; every one of NaCl's is ionic, and following
+those turned a 9-atom cell into 59); **finite fragments only** (a lattice or a
+covalent polymer is infinite, and every shell looks as unfinished as the
+last); **whole molecules** (half a five-ring is not a thing that exists —
+round 33's rule one step further out); and **de-duplicate against what is
+already drawn** (`bonded_exterior` keyed images by `(site, image)`, which
+assumes every input atom is its own (0,0,0) image — false the moment the input
+carries boundary copies, and a structure with 777 of them grew to 6389 atoms).
+A fragment that straddles a face must also be made CONTIGUOUS before it is
+translated, or its far half lands two cells out bonded to nothing. ZIF
+176/196 -> 216/252, MOF-5 424/488 -> 616/704, molecular crystals untouched.
+873 tests.
+
+Round 38 (2026-08-05, the chemistry a distance rule cannot have): Christian's
+diagnosis, implemented in three parts. **BOND KINDS** (`bonding.bond_kind`):
+metal-to-non-metal is a COORDINATION bond and that is where a framework gets
+cut, which is how Mercury knows to stop after the carboxylate. DERIVED from
+the element pair, never stored — so it cannot go stale, cannot be lost by an
+edit and needs no reindexing when atoms are deleted. Metal-to-METAL stays
+covalent, or an SBU would be dissected into loose atoms. `fragment_info` now
+cuts a component at its coordination bonds **only if that component came back
+periodic**: MIL-53's one 152-atom infinite component becomes 8 linkers + 8
+OH bridges + 8 waters + 8 Al, every one finite and completable at the
+boundary, while ferrocene — finite already — is never touched. Rock salt cuts
+into single ions, which reproduces the round-32 per-atom completion for the
+right reason. **VALENCE SANITY** (`bonding.prune_pairs`, used by BOTH
+`perceive_bonds` and `cif.periodic_pairs`): a bond shorter than 0.65x the
+covalent radii is impossible (C#C sits at 0.80, an X-ray riding C-H at 0.87,
+HpPyBz's spurious contact at 0.50), and bonds past an element's covalent
+valence are dropped LONGEST FIRST. Coordination bonds are exempt from the
+cap — a chloride bridging three metals is ordinary. On the real MIL-53-lp
+file: 80 carbons over valence -> 0, 384 bonds -> 264. **OCCUPANCY**
+(`cif.resolve_disorder`): read since round 18 and finally USED. Three
+policies — `dominant` (default; keep the most occupied of each overlapping
+set), `major` (also drop < 50%, which is a framework without its disordered
+guest), `all` (the old superimposed behaviour) — driven by the disorder GROUP
+columns where the file has them and by geometric overlap where it does not.
+It runs on the EXPANDED atoms, because alternatives are routinely symmetry
+images of one another rather than separate rows. A lone partial site is never
+dropped: it is a real partial site, and a half-occupied atom on a special
+position is a special position. Every refusal is REPORTED —
+`MainWindow.chemistry_note` puts it in the import message and on the ❖ page,
+because a silently dropped atom is indistinguishable from a bug. 856 tests.
+
+Round 37 (2026-08-05, Blender export + the cascade that stopped cascading):
+**`Ctrl+Shift+B` writes a Blender BUILD SCRIPT** (`core/blender_export.py` +
+`BlenderExportDialog`), which is roadmap item 1 of the rendering list,
+delivered. A `.py` and not a `.blend` because writing .blend needs Blender
+itself; the script is also diffable, editable and re-runnable. It carries
+**materials with the right colours** (one per element plus one per DISTINCT
+custom colour, so an outliner-painted atom arrives painted and two atoms
+painted alike share a material), sRGB->linear converted; **the camera in
+exactly the viewport's pose** (both look down local -Z with +Y up, so the
+world matrix is the view rotation transposed with the eye in the translation
+column — no Euler conversion, and ortho viewports export ortho); **an HDRI
+from Blender's own material-preview set**, resolved at RUN time via
+`bpy.utils.system_resource` so no path from this machine is baked in; **a lamp
+rig placed in the camera's frame** with energies going as distance SQUARED
+(and halved when an HDRI is present, which is what stopped the first render
+blowing out); the unit cell as a/b/c-coloured cylinders; and the whole render
+setup. VERIFIED BY RUNNING IT: Blender 5.1 headless, cubane and rock salt,
+renders compared against the viewport grab — that is how the ASCII bug and the
+engine-enum bug were found, neither of which any offline test would have
+caught. **Shift+N was not a UI bug**: `opsin.ch.cam.ac.uk` is unreachable from
+the desktop (DNS resolves, connections time out), and `_resolve_inner`
+RETURNED on a tier-1 network failure instead of falling through — so a dead
+OPSIN killed every import-by-name, including names PubChem knows perfectly
+well. A dead tier now costs a tier, not the answer; **NIH CACTUS is a third
+tier** (a different index again, answered in 0.4 s while OPSIN timed out); a
+per-session **circuit breaker** stops paying the 6 s timeout on every
+subsequent lookup (first lookup 6.7 s, the rest 0.4 s); and `_http_get`
+normalises `TimeoutError`/`OSError` to `URLError`, because a READ timeout
+raises the bare one and sails straight through every `except URLError` in the
+module. 829 tests.
+
+Round 36 (2026-08-04, the right button arbitrates + the methyl rotor):
+**a right press no longer takes off.** Round 35 started flight optimistically
+on the PRESS, reasoning that a click simply never travels anywhere — but
+taking off CAPTURES the pointer (hides it, parks it at the viewport centre and
+re-seeds it after every move), so by the time the button came up the release
+position WAS the viewport centre, picked nothing, and any hand tremor in
+between had already set `_drag_moved`. The geometry context menu was therefore
+unreachable, which is exactly what Christian reported. A press now ARMS
+(`_arm_fly`) and waits: released inside `fly_hold_ms` (Settings > Flight,
+default 250 ms) it is an ordinary right CLICK and the menu opens AT ONCE at
+the PRESS position; held past it, or dragged past the click slop, it flies;
+double-clicked it latches, as before. 0 ms disables hold-to-fly and leaves
+the double-click as the only way in. The deferred-menu machinery is GONE with
+its cause — nothing needs holding back for a possible double-click now that a
+single press cannot start anything. **The methyl rotor** (`internal.TWIST` +
+`torsion_split` + `set_twist`, key **T**, also in the right-click menu): the
+one edit a Cartesian editor and a 4-atom dihedral both fail to make
+convenient. The selection says WHICH GROUP, not which atoms move — MoloM takes
+the smallest fragment containing the whole selection that hangs off the rest
+by exactly ONE bond, so the carbon, one hydrogen, the three hydrogens or the
+whole CH3 all give the same rotor, and selecting the carbon alone (which sits
+ON the axis and could never move) still works. Cutting is over BRIDGES only
+(iterative Tarjan + a 2-edge-connected condensation, so it is linear rather
+than a BFS per bond), which is what makes a ring refuse honestly instead of
+deforming. Both sides of the cut need >= 2 atoms: an anchor side of one atom
+means rotating the whole molecule about a terminal C-H, which is what R is
+for. Christian's suggestion of pressing X twice cannot work — that cycles to
+the OBJECT's local frame, and a C-R bond is no part of it; the axis belongs to
+the molecule's connectivity, so it needs its own operator. Also: two round-35
+ribbon tests failed on THIS machine only — `ndarray.ptp()` was removed in
+NumPy 2.0 and the desktop runs 2.x; `np.ptp(arr)` works on both. 791 tests.
+
 Round 35 (2026-08-04, 6DoF flight + VESTA crystal controls): **the selection
 outline was five times too fat** — on cubane the eight carbons merged into one
 orange blob with the hydrogens welded on, which is the opposite of what an
@@ -832,7 +956,11 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   bond iff `0.32² < d² < (r_cov_i + r_cov_j + 0.45)²`, He/Ne/Ar/Kr never
   bond (Xe DOES), H–H never bonds, radii ≤ 0 → 2.0 Å. All perceived bonds are
   order 1; `perceive_structure_bonds(keep_orders=True)` preserves user-drawn
-  orders across re-perception (frame changes).
+  orders across re-perception (frame changes). **Round 38 adds chemistry on
+  top of that distance rule** — `bond_kind` (covalent vs coordination),
+  `MAX_COVALENT` and `IMPOSSIBLE_FACTOR`, applied by `prune_pairs`, which is
+  shared with `cif.periodic_pairs` so the crystal path and the molecular path
+  cannot disagree. `sanity=False` gets the bare Avogadro rule back.
 - **Ball-and-stick sizing** (`core/style.py`) = Avogadro's ballandstick.cpp:
   sphere = VdW × 0.3; bond cylinder r = 0.1 Å; double bond = 2 cylinders at
   ±1.0×r_bond offset, each 1.3×r_bond, NO centre cylinder; triple = 2 at
@@ -887,7 +1015,11 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   (parses "-x+1/2, y, -z"), `parse_cif` -> asymmetric unit, `expand` ->
   full cell with minimum-image de-duplication. No new dependency; the CIF
   subset real files use is small. `ui/viewport.cell_of(obj)` reads the cell
-  back out of `Structure.metadata["cell"]`.
+  back out of `Structure.metadata["cell"]`. Round 38: `resolve_disorder`
+  (occupancy + disorder groups, three policies), `periodic_pairs` (the
+  minimum-image bond list, valence-sanitised), and `fragment_info` cutting a
+  PERIODIC component at its coordination bonds — which is what makes a
+  framework's linkers finite and completable at the boundary.
 - `core/ptable.py` — where each element sits in the 18-column chart (f-block
   detached on rows 9/10) + the black-or-white text rule for a cell painted in
   the element's colour. Drawn by `ui/periodic_table.py`.
@@ -898,7 +1030,13 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   set a distance / angle / dihedral so the trailing fragment follows rigidly.
   `moving_group` returns `(indices, blocked)`; `blocked` covers both a ring
   and a non-bonded pair inside one fragment, where "which half is the far
-  half" has no answer and only the picked atom may move.
+  half" has no answer and only the picked atom may move. Round 36 added the
+  ROTOR: `torsion_split(n, bonds, selected)` finds the smallest fragment
+  containing the selection that hangs off one bridge (Tarjan bridges + a
+  2-edge-connected condensation, then the minimum over tree edges — linear,
+  not a BFS per bond), and `set_twist` spins it. Use it, not `moving_group`,
+  whenever the question is "which group did they mean?" rather than "which
+  bond did they name?".
 - `core/flight.py` — the 6DoF model behind right-mouse fly AND shuttle mode.
   `AimReticle` is the VIRTUAL STICK: a persistent offset whose deflection is a
   sustained turn rate, with a rescaled dead zone. It never decays — that is
@@ -909,6 +1047,13 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   is the separated aiming mark. Roll is an explicit angle here and an explicit
   PARAMETER on `Camera.fly_look`, applied after the azimuth/elevation rebuild
   so it can never accumulate; pitch is still clamped short of vertical.
+- `core/blender_export.py` — the scene as a Blender BUILD SCRIPT: geometry
+  (following `viewport._rebuild`'s rules exactly — modifier output, per-atom
+  colours/sizes, hidden atoms, the multi-bond layout), materials, camera,
+  lamp rig, world/HDRI and render settings. `collect()` returns plain data and
+  `build_script()` renders it into source, so the data and the text are
+  testable separately (and a .blend writer could reuse `collect` unchanged).
+  The emitted script is deliberately **ASCII only** and must stay that way.
 - `core/orient.py` — crystallographic view orientations for the ❖ ribbon:
   direct and RECIPROCAL axis directions (the latter from the inverse
   transpose — a normal is covariant), `look_along`, and the classical
@@ -1007,6 +1152,113 @@ independent cross-check inside a single fixture.
   vector then spin so the backbone points outward.
 
 ## Hard-won gotchas (don't re-learn these)
+- **Measure before believing "it fails on almost all of them"** (round 39).
+  Nine files, three independent references (ASE, pymatgen, and each file's own
+  `_chemical_formula_sum` x `_cell_formula_units_Z`): six were already exact,
+  one was not a structure, and the real bug was in one place. The formula x Z
+  check needs no dependency at all and is the fastest way to separate "our
+  reader is wrong" from "this file is unusual".
+- **A finite molecule straddling a face is NOT severed** (round 39) —
+  `unwrap_molecules` pulls it back together (round 19). The severing only
+  happens where unwrapping is refused, i.e. in a percolating component (round
+  25). So a test fixture for cut bonds must contain a FRAMEWORK; four carbons
+  in a box will silently be reassembled and prove nothing.
+- **Translating a fragment that straddles a face keeps it in pieces**
+  (round 39). It is stored split precisely because it could not be unwrapped,
+  so a rigid shift throws the far half two cells out, where it hangs bonded to
+  nothing. Walk it contiguous around the atom you are placing FIRST, then
+  translate that.
+- **Dedupe image atoms against POSITIONS, not against (site, image) keys**
+  (round 39). The key assumes every input atom is the (0,0,0) image of its
+  site, which stops being true the moment the input carries boundary copies —
+  `expand(boundary=True)` puts atoms outside [0,1) by design.
+- **A module-global circuit breaker is shared state across the whole suite**
+  (round 39). Anything that reaches the real network once marks OPSIN down,
+  and later tests that expect it to be TRIED then fail in a different file
+  with no obvious connection — passing alone, failing in the full run.
+  `tests/conftest.py` resets it around every test, next to the QSettings
+  sandbox and for the same reason.
+- **A bond KIND is derived, not stored** (round 38). It is a pure function of
+  the two element symbols, so `bond_kind(a, b)` cannot go stale, cannot be
+  lost by an edit, needs no reindexing in `delete_atoms`, and never has to be
+  added to `Scene.snapshot`/`to_dict` — the four-place checklist that
+  `atom_colors` exists to remind you about. Store only what cannot be
+  recomputed. (The cost is that a user cannot override one bond's kind; if
+  that is ever wanted, add a sparse override dict and pay the four places.)
+- **Cut the framework only where it is INFINITE** (round 38). Splitting every
+  metal-ligand bond would dismantle ferrocene and strand a paddlewheel's
+  ligands from their metal at the cell boundary. `fragment_info` walks the
+  full graph first and applies the coordination cut only to components that
+  came back periodic — the hierarchy is "molecule, unless that is impossible",
+  not "always cut at metals".
+- **A valence cap belongs on COVALENT bonds only** (round 38). Applied to all
+  bonds it would cull a chloride bridging three metals, an eight-coordinate
+  lanthanide, every framework node — i.e. exactly the structures the whole
+  exercise is for. The two rules compose: coordination bonds are exempt from
+  the cap, and the impossibly-short rule applies to everything because no
+  chemistry puts two nuclei that close.
+- **Physically impossible test fixtures start failing when the code gets
+  chemistry** (round 38). `test_molecules_are_reassembled_across_the_boundary`
+  used a 0.4 A O-H because the number was convenient; valence sanity now
+  refuses it, and the test broke without the code being wrong. When adding a
+  rule about what is real, expect the synthetic fixtures to be the first
+  casualties — fix the fixture, not the rule.
+- **Say what you refused to draw** (round 38). Three separate mechanisms now
+  discard atoms and bonds, and a viewer that quietly hides part of a file
+  earns a reputation for being wrong. `MainWindow.chemistry_note` surfaces
+  every drop in the import message and on the ❖ page; `perceive_bonds` and
+  `cif.expand` both take a `report` dict for the same reason.
+- **A fallback tier that RETURNS on failure is not a fallback** (round 37).
+  `resolve._resolve_inner` returned "couldn't reach OPSIN" on a tier-1 network
+  error, so one service going quiet took the whole cascade down and
+  import-by-name failed for names PubChem answers instantly. The shape to
+  copy: catch, record the failure in a `trouble` list, FALL THROUGH, and
+  report it as a NOTE on whatever does answer. And put a circuit breaker on it
+  — re-learning that a service is down costs the full timeout every single
+  time, which is what makes a working feature feel broken.
+- **A read timeout is not a `URLError`** (round 37). `urlopen` wraps a
+  CONNECT failure in URLError but a READ timeout raises a bare `TimeoutError`,
+  and `ssl.SSLError` is another `OSError` that gets through. Normalise in the
+  one HTTP helper, not at five call sites.
+- **Generated source must be ASCII** (round 37). This project's prose is full
+  of em dashes; a `.py` written for another program passes through whatever
+  encoding the writing step happened to use, and one cp1252 write turns an em
+  dash into byte 0x97, which Blender reports as `SyntaxError: 'utf-8' codec
+  can't decode byte 0x97` in a file nobody has edited. `blender_export`
+  ascii-folds everything it emits AND the app writes UTF-8 explicitly.
+- **Verify a generated program by RUNNING it** (round 37). Blender 4.4/5.1
+  live on this machine: `blender -b --python out.py -o render_ -f 1` renders
+  headless in a couple of seconds, and the resulting PNG next to a
+  `grabFramebuffer()` of the viewport is the only real proof the camera
+  matches. It caught the ASCII bug (the script never ran, and Blender happily
+  rendered its DEFAULT CUBE instead — a silent success is the dangerous
+  failure) and an engine bug: `bl_rna.properties["engine"].enum_items` does
+  not list external engines, so the Cycles check silently fell through to
+  EEVEE. Assign and catch `TypeError` instead.
+- **Blender's shader sockets are LINEAR** (round 37) while every colour picker
+  is sRGB, so a palette dropped in raw renders visibly washed out; and lamp
+  power must scale with distance SQUARED or a preset tuned on a small molecule
+  leaves a framework black. An HDRI plus a full lamp rig double-lights the
+  scene — halve the lamps when there is a world.
+- **A gesture that CAPTURES the pointer cannot start optimistically**
+  (round 36). "Start flight on the press; a click never travels anywhere" is
+  false the moment taking off hides the cursor and re-centres it: the release
+  arrives at the viewport centre, `_pick_at` finds nothing there, and the
+  click half of the button is dead. Any press that both (a) grabs or moves the
+  pointer and (b) shares its button with a click action must ARM and wait for
+  a hold, a drag or a release to say which it was. The corollary is that the
+  click's position must be the PRESS position, never the release's.
+- **A deferral is a symptom, not a fix** (round 36, retiring round 35's).
+  Holding the context menu back by a double-click interval was there only
+  because the press had already committed to flight. Once the press commits to
+  nothing, the menu can open immediately and the delay is pure loss. Whenever
+  a "wait and see which gesture this is" timer appears, check whether the real
+  problem is that something ACTED too early.
+- **`_project` returns `(xy, in_front)`, not `xy`** (round 36). Indexing the
+  tuple as an array raises inside `paintGL`, where Qt PRINTS the traceback and
+  carries on — the overlay silently never draws. Caught by the GUI smoke run,
+  invisible to every offscreen test. Same lesson as round 34: run a real
+  window when touching a paint path.
 - **Nothing camera-constant may be computed per PRIMITIVE** (round 35c). The
   round-33 lesson was "not in a paint path"; this is the sharper version. The
   symmetry overlay called `_eye_position()` once per line segment, and each
@@ -1588,9 +1840,10 @@ leave the table pointing at the wrong index.
 Shipped: `Ctrl+Shift+E` saves the viewport framebuffer as PNG/JPG at its
 current resolution (already 4x MSAA). Good enough for slides and notes.
 Options for publication-quality output, in the order they are worth doing:
-1. **Blender export** — Christian lives in Blender; writing a .py that
-   builds the scene there (metaballs/instanced UV spheres + Cycles) gives
-   the best images and reuses skills he already has. Recommended.
+1. ~~**Blender export**~~ **DELIVERED round 37** (`core/blender_export.py`,
+   Ctrl+Shift+B) — materials, camera, HDRI, lamps, unit cell, render setup,
+   behind a pre-configuration dialog. Verified by running the output in
+   Blender 5.1 headless and comparing the render with the viewport.
 2. **Offscreen supersampling** — render the existing GL scene into an FBO at
    4-8x and downsample. Cheap to add, no new dependency, no new look.
 3. **POV-Ray** — what Avogadro 1 used. Still works and produces nice CPU
@@ -1617,6 +1870,39 @@ batches. Known next items, rough order:
      and partial occupancies, and `.cif` EXPORT with a space group re-derived
      by spglib. Keep our zero-dependency reader as the bottom tier and put
      pymatgen above it, mirroring the rdkit/openbabel tiering.
+   - ~~**BOND TYPING is the missing hierarchy**~~ **DELIVERED round 38**, all
+     three parts (kinds, valence sanity, occupancy). The scoping is kept
+     below because the reasoning is what matters, and because the two files
+     it was measured on are still the regression cases. Christian's argument: MOF-5 is infinite through its bonds, benzoic
+     acid is fine on distance alone, HpPyBz breaks because its geometry is
+     not physical — so distance + connectivity CANNOT be a robust rule, and
+     "there has to be code in Mercury that is chemistry, not just maths".
+     Mercury knows to stop after the carboxylate because a Zn-O bond is
+     COORDINATIVE and that is the logical place to cut. Measured on his own
+     `MIL_53_Al - Kopie.cif` (176 atoms): as read it is ONE 152-atom periodic
+     component; cutting every metal-ligand bond gives 32 FINITE components —
+     8 x 16 (the BDC linkers), 8 x 3 (waters), 8 x 2 (the OH bridges), 8 x 1
+     (the Al centres). Exactly his hypothesis, and it makes whole-molecule
+     boundary completion terminate on a framework.
+     So the design is a bond KIND, not a bond list: covalent / coordinative
+     (metal-donor) / ionic, assigned at perception, with "molecule" meaning a
+     component over COVALENT bonds only. Two more pieces are needed and
+     neither is optional:
+       * **valence sanity** — reject bonds that give an impossible
+         coordination number (H > 1 is already capped, round 35b; C > 4,
+         O > 3, halide > 1), longest first. This is what HpPyBz needs, and it
+         is NOT the metal rule: that file's fusion comes from a 0.75 A
+         contact, which no bond-typing scheme would catch.
+       * **occupancy**, because the same failure arrives from disorder:
+         `MIL-53-lp-new.cif` (also his) has 640 valence violations — carbons
+         with 5, 6 and 9 neighbours — purely because our reader ignores
+         `_atom_site_occupancy` and superimposes every disorder alternative.
+         Two of the three CIFs on this machine hit that, so it is not an edge
+         case.
+     Worth knowing for the implementation: the CSD ships CURATED connectivity
+     with its entries, so Mercury frequently is not perceiving bonds at all —
+     it is reading them, with types included. We never have that luxury, which
+     is why our perception has to carry the chemistry itself.
    - **displayed bonds are still non-periodic** — `unwrap_molecules` uses the
      minimum image, but the `perceive_structure_bonds` that runs afterwards
      does not, so a FRAMEWORK (as opposed to a molecular crystal) still shows
@@ -1627,14 +1913,15 @@ batches. Known next items, rough order:
    - ~~SYMMETRY AS A MODIFIER~~ DELIVERED round 29 (`SymmetryModifier`): the
      base stays the asymmetric unit while the viewport and exporter see the
      full cell. Packing is still a destructive rebuild (above).
-   - **PARTIAL OCCUPANCIES (`_atom_site_occupancy` != 1)**: the parser reads
-     the column but IGNORES it, so a disordered structure currently shows
-     every alternative position at once, superimposed. Christian flagged that
-     many viewers handle this badly and wants a large test set. Needed:
-     read occupancy and disorder-group tags, decide a display policy
-     (dominant component by default, with a way to see the others), and
-     carry it into export. Worth collecting several real disordered CIFs as
-     fixtures before writing any of it.
+   - ~~**PARTIAL OCCUPANCIES**~~ **DELIVERED round 38**
+     (`cif.resolve_disorder`, Settings > CIF disorder). Occupancy and the
+     disorder GROUP/ASSEMBLY columns are read and applied, with three
+     policies and a report of what was dropped. Still open on this:
+     **occupancy is not carried into EXPORT** (a written .cif claims full
+     occupancy for everything), and the policy is applied at IMPORT so
+     switching it re-reads the file rather than re-resolving in place.
+     Christian's wish for a large disordered test set also stands — the two
+     MIL-53 files on this machine are the only real fixtures so far.
    - ~~SCHEMATIC SYMMETRY OPERATIONS~~ DELIVERED round 25
      (`core/symmetry.py` + the viewport overlay). Original scoping kept
      below for the reasoning:

@@ -719,18 +719,25 @@ def _try_heuristic_file(path, fmt):
     return [(atoms, meta)]
 
 
-def _read_cif(path):
-    # type: (str) -> Optional[List[Tuple[List[Atom], Optional[dict]]]]
+def _read_cif(path, disorder=None):
+    # type: (str, Optional[str]) -> Optional[List[Tuple[List[Atom], Optional[dict]]]]
     """Native CIF read -> one record with the crystallography in metadata.
 
     Returns None (not an exception) if this file is not usable CIF, so the
     caller simply falls through to the OpenBabel cascade.
+
+    `disorder` picks what to do with partially occupied sites; None takes
+    `cif.POLICY_DOMINANT`, which resolves superimposed alternatives.
     """
+    from . import cif as _cif
+    disorder = disorder or _cif.POLICY_DOMINANT
     from . import cif as cif_mod
+    report = {}
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             data = cif_mod.parse_cif(fh.read())
-        symbols, coords = cif_mod.expand(data)
+        symbols, coords = cif_mod.expand(data, disorder=disorder,
+                                         report=report)
     except (cif_mod.CifError, ValueError, OSError):
         return None
     if not symbols:
@@ -743,17 +750,24 @@ def _read_cif(path):
         "spacegroup": data.spacegroup,
         "symops": [op.as_xyz() for op in data.symops],
         # The asymmetric unit, kept so the full cell can be rebuilt (or
-        # re-exported) without re-reading the file.
+        # re-exported) without re-reading the file. Occupancies ride along:
+        # without them a rebuild would resolve the disorder differently from
+        # the import, which is the sort of drift nobody would ever spot.
         "asym_symbols": list(data.symbols),
         "asym_frac": [[float(v) for v in row] for row in data.frac],
+        "asym_occupancy": [float(o) for o in data.occupancy],
+        "disorder_policy": disorder,
     }
+    if report.get("disorder"):
+        meta["disorder"] = dict(report["disorder"])
     if data.name:
         meta["name"] = data.name
     return [(atoms, meta)]
 
 
-def read_structures(path, fmt=None, timeout=IMPORT_READ_TIMEOUT_S):
-    # type: (str, Optional[str], float) -> List[Tuple[List[Atom], Optional[dict]]]
+def read_structures(path, fmt=None, timeout=IMPORT_READ_TIMEOUT_S,
+                    disorder=None):
+    # type: (str, Optional[str], float, Optional[str]) -> List[Tuple[List[Atom], Optional[dict]]]
     """Read ALL structures (records/frames) from a coordinate file.
 
     Returns [(atoms, metadata), ...]; raises CoordGenError if nothing could
@@ -775,7 +789,7 @@ def read_structures(path, fmt=None, timeout=IMPORT_READ_TIMEOUT_S):
         # OUR reader first: OpenBabel reads .cif fine but discards the cell
         # and the space group, and those are the whole point of the format.
         # It stays as the fallback for the exotic dialects.
-        native = _read_cif(path)
+        native = _read_cif(path, disorder=disorder)
         if native is not None:
             return native
 

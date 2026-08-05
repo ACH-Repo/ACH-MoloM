@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..core import align as align_mod
+from ..core import blender_export as blender_mod
 from ..core import build as build_mod
 from ..core import modifiers as modifiers_mod
 from ..core import (bonding, edits, input_map, internal, io, measure, project,
@@ -37,8 +38,8 @@ from ..core.structure import Structure
 from ..core import style as style_mod
 from ..core.undo import UndoStack
 from .choice_popup import ChoicePopup
-from .dialogs import (MetaAtomDialog, OperatorSearchDialog, ResolveNameDialog,
-                      SettingsDialog)
+from .dialogs import (BlenderExportDialog, MetaAtomDialog,
+                      OperatorSearchDialog, ResolveNameDialog, SettingsDialog)
 from .crystal_ribbon import CrystalRibbon
 from .optimize_panel import OptimizeDock, OptimizeWorker, TASK_SELECTION
 from . import properties as properties_mod
@@ -155,6 +156,13 @@ class MainWindow(QMainWindow):
             self.settings.value("label_scale", 1.0))
         self.viewport.adjust_h = self.settings.value(
             "adjust_hydrogens", "true") in (True, "true")
+        #: What to do with partially occupied CIF sites — see
+        #: `core.cif.resolve_disorder`. An import-time decision, so changing it
+        #: applies to the next file opened (and to a crystal-view rebuild).
+        policy = self.settings.value("disorder_policy",
+                                     cif_mod.POLICY_DOMINANT)
+        self.disorder_policy = (policy if policy in cif_mod.DISORDER_POLICIES
+                                else cif_mod.POLICY_DOMINANT)
         for key, attr in self._FLIGHT_KEYS.items():
             stored = self.settings.value("flight_" + key, None)
             if stored is not None:
@@ -392,6 +400,12 @@ class MainWindow(QMainWindow):
         r("export_image", "Export image (PNG snapshot of the viewport)...",
           lambda c: c.on_export_image(), enabled=has_obj, category="File",
           shortcut="Ctrl+Shift+E", key="Ctrl+Shift+E")
+        r("export_blender",
+          "Export to Blender (script with materials, camera, HDRI)...",
+          lambda c: c.on_export_blender(), enabled=has_obj, category="File",
+          shortcut="Ctrl+Shift+B", key="Ctrl+Shift+B",
+          aliases=("render", "cycles", "hdri", "publication figure",
+                   "ray trace", "bpy"))
         r("clear_scene", "Clear scene (remove all molecules)",
           lambda c: c.on_clear_scene(), enabled=has_obj, category="File")
 
@@ -429,6 +443,14 @@ class MainWindow(QMainWindow):
         r("rotate", "Rotate selection",
           lambda c: c.viewport.start_rotate(), enabled=sel, category="Edit",
           shortcut="R, then X/Y/Z, degrees", key="R")
+        # T, not an axis lock inside R: the axis is a BOND, which belongs to
+        # the molecule rather than to the object frame X/Y/Z cycle through.
+        r("twist_bond", "Twist a terminal group about its bond axis "
+          "(methyl rotor)",
+          lambda c: c.viewport.start_twist(), enabled=sel, category="Edit",
+          shortcut="T", key="T",
+          aliases=("methyl", "rotor", "torsion", "spin group",
+                   "internal rotation", "conformer"))
         r("undo", "Undo", lambda c: c.on_undo(),
           enabled=lambda c: c.undo.can_undo, category="Edit",
           shortcut="Ctrl+Z", key="Ctrl+Z")
@@ -733,6 +755,7 @@ class MainWindow(QMainWindow):
         self._add_op(m_file, "new_molecule", "New &empty molecule")
         self._add_op(m_file, "save_as", "&Export geometry...")
         self._add_op(m_file, "export_image", "Export &image...")
+        self._add_op(m_file, "export_blender", "Export to &Blender...")
         self._add_op(m_file, "clear_scene", "&Clear scene")
         m_file.addSeparator()
         self.recent_menu = m_file.addMenu("&Recent files")
@@ -1114,7 +1137,7 @@ class MainWindow(QMainWindow):
             if mod is None:
                 return
             self.push_undo()
-            obj.modifiers.append(mod)
+            self._add_modifier(obj, mod)
             # ...and REDUCE the base to the asymmetric unit. Without this the
             # modifier re-applies the operations to a molecule that is
             # already the full cell, de-duplicates straight back to what was
@@ -1139,12 +1162,31 @@ class MainWindow(QMainWindow):
                     "identity operation — open the card and add operations "
                     "one at a time to build a cell".format(obj.name), 9000)
             return
+        elif kind == "boundary":
+            cell = cell_of(obj)
+            if cell is None:
+                self.statusBar().showMessage(
+                    "{} has no unit cell — boundary bonds only mean "
+                    "something in a periodic structure".format(obj.name), 6000)
+                return
+            self.push_undo()
+            obj.modifiers.append(self._new_boundary_modifier(obj))
+            obj.structure.metadata["cell_exterior"] = 1
+            self._sync_modifier_page()
+            self.viewport.refresh_geometry()
+            self._update_counts()
+            self.statusBar().showMessage(
+                "Boundary bonds on for {}: {} atoms drawn from a {}-atom "
+                "cell, with every bond across a face closed".format(
+                    obj.name, len(obj.evaluated()[0]),
+                    obj.structure.n_atoms), 8000)
+            return
         elif kind == "array":
             self.push_undo()
             # default offset along +X, just past the molecule, so the very
             # first click already shows a sensible row instead of a pile-up
             span = obj.structure.bounding_radius() * 2.0 + 1.0
-            obj.modifiers.append(modifiers_mod.ArrayModifier(
+            self._add_modifier(obj, modifiers_mod.ArrayModifier(
                 count=3, offset=(round(span, 2), 0.0, 0.0)))
         else:
             return
@@ -1601,6 +1643,113 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "Wrote {} ({}x{})".format(os.path.basename(path),
                                       img.width(), img.height()), 6000)
+
+    # ------------------------------------------------------------ Blender
+    #: Export options that are worth remembering between sessions. The camera
+    #: and the resolution are NOT among them: those follow the viewport, and
+    #: restoring last week's resolution over today's window is never right.
+    _BLENDER_KEYS = ("hdri", "hdri_strength", "hdri_rotation", "hdri_visible",
+                     "lights", "light_strength", "roughness",
+                     "metallic_metals", "sphere_subdivisions", "bond_sides",
+                     "shade_smooth", "unit_cell", "engine", "samples",
+                     "view_transform", "clear_scene", "collection",
+                     "style_key")
+
+    def _blender_options(self):
+        # type: () -> blender_mod.ExportOptions
+        """Last session's choices, or the defaults."""
+        opts = blender_mod.ExportOptions()
+        for key in self._BLENDER_KEYS:
+            stored = self.settings.value("blender_" + key, None)
+            if stored is None:
+                continue
+            current = getattr(opts, key)
+            try:
+                if isinstance(current, bool):
+                    setattr(opts, key, stored in (True, "true", "True", 1))
+                elif isinstance(current, int):
+                    setattr(opts, key, int(stored))
+                elif isinstance(current, float):
+                    setattr(opts, key, float(stored))
+                else:
+                    setattr(opts, key, stored or None if key == "style_key"
+                            else stored)
+            except (TypeError, ValueError):
+                pass
+        return opts
+
+    def on_export_blender(self):
+        """Pre-configure, then write a Blender build script.
+
+        A script rather than a .blend because writing .blend needs Blender
+        itself; this way there is nothing to find, nothing to shell out to,
+        and the result is editable text. See core/blender_export.py.
+        """
+        vis = [o for o in self.scene.visible_objects() if o.structure.n_atoms]
+        if not vis:
+            self.statusBar().showMessage("Nothing visible to export", 5000)
+            return
+        vp = self.viewport
+        summary = "{}: {} atoms".format(
+            ", ".join(o.name for o in vis[:3])
+            + (" +{} more".format(len(vis) - 3) if len(vis) > 3 else ""),
+            sum(len(o.evaluated()[0]) for o in vis))
+        dlg = BlenderExportDialog(self, self._blender_options(), summary,
+                                  (vp.width(), vp.height()))
+        if not dlg.exec():
+            return
+        opts = dlg.options()
+        opts.atom_scale = vp.atom_scale
+        for key in self._BLENDER_KEYS:
+            self.settings.setValue("blender_" + key, getattr(opts, key))
+        base = (os.path.splitext(os.path.basename(self.project_path))[0]
+                if self.project_path else (vis[0].name or "molom"))
+        start = self.settings.value("last_dir", "")
+        path, _f = QFileDialog.getSaveFileName(
+            self, "Export Blender script",
+            blender_mod.default_path(start, base),
+            "Blender Python script (*.py);;All files (*)")
+        if not path:
+            return
+        try:
+            source = self.blender_script(opts, os.path.basename(path))
+        except Exception as e:
+            QMessageBox.critical(self, "Export failed", str(e))
+            return
+        try:
+            # UTF-8 explicitly: Blender reads scripts as UTF-8, and Windows
+            # would otherwise write cp1252 and hand it a byte it refuses.
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(source)
+        except OSError as e:
+            QMessageBox.critical(self, "Export failed",
+                                 "Could not write {}\n{}".format(path, e))
+            return
+        self.settings.setValue("last_dir", os.path.dirname(path))
+        self.statusBar().showMessage(
+            "Wrote {} - open it in Blender's Scripting workspace and press "
+            "Run".format(os.path.basename(path)), 10000)
+
+    def blender_script(self, options, basename=""):
+        # type: (blender_mod.ExportOptions, str) -> str
+        """The script for the CURRENT scene and camera. Split out from the
+        dialog plumbing so the whole export is testable without Qt file
+        dialogs — and so a future "re-export with the same settings" has
+        something to call."""
+        vp = self.viewport
+        style = vp.style
+        if options.style_key:
+            style = style_mod.STYLE_BY_KEY.get(options.style_key, style)
+        data = blender_mod.collect(
+            self.scene, style, options,
+            camera=vp.camera if options.match_viewport else None,
+            width=options.resolution[0], height=options.resolution[1],
+            cell_of=cell_of if options.unit_cell else None)
+        title = ", ".join(o.name for o in self.scene.visible_objects()
+                          if o.structure.n_atoms) or "scene"
+        return blender_mod.build_script(
+            data, options, title=title, version=__version__,
+            basename=basename, summary=blender_mod.summarise(data))
 
     def _selected_object(self):
         ids = {p[0] for p in self.viewport.selection}
@@ -2105,7 +2254,16 @@ class MainWindow(QMainWindow):
         otherwise be all-single — which makes editing and any later force
         field run start from the wrong chemistry. After this, orders only
         ever change on explicit user action."""
-        bonding.perceive_structure_bonds(s)
+        report = {}
+        bonding.perceive_structure_bonds(s, report=report)
+        if report.get("dropped_bonds"):
+            # Kept on the structure so the import message, the crystal page
+            # and a later "why is that atom not bonded?" all have the same
+            # answer. Refusing a bond silently is how a viewer earns a
+            # reputation for being wrong.
+            s.metadata["dropped_bonds"] = [
+                {"i": i, "j": j, "distance": round(d, 3), "reason": why}
+                for i, j, d, why in report["dropped_bonds"]]
         bonding.perceive_structure_bond_orders(s)
         # Pin a crystal's cell box to the atoms as imported, so it travels
         # with them under any later transform.
@@ -2118,14 +2276,49 @@ class MainWindow(QMainWindow):
         self._perceive_fresh(s)
         obj = self.scene.add(s)
         self.active_id = obj.id
+        # A framework's bonds do not stop at the wall. Close them at import,
+        # or the first thing anyone sees of a ZIF is severed linkers.
+        closed = self._autoclose_boundary(obj)
         self._sync_all(fit=True)
         if path:
             self._push_recent(path)
             extra = self._attach_frequencies(obj, path)
             note = ", ".join([n for n in (note, extra) if n]) or None
+        chem = self.chemistry_note(s)
+        if closed:
+            chem = ", ".join([n for n in (
+                chem, "{} bonds closed across the cell faces (+{} image "
+                "atoms, drawn only)".format(
+                    s.metadata.get("boundary_bonds", 0),
+                    s.metadata.get("boundary_atoms", 0))) if n])
+        note = ", ".join([n for n in (note, chem) if n]) or None
         self.statusBar().showMessage(
             "Added {}{}".format(obj.name,
                                 " ({})".format(note) if note else ""), 6000)
+
+    @staticmethod
+    def chemistry_note(structure):
+        # type: (Structure) -> Optional[str]
+        """What the chemistry filters did to this import, in one phrase.
+
+        Round 38 gave the reader three ways to REFUSE what a file says —
+        disorder alternatives, impossible contacts, over-valence bonds — and a
+        refusal the user is not told about is indistinguishable from a bug.
+        This is what makes them visible without a dialog.
+        """
+        meta = getattr(structure, "metadata", None) or {}
+        bits = []
+        dis = meta.get("disorder") or {}
+        if dis.get("dropped"):
+            bits.append("{} disorder alternative(s) resolved".format(
+                dis["dropped"]))
+        dropped = meta.get("dropped_bonds") or []
+        if dropped:
+            short = sum(1 for d in dropped if "short" in d.get("reason", ""))
+            bits.append("{} impossible bond(s) dropped".format(len(dropped))
+                        if short else
+                        "{} over-valence bond(s) dropped".format(len(dropped)))
+        return "; ".join(bits) or None
 
     # ------------------------------------------------------------ vibrations
     _FREQ_SUFFIXES = (".out", ".log", ".txt", ".orca", ".output")
@@ -2627,7 +2820,8 @@ class MainWindow(QMainWindow):
                 self._install_smiles_batch(pairs, "SMILES file")
                 self._push_recent(path)
                 return
-            structs = io.read_structures(path)
+            structs = io.read_structures(path,
+                                         disorder=self.disorder_policy)
             base = os.path.splitext(os.path.basename(path))[0]
             if len(structs) > 1 and io.frames_are_trajectory(structs):
                 s = Structure.from_frames(structs, name=base)
@@ -3523,7 +3717,95 @@ class MainWindow(QMainWindow):
             self.outliner.highlight(obj_id)
         meta = obj.structure.metadata
         meta["cell_exterior"] = 1 if on else 0
-        self.on_crystal_view(meta.get("cell_view", "cell"))
+        # Round 39: this is a MODIFIER now, not a rebuild. The old path baked
+        # the exterior atoms into the atom list, which changed the cell's atom
+        # count — so "show me the bonds across the faces" quietly stopped the
+        # molecule being the unit cell. Non-destructive keeps both.
+        mod = self._boundary_modifier(obj)
+        if mod is None:
+            if not on:
+                return
+            self.push_undo()
+            obj.modifiers.append(self._new_boundary_modifier(obj))
+        else:
+            self.push_undo()
+            mod.enabled = bool(on)
+        self._sync_modifier_page()
+        self.viewport.refresh_geometry()
+        self._update_counts()
+        self.statusBar().showMessage(
+            "{}: bonds across the cell faces {} ({} atoms drawn from a "
+            "{}-atom cell)".format(obj.name, "closed" if on else "left open",
+                                   len(obj.evaluated()[0]),
+                                   obj.structure.n_atoms), 7000)
+
+    @staticmethod
+    def _new_boundary_modifier(obj, shells=1):
+        # type: (object, int) -> object
+        cell = cell_of(obj)
+        return modifiers_mod.BoundaryModifier(
+            cell=cell.to_dict() if cell is not None else None, shells=shells)
+
+    @staticmethod
+    def _boundary_modifier(obj):
+        for m in getattr(obj, "modifiers", None) or ():
+            if getattr(m, "kind", "") == "boundary":
+                return m
+        return None
+
+    @staticmethod
+    def _add_modifier(obj, mod):
+        """Append, keeping BOUNDARY last.
+
+        The stack runs in order and boundary bonds are about the FINAL
+        geometry: if it ran before a symmetry or array modifier, those would
+        expand its image atoms as though they were real cell contents, and the
+        picture would grow a shell of a shell.
+        """
+        mods = obj.modifiers
+        if getattr(mod, "kind", "") == "boundary":
+            mods.append(mod)
+            return
+        cut = len(mods)
+        for k, m in enumerate(mods):
+            if getattr(m, "kind", "") == "boundary":
+                cut = k
+                break
+        mods.insert(cut, mod)
+
+    def _autoclose_boundary(self, obj):
+        # type: (object) -> bool
+        """Add the boundary-bonds modifier if this crystal actually needs one.
+
+        A structure whose bonds all sit inside the box (a molecular crystal —
+        benzoic acid, urea) gets nothing: there is nothing to close, and an
+        inert modifier on the stack is clutter. A FRAMEWORK gets it turned on
+        at import, because without it the picture is not merely sparse, it is
+        WRONG — Christian's ZIFs came out as heaps of severed linkers with 48
+        atoms missing a bond each.
+        """
+        cell = cell_of(obj)
+        s = obj.structure
+        if cell is None or s.n_atoms == 0 or self._boundary_modifier(obj):
+            return False
+        mod = self._new_boundary_modifier(obj)
+        try:
+            symbols, _xyz, bonds = mod.evaluate(s.symbols, s.coords, s.bonds)
+        except (ValueError, cif_mod.CifError):
+            return False
+        # ASK THE MODIFIER, do not guess from the bond list. Comparing
+        # periodic pairs against `structure.bonds` by INDEX over-triggers on a
+        # structure that already carries boundary copies: the partner is
+        # present under a different index, so the bond looks undrawn when it
+        # is drawn perfectly well, and the object collects an inert modifier.
+        added = len(symbols) - s.n_atoms
+        if added <= 0:
+            return False
+        obj.modifiers.append(mod)
+        s.metadata["cell_exterior"] = 1
+        s.metadata["boundary_bonds"] = len(bonds) - len(s.bonds)
+        s.metadata["boundary_atoms"] = added
+        return True
 
     def _on_crystal_advanced(self, obj_id):
         """"Advanced..." hands off to the unit-cell page, keeping the crystal
@@ -3687,7 +3969,8 @@ class MainWindow(QMainWindow):
             n_asym=len(meta.get("asym_symbols") or ()),
             n_atoms=obj.structure.n_atoms,
             mode=meta.get("cell_view", "cell"),
-            exterior=int(meta.get("cell_exterior", 0)))
+            exterior=int(meta.get("cell_exterior", 0)),
+            chemistry=self.chemistry_note(obj.structure) or "")
 
     def on_meta_atom(self):
         """Configure the meta atom (the periodic table's ✳ button, and F3).
@@ -3745,7 +4028,7 @@ class MainWindow(QMainWindow):
         else:
             mod.na = mod.nb = mod.nc = 1
         meta = obj.structure.metadata or {}
-        mod.exterior = int(meta.get("cell_exterior", 0))
+        mod.exterior = 0          # the BoundaryModifier owns this now
         meta["cell_view"] = mode
         self._sync_modifier_page()
         self.viewport.refresh_geometry()
@@ -3788,10 +4071,21 @@ class MainWindow(QMainWindow):
             return
         symops = [cif_mod.SymOp.from_xyz(t) for t in meta.get("symops")
                   or ["x,y,z"]]
+        report = {}
         symbols, coords = cif_mod.build_view(
             cell, asym_symbols, asym_frac, symops, mode=mode,
             na=na, nb=nb, nc=nc,
-            exterior=int(meta.get("cell_exterior", 0)))
+            # exterior=0 ALWAYS: closing the bonds across the cell faces
+            # is the BoundaryModifier's job now (round 39), and doing it here
+            # too would add every exterior atom twice.
+            exterior=0,
+            # The occupancies and the policy ride with the object, so a
+            # rebuild resolves the disorder exactly as the import did.
+            occupancy=meta.get("asym_occupancy"),
+            disorder=meta.get("disorder_policy") or self.disorder_policy,
+            report=report)
+        if report.get("disorder"):
+            meta["disorder"] = dict(report["disorder"])
         if not symbols:
             self.statusBar().showMessage("That view produced no atoms", 4000)
             return
@@ -3874,6 +4168,7 @@ class MainWindow(QMainWindow):
             render_subdiv=self.viewport.render_subdiv_bonus,
             input_preset=self.viewport.input_preset,
             label_scale=self.viewport.label_scale,
+            disorder_policy=self.disorder_policy,
             on_speed_change=lambda v: setattr(self.viewport.camera,
                                               "rotate_speed", v),
             on_atom_scale_change=self.viewport.set_atom_scale,
@@ -3898,7 +4193,7 @@ class MainWindow(QMainWindow):
                     "strafe_factor": "fly_strafe_factor",
                     "roll_rate": "fly_roll_rate", "turn_rate": "fly_turn_rate",
                     "bank_angle": "fly_bank_angle",
-                    "aim_expo": "fly_aim_expo"}
+                    "aim_expo": "fly_aim_expo", "hold_ms": "fly_hold_ms"}
 
     def _flight_tuning(self):
         # type: () -> dict
@@ -3918,7 +4213,9 @@ class MainWindow(QMainWindow):
             return
         if key == "aim_expo":
             fly["aim"].expo = max(float(value), 1.0)
-        elif key != "turn_rate":
+        elif key not in ("turn_rate", "hold_ms"):
+            # `hold_ms` and `turn_rate` are the viewport's, not the model's —
+            # pushing them into FlightModel would invent attributes on it.
             setattr(fly["model"], key, float(value))
 
     def _settings_closed(self, dlg, result, old_speed, old_scale, old_labels,
@@ -3931,6 +4228,8 @@ class MainWindow(QMainWindow):
             self.settings.setValue("input_preset", self.viewport.input_preset)
             self.viewport.precision_factor = dlg.precision_factor()
             self.viewport.adjust_h = dlg.adjust_hydrogens()
+            self.disorder_policy = dlg.disorder_policy()
+            self.settings.setValue("disorder_policy", self.disorder_policy)
             self.undo.set_limit(dlg.undo_limit())
             self.viewport.set_atom_scale(dlg.atom_scale())
             self._set_label_scale(dlg.label_scale())

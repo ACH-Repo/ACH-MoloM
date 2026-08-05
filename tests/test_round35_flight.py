@@ -425,25 +425,14 @@ def test_ctrl_no_longer_creeps_now_that_it_descends(win):
     assert "ControlModifier" not in src
 
 
-def test_a_right_click_off_the_selection_defers_no_menu(win):
-    """The deferral is paid only where a menu would actually appear, so
-    double-clicking into flight over empty space costs nothing."""
+def test_a_right_click_off_the_selection_opens_nothing(win):
+    """`open_context_menu` refuses anywhere but on an already-selected atom,
+    so an ordinary right click over empty space costs nothing at all."""
     from PySide6.QtCore import QPointF
     vp = win.viewport
     vp.set_selection([])
-    vp._defer_context_menu(QPointF(5.0, 5.0))
-    assert not vp._fly_menu_timer.isActive()
-
-
-def test_a_deferred_menu_is_dropped_if_flight_latched_meanwhile(win):
-    from PySide6.QtCore import QPointF
-    vp = win.viewport
-    vp._fly_menu_pos = QPointF(5.0, 5.0)
-    vp.start_fly(latched=True)
-    vp._fire_deferred_menu()                 # would have opened the menu
-    assert vp._fly_menu_pos is None
-    assert vp.flying()                       # flight was not disturbed
-    vp.stop_fly(coast=False)
+    vp.open_context_menu(QPointF(5.0, 5.0))
+    assert vp._context_popup is None
 
 
 def test_looking_around_does_not_move_the_camera(win):

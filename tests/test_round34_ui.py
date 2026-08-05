@@ -309,7 +309,13 @@ def test_the_menu_offers_the_edit_that_fits_the_selection(chain):
         vp.set_selection([(obj.id, i) for i in range(n)])
         keys = [k for k, _label, _tip in vp.context_entries()]
         assert "internal:" + kind in keys
-        assert sum(k.startswith("internal:") for k in keys) == 1
+        # Exactly ONE count-driven edit. The twist (round 36) is not one of
+        # them — it is offered from any selection that resolves to a rotor,
+        # and it sits below whichever of these fits.
+        counted = [k for k, count, _u, _l in internal.KINDS
+                   if count is not None]
+        assert sum(k == "internal:" + c for k in keys
+                   for c in counted) == 1
 
 
 def test_the_menu_shows_the_current_value(chain):
@@ -326,8 +332,13 @@ def test_the_menu_drops_the_geometry_entry_when_nothing_fits(chain):
     vp = win.viewport
     vp.set_selection([(obj.id, 0)])
     keys = [k for k, _label, _tip in vp.context_entries()]
-    assert not any(k.startswith("internal:") for k in keys)
-    assert "op:hide_selected" in keys   # but the plain edits are still there
+    # One atom is no length, angle or dihedral...
+    for kind in (internal.DISTANCE, internal.ANGLE, internal.DIHEDRAL):
+        assert "internal:" + kind not in keys
+    # ...but it does point at a rotor, which is the whole point of the twist:
+    # it takes a selection, not an ordered set of picks.
+    assert "internal:" + internal.TWIST in keys
+    assert "op:hide_selected" in keys   # and the plain edits are still there
 
 
 def test_an_empty_selection_has_no_menu(win):

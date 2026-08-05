@@ -185,6 +185,10 @@ class ScalarState(_NumericEntry):
         self.maximum = maximum
         self.unit = unit
         self.label = label
+        #: Show "(was X)" alongside the value. True for a coordinate being
+        #: SET; false for a relative one (the twist), where the start is 0 by
+        #: construction and reporting it is noise.
+        self.show_start = True
         self._accum = 0.0
         self._ref = None            # type: Optional[float]
 
@@ -231,7 +235,7 @@ class ScalarState(_NumericEntry):
             body = "{} [{}] {}".format(self.label, self.number, self.unit)
         else:
             body = "{} {:.3f} {}".format(self.label, self.value(), self.unit)
-        was = "  (was {:.3f})".format(self.start)
+        was = "  (was {:.3f})".format(self.start) if self.show_start else ""
         return body.strip() + was
 
 

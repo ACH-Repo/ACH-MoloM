@@ -27,6 +27,7 @@ clicks belong to the draw tool, and adding atoms is only possible here.
 | letters | hotkeys | hotkeys (the same ones) |
 | 1 / 2 / 3 / 0 | bond order for 2 selected atoms | same |
 | G / R | move / rotate | move / rotate (unchanged) |
+| **T** | twist the selected terminal group about its bond axis | same |
 | X / Y / Z | lock the anchored tumble axis | free |
 
 **Letters are ordinary hotkeys in BOTH modes** (round 20). Edit mode used to
@@ -56,6 +57,7 @@ Measured//computed **file** imports (xyz, sdf, pdb, …) are never silently
 transformed.
 | **Export geometry...** — every molecule ticked visible in the outliner goes into the file (merged into one record); a single visible trajectory still writes all its frames | **Ctrl+E** | scene not empty |
 | **Export image...** — PNG/JPG snapshot of the viewport exactly as drawn (grid, labels and all) at its current resolution | **Ctrl+Shift+E** | scene not empty |
+| **Export to Blender...** — a build SCRIPT (`.py`) with materials, camera, lights and world, after a pre-configuration dialog. See below | **Ctrl+Shift+B** | scene not empty |
 | **New empty molecule** — an empty object to draw into (Tab on an empty scene does this too) | — | — |
 | Clear scene | — | scene not empty |
 
@@ -101,6 +103,7 @@ drag that *starts on an atom* draws instead (see the mode table above).
 | **Geometry: set bond length** — drag or type an exact value; the whole trailing FRAGMENT follows, so every other length and angle is preserved. LMB/Enter set, RMB/Esc cancel | right-click over the selection, or F3 | exactly 2 atoms of one molecule |
 | **Geometry: set angle** — the vertex is the **middle atom in pick order**; the far fragment swings about it | right-click over the selection, or F3 | exactly 3 atoms of one molecule |
 | **Geometry: set dihedral** — the two inner atoms in pick order are the axis; the far fragment spins about it | right-click over the selection, or F3 | exactly 4 atoms of one molecule |
+| **Twist a terminal group about its bond axis** (the methyl rotor) — the selection says *which group*, not which atoms move: MoloM takes the **smallest fragment containing the whole selection that hangs off the rest by exactly one bond**, so the carbon, one hydrogen, the three hydrogens or the whole CH₃ all give the same rotor. That bond is the axis, drawn dashed with a ring on the fixed end. A **relative** angle — drag, scroll or type degrees; LMB/Enter set, RMB/Esc cancel | **T**, right-click over the selection, or F3 | the selection resolves to a rotor: **both** sides of the cut need ≥2 atoms, so a ring atom, a lone terminal H and a whole molecule are all refused (with a reason) |
 | Add atom... | **Shift+A** | — |
 
 ### A — selection-aware align
@@ -736,8 +739,9 @@ needs RDKit position constraints and is the next refinement.
 | MMB drag | orbit | orbit |
 | Shift / Ctrl + MMB drag | pan / zoom | pan / zoom |
 | Alt + LMB drag | orbit | orbit (for mice with a stiff wheel-click) |
-| **RMB hold** | **fly** (see below) | **fly** |
-| **RMB click over the selection** | context menu | context menu |
+| **RMB hold** (past ~250 ms, or drag) | **fly** (see below) | **fly** |
+| **RMB double-click** | **fly, latched** — hands free until a single right click or Esc lands you | same |
+| **RMB click over the selection** | context menu, at once | context menu, at once |
 | LMB drag | box select | box select |
 
 **Auto** decides per event: a precision trackpad reports pixel deltas, a
@@ -770,6 +774,15 @@ jump, which reads as a broken viewport (`core/input_map.py`).
 Everspace-style handling. **Hold RMB** to fly for a moment, or **double-click
 RMB to LATCH** it — then both hands are free and a **single right click or
 Esc** lands you.
+
+**A right press ARMS flight; it does not start it** (round 36). Taking off
+captures the pointer — hides it and parks it at the viewport centre — so
+starting on the press made the release land in the middle of the screen with
+nothing under it, and the right-click menu became unreachable. Held past
+**Hold to fly** (Settings > Flight, default 250 ms) *or* dragged past the
+click slop, the press becomes flight; released before either, it is an
+ordinary right CLICK. Set the delay to **0** to switch hold-to-fly off
+entirely and reach flight only by double-clicking.
 
 | Input | Effect |
 |---|---|
@@ -831,7 +844,8 @@ on exit because the orbit camera is a turntable with no way to represent a
 rolled pose.
 
 All of it is tunable live in **App > Settings > Flight** (acceleration, drag,
-auto-brake, strafe response, roll rate, turn rate), including while flying.
+auto-brake, strafe response, roll rate, turn rate, aim expo and the
+hold-to-fly delay), including while flying.
 
 **Shuttle / pilot mode uses the identical model**, with the molecule as the
 airframe instead of the camera — so there is one place to tune the feel and
@@ -848,20 +862,92 @@ devices. Hanging pan off a modified right-drag was rejected because every
 modifier that could carry it already means something *inside* flight.
 
 ### Right-click menu (over the selection)
-A right-CLICK — pressed and released without moving or thrusting, with the
-cursor **on a selected atom** — opens a small at-the-cursor menu
+A right-CLICK — pressed and released inside the hold delay, with the cursor
+**on a selected atom** — opens a small at-the-cursor menu
 (`ui/choice_popup.py`, the same widget J uses) instead of flying. It lists
 only what applies: the geometry edit that fits the selection size (with its
-CURRENT value, so the menu doubles as a readout), plus Hide and Delete. The
-entries run the registered operators, so the menu, the hotkey and F3 can
-never disagree.
+CURRENT value, so the menu doubles as a readout), the **twist** when the
+selection resolves to a rotor, plus Hide and Delete. The entries run the
+registered operators, so the menu, the hotkey and F3 can never disagree.
+
+It opens **immediately** on the release (round 36). Round 35 held it back by
+one double-click interval so that double-clicking into flight would not pop a
+menu first; that is no longer needed, because a single press cannot start
+flight any more. The cost is that a right double-click *on a selected atom*
+flashes the menu instead of latching flight — anywhere else it latches as
+before, and holding still works even on a selected atom.
+
+## Blender export (Ctrl+Shift+B, round 37)
+Writes a **Python script**, not a `.blend` — writing .blend needs Blender
+itself, and hunting for an installation to shell out to is exactly the sort of
+fragile thing this project avoids. A script is also better: diffable, editable
+before it runs, re-runnable after the scene changes, and it shows how the
+scene was built. Open it in Blender's Scripting workspace and press Run, or
+`blender --python file.py`. **One Angstrom = one Blender unit.**
+
+A dialog comes up first, because a render is a dozen decisions and every one
+is quicker to make here than to hunt for in Blender afterwards. Defaults are
+chosen so that "just press OK" gives something worth looking at.
+
+| Group | What it does |
+|---|---|
+| **Environment (HDRI)** | Blender's own material-preview HDRIs — `forest`, `studio`, `city`, `courtyard`, `interior`, `night`, `sunrise`, `sunset` — or a file of your own, or none. Resolved from `bpy.utils.system_resource` when the script RUNS, so no path from this machine is baked in. Strength and Z rotation included; rotation is the cheapest way to move a highlight off an atom you need to read |
+| **Show the environment behind the molecule** | Off (default) renders on a **transparent** background while still lighting with the HDRI — what a figure wants |
+| **Camera** | Placed in exactly the viewport's pose: same position, same aim, same vertical field of view, orthographic if the viewport is. Resolution defaults to the viewport's own size, so the framing you see is the framing you get |
+| **Lamp rig** | Three-point studio / key only / none / sun. Lamps are placed in the CAMERA's frame so the rig follows the shot, and their power goes as **distance squared** so a 5 Å molecule and a 100 Å framework are lit the same. With an HDRI they run at **half** strength — both at full blows the white hydrogens out |
+| **Materials** | One per element **plus one per distinct custom colour**, so an atom the outliner painted violet arrives violet and two atoms painted alike share a material. Colours are converted **sRGB → linear** (Blender's sockets are linear; raw sRGB renders washed out). Metals optionally get a metallic shader |
+| **Geometry** | Style (or follow the viewport), icosphere subdivisions, bond sides, shade smooth. Bonds are split at the midpoint and coloured by each atom, exactly as the viewport draws them; hidden atoms, per-atom sizes and the modifier stack all carry over |
+| **Unit cell** | The box as cylinders with a/b/c in the axis colours |
+| **Render** | Cycles or EEVEE (the script falls back gracefully — EEVEE was renamed twice and Cycles is an add-on), samples, and the view transform. **Standard** keeps the viewport's colours literally; AgX/Filmic roll off the highlights |
+
+Everything lands in a `MoloM` collection with `atoms`, `bonds` and `rig`
+sub-collections, so re-running the script cannot lose your own objects. Atoms
+and bonds share one mesh datablock each and are linked duplicates with
+per-OBJECT material slots: the file stays small and every atom is still
+individually selectable. Choices are remembered between sessions (the camera
+and resolution are not — those follow the viewport).
+
+## Boundary bonds (round 39)
+A bond whose partner sits in the next cell is not drawn by a straight-line
+perceiver, so a **framework comes out severed at every face**. On a real ZIF
+the connectivity had 224 bonds and only 196 were drawable — 48 atoms short a
+bond each, and every imidazolate at a face reduced to a stub.
+
+The **Boundary bonds** modifier closes them by materialising the periodic
+image at the far end of each cut bond. It is a MODIFIER, so the molecule
+itself stays exactly the cell contents (Z, the ❖ atom count, editing and
+unit-cell export are unaffected) while the viewport and the Blender export see
+a continuous framework. It is added automatically at import when a crystal
+needs one, appears on the Modifiers page, and the ❖ page's *Bonded atoms
+outside the cell* checkbox switches it on and off.
+
+Four rules, each of which stops it running away:
+
+| Rule | Why |
+|---|---|
+| **covalent bonds only** | Every one of MOF-5's 24 cross-face bonds is a covalent C–C inside a linker; every one of rock salt's is ionic. Following coordination bonds turned a 9-atom NaCl cell into 59 and said nothing new — and a coordination bond is where a framework is *meant* to be cut (round 38) |
+| **finite fragments only** | A lattice or a covalent polymer is infinite; every shell you draw looks as unfinished as the last. The explicit round-35 *exterior* search still works on those — that is a deliberate "show me one more shell", not an automatic fix |
+| **whole molecules** | Half a five-ring is not a thing that exists. Turn it off in the card for the cheaper single-atom closure |
+| **de-duplicate by position** | An image landing on an atom that is already drawn is a duplicate. Without this a structure carrying 777 boundary copies grew to 6389 atoms |
+
+## Chemistry filters (round 38)
+Three things a distance rule cannot know, applied at import and reported in
+the status bar and on the ❖ page. **Every refusal is stated** — a silently
+dropped atom is indistinguishable from a bug.
+
+| Filter | What it does | Why |
+|---|---|---|
+| **Bond kinds** | A bond between a metal and a non-metal is a **coordination** bond (`bonding.bond_kind`). Metal–metal stays covalent | It is where a framework gets cut into molecules. MIL-53's single 152-atom infinite component becomes 8 linkers + 8 OH bridges + 8 waters + 8 Al, all finite and completable at the cell boundary — which is how Mercury knows to stop after the carboxylate. The cut is applied **only to components that are actually infinite**, so ferrocene is never dissected |
+| **Valence sanity** | Bonds shorter than 0.65 × the covalent radii are impossible and go; bonds past an element's covalent valence go **longest first**. Coordination bonds are exempt from the cap | HpPyBz_th.cif's 0.75 Å C···C fused four molecules into a chain that percolated, so the whole cell read as a framework. On MIL-53-lp: 80 carbons over valence → 0, 384 bonds → 264. A chloride bridging three metals is ordinary and must survive |
+| **Occupancy / disorder** | `_atom_site_occupancy` and the disorder GROUP columns are read and applied. Settings ▸ **CIF disorder**: *Resolve superimposed alternatives* (default), *Only the major component* (drops < 50%), *Draw every alternative* (the raw file) | A disordered CIF lists every alternative, and drawing them together superimposes atoms that are never present at once. Resolution runs on the EXPANDED atoms, because alternatives are routinely symmetry images of one another. A **lone** partial site is never dropped — it is a real partial site, and a half-occupied atom on a special position is a special position |
 
 ## Settings
 **Pointing device (auto / trackpad / mouse)**, rotation sensitivity,
 Shift-drag precision factor, **sphere size** (scales every atom radius,
 updates live — only the instance buffers are rebuilt), **atom label size**,
 **undo history depth (default 30)**, **adjust hydrogens when editing**,
-startup maximized/windowed, render resolution and smoothness.
+**CIF disorder policy**, startup maximized/windowed, render resolution and
+smoothness.
 
 Atom labels are sized from each atom's on-screen RADIUS (so they track zoom)
 and only squeezed when the text would overhang the sphere — every label in a

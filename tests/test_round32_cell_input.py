@@ -141,8 +141,20 @@ def test_periodicity_is_detected_even_in_a_two_atom_cell():
     so rock salt looked finite. It bonds to its own lattice image, which is
     what actually makes it a lattice."""
     data = cif.parse_cif(PRIMITIVE_NACL)
-    info = cif.fragment_info(list(data.symbols), data.frac, data.cell)
+    info = cif.fragment_info(list(data.symbols), data.frac, data.cell,
+                             split_coordination=False)
     assert info and all(periodic for _g, periodic in info)
+
+
+def test_an_ionic_lattice_is_cut_into_ions_not_left_infinite():
+    """Round 38: Na-Cl is a COORDINATION bond, so the lattice is cut there
+    and each ion becomes its own finite fragment. The boundary output is
+    unchanged — a one-atom fragment completes exactly like the per-atom rule
+    it replaces — but now for the right reason, and the same cut is what makes
+    a MOF's linkers finite."""
+    data = cif.parse_cif(PRIMITIVE_NACL)
+    info = cif.fragment_info(list(data.symbols), data.frac, data.cell)
+    assert [sorted(g) for g, _p in info] == [[0], [1]]
 
 
 def test_a_real_molecule_is_not_called_periodic():
@@ -343,7 +355,11 @@ def test_adding_a_symmetry_modifier_changes_something(win, tmp_path):
     obj = _open_nacl(win, tmp_path)
     assert obj.structure.n_atoms == 9            # the drawn cell
     win.on_add_modifier("symmetry")
-    assert len(obj.modifiers) == 1
+    # by KIND, not by index: a crystal whose bonds cross the cell faces also
+    # carries a boundary modifier (round 39), and it is kept LAST.
+    syms = [m for m in obj.modifiers if getattr(m, "kind", "") == "symmetry"]
+    assert len(syms) == 1
+    assert getattr(obj.modifiers[-1], "kind", "") in ("symmetry", "boundary")
     assert obj.structure.n_atoms == 2            # base = the asymmetric unit
     assert len(obj.evaluated()[0]) == 9          # what gets drawn/exported
 
@@ -355,7 +371,11 @@ def test_a_plain_molecule_can_take_a_symmetry_modifier(win):
     for exactly the job it is most instructive for."""
     obj = win.scene.objects[0]
     win.on_add_modifier("symmetry")
-    assert len(obj.modifiers) == 1
+    # by KIND, not by index: a crystal whose bonds cross the cell faces also
+    # carries a boundary modifier (round 39), and it is kept LAST.
+    syms = [m for m in obj.modifiers if getattr(m, "kind", "") == "symmetry"]
+    assert len(syms) == 1
+    assert getattr(obj.modifiers[-1], "kind", "") in ("symmetry", "boundary")
     mod = obj.modifiers[0]
     assert mod.symops == ["x,y,z"]               # identity to start from
     assert mod.cell["a"] > 0.0                   # a box was invented for it
@@ -392,7 +412,7 @@ def test_a_molecule_on_the_cell_origin_would_map_onto_itself(win):
 def test_a_crystal_still_uses_its_own_cell(win, tmp_path):
     obj = _open_nacl(win, tmp_path)
     win.on_add_modifier("symmetry")
-    mod = obj.modifiers[0]
+    mod = [m for m in obj.modifiers if getattr(m, "kind", "") == "symmetry"][0]
     assert len(mod.symops) == 4                  # the file's operations
     assert mod.cell["a"] == pytest.approx(2.86)
     assert np.allclose(mod.origin, np.zeros(3))  # the CIF's own frame
@@ -403,7 +423,8 @@ def test_the_symmetry_card_is_not_blank(win, tmp_path):
     win.properties.setVisible(True)
     win.on_add_modifier("symmetry")
     win._sync_modifier_page()
-    mod = win._active_obj().modifiers[0]
+    mod = [m for m in win._active_obj().modifiers
+           if getattr(m, "kind", "") == "symmetry"][0]
     assert "ops" in win.modifier_page._summary(mod)
 
 

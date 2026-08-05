@@ -11,7 +11,14 @@ Tier order:
   pasted SMILES / InChI   -> RDKit (offline)
   IUPAC name              -> OPSIN web service   (handles novel names PubChem lacks)
   trade/common name, CAS  -> PubChem PUG-REST
+  still nothing           -> NIH CACTUS resolver (a different index again)
   miss                    -> PubChem autocomplete ("did you mean ...")
+
+**A dead tier costs you a tier, not the answer.** Every hop is wrapped so an
+unreachable service falls through to the next one and is reported as a NOTE on
+whatever does answer. That is the whole point of a cascade, and it was broken
+for OPSIN until round 37: `opsin.ch.cam.ac.uk` going quiet made every
+import-by-name fail outright, even for names PubChem knows perfectly well.
 
 Every web result records provenance (source + retrieval date). The SMILES is
 RDKit-sanitised and salt-stripped to one fragment (QM wants a single molecule,
@@ -32,7 +39,15 @@ from typing import List, Optional
 
 OPSIN_URL = "https://opsin.ch.cam.ac.uk/opsin/{}.smi"
 PUBCHEM = "https://pubchem.ncbi.nlm.nih.gov/rest"
+#: NIH's Chemical Identifier Resolver. A third INDEPENDENT index — it knows
+#: trade names, CAS numbers and systematic names, and it is neither Cambridge
+#: nor NCBI, so it is unlikely to be down at the same time as either.
+CACTUS_URL = "https://cactus.nci.nih.gov/chemical/structure/{}/smiles"
 TIMEOUT = 12
+#: OPSIN is tier ONE for a name and it is a small academic service that is
+#: sometimes slow or down. Waiting the full timeout before even trying PubChem
+#: makes a working lookup feel broken, so its own attempt is kept short.
+OPSIN_TIMEOUT = 6
 
 _INCHI = re.compile(r"^InChI=", re.I)
 _INCHIKEY = re.compile(r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$")
@@ -77,7 +92,16 @@ class Resolution:
 def _http_get(url, timeout=TIMEOUT):
     """Return (status_code, body_text). Raises urllib.error.URLError with no network.
     HTTP errors (404 etc.) are returned as (code, body), not raised, so callers
-    can branch on them."""
+    can branch on them.
+
+    Every other failure is re-raised AS `URLError` on purpose. A read that
+    times out raises a bare `TimeoutError` (socket.timeout) rather than a
+    URLError, and an SSL failure raises `ssl.SSLError` — both are `OSError`
+    subclasses that sail straight through `except urllib.error.URLError` and
+    out of the resolver, where every caller in this module is written to
+    expect one exception type. One place to normalise beats five places to
+    remember.
+    """
     req = urllib.request.Request(
         url, headers={"User-Agent": "molom-resolver/1.0",
                       "Accept": "application/json, text/plain, */*"})
@@ -89,10 +113,50 @@ def _http_get(url, timeout=TIMEOUT):
             return e.code, e.read().decode("utf-8", "replace")
         except Exception:
             return e.code, ""
+    except urllib.error.URLError:
+        raise
+    except OSError as e:                      # TimeoutError, SSLError, ...
+        raise urllib.error.URLError(
+            "timed out after {}s".format(timeout)
+            if isinstance(e, TimeoutError) else e)
 
 
 def _reason(e):
     return getattr(e, "reason", e)
+
+
+# ------------------------------------------------------- circuit breaker
+#: A service that just timed out will almost certainly time out again, and
+#: paying `OPSIN_TIMEOUT` seconds per lookup to re-learn that makes the whole
+#: feature feel broken even though it works. So a failure is remembered and
+#: that tier is SKIPPED for a while — the first lookup after an outage starts
+#: is slow, the rest are not, and it heals by itself.
+DOWN_FOR = 600.0            # seconds
+_DOWN = {}                  # service -> monotonic time of the failure
+
+
+def reset_service_state():
+    """Forget every recorded outage (tests, and 'try again now')."""
+    _DOWN.clear()
+
+
+def _is_down(service):
+    when = _DOWN.get(service)
+    if when is None:
+        return False
+    import time as _time
+    if _time.monotonic() - when > DOWN_FOR:
+        _DOWN.pop(service, None)
+        return False
+    return True
+
+
+def _mark_down(service, live):
+    """Only a REAL network failure trips the breaker. An injected getter is a
+    test's business and must not leave state behind for the next test."""
+    if live:
+        import time as _time
+        _DOWN[service] = _time.monotonic()
 
 
 # ---------------------------------------------------------------- RDKit (optional)
@@ -227,13 +291,25 @@ def _resolve_inner(q, allow_network, get):
         return Resolution(query=q, error="offline: only SMILES/InChI resolve without internet")
 
     today = datetime.date.today().isoformat()
+    trouble = []          # tiers that were unreachable, for the final message
+    live = get is _http_get
 
     # 1) OPSIN for systematic names (offline-resolver power, over HTTP)
-    if kind == "name":
+    if kind == "name" and not _is_down("opsin"):
+        # Only the REAL getter gets the short timeout; an injected one keeps
+        # the plain `get(url)` contract the tests are written against.
+        opsin_get = get
+        if live:
+            opsin_get = lambda url: _http_get(url, timeout=OPSIN_TIMEOUT)
         try:
-            status, body = get(OPSIN_URL.format(urllib.parse.quote(q)))
+            status, body = opsin_get(OPSIN_URL.format(urllib.parse.quote(q)))
         except urllib.error.URLError as e:
-            return Resolution(query=q, error="couldn't reach OPSIN ({})".format(_reason(e)))
+            # FALL THROUGH to PubChem. This used to return, which made a tier
+            # ONE outage look like total failure — the whole point of a
+            # cascade is that a dead service costs you a tier, not the answer.
+            trouble.append("OPSIN unreachable ({})".format(_reason(e)))
+            _mark_down("opsin", live)
+            status, body = 0, ""
         smi = body.strip()
         if status == 200 and smi and "\n" not in smi:
             return _finish(Resolution(query=q, source="OPSIN web service", retrieved=today), smi)
@@ -244,7 +320,9 @@ def _resolve_inner(q, allow_network, get):
         status, body = get("{}/pug/compound/{}/{}/cids/JSON".format(
             PUBCHEM, namespace, urllib.parse.quote(q)))
     except urllib.error.URLError as e:
-        return Resolution(query=q, error="couldn't reach PubChem ({})".format(_reason(e)))
+        trouble.append("PubChem unreachable ({})".format(_reason(e)))
+        _mark_down("pubchem", live)
+        status, body = 0, ""
     cids = []
     if status == 200:
         try:
@@ -256,16 +334,47 @@ def _resolve_inner(q, allow_network, get):
         smi = _pubchem_smiles(cid, get)
         if smi:
             res = Resolution(query=q, source="PubChem CID {}".format(cid), retrieved=today)
+            notes = list(trouble)
             if len(cids) > 1:
-                res.note = "{} PubChem hits; used first (CID {}). Others: {}".format(
-                    len(cids), cid, ", ".join(str(c) for c in cids[1:6]))
+                notes.append("{} PubChem hits; used first (CID {}). Others: {}".format(
+                    len(cids), cid, ", ".join(str(c) for c in cids[1:6])))
+            if notes:
+                # A tier that fell over is worth SAYING even when the answer
+                # arrived: it explains the pause, and it is the only warning
+                # that a systematic name was matched by search rather than
+                # parsed.
+                res.note = "; ".join(notes)
             return _finish(res, smi)
 
-    # 3) no match -> autocomplete suggestions
+    # 3) NIH CACTUS — a different index, and the tier that saves a SYSTEMATIC
+    # name when OPSIN is down and PubChem's search does not know it.
+    try:
+        if _is_down("cactus"):
+            raise urllib.error.URLError("skipped: it was down a moment ago")
+        status, body = get(CACTUS_URL.format(urllib.parse.quote(q, safe="")))
+    except urllib.error.URLError as e:
+        trouble.append("CACTUS unreachable ({})".format(_reason(e)))
+        _mark_down("cactus", live)
+        status, body = 0, ""
+    if status == 200:
+        smi = (body or "").strip().splitlines()[0].strip() if body.strip() \
+            else ""
+        # It answers a miss with an HTML page, not a 404, so the body has to
+        # be checked for actually being a SMILES.
+        if smi and _SMILES_CHARS.match(smi):
+            res = Resolution(query=q, source="NIH CACTUS resolver",
+                             retrieved=today)
+            if trouble:
+                res.note = "; ".join(trouble)
+            return _finish(res, smi)
+
+    # 4) no match -> autocomplete suggestions
     sugg = _autocomplete(q, get)
     msg = "no match for {!r}".format(q)
     if sugg:
         msg += " - did you mean: " + ", ".join(sugg[:5]) + "?"
+    if trouble:
+        msg += " (" + "; ".join(trouble) + ")"
     return Resolution(query=q, error=msg, candidates=sugg)
 
 
@@ -331,7 +440,8 @@ def check_services(get=None):
             return _http_get(url, timeout=6)
     out = []
     for label, url in (("OPSIN web service", OPSIN_URL.format("benzene")),
-                       ("PubChem PUG-REST", "{}/pug/compound/name/water/cids/JSON".format(PUBCHEM))):
+                       ("PubChem PUG-REST", "{}/pug/compound/name/water/cids/JSON".format(PUBCHEM)),
+                       ("NIH CACTUS resolver", CACTUS_URL.format("benzene"))):
         try:
             status, body = get(url)
             ok = status == 200 and bool((body or "").strip())

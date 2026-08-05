@@ -1,4 +1,5 @@
-"""Bond perception — a faithful port of Avogadro 2's rule.
+"""Bond perception — a faithful port of Avogadro 2's rule, plus the chemistry
+a pure distance rule cannot have.
 
 Source: avogadrolibs `Molecule::perceiveBondsSimple(tolerance=0.45,
 minDistance=0.32)` (avogadro/core/molecule.cpp):
@@ -9,9 +10,28 @@ with two chemistry guards: atoms whose element is He/Ne/Ar/Kr never bond, and
 H-H pairs never bond. Covalent radii <= 0 fall back to 2.0 Angstrom (dummy
 atoms). All perceived bonds are single (order 1) — order assignment is an
 editing/format concern, not a distance one.
+
+**Round 38: distance alone is not enough, and it never was.** Christian's
+argument, which is correct: MOF-5 is infinite through its bonds, benzoic acid
+is fine on distance alone, and HpPyBz breaks because its geometry is not
+physical — so no combination of "how far apart" and "what is connected to
+what" can be robust. Two pieces of chemistry are added here, and a third
+(occupancy) lives in `cif.py`:
+
+* **BOND KINDS.** A bond between a metal and a non-metal is a COORDINATION
+  bond, and that is the logical place to cut a framework into molecules —
+  which is how Mercury knows to stop after the carboxylate rather than
+  following Zn-O-Zn forever. It is derived from the element pair rather than
+  stored, so it cannot go stale, cannot be lost by an edit, and needs no
+  reindexing when atoms are deleted.
+* **VALENCE SANITY.** A carbon with nine neighbours is not a carbon with nine
+  neighbours; it is a file with a problem. Bonds that push an atom past a
+  possible coordination number are dropped LONGEST FIRST, and bonds far
+  shorter than any real one are dropped outright. Both apply to the covalent
+  bonds only: a chloride bridging three metals is perfectly ordinary.
 """
 
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -20,6 +40,142 @@ from . import elements
 TOLERANCE = 0.45       # Angstrom, Avogadro default
 MIN_DISTANCE = 0.32    # Angstrom, Avogadro default
 _NOBLE = frozenset((2, 10, 18, 36))   # He, Ne, Ar, Kr
+
+# ------------------------------------------------------------------- kinds
+#: What a bond IS, as opposed to how long it is.
+COVALENT = "covalent"
+#: Metal-to-non-metal. Ionic contacts (Na-Cl) land here too: the distinction
+#: matters to a chemist but not to the one decision that hangs off this —
+#: "does this link hold a molecule together?" — where both answer no.
+COORDINATION = "coordination"
+
+#: Everything that is NOT a metal. The d/f block plus Al/Ga/In/Sn/Pb/Bi and
+#: friends are metals; this is the canonical list for the whole package
+#: (`polyhedra.is_metal` delegates here).
+NON_METALS = frozenset(
+    "H He B C N O F Ne Si P S Cl Ar As Se Br Kr Te I Xe At Rn".split())
+
+
+def is_metal(symbol):
+    # type: (str) -> bool
+    z = elements.atomic_number(symbol)
+    if z <= 0:
+        return False
+    return elements.symbol(z) not in NON_METALS and z > 2
+
+
+def bond_kind(symbol_i, symbol_j):
+    # type: (str, str) -> str
+    """COVALENT or COORDINATION, from the element pair alone.
+
+    Metal-to-metal stays COVALENT on purpose: a Re-Re quadruple bond is a real
+    covalent bond, and more practically an SBU (a Zn4O cluster, a paddlewheel)
+    is ONE node of a framework and must not be dissected into loose atoms.
+    Exactly one metal in the pair is what makes a bond the framework's weak
+    link — and the place a chemist would cut it.
+    """
+    a, b = is_metal(symbol_i), is_metal(symbol_j)
+    return COORDINATION if (a != b) else COVALENT
+
+
+def classify_bonds(symbols, bonds):
+    # type: (List[str], List[tuple]) -> List[str]
+    """Kind per bond, parallel to `bonds`."""
+    return [bond_kind(symbols[int(b[0])], symbols[int(b[1])]) for b in bonds]
+
+
+def covalent_bonds(symbols, bonds):
+    # type: (List[str], List[tuple]) -> List[tuple]
+    """Just the covalent ones — the connectivity that defines a MOLECULE.
+
+    Walking THIS graph instead of the full one is what makes a framework
+    finite: MIL-53's 152-atom periodic component becomes 8 BDC linkers, 8
+    hydroxide bridges, 8 waters and 8 aluminium centres, every one of them a
+    finite fragment that can be completed at the cell boundary.
+    """
+    return [b for b in bonds
+            if bond_kind(symbols[int(b[0])], symbols[int(b[1])]) == COVALENT]
+
+
+# ---------------------------------------------------------- valence sanity
+#: Maximum number of COVALENT bonds, by atomic number. Deliberately generous —
+#: this is a test for the IMPOSSIBLE, not for the unusual, so hypervalent
+#: phosphorus (PF5) and sulfur (SF6) are allowed and only chemistry that
+#: cannot exist is refused. Anything absent is uncapped, which includes every
+#: metal: a metal's high coordination number is real, and its bonds are
+#: COORDINATION bonds that this never looks at anyway.
+MAX_COVALENT = {
+    1: 1,                                     # H  (see _cap_hydrogens)
+    5: 4, 6: 4, 7: 4, 8: 3, 9: 1,             # B  C  N  O  F
+    14: 4, 15: 5, 16: 6, 17: 4,               # Si P  S  Cl (perchlorate)
+    33: 5, 34: 6, 35: 4, 52: 6, 53: 6,        # As Se Br Te I
+}
+
+#: A bond shorter than this FRACTION of the two covalent radii is not a bond,
+#: whatever the distance test says. Calibrated against the shortest real
+#: bonds: with Pyykko radii a C#C triple bond sits at ratio 0.80, C#O at 0.82,
+#: an X-ray riding C-H at 0.87 — while HpPyBz_th.cif's spurious contact is a
+#: 0.75 A C...C, ratio 0.50. 0.65 sits in the gap with room on both sides.
+IMPOSSIBLE_FACTOR = 0.65
+
+
+def prune_pairs(symbols, pairs, distances, impossible=True, valence=True):
+    # type: (List[str], List[tuple], np.ndarray, bool, bool) -> Tuple[List[int], List[tuple]]
+    """Which of these candidate bonds survive the chemistry.
+
+    Returns `(keep_indices, dropped)`, where `dropped` is
+    `[(i, j, distance, reason), ...]` so the caller can SAY what it threw
+    away — a bond quietly disappearing is worse than a bond wrongly drawn.
+
+    Takes explicit distances because the two callers measure differently:
+    `perceive_bonds` uses straight lines and `cif.periodic_neighbours` uses
+    the minimum image. The chemistry is identical; only the metric differs.
+    """
+    n = len(symbols)
+    radii = covalent_radii(symbols)
+    dropped = []
+    alive = [True] * len(pairs)
+    order = np.argsort(-np.asarray(distances, dtype=float)) \
+        if len(pairs) else []
+    if impossible:
+        for k, (i, j) in enumerate(pairs):
+            if not (0 <= i < n and 0 <= j < n):
+                alive[k] = False
+                continue
+            floor = IMPOSSIBLE_FACTOR * (radii[i] + radii[j])
+            if float(distances[k]) < floor:
+                alive[k] = False
+                dropped.append((int(i), int(j), float(distances[k]),
+                                "impossibly short"))
+    if valence:
+        # Longest first: an over-coordinated atom keeps its SHORTEST bonds,
+        # which are the ones a real structure would have.
+        degree = {}                       # atom -> covalent bonds still alive
+        for k, (i, j) in enumerate(pairs):
+            if not alive[k]:
+                continue
+            if bond_kind(symbols[i], symbols[j]) != COVALENT:
+                continue
+            degree[i] = degree.get(i, 0) + 1
+            degree[j] = degree.get(j, 0) + 1
+        for k in order:
+            if not alive[k]:
+                continue
+            i, j = pairs[k]
+            if bond_kind(symbols[i], symbols[j]) != COVALENT:
+                continue
+            cap_i = MAX_COVALENT.get(elements.atomic_number(symbols[i]))
+            cap_j = MAX_COVALENT.get(elements.atomic_number(symbols[j]))
+            over = ((cap_i is not None and degree.get(i, 0) > cap_i)
+                    or (cap_j is not None and degree.get(j, 0) > cap_j))
+            if not over:
+                continue
+            alive[k] = False
+            degree[i] -= 1
+            degree[j] -= 1
+            dropped.append((int(i), int(j), float(distances[k]),
+                            "over the covalent valence"))
+    return [k for k, ok in enumerate(alive) if ok], dropped
 
 # Pairs per numpy block in the O(N^2) sweep — bounds peak memory (~3 float64
 # arrays of this length) while keeping the vectorised inner loop long.
@@ -34,14 +190,19 @@ def covalent_radii(symbols):
     r[r <= 0.0] = 2.0
     return r
 
-def perceive_bonds(symbols, coords, tolerance=TOLERANCE, min_distance=MIN_DISTANCE):
-    # type: (List[str], np.ndarray, float, float) -> List[Tuple[int, int, int]]
+def perceive_bonds(symbols, coords, tolerance=TOLERANCE,
+                   min_distance=MIN_DISTANCE, sanity=True, report=None):
+    # type: (List[str], np.ndarray, float, float, bool, Optional[dict]) -> List[Tuple[int, int, int]]
     """Perceive bonds from geometry. Returns [(i, j, 1), ...] with i < j.
 
     Vectorised numpy over all unique pairs, processed in blocks so a large
     molecule doesn't allocate an N^2 matrix at once. For the sizes a molecule
     builder edits (10^2..10^4 atoms) this is comfortably fast without a
     spatial index.
+
+    `sanity` applies the chemistry on top of the distance rule (see the module
+    docstring): impossibly short contacts and over-valence bonds are dropped.
+    Pass a dict as `report` to be told what went, and why.
     """
     n = len(symbols)
     if n < 2:
@@ -54,6 +215,7 @@ def perceive_bonds(symbols, coords, tolerance=TOLERANCE, min_distance=MIN_DISTAN
 
     ii, jj = np.triu_indices(n, k=1)
     bonds = []  # type: List[Tuple[int, int, int]]
+    dists = []  # type: List[float]
     min_sq = float(min_distance) ** 2
     for s in range(0, ii.size, _BLOCK):
         bi = ii[s:s + _BLOCK]
@@ -64,8 +226,15 @@ def perceive_bonds(symbols, coords, tolerance=TOLERANCE, min_distance=MIN_DISTAN
         ok = (d2 < cutoff * cutoff) & (d2 > min_sq)
         ok &= ~(noble[bi] | noble[bj])          # noble gases never auto-bond
         ok &= ~(hydrogen[bi] & hydrogen[bj])    # no H-H bonds
-        for a, b in zip(bi[ok], bj[ok]):
+        for a, b, d in zip(bi[ok], bj[ok], np.sqrt(d2[ok])):
             bonds.append((int(a), int(b), 1))
+            dists.append(float(d))
+    if sanity and bonds:
+        keep, dropped = prune_pairs(symbols, [(i, j) for i, j, _o in bonds],
+                                    np.asarray(dists))
+        if report is not None:
+            report.setdefault("dropped_bonds", []).extend(dropped)
+        bonds = [bonds[k] for k in keep]
     return _cap_hydrogens(bonds, xyz, hydrogen)
 
 
@@ -114,8 +283,9 @@ def _cap_hydrogens(bonds, xyz, hydrogen):
 
 
 def perceive_structure_bonds(structure, tolerance=TOLERANCE,
-                             min_distance=MIN_DISTANCE, keep_orders=True):
-    # type: (object, float, float, bool) -> None
+                             min_distance=MIN_DISTANCE, keep_orders=True,
+                             report=None):
+    # type: (object, float, float, bool, Optional[dict]) -> None
     """Re-perceive `structure.bonds` in place from the current frame.
 
     With keep_orders=True (default), a re-perceived bond that already existed
@@ -129,7 +299,8 @@ def perceive_structure_bonds(structure, tolerance=TOLERANCE,
     """
     old = {(i, j): o for i, j, o in structure.bonds} if keep_orders else {}
     fresh = perceive_bonds(structure.symbols, structure.coords,
-                           tolerance=tolerance, min_distance=min_distance)
+                           tolerance=tolerance, min_distance=min_distance,
+                           report=report)
     structure.bonds = [(i, j, old.get((i, j), 1)) for i, j, _ in fresh]
 
 

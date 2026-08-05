@@ -56,6 +56,7 @@ class ModifierPage(QWidget):
         self.add_combo = QComboBox()
         self.add_combo.addItem("Array", "array")
         self.add_combo.addItem("Symmetry (CIF)", "symmetry")
+        self.add_combo.addItem("Boundary bonds", "boundary")
         self.add_combo.setMaximumWidth(120)
         add_btn = QPushButton("+ Add")
         add_btn.setMaximumWidth(70)
@@ -188,6 +189,37 @@ class ModifierPage(QWidget):
                 lambda v, m=mod, s=summary:
                 self._set(m, "relative", bool(v), s))
             form.addRow("", rel)
+        elif getattr(mod, "kind", "") == "boundary":
+            note = QLabel(
+                "Bond perception measures straight lines, so a bond whose "
+                "partner sits in the next cell is not drawn and a framework "
+                "comes out severed at every face. This adds the periodic "
+                "image at the far end of each such bond. The molecule itself "
+                "is untouched — it stays the cell contents.")
+            note.setWordWrap(True)
+            note.setStyleSheet("color: rgba(200,200,200,150);")
+            form.addRow(note)
+            whole = QCheckBox("whole molecules")
+            whole.setChecked(bool(getattr(mod, "whole_molecules", True)))
+            whole.setToolTip(
+                "Bring the WHOLE molecule on the far side of a cut bond "
+                "(half an imidazolate ring is not a thing that exists). "
+                "Off closes each bond with the single atom that completes "
+                "it, which draws far fewer atoms.")
+            whole.toggled.connect(
+                lambda v, m=mod, s=summary:
+                self._set(m, "whole_molecules", bool(v), s))
+            form.addRow("", whole)
+            shells = QSpinBox()
+            shells.setRange(1, 4)
+            shells.setValue(int(getattr(mod, "shells", 1)))
+            shells.setMaximumWidth(60)
+            shells.setToolTip(
+                "Only used with 'whole molecules' off: how far to follow the "
+                "bonds out. 1 closes every bond that crosses a face.")
+            shells.valueChanged.connect(
+                lambda v, m=mod, s=summary: self._set(m, "shells", int(v), s))
+            form.addRow("Shells:", shells)
         elif getattr(mod, "kind", "") == "symmetry":
             # Without these the card is a bare title with an arrow that opens
             # onto nothing, which reads as a modifier that did not work.
@@ -360,6 +392,11 @@ class ModifierPage(QWidget):
             block = "" if max(mod.na, mod.nb, mod.nc) <= 1 else \
                 "  {}x{}x{}".format(mod.na, mod.nb, mod.nc)
             return "{} ops{}".format(len(mod.symops), block)
+        if kind == "boundary":
+            return ("close bonds across faces, whole molecules"
+                    if getattr(mod, "whole_molecules", True)
+                    else "close bonds across faces, {} shell(s)".format(
+                        int(getattr(mod, "shells", 1))))
         return ""
 
     def _toggle(self, body, arrow):
@@ -566,7 +603,7 @@ class CrystalPage(QWidget):
                                self.nc.value())
 
     def set_cell(self, cell, spacegroup="", n_asym=0, n_atoms=0, mode="cell",
-                 name="", exterior=0):
+                 name="", exterior=0, chemistry=""):
         """Refresh from the active molecule.
 
         `cell=None` greys every CONTROL but leaves the page itself readable —
@@ -597,9 +634,13 @@ class CrystalPage(QWidget):
             "a = {:.4f}  b = {:.4f}  c = {:.4f} A\n"
             "alpha = {:.2f}  beta = {:.2f}  gamma = {:.2f}\n"
             "Space group: {}\nAsymmetric unit: {} site(s)\n"
-            "Showing: {} atoms".format(
+            "Showing: {} atoms{}".format(
                 cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma,
-                spacegroup or "not stated", n_asym, n_atoms))
+                spacegroup or "not stated", n_asym, n_atoms,
+                # What the reader REFUSED to draw. A silently dropped atom or
+                # bond is indistinguishable from a bug, and this page is where
+                # someone comes to ask why the cell looks like that.
+                "\n" + chemistry if chemistry else ""))
         chosen = {"asym": self.asym_radio,
                   "packing": self.pack_radio}.get(mode, self.cell_radio)
         self._loading = True
