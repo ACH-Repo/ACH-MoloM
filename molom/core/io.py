@@ -756,6 +756,14 @@ def _read_cif(path, disorder=None):
         "asym_symbols": list(data.symbols),
         "asym_frac": [[float(v) for v in row] for row in data.frac],
         "asym_occupancy": [float(o) for o in data.occupancy],
+        # The disorder GROUP and ASSEMBLY labels, alongside the occupancies
+        # and for exactly the same reason: `resolve_disorder` uses them in
+        # preference to geometric overlap, so a rebuild without them resolves
+        # a DIFFERENT structure from the one just imported. Stored as strings
+        # so they survive the JSON savepoint unchanged.
+        "asym_disorder_groups": [str(g) for g in data.disorder_groups],
+        "asym_disorder_assemblies": [str(a)
+                                     for a in data.disorder_assemblies],
         "disorder_policy": disorder,
         # Where `symops` came from. "file" is the file's own loop; anything
         # else means the reader derived them from the named group, and

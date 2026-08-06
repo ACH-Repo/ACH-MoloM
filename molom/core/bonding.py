@@ -242,7 +242,9 @@ def perceive_bonds(symbols, coords, tolerance=TOLERANCE,
 
     `sanity` applies the chemistry on top of the distance rule (see the module
     docstring): impossibly short contacts and over-valence bonds are dropped.
-    Pass a dict as `report` to be told what went, and why.
+    Pass a dict as `report` to be told what went, and why — `dropped_bonds`
+    explains each refusal, and `refused` is the same set as a drawable pair
+    list, for the round-43 visualisation override (see `_refused_display`).
     """
     n = len(symbols)
     if n < 2:
@@ -272,10 +274,65 @@ def perceive_bonds(symbols, coords, tolerance=TOLERANCE,
     if sanity and bonds:
         keep, dropped = prune_pairs(symbols, [(i, j) for i, j, _o in bonds],
                                     np.asarray(dists))
+        kept = [bonds[k] for k in keep]
         if report is not None:
             report.setdefault("dropped_bonds", []).extend(dropped)
-        bonds = [bonds[k] for k in keep]
+            if dropped:
+                report["refused"] = _refused_display(bonds, kept, xyz,
+                                                     hydrogen)
+        bonds = kept
     return _cap_hydrogens(bonds, xyz, hydrogen)
+
+
+def _refused_display(candidates, kept, xyz, hydrogen):
+    # type: (List[tuple], List[tuple], np.ndarray, np.ndarray) -> List[tuple]
+    """The bonds the chemistry refused, as a list something can DRAW.
+
+    Round 43, for the visualisation override. MoloM's rule is that only a real
+    bond is drawn as a bond, and that rule stays — but on a wholly disordered
+    structure it hides the shape of the thing entirely. Christian's
+    `2240539.cif` is a plastic crystal, one molecule smeared over 192
+    operations of Fm-3m: 752 contacts pass the distance test, `prune_pairs`
+    refuses 528 of them (432 over-valence, 96 impossibly short), and what is
+    left is 77 components of about five atoms — a cloud of spheres where VESTA
+    shows four solid cages.
+
+    Note what this is NOT: the difference between the sane list and the raw
+    candidates. The HYDROGEN CAP still applies, because a hydrogen drawn with
+    five sticks is never a picture worth having (round 35b), and it is free to
+    keep: capped and uncapped give the SAME four 70-atom components on that
+    file (368 sticks against 752). So the override restores every bond the
+    CHEMISTRY filters refused and none of the ones the cap refused.
+    """
+    final = _cap_hydrogens(list(kept), xyz, hydrogen)
+    have = {(int(i), int(j)) for i, j, _o in final}
+    # Which hydrogens already have their one stick. Capping the refused list
+    # against the KEPT list, rather than capping the two separately and taking
+    # the union, is the whole subtlety here: a hydrogen's nearest neighbour
+    # among ALL candidates is often one of the impossibly short contacts, so
+    # two independent caps choose two different partners and the union hands
+    # that hydrogen two sticks. Measured on 2240539.cif: 240 refused bonds
+    # that way against 144 this way, and 96 double-bonded hydrogens.
+    bonded_h = set()
+    for i, j, _o in final:
+        for a in (i, j):
+            if hydrogen[a]:
+                bonded_h.add(int(a))
+    rest = []
+    for i, j, _o in candidates:
+        if (int(i), int(j)) in have:
+            continue
+        d = float(np.linalg.norm(np.asarray(xyz[i]) - np.asarray(xyz[j])))
+        rest.append((d, int(i), int(j)))
+    rest.sort()                       # nearest first: an unbonded hydrogen
+    out = []                          # keeps its closest partner, as the cap
+    for _d, i, j in rest:             # would have chosen
+        hs = [a for a in (i, j) if hydrogen[a]]
+        if any(a in bonded_h for a in hs):
+            continue
+        out.append((i, j))
+        bonded_h.update(hs)
+    return out
 
 
 def _cap_hydrogens(bonds, xyz, hydrogen):

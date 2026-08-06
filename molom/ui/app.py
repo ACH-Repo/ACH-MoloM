@@ -26,6 +26,8 @@ from ..core import modifiers as modifiers_mod
 from ..core import (bonding, edits, input_map, internal, io, measure, project,
                     rotations)
 from ..core import cif as cif_mod
+from ..core import coplanar
+from ..core import spacegroups
 from ..core import templates as tpl_mod
 from ..core import vibrations as vib_mod
 from ..core import timeline as timeline_mod
@@ -106,6 +108,13 @@ class MainWindow(QMainWindow):
         self.project_path = None         # type: Optional[str]  (.molom)
         self._local_view = None          # {obj_id: visible} while isolated
         self._pending_suppress = False   # merge the next push into this one
+        #: (obj_id, pose) captured when an edit STARTS. An edit is not a rigid
+        #: motion, so the Kabsch fit that recovers a crystal's orientation
+        #: absorbs part of it as a spurious rotation — which then drifts the
+        #: drawn cell box and corrupts the fractional coordinates written back
+        #: to the asymmetric unit. The pose before the atoms moved is the
+        #: trustworthy one.
+        self._pose_before_edit = None
         self._last_push_suppressed = False
         self._repeat_macro = None        # {"delta"} after D + move
         self._macro_serial = -1          # viewport transform_serial it came from
@@ -136,7 +145,7 @@ class MainWindow(QMainWindow):
         self.viewport.origin_active_changed.connect(
             lambda _on: self._sync_transform_panel())
         # Undo hooks: modals + anchored-rotation gestures snapshot through us.
-        self.viewport.on_model_edit_begin = self.push_undo
+        self.viewport.on_model_edit_begin = self.begin_model_edit
         self.viewport.on_model_edit_cancel = self._on_model_edit_cancel
         self.viewport.on_align_key = self._on_align_key
         self.viewport.on_align_confirm = self._on_align_confirm
@@ -248,6 +257,8 @@ class MainWindow(QMainWindow):
         self.crystal_page.box_toggled.connect(self._set_cell_box)
         self.crystal_page.poly_check.toggled.connect(
             lambda on: self._set_obj_flag("polyhedra", on))
+        self.crystal_page.refused_toggled.connect(
+            lambda on: self._set_obj_flag("show_refused_bonds", on))
         self.crystal_page.sym_check.toggled.connect(
             lambda on: self._set_obj_flag("show_symmetry", on))
         self.crystal_page.ghost_check.toggled.connect(
@@ -656,6 +667,21 @@ class MainWindow(QMainWindow):
           lambda c: c.on_crystal_packing(), enabled=has_cell,
           category="Crystal", aliases=("cif", "supercell", "lattice",
                                        "repeat"))
+        r("make_coplanar",
+          "Make the selected substituent coplanar with its ring",
+          lambda c: c.on_make_coplanar(), enabled=sel, category="Edit",
+          aliases=("flat", "planar", "coplanar", "imidazolate", "ring",
+                   "flatten", "substituent", "sp2", "conjugation"))
+        r("crystal_edit_asym",
+          "Crystal: edit the asymmetric unit (cell follows the symmetry)",
+          lambda c: c.on_edit_asymmetric_unit(), enabled=has_cell,
+          category="Crystal", aliases=("cif", "symmetry", "asymmetric",
+                                       "propagate", "repeat", "space group"))
+        r("crystal_resymmetrise",
+          "Crystal: re-derive the space group from the coordinates",
+          lambda c: c.on_reevaluate_symmetry(), enabled=has_cell,
+          category="Crystal", aliases=("cif", "symmetry", "space group",
+                                       "spglib", "triclinic", "P1"))
         r("cell_info", "Unit cell: report cell parameters and space group",
           lambda c: c.on_cell_info(),
           enabled=lambda c: c._active_cell() is not None,
@@ -955,9 +981,136 @@ class MainWindow(QMainWindow):
                 self._macro_serial = serial
         elif serial != self._macro_serial:
             self._repeat_macro = None      # a plain transform superseded it
+        # An edit to a crystal's FULL CELL breaks the symmetry the file
+        # declared, so the operators are re-derived from where the atoms now
+        # are (round 43d). Skipped entirely when a symmetry modifier owns the
+        # expansion — there the base is the asymmetric unit and the operators
+        # still hold, which is the whole point of editing that way.
+        self._reevaluate_edited_crystal()
         self._update_counts()
         self._on_selection_changed(self.viewport.selection)
         self._sync_transform_panel()
+
+    def base_is_asymmetric_unit(self, obj):
+        # type: (object) -> bool
+        """Whether this object's ATOMS are the asymmetric unit, not the cell.
+
+        Two ways to be in that state and they must be treated alike, which is
+        what round 43d got wrong: a `SymmetryModifier` on the stack (the F3
+        route), or the ❖ page's own "Asymmetric unit only" radio, which
+        rebuilds the base and adds no modifier at all. Christian used the
+        radio, so the modifier-only test never fired.
+        """
+        meta = getattr(obj.structure, "metadata", None) or {}
+        if any(getattr(m, "kind", "") == "symmetry"
+               for m in getattr(obj, "modifiers", None) or ()):
+            return True
+        return str(meta.get("cell_view", "cell")) == "asym"
+
+    def _reevaluate_edited_crystal(self):
+        """After an edit: keep the asymmetric unit, or re-derive the cell."""
+        obj_id = getattr(self.viewport, "edit_obj_id", None)
+        obj = self.scene.get(obj_id) if obj_id is not None else None
+        if obj is None:
+            obj = self._active_obj()
+        if obj is None or not (obj.structure.metadata or {}).get("symops"):
+            return
+        try:
+            if self.base_is_asymmetric_unit(obj):
+                # NEVER re-derive here. The atoms in front of us are one
+                # asymmetric unit, which by construction has no symmetry among
+                # itself — spglib answers P1, correctly, about the wrong
+                # question, and the file's real group is destroyed. Christian:
+                # "I wanted the reevaluation of the space group to be
+                # restricted to editing the full cell directly."
+                #
+                # It is also the wrong answer chemically: changing one Zn to Co
+                # in the asymmetric unit changes ALL EIGHT of its images
+                # together, so the operators still map the structure onto
+                # itself and the group is untouched.
+                self.sync_asymmetric_unit(obj)
+                return
+            changed = self.reevaluate_symmetry(obj)
+        except Exception:                    # never let this break an edit
+            return
+        if changed:
+            self._sync_crystal_page()
+
+    def sync_asymmetric_unit(self, obj):
+        # type: (object) -> bool
+        """Write an edit to the asymmetric unit back into the metadata.
+
+        Every crystal rebuild regenerates from `asym_symbols`/`asym_frac`, so
+        an edit that does not reach them is discarded the moment anything on
+        the ❖ page is touched — Christian's "switching back to full unit cell
+        doesn't change anything, except that the Co switches back to Zn".
+        This is what makes editing the asymmetric unit PERSISTENT.
+        """
+        s = obj.structure
+        meta = s.metadata
+        cell = cell_of(obj)
+        if cell is None or s.n_atoms == 0:
+            return False
+        # Prefer the pose from BEFORE the edit: measuring it now would read
+        # the atom the user just moved as a rotation of the whole crystal.
+        pose = None
+        remembered = self._pose_before_edit
+        if remembered is not None and remembered[0] == obj.id:
+            pose = remembered[1]
+        else:
+            pose = obj.cell_pose()
+        xyz = np.asarray(s.coords, dtype=float)
+        if pose is not None:
+            rot, shift = pose
+            xyz = (xyz - np.asarray(shift)) @ np.asarray(rot)
+        frac = cell.to_fractional(xyz)
+        meta["asym_symbols"] = list(s.symbols)
+        meta["asym_frac"] = [[float(v) for v in row] for row in frac]
+        # Re-pin against the CELL-frame coordinates, so the next fit returns
+        # this same pose exactly and the error cannot accumulate over a run of
+        # edits. Without this the box creeps a little further with every atom
+        # moved, which is what "a small re-scaling of the unit cell boundary"
+        # looks like from the outside.
+        set_cell_reference(s, xyz)
+        # The parallel columns must stay the same length as the sites they
+        # describe. When atoms have been added or deleted the old values no
+        # longer line up with anything, and a silently mis-indexed occupancy
+        # is worse than none, so they are reset rather than guessed at.
+        n = s.n_atoms
+        for key, fill in (("asym_occupancy", 1.0),
+                          ("asym_disorder_groups", ""),
+                          ("asym_disorder_assemblies", "")):
+            values = meta.get(key)
+            if values is None:
+                continue
+            if len(values) != n:
+                meta[key] = [fill] * n
+        return True
+
+    def begin_model_edit(self):
+        """Undo snapshot, plus the crystal's pose while it can still be read.
+
+        The viewport calls this before it moves any atom. Capturing the pose
+        here rather than after the fact is what keeps a crystal's cell box
+        still during an edit: `cell_pose` is a Kabsch fit against a sample of
+        the atoms, and moving some of those atoms makes the fit report a
+        rotation that nobody performed.
+        """
+        obj = self._edited_crystal()
+        self._pose_before_edit = ((obj.id, obj.cell_pose())
+                                  if obj is not None else None)
+        self.push_undo()
+
+    def _edited_crystal(self):
+        """Whichever crystal an edit is about to touch, or None."""
+        obj_id = getattr(self.viewport, "edit_obj_id", None)
+        obj = self.scene.get(obj_id) if obj_id is not None else None
+        if obj is None:
+            obj = self._active_obj()
+        if obj is None or not (getattr(obj.structure, "metadata", None)
+                               or {}).get("cell"):
+            return None
+        return obj
 
     # ------------------------------------------------------------- undo/redo
     def push_undo(self):
@@ -2276,6 +2429,15 @@ class MainWindow(QMainWindow):
             s.metadata["dropped_bonds"] = [
                 {"i": i, "j": j, "distance": round(d, 3), "reason": why}
                 for i, j, d, why in report["dropped_bonds"]]
+        # The same refusals as a drawable list, for the ❖ page's override
+        # (round 43). Kept even when the tick is off: it costs a few hundred
+        # int pairs, and computing it later would mean re-perceiving bonds
+        # that the user may have edited since.
+        if report.get("refused"):
+            s.metadata["refused_bonds"] = [[int(i), int(j)]
+                                           for i, j in report["refused"]]
+        else:
+            s.metadata.pop("refused_bonds", None)
         bonding.perceive_structure_bond_orders(s)
         # Pin a crystal's cell box to the atoms as imported, so it travels
         # with them under any later transform.
@@ -3796,13 +3958,18 @@ class MainWindow(QMainWindow):
         # The modifier is non-destructive; the search rebuilds the view, so it
         # goes through the same path the asym/cell/packing switch uses and
         # cannot drift from it.
+        # The MODIFIER is deliberately NOT touched here (round 43c). It closes
+        # bonds that cross a cell face, which is a correctness fix a framework
+        # needs whether or not anyone wants the neighbouring molecules drawn —
+        # round 39 added it at import for exactly that reason. Driving it from
+        # this checkbox conflated the two: `_autoclose_boundary` sets
+        # `cell_exterior = 1` at import while showing NO shell, so the first
+        # untick disabled a modifier that was never the user's doing and the
+        # picture lost atoms it had been showing since it opened. The modifier
+        # remains on the Modifiers page, where it can be switched off on
+        # purpose. This control now means one thing: draw the neighbouring
+        # cells' molecules that reach into this one.
         self.push_undo()
-        mod = self._boundary_modifier(obj)
-        if mod is None:
-            if on:
-                obj.modifiers.append(self._new_boundary_modifier(obj))
-        else:
-            mod.enabled = bool(on)
         self._rebuild_exterior(obj)
         self._sync_modifier_page()
         self.viewport.refresh_geometry()
@@ -3851,17 +4018,19 @@ class MainWindow(QMainWindow):
             # shell, which on a lattice buries the cell (see `expand`).
             exterior=0,
             shell_molecules=bool(meta.get("cell_exterior", 0)),
-            occupancy=meta.get("asym_occupancy"),
             disorder=meta.get("disorder_policy") or self.disorder_policy,
-            report=report)
+            report=report, **self._view_disorder_kwargs(meta))
         if not symbols:
             return
         meta.pop("site_occupancy", None)
         if report.get("site_occupancy"):
             meta["site_occupancy"] = dict(report["site_occupancy"])
         s = obj.structure
+        # Capture the pose BEFORE the atoms are replaced — it is measured
+        # against them.
+        pose = self._rebuild_pose(s)
         s.symbols = list(symbols)
-        s.frames = [np.asarray(coords, dtype=float)]
+        s.frames = [self._apply_rebuild_pose(coords, pose)]
         s.set_frame(0)
         s.bonds = []
         # Per-atom display overrides indexed the OLD atom list.
@@ -3870,7 +4039,300 @@ class MainWindow(QMainWindow):
         obj.atom_label_modes = {}
         obj.atom_hidden, obj.atom_scales = set(), {}
         self._perceive_fresh(s)
+        # ...and re-pin the box against the CELL frame, not the posed atoms.
+        set_cell_reference(s, coords)
         self.viewport.set_selection([])
+
+    def on_make_coplanar(self):
+        """Flatten a substituent into the plane of the ring it hangs off.
+
+        Christian, on building substituted imidazolates: a substituent on an
+        sp2 ring carbon belongs IN the ring plane, and dragging it there by
+        hand is exactly the sort of thing a Cartesian editor is bad at.
+
+        The selection says WHICH GROUP, the same way the rotor does (round
+        36): `torsion_split` takes the smallest fragment containing the
+        selection that hangs off one bond, so picking the substituent's first
+        atom, one of its hydrogens or the whole thing all give the same
+        answer. The group then moves RIGIDLY — two rotations about the ring
+        atom — so no bond length or internal angle changes.
+        """
+        found = self.viewport.internal_picks()
+        if found is None:
+            self.statusBar().showMessage(
+                "Select the substituent to flatten (any atom of it will do)",
+                5000)
+            return
+        obj_id, rows = found
+        obj = self.scene.get(obj_id)
+        if obj is None:
+            return
+        s = obj.structure
+        split = internal.torsion_split(s.n_atoms, s.bonds, rows)
+        if split is None:
+            self.statusBar().showMessage(
+                "No single bond frees that selection — pick a substituent "
+                "hanging off the ring, not a ring atom itself", 6000)
+            return
+        moving, stay, attach = split
+        ring = coplanar.ring_through(stay, s.bonds, s.n_atoms)
+        if not ring:
+            self.statusBar().showMessage(
+                "{} is not in a ring, so there is no plane to be coplanar "
+                "with".format(self.scene.pick_label((obj_id, stay))), 6000)
+            return
+        plane = coplanar.plane_of(s.coords, ring)
+        if plane is None:
+            return
+        point, normal = plane
+        group = sorted(moving)
+        before = coplanar.flatness(s.coords, group, point, normal)
+        self.push_undo()
+        moved = coplanar.make_coplanar(s.coords, group, stay, attach,
+                                       normal=normal, point=point)
+        s.frames[s.current_frame] = moved
+        s.set_frame(s.current_frame)
+        self.viewport.refresh_geometry()
+        after = coplanar.flatness(s.coords, group, point, normal)
+        self.statusBar().showMessage(
+            "Coplanar with the {}-ring: {} atom(s) moved rigidly, out-of-"
+            "plane rms {:.3f} -> {:.3f} A{}".format(
+                len(ring), len(group), before, after,
+                "  (an sp3 group cannot be flat — its attachment is)"
+                if after > 0.05 else ""), 9000)
+
+    def on_edit_asymmetric_unit(self):
+        """F3: hand editing back to the asymmetric unit."""
+        obj = self._active_obj()
+        note = self.enable_symmetry_editing(obj)
+        if not note:
+            self.statusBar().showMessage(
+                "That molecule has no space group to propagate edits with",
+                5000)
+            return
+        self.statusBar().showMessage(
+            "{}: editing the asymmetric unit — {}. The cell is regenerated "
+            "from it, so the space group is kept.".format(obj.name, note),
+            8000)
+
+    def on_reevaluate_symmetry(self):
+        """F3: re-derive the space group, on demand rather than on edit."""
+        obj = self._active_obj()
+        if obj is None:
+            return
+        meta = obj.structure.metadata
+        if self.base_is_asymmetric_unit(obj):
+            self.statusBar().showMessage(
+                "{} is showing its asymmetric unit, whose symmetry is {} by "
+                "construction — switch to the full unit cell to re-derive "
+                "it".format(obj.name, meta.get("spacegroup") or "the group"),
+                7000)
+            return
+        changed = self.reevaluate_symmetry(obj, announce=False)
+        if changed:
+            self._sync_crystal_page()
+            self.statusBar().showMessage(
+                "{}: space group re-derived as {} ({} operator(s))".format(
+                    obj.name, changed, len(meta.get("symops") or [])), 8000)
+        else:
+            self.statusBar().showMessage(
+                "{}: the coordinates still have {}".format(
+                    obj.name, meta.get("spacegroup") or "no stated symmetry"),
+                6000)
+
+    def enable_symmetry_editing(self, obj):
+        # type: (object) -> Optional[str]
+        """Edit the ASYMMETRIC UNIT and have the cell follow, live.
+
+        Christian: "I want to be able to change the asymmetric unit and have
+        the change repeated while the space group is kept constant."
+
+        That is exactly the bargain `SymmetryModifier` was built for (round
+        29): the base molecule becomes the asymmetric unit — the thing you
+        actually edit — while the viewport, the exporter and the ❖ page all
+        see the full cell regenerated from it on every change. What was
+        missing is a way to GET there from an ordinary .cif import, whose base
+        is the whole cell; adding the modifier on top of that would re-apply
+        the operations to atoms that already carry them (the round-32 trap).
+
+        So the base is reduced first: to the file's own asymmetric unit where
+        it was stored, and otherwise to one atom per symmetry orbit worked out
+        from the coordinates. Returns a short description, or None.
+        """
+        if obj is None:
+            return None
+        s = obj.structure
+        meta = s.metadata
+        cell = cell_of(obj)
+        if cell is None or not meta.get("symops"):
+            return None
+        if any(getattr(m, "kind", "") == "symmetry" for m in obj.modifiers):
+            return "already symmetry-linked"
+        frac = self._crystal_fractional(obj)
+        if frac is None:
+            return None
+        asym_symbols = meta.get("asym_symbols")
+        asym_frac = meta.get("asym_frac")
+        if asym_symbols and asym_frac:
+            symbols = list(asym_symbols)
+            reduced = np.asarray(asym_frac, dtype=float)
+        else:
+            keep = spacegroups.orbit_representatives(
+                cell, list(s.symbols), frac)
+            if not keep:
+                return None
+            symbols = [s.symbols[i] for i in keep]
+            reduced = np.asarray(frac, dtype=float)[keep]
+        self.push_undo()
+        s.symbols = list(symbols)
+        s.frames = [reduced @ cell.matrix()]
+        s.set_frame(0)
+        s.bonds = []
+        obj.atom_colors, obj.atom_labels = {}, set()
+        obj.atom_label_text, obj.atom_label_colors = {}, {}
+        obj.atom_label_modes = {}
+        obj.atom_hidden, obj.atom_scales = set(), {}
+        self._perceive_fresh(s)
+        self._add_modifier(obj, modifiers_mod.SymmetryModifier(
+            cell=cell.to_dict(), symops=list(meta.get("symops") or [])))
+        meta["cell_view"] = "asym"
+        self.viewport.set_selection([])
+        self.viewport.refresh_geometry()
+        self._sync_all()
+        return "{} atoms in the asymmetric unit, {} operator(s)".format(
+            len(symbols), len(meta.get("symops") or []))
+
+    def _crystal_fractional(self, obj):
+        # type: (object) -> object
+        """This crystal's atoms in FRACTIONAL coordinates, pose removed.
+
+        Everything symmetry-related is fractional, and a crystal the user has
+        rotated is no longer in its cell's frame (round 43c) — so the pose has
+        to come off first or the space group comes back as P1 for no better
+        reason than the viewport angle.
+        """
+        cell = cell_of(obj)
+        if cell is None or obj.structure.n_atoms == 0:
+            return None
+        xyz = np.asarray(obj.structure.coords, dtype=float)
+        pose = obj.cell_pose()
+        if pose is not None:
+            rot, shift = pose
+            xyz = (xyz - np.asarray(shift)) @ np.asarray(rot)
+        return cell.to_fractional(xyz)
+
+    def reevaluate_symmetry(self, obj, announce=True):
+        # type: (object, bool) -> Optional[str]
+        """Re-derive the space group from where the atoms NOW are.
+
+        Christian's rule, and it is the honest one: "if the full cell is
+        edited, then the space group has to be reevaluated or set to triclinic
+        because the symmetry has been broken." Keeping the file's operators
+        after an edit is the dangerous alternative — they would expand the
+        edited cell into a structure that never existed, confidently.
+
+        Skipped whenever the base IS the asymmetric unit — by a symmetry
+        modifier or by the ❖ page's radio. One asymmetric unit has no symmetry
+        among itself, so spglib would answer P1 perfectly correctly about the
+        wrong question and destroy the group the file actually stated.
+        Returns the new symbol when it changed, else None.
+        """
+        if obj is None:
+            return None
+        s = obj.structure
+        meta = s.metadata
+        cell = cell_of(obj)
+        if cell is None or not meta.get("symops"):
+            return None
+        if self.base_is_asymmetric_unit(obj):
+            return None
+        frac = self._crystal_fractional(obj)
+        if frac is None:
+            return None
+        found = spacegroups.from_structure(cell, list(s.symbols), frac)
+        if found is not None and found.xyz:
+            ops, symbol, number = found.xyz, found.symbol or "P 1", found.number
+        else:
+            # Nothing survived, so say so plainly rather than keep operators
+            # that no longer hold. P1 is always true of any structure.
+            ops, symbol, number = ["x,y,z"], "P 1", 1
+        was = str(meta.get("spacegroup", ""))
+        if (len(ops) == len(meta.get("symops") or ())
+                and spacegroups.canonical_key(symbol)
+                == spacegroups.canonical_key(was)):
+            return None                      # unbroken; nothing to report
+        meta["symops"] = list(ops)
+        meta["spacegroup"] = symbol
+        meta["it_number"] = int(number or 0)
+        meta.pop("hall", None)
+        meta["symmetry_source"] = spacegroups.SOURCE_DERIVED
+        meta["symmetry_note"] = (
+            "symmetry re-derived from the edited coordinates: {} -> {} "
+            "({} operator(s))".format(was or "unstated", symbol, len(ops)))
+        if announce:
+            self.statusBar().showMessage(
+                "Symmetry broken by the edit — space group is now {} "
+                "({} operator(s), was {})".format(symbol, len(ops),
+                                                  was or "unstated"), 8000)
+        return symbol
+
+    @staticmethod
+    def _rebuild_pose(structure):
+        # type: (Structure) -> Optional[tuple]
+        """The rigid motion the user has applied since this crystal was built.
+
+        Every crystal rebuild regenerates coordinates as `frac @ cell.matrix()`
+        — i.e. in the CELL's own frame, the pose the file had. So a crystal the
+        user has rotated snaps back to its import orientation the moment any ❖
+        control is touched, and the exterior atoms come back in a different
+        place: Christian's "not invariant under rotation of the unit cell".
+
+        Recovered the same way the cell BOX follows its molecule (round 19),
+        against the same stored reference sample — so the box and the atoms
+        cannot disagree about which way the crystal is facing.
+        """
+        meta = getattr(structure, "metadata", None) or {}
+        ref = meta.get("cell_ref_xyz")
+        idx = meta.get("cell_ref_idx")
+        if not ref or not idx or structure.n_atoms == 0:
+            return None
+        try:
+            cur = np.asarray([structure.coords[int(i)] for i in idx],
+                             dtype=float)
+        except (IndexError, ValueError):
+            return None
+        return cif_mod.rigid_from_reference(np.asarray(ref, dtype=float), cur)
+
+    @staticmethod
+    def _apply_rebuild_pose(coords, pose):
+        # type: (np.ndarray, Optional[tuple]) -> np.ndarray
+        """Put freshly generated cell coordinates back into the user's pose."""
+        if pose is None:
+            return coords
+        rot, shift = pose
+        return np.asarray(coords, dtype=float) @ np.asarray(rot).T + shift
+
+    @staticmethod
+    def _view_disorder_kwargs(meta):
+        # type: (dict) -> dict
+        """Everything `build_view` needs to resolve disorder as the IMPORT did.
+
+        One helper because there are two rebuild paths — the asym/cell/packing
+        switch and the exterior checkbox — and when they disagree the first
+        toggle of either silently re-resolves the structure. They did disagree:
+        both passed the occupancies and neither passed the GROUP and ASSEMBLY
+        columns, which `resolve_disorder` prefers over geometric overlap. On
+        7712836.cif that was 999 drawn atoms becoming 469, and it looked like
+        atoms vanishing when a checkbox was unticked.
+
+        Absent keys give None, which is the pre-round-43c behaviour — so a
+        savepoint written before this existed still loads.
+        """
+        return {
+            "occupancy": meta.get("asym_occupancy"),
+            "disorder_groups": meta.get("asym_disorder_groups"),
+            "disorder_assemblies": meta.get("asym_disorder_assemblies"),
+        }
 
     @staticmethod
     def _new_boundary_modifier(obj, shells=1):
@@ -3935,7 +4397,11 @@ class MainWindow(QMainWindow):
         if added <= 0:
             return False
         obj.modifiers.append(mod)
-        s.metadata["cell_exterior"] = 1
+        # NOT `cell_exterior = 1`. That is the ❖ checkbox's flag, meaning "draw
+        # the neighbouring molecules"; adding this modifier is a different
+        # thing and the import shows no shell. Setting it here left the box
+        # ticked over a picture that had none, so the first untick removed
+        # atoms the user had never asked to add.
         s.metadata["boundary_bonds"] = len(bonds) - len(s.bonds)
         s.metadata["boundary_atoms"] = added
         return True
@@ -4112,6 +4578,8 @@ class MainWindow(QMainWindow):
             naming=naming,
             bravais=(naming.bravais if naming is not None else ""),
             density=self._calculated_density(info, cell),
+            refused=len(meta.get("refused_bonds") or ()),
+            refused_on=bool(meta.get("show_refused_bonds")),
             name=obj.name)
         self.crystal_page.set_detail(
             info, naming=naming, site_occupancy=meta.get("site_occupancy"))
@@ -4223,11 +4691,15 @@ class MainWindow(QMainWindow):
             # is the BoundaryModifier's job now (round 39), and doing it here
             # too would add every exterior atom twice.
             exterior=0,
-            # The occupancies and the policy ride with the object, so a
-            # rebuild resolves the disorder exactly as the import did.
-            occupancy=meta.get("asym_occupancy"),
+            # The exterior setting is part of the VIEW, so switching
+            # asym/cell/packing must carry it or the checkbox silently
+            # un-applies itself on the next mode change.
+            shell_molecules=bool(meta.get("cell_exterior", 0)),
+            # The occupancies, the disorder columns and the policy all ride
+            # with the object, so a rebuild resolves the disorder exactly as
+            # the import did.
             disorder=meta.get("disorder_policy") or self.disorder_policy,
-            report=report)
+            report=report, **self._view_disorder_kwargs(meta))
         if report.get("disorder"):
             meta["disorder"] = dict(report["disorder"])
         # Rebuilt views renumber the atoms, so the shared-site map has to be
@@ -4241,8 +4713,11 @@ class MainWindow(QMainWindow):
             return
         self.push_undo()
         s = obj.structure
+        # Keep whatever rigid motion the user has applied (see _rebuild_pose):
+        # a regenerated view is in the CELL's frame, not the viewport's.
+        pose = self._rebuild_pose(s)
         s.symbols = list(symbols)
-        s.frames = [np.asarray(coords, dtype=float)]
+        s.frames = [self._apply_rebuild_pose(coords, pose)]
         s.set_frame(0)
         s.bonds = []
         # Per-atom display overrides indexed the OLD atom list.
@@ -4250,6 +4725,7 @@ class MainWindow(QMainWindow):
         obj.atom_label_text, obj.atom_label_colors = {}, {}
         obj.atom_label_modes = {}
         self._perceive_fresh(s)
+        set_cell_reference(s, coords)      # cell frame, not the posed atoms
         meta["cell_view"] = mode
         self.viewport.set_selection([])
         self._sync_all()

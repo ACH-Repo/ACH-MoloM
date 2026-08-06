@@ -23,6 +23,11 @@ class Modifier:
 
     kind = "modifier"
 
+    #: Whether `evaluate` takes the crystal's `pose` (see `evaluate_stack`).
+    #: True only for modifiers that do FRACTIONAL-coordinate arithmetic, which
+    #: is meaningless on atoms the user has rotated away from the cell frame.
+    wants_pose = False
+
     def __init__(self, name="", enabled=True):
         self.name = name or self.kind
         self.enabled = bool(enabled)
@@ -190,20 +195,41 @@ class BoundaryModifier(Modifier):
         self._cache_key = None
         self._cache = None
 
-    def evaluate(self, symbols, coords, bonds):
+    wants_pose = True
+
+    def evaluate(self, symbols, coords, bonds, pose=None):
         from . import bonding
         from . import cif as cif_mod
         if not self.cell or not len(symbols):
             return symbols, coords, bonds
         xyz = np.asarray(coords, dtype=float).reshape(len(symbols), 3)
+        # EVERYTHING below is fractional-coordinate arithmetic against a cell
+        # whose matrix is built in a canonical orientation, so it is only
+        # meaningful on atoms that are still in the cell's own frame. Rotating
+        # the crystal in the viewport used to change the answer — 2130205 went
+        # from 216 drawn atoms to 230, 276 and 246 at 10, 37 and 90 degrees,
+        # with nothing else touched, which is Christian's "not invariant under
+        # rotation of the unit cell". Undo the pose, work, put it back.
+        world = xyz
+        if pose is not None:
+            rot, shift = pose
+            xyz = (xyz - np.asarray(shift)) @ np.asarray(rot)
         # Cached on the GEOMETRY, not per call: `evaluated()` runs on every
         # viewport rebuild, and re-deriving a framework's boundary each frame
         # is the round-33 mistake in a new place.
         key = (xyz.tobytes(), tuple(symbols), self.shells,
                self.covalent_only, self.whole_molecules,
                tuple(sorted(self.cell.items())))
+        def to_world(local):
+            """Cell frame -> the pose the atoms actually arrived in."""
+            if pose is None:
+                return local
+            rot, shift = pose
+            return np.asarray(local) @ np.asarray(rot).T + np.asarray(shift)
+
         if key == self._cache_key:
-            return self._cache[0], self._cache[1].copy(), list(self._cache[2])
+            return (self._cache[0], to_world(self._cache[1].copy()),
+                    list(self._cache[2]))
         try:
             cell = cif_mod.Cell.from_dict(self.cell)
         except (KeyError, TypeError, ValueError, cif_mod.CifError):
@@ -229,7 +255,7 @@ class BoundaryModifier(Modifier):
                                    if i >= n or j >= n]
         self._cache_key = key
         self._cache = (out_symbols, out_xyz, out_bonds)
-        return out_symbols, out_xyz.copy(), list(out_bonds)
+        return out_symbols, to_world(out_xyz.copy()), list(out_bonds)
 
     def to_dict(self):
         d = super().to_dict()
@@ -267,15 +293,25 @@ def from_dict(d):
     return None
 
 
-def evaluate_stack(modifiers, symbols, coords, bonds):
-    # type: (List[Modifier], List[str], np.ndarray, List) -> Tuple[List[str], np.ndarray, List]
+def evaluate_stack(modifiers, symbols, coords, bonds, pose=None):
+    # type: (List[Modifier], List[str], np.ndarray, List, Optional[tuple]) -> Tuple[List[str], np.ndarray, List]
     """Run the enabled modifiers in order. Returns fresh lists/arrays; the
-    inputs are never modified."""
+    inputs are never modified.
+
+    `pose` is the rigid motion carrying the crystal's own frame onto the
+    coordinates as they stand — `(R, t)` with `world = local @ R.T + t`, from
+    `cif.rigid_from_reference`. Only modifiers declaring `wants_pose` are
+    given it, because only they work in fractional coordinates.
+    """
     sym = list(symbols)
     xyz = np.asarray(coords, dtype=float).reshape(len(symbols), 3).copy()
     bnd = list(bonds)
     for mod in modifiers or ():
-        if mod.enabled:
+        if not mod.enabled:
+            continue
+        if pose is not None and getattr(mod, "wants_pose", False):
+            sym, xyz, bnd = mod.evaluate(sym, xyz, bnd, pose=pose)
+        else:
             sym, xyz, bnd = mod.evaluate(sym, xyz, bnd)
     return sym, xyz, bnd
 

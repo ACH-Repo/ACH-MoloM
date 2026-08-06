@@ -203,6 +203,26 @@ def object_geometry(obj, style, atom_scale=1.0):
                               round(float(r), 6)))
                 bonds.append((names[j], _xyz(mid), _xyz(b),
                               round(float(r), 6)))
+        # The ❖ page's refused-bond override (round 43) follows into the
+        # render, or the export would silently disagree with the viewport it
+        # was set up in. Their own materials, from the muted colour, so they
+        # stay adjustable as a group once the scene is in Blender.
+        if (s.metadata or {}).get("show_refused_bonds"):
+            r_ref = bond_radius * style_mod.REFUSED_BOND_SCALE
+            for i, j in (s.metadata.get("refused_bonds") or ()):
+                if not (0 <= i < len(symbols) and 0 <= j < len(symbols)):
+                    continue
+                if i % base_n in hidden or j % base_n in hidden:
+                    continue
+                p1, p2 = coords[i], coords[j]
+                mid = (np.asarray(p1) + np.asarray(p2)) / 2.0
+                for atom, a, b in ((i, p1, mid), (j, mid, p2)):
+                    rgb = style_mod.muted(colors[atom])
+                    name = "MoloM {} refused".format(
+                        elements.symbol(zs[atom]))
+                    materials[name] = (rgb, elements.symbol(zs[atom]))
+                    bonds.append((name, _xyz(a), _xyz(b),
+                                  round(float(r_ref), 6)))
     return atoms, bonds, materials
 
 

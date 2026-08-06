@@ -29,6 +29,8 @@ import re
 from fractions import Fraction
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+
 #: Where a set of operators came from. `SOURCE_FILE` never originates here --
 #: it is what `cif.parse_cif` records when the file listed its own loop, which
 #: ALWAYS wins over anything this module could derive.
@@ -592,3 +594,146 @@ def is_p1(symbol="", number=0):
         return True
     plain, _ = split_setting_code(symbol)
     return canonical_key(plain) in ("p1", "p11", "p111")
+
+
+# ------------------------------------------- symmetry FROM the coordinates
+#: Operators worked out from where the atoms actually are, rather than from a
+#: name the file gave. This is the only source that can be WRONG about the
+#: file's intent and right about the structure in front of it -- which is
+#: exactly what is wanted after the user has edited a cell.
+SOURCE_DERIVED = "derived"
+
+#: Default Cartesian tolerance for deciding two atoms are symmetry-related.
+#: Deliberately loose-ish: a hand-edited or force-field-relaxed cell is never
+#: exact, and a tolerance that only accepts perfect symmetry would report P1
+#: for every structure anyone has touched.
+DEFAULT_SYMPREC = 1e-3
+
+
+def content_subset(symbols, frac, grid=1000):
+    # type: (list, object, int) -> List[int]
+    """Indices of ONE atom per distinct site — the cell's actual content.
+
+    A drawn crystal carries boundary copies (round 32: an atom on a face
+    belongs to both faces, one at a corner to all eight), and those are exact
+    lattice translations of atoms already present. Wrapping puts a copy back
+    on top of its original, so a symmetry search sees the same site twice and
+    spglib refuses the cell outright — measured: it returns None for every one
+    of 7712836 (999 atoms), 2240539 (980) and 2478154 (28), while giving the
+    file's own group for all three on their content alone.
+
+    Keyed on a rounded grid rather than compared pairwise, so this is O(n)
+    rather than O(n^2) on the structures where it matters most. The 27
+    neighbouring buckets are probed as well, because a single key is fragile
+    exactly where it must not be: two copies either side of a bucket edge get
+    different keys and both survive. Measured on 7712836, whose content is 222
+    atoms — a plain key gave 222 at grids of 100, 200, 500 and 2000 and 225 at
+    1000, and those three phantom sites are enough for spglib to refuse the
+    cell entirely. Wrapping is modular, so the probe wraps too.
+    """
+    wrapped = np.asarray(frac, dtype=float).reshape(-1, 3) % 1.0
+    keys = np.rint(wrapped * grid).astype(int) % grid
+    seen, keep = set(), []
+    offsets = [(a, b, c) for a in (-1, 0, 1) for b in (-1, 0, 1)
+               for c in (-1, 0, 1)]
+    for index, sym in enumerate(symbols):
+        name = str(sym)
+        i, j, k = (int(keys[index][0]), int(keys[index][1]),
+                   int(keys[index][2]))
+        if any((name, (i + a) % grid, (j + b) % grid, (k + c) % grid) in seen
+               for a, b, c in offsets):
+            continue
+        seen.add((name, i, j, k))
+        keep.append(index)
+    return keep
+
+
+def _spglib_cell(cell, symbols, frac):
+    from . import elements
+    lattice = np.asarray(cell.matrix(), dtype=float)
+    positions = np.asarray(frac, dtype=float).reshape(-1, 3) % 1.0
+    numbers = [int(elements.atomic_number(s)) for s in symbols]
+    return (lattice, positions, numbers)
+
+
+def _dataset(cell, symbols, frac, symprec):
+    """spglib's dataset for the cell CONTENT, plus the index map back."""
+    if not available() or cell is None or not len(symbols):
+        return None, []
+    try:
+        import spglib
+    except ImportError:                                  # pragma: no cover
+        return None, []
+    keep = content_subset(symbols, frac)
+    sub_symbols = [symbols[i] for i in keep]
+    sub_frac = np.asarray(frac, dtype=float).reshape(-1, 3)[keep]
+    try:
+        data = spglib.get_symmetry_dataset(
+            _spglib_cell(cell, sub_symbols, sub_frac), symprec=float(symprec))
+    except (TypeError, ValueError, RuntimeError):
+        return None, keep
+    return data, keep
+
+
+def from_structure(cell, symbols, frac, symprec=DEFAULT_SYMPREC):
+    # type: (object, list, object, float) -> Optional[Symmetry]
+    """The space group the ATOMS have, not the one the file claimed.
+
+    The primitive behind "re-evaluate the symmetry after an edit". Everything
+    else in this module maps a NAME onto operators; this maps COORDINATES onto
+    them, which is the only thing that can be trusted once a user has moved an
+    atom. Returns None when spglib is unavailable or finds nothing -- the
+    caller must then fall back to P1 rather than keep stale operators, because
+    operators that no longer describe the structure will happily expand it
+    into a cell that never existed.
+
+    `symprec` is in the same units as the lattice (Angstrom here).
+    """
+    dataset, _keep = _dataset(cell, symbols, frac, symprec)
+    if dataset is None:
+        return None
+    rotations = _attr(dataset, "rotations", None)
+    translations = _attr(dataset, "translations", None)
+    if rotations is None or translations is None:
+        return None
+    xyz = [_xyz_from_matrix(r, t) for r, t in zip(rotations, translations)]
+    if not xyz:
+        return None
+    # Identity first, as everywhere else -- `expand` de-duplicates against the
+    # first operator's output and a stray ordering makes that harder to read.
+    ident = "x,y,z"
+    if ident in xyz:
+        xyz = [ident] + [t for t in xyz if t != ident]
+    return Symmetry(xyz,
+                    symbol=str(_attr(dataset, "international", "") or ""),
+                    number=int(_attr(dataset, "number", 0) or 0),
+                    source=SOURCE_DERIVED, backend="spglib")
+
+
+def orbit_representatives(cell, symbols, frac, symprec=DEFAULT_SYMPREC):
+    # type: (object, list, object, float) -> Optional[List[int]]
+    """One atom index per symmetry orbit -- i.e. an ASYMMETRIC UNIT.
+
+    spglib's `equivalent_atoms` labels every atom with the index of its
+    orbit's representative, so the distinct labels ARE the asymmetric unit.
+    Used to reduce an edited full cell back to something the symmetry can be
+    applied to, without which "keep editing the asymmetric unit" has nothing
+    to edit.
+    """
+    dataset, keep = _dataset(cell, symbols, frac, symprec)
+    if dataset is None:
+        return None
+    equivalent = _attr(dataset, "equivalent_atoms", None)
+    if equivalent is None:
+        return None
+    # `equivalent` indexes the CONTENT subset, so map back to the caller's
+    # numbering before returning — an index into the wrong list is exactly the
+    # kind of silent wrongness round 42 spent a whole round on.
+    seen, out = set(), []
+    for local, rep in enumerate(equivalent):
+        rep = int(rep)
+        if rep in seen:
+            continue
+        seen.add(rep)
+        out.append(keep[rep] if 0 <= rep < len(keep) else keep[local])
+    return sorted(set(out))

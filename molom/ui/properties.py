@@ -448,6 +448,7 @@ class CrystalPage(QWidget):
     poly_toggled = Signal(bool)
     exterior_toggled = Signal(bool)
     occupancy_toggled = Signal(bool)
+    refused_toggled = Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -622,6 +623,26 @@ class CrystalPage(QWidget):
         self.occupancy_check.toggled.connect(self.occupancy_toggled.emit)
         lay.insertWidget(lay.indexOf(self.poly_check) + 1,
                          self.occupancy_check)
+
+        # The one control on this page that makes the picture LESS true on
+        # purpose, so it says so in as many words. Placed relative to a named
+        # widget, never by literal layout index (round 41).
+        self.refused_check = QCheckBox("Show refused bonds")
+        self.refused_check.setToolTip(
+            "Draw the contacts MoloM refused as bonds — impossibly short "
+            "ones, and those past the element's covalent valence.\n\n"
+            "A VISUALISATION OVERRIDE, off by default. On a wholly disordered "
+            "structure the refused contacts are what carry the shape: "
+            "2240539.cif draws as 77 loose fragments with them off and as the "
+            "four cages VESTA shows with them on.\n\n"
+            "They are drawn thinner and greyed, because they are not "
+            "chemistry — a short contact between two disorder alternatives is "
+            "two places one atom might be, not a bond.")
+        self.refused_check.toggled.connect(
+            lambda v: None if self._loading
+            else self.refused_toggled.emit(bool(v)))
+        lay.insertWidget(lay.indexOf(self.occupancy_check) + 1,
+                         self.refused_check)
         dragcheck.install(self)
         self.set_cell(None)
 
@@ -762,7 +783,7 @@ class CrystalPage(QWidget):
 
     def set_cell(self, cell, spacegroup="", n_asym=0, n_atoms=0, mode="cell",
                  name="", exterior=0, chemistry="", symmetry="", naming=None,
-                 bravais="", density=None):
+                 bravais="", density=None, refused=0, refused_on=False):
         """Refresh from the active molecule.
 
         `cell=None` greys every CONTROL but leaves the page itself readable —
@@ -777,11 +798,21 @@ class CrystalPage(QWidget):
                   self.occupancy_check):
             w.setEnabled(has)
         self._sync_pack_enabled()
+        # Nothing was refused on this molecule, so there is nothing to
+        # override — greyed, and the count says why rather than leaving a
+        # live-looking tick that would do nothing.
+        self.refused_check.setEnabled(has and refused > 0)
+        self.refused_check.setText(
+            "Show refused bonds ({})".format(refused) if refused
+            else "Show refused bonds")
         # Guarded: writing a widget from sync fires its own valueChanged,
         # which the app would read back as "the user asked for this" — the
-        # round-30 TimelinePanel bug in a different costume.
+        # round-30 TimelinePanel bug in a different costume. The refused tick
+        # is PER CRYSTAL, so it has to be read back from the active object or
+        # it would carry one molecule's setting onto the next.
         self._loading = True
         self.ext_check.setChecked(bool(exterior))
+        self.refused_check.setChecked(bool(refused_on))
         self._loading = False
         if not has:
             self.summary.setText(

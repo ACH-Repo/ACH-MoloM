@@ -56,6 +56,202 @@ the operator key table, CIF reading with symmetry, coordination polyhedra,
 meta atoms, the scene clock with a multi-track timeline, vibrational modes,
 per-element display control, and the symmetry modifier. 512 tests.
 
+Round 43 (2026-08-05, the refused-bond override — closing round 42d's last
+gap): round 42d ended with VESTA drawing the contacts we refuse, so its cages
+read as solid polyhedra while ours were clouds of spheres in the right places.
+This is the tick that closes it, and it is deliberately a **VISUALISATION
+override**: MoloM's rule that only a real bond is drawn as a bond does not
+change, the user just gets to break it on purpose. **Christian's own wording
+was "tick impossible bonds", and measuring first showed that would not have
+worked** — on `2240539.cif` the refusals are 432 over-valence against only 96
+impossibly short, so restoring the short ones alone leaves the picture broken.
+The tick covers everything `prune_pairs` refused. `bonding._refused_display`
+returns them as a drawable pair list in `report["refused"]`, stored at import
+as `metadata["refused_bonds"]` and gated by `metadata["show_refused_bonds"]`
+(the `polyhedra` pattern — per-object display state in metadata rides undo and
+savepoints for free, no `Scene.snapshot` four-place checklist). **The hydrogen
+cap still applies**, and that is the one genuinely subtle part: capping the
+kept list and the full candidate list SEPARATELY picks different partners for
+the same hydrogen — a hydrogen's nearest neighbour among all candidates is
+often one of the impossible contacts — so their union hands it two sticks. 240
+refused bonds that way against 144 done properly, with 96 double-bonded
+hydrogens. Capping the refused list AGAINST the kept one, nearest first, is
+what makes the union honest. Costs nothing either: capped and uncapped give
+the SAME four 70-atom components (368 sticks against 752), which are exactly
+the four F-centred lattice points round 42d measured. Measured end to end —
+77 components with the tick off, 25 with it on (four cages of 70 plus 21 loose
+atoms), and the GUI grab with hydrogens hidden is a scatter of dots before and
+VESTA's cages after. Drawn **thinner (0.45x) and blended halfway to grey**
+(`style.muted`, `REFUSED_BOND_*` — in `core` so the viewport and the Blender
+export cannot drift), because a figure made with the tick on must not assert
+chemistry nobody believes. They ride the ORDINARY cylinder buffer, not a pass
+of their own: they are scene geometry, and only overlays need their own
+buffers (round 35). The export carries them into Blender under their own
+`MoloM C refused` materials so they stay adjustable as a group; verified by
+running the script in Blender 5.1 headless. The ❖ tick greys out and reads
+"Show refused bonds (144)" so a molecule with nothing refused cannot offer a
+live-looking control that does nothing.
+
+Round 43e (2026-08-06, round 43d's asymmetric-unit editing actually working):
+Christian: "Editing asymmetric units does not work at all... When I change one
+of the Zn in the asymmetric unit to Co I am told that the re-derived space
+group is P1, which is obviously incorrect." Right twice over, and the second
+half is the deeper one. **(1) The re-derivation fired while the base WAS the
+asymmetric unit.** Round 43d guarded on "is there a `SymmetryModifier`?", and
+the ❖ page's own "Asymmetric unit only" radio — the route he took, and the
+obvious one — rebuilds the base and adds no modifier at all. spglib then
+answered P1 perfectly correctly about 22 atoms alone in a box and overwrote a
+real Pbca. `base_is_asymmetric_unit` tests BOTH routes, and re-derivation is
+now restricted to the full cell exactly as he asked. The chemistry agrees:
+changing one Zn to Co in the asymmetric unit changes all EIGHT of its images
+together, so the operators still map the structure onto itself and the group
+is untouched — the re-derivation was not wrong, it was asked the wrong
+question. **(2) Nothing wrote the edit back**, so the next rebuild regenerated
+from the file's own `asym_symbols` and "the Co switches back to Zn".
+`sync_asymmetric_unit` writes symbols and fractional coordinates back whenever
+the base is the asymmetric unit, which is what makes the edit persistent;
+parallel columns (occupancy, disorder group/assembly) are reset rather than
+guessed at when the atom count changes, because a silently mis-indexed
+occupancy is worse than none. Measured end to end: asym Zn->Co keeps Pbca with
+8 operators, the full cell comes back **Co 8 / Zn 8**, and switching back to
+asym still shows the Co. **(3) The cell box crept**, which is his "small
+re-scaling of the unit cell boundary". `cell_pose` is a Kabsch fit against a
+SAMPLE OF THE ATOMS (round 19), and an edit is not a rigid motion — so moving
+an atom that is in the sample makes the fit report a rotation nobody
+performed, and the box follows it a little further with every edit. Two parts:
+`begin_model_edit` captures the pose BEFORE the atoms move (the viewport
+already calls into it, so this costs nothing), and the write-back re-pins the
+reference against the CELL-frame coordinates so the error cannot accumulate.
+A test drives six consecutive edits and pins the box to 1e-6. Measured
+separately and worth recording: a, b, c, the box origin and its orientation
+are identical across import -> asym -> edit -> cell on 2130205 and 2478154, so
+the box GEOMETRY never changed — what he saw was the drift plus a full cell
+that, once the group was P1, drew only the asymmetric unit inside a
+correctly-sized box. **Also new: `core/coplanar.py`** — "if I add a substituent
+to an imidazolate ring, the substituent is coplanar with the plane". The
+selection says WHICH GROUP via `internal.torsion_split` (round 36), so any
+atom of the substituent gives the same answer, and the group then moves
+RIGIDLY: swing the attachment bond into the ring plane, then spin about it
+until the group lies flattest. **Never a projection** — flattening by
+projecting onto the plane shortens every bond that was out of it, giving a
+coplanar and chemically wrong answer. The spin has a closed form
+(`t = (atan2(B, (C-A)/2) + pi) / 2`, one atan2, and the `+ pi` is what picks
+the minimum rather than the maximum). Measured: a planar substituent reaches
+**exactly 0** out-of-plane rms with every bond length preserved to 1e-9 and
+the ring untouched; an sp3 methyl cannot be flat and correctly puts its
+ATTACHMENT atom in the plane instead, which the status line says out loud.
+963 tests.
+
+Round 43d (2026-08-06, unit-cell edits that persist, symmetry kept honest):
+Christian's spec, both halves. "I want to be able to change the asymmetric
+unit and have the change repeated while the space group is kept constant. If
+the full cell is edited, then the space group has to be reevaluated or set to
+triclinic because the symmetry has been broken." **Which half applies is
+decided by whether a `SymmetryModifier` owns the expansion**, which is the
+distinction that makes this coherent rather than two features fighting. With
+one, the base IS the asymmetric unit (round 29's bargain), every edit is
+repeated by the operators and the space group is an INPUT that must not be
+touched; without one, the base is the full cell, so an edit really does break
+the symmetry. `F3 > Crystal: edit the asymmetric unit` gets you from an
+ordinary .cif import (whose base is the whole cell) to the first state:
+`enable_symmetry_editing` REDUCES the base first — to the file's own
+asymmetric unit where it was stored, otherwise to one atom per symmetry orbit
+— because adding the modifier on top of already-expanded atoms is the round-32
+trap. Measured: 176 base atoms become 22, the picture stays at 176 drawn, and
+moving ONE asymmetric atom moves exactly 8, one per operator. The other half
+is new machinery: **`spacegroups.from_structure` is the first thing in that
+module that reads symmetry off ATOMS instead of off a name**, via spglib's
+dataset, with `orbit_representatives` for the reduction. It runs on every edit
+commit (`_reevaluate_edited_crystal`) and is also an explicit F3 operator.
+Two rules keep it from doing harm: an UNBROKEN cell returns None and is left
+alone (a control that fires when nothing changed would rewrite the file's own
+setting with the database's spelling — `P 1 21/n 1` silently becoming
+`P2_1/c`), and a structure with a symmetry modifier is skipped entirely, or
+re-deriving from a lone asymmetric unit would collapse a perfectly good
+structure to P1. **The hazard that made it return None on every real file**:
+a drawn crystal carries boundary copies, which wrap onto atoms already
+present, and spglib refuses a cell that lists the same site twice — measured
+as None for 7712836 (999 atoms), 2240539 (980) and 2478154 (28) while giving
+the file's own group for all three on their content alone. `content_subset`
+reduces to one atom per distinct site on a rounded grid, probing the 27
+neighbouring buckets because a single key splits two copies that straddle a
+bucket edge (222 true sites came back as 225 at grid 1000 and correctly at
+100/200/500/2000 — an arbitrary-grid coin toss, and three phantom sites are
+enough to lose the whole search). Element is part of the key, so a shared site
+(round 42) is never collapsed. Verified across every CIF on this machine:
+**12 of 12 reproduce their own operator count from coordinates alone**, and
+the content reduction recovers the exact cell content every time (280, 222,
+16, 6, 42). 947 tests.
+
+Round 43c (2026-08-05, the exterior control: lossless and orientation-free):
+two more of Christian's, both about atoms appearing and disappearing when
+nothing chemical changed. **(1) The rebuild resolved the disorder differently
+from the import.** `build_view` reconstructs a `CifData` from what the object
+stored, and it passed the occupancies but NOT the `_atom_site_disorder_group`
+and `_atom_site_disorder_assembly` columns — which `resolve_disorder` prefers
+over geometric overlap. So the first touch of any ❖ control silently
+re-resolved the structure: on `7712836.cif` 222 content atoms became 294 and
+999 drawn became 469, which is exactly "when it is unticked again, even more
+atoms disappear". The columns ride in metadata now
+(`asym_disorder_groups`/`_assemblies`) and both rebuild paths take them from
+ONE helper, `_view_disorder_kwargs`, because the two paths disagreeing is the
+whole failure mode. **(2) The checkbox was driving two mechanisms that mean
+different things.** `_autoclose_boundary` adds the BoundaryModifier at import —
+a correctness fix a framework needs whether or not anyone wants neighbouring
+molecules drawn — and set `cell_exterior = 1` with it, so the box read TICKED
+over a picture containing no shell at all. The first untick then disabled a
+modifier the user had never enabled. The modifier is left alone by this
+control now (it lives on the Modifiers page); the checkbox means one thing,
+"draw the neighbouring cells' molecules". Round trip measured lossless:
+999 -> 999 -> 999. **(3) Nothing cell-based was invariant under rotation.** A
+cell is stored as lengths and angles, so `cell.matrix()` is built in a
+canonical orientation and every fractional calculation assumes the atoms are
+still in it — rotate `2130205.cif` and the drawn count went 216 -> 230, 276,
+246 at 10, 37 and 90 degrees with nothing else touched. `MolObject.cell_pose`
+recovers the rigid motion from the SAME reference sample the cell box follows
+(round 19), `evaluate_stack` hands it to any modifier declaring `wants_pose`,
+and `BoundaryModifier` un-poses, works, and re-poses. Opt-in on purpose: an
+ArrayModifier's offset is a WORLD vector and must not be reinterpreted in the
+cell frame. Also fixed alongside: a crystal rebuild regenerated coordinates as
+`frac @ matrix`, i.e. in the file's pose, so touching any ❖ control snapped a
+rotated crystal back — `_rebuild_pose`/`_apply_rebuild_pose` carry it, and the
+cell reference is re-pinned against the CELL-frame coordinates (`
+set_cell_reference(s, coords)`) because pinning it against the posed atoms
+would make the fit the identity and draw the box square-on around rotated
+atoms. 935 tests.
+
+Round 43b (2026-08-05, "only one third of the CH polyhedra are shown"):
+Christian put the override next to his VESTA export and counted. He was right,
+and the arithmetic says exactly how right: the four cages sit ON the F-centred
+lattice points, so the one at the origin belongs to all EIGHT corners and each
+face-centred one to two opposite faces — **14 images, and MoloM drew 4**, which
+is his one third. Three independent faults, all of them round 42d's geometric
+grouping not having been carried far enough. (1) `expand`'s BOUNDARY branch
+called `fragment_info` without `geometric=wholly_disordered` — the
+`shell_molecules` branch six lines below it had it, and `unwrap_molecules`
+above it had it, so this was a plain omission. On the chemistry graph the file
+is 140 singletons and 70 pairs, so the 18 atoms lying exactly on a face carried
+a two-atom shard each instead of their 70-atom cage: 21 atoms added rather than
+700. (2) `_reaches_into_cell` perceives its own bonds and was doing it with
+`sanity=True`, so each cage copy shattered and the shards that happened to lie
+outside were culled INDIVIDUALLY — the copies came back as 45-, 19-, 18- and
+17-atom stumps with centroids at 0.93 instead of on a lattice point. It takes
+`geometric=` now, and it matters more here than anywhere else because this
+function decides what survives. (3) With both fixed the count went 4 -> 13, and
+the missing one was the (1,1,1) corner: `boundary_images` derived its lattice
+shifts from the TRIGGERING ATOM, and the corner cage has atoms on the x, y and
+z faces but **none with all three coordinates at zero** (measured: 6 atoms with
+two coordinates on a face, 12 with one, none with three). Per-atom shifts can
+therefore reach three faces and three edges but never the far corner. The
+options are pooled over the whole group now — for a FINITE group only; a
+periodic component still travels atom by atom, which is what keeps rock salt at
+eight corner sodiums instead of a slab. Result 4 -> **14 complete 70-atom
+cages, 8 corners + 6 face centres**, 980 atoms, no truncated fragments.
+**Blast radius measured, not assumed**: every CIF on this machine expanded
+before and after, and `2240539.cif` is the ONLY file whose count changes —
+cell CONTENT is identical everywhere, including the 999-atom 7712836, ferrocene
+and the solid solution. 928 tests.
+
 Round 42 (2026-08-05, VESTA's occupancy pie spheres): a correctness fix with a
 rendering feature on top. `1547149.cif` puts **Nb 0.50, Ti 0.25, Ni 0.15 and
 Co 0.10 on ONE position** — a substitutional solid solution, and the file
@@ -107,9 +303,11 @@ FULLY occupied molecules, and grouping geometrically there re-fuses two
 separate molecules — the suite caught exactly that regression when the change
 was first made unconditionally, which is why it is narrowed. Christian also
 found that **2240539 breaks Mercury outright** (it will not open the file),
-which retrospectively justifies picking VESTA as the ground truth. STILL OPEN
+which retrospectively justifies picking VESTA as the ground truth. ~~STILL OPEN
 on that file: VESTA also DRAWS those contacts, so its cages read as solid
-polyhedra while ours are clouds of spheres in the right places.
+polyhedra while ours are clouds of spheres in the right places.~~ **CLOSED in
+round 43** by the ❖ page's refused-bond tick — as an OVERRIDE, so the rule that
+only a real bond is drawn as a bond is untouched.
 
 Round 42c (2026-08-05, the sweep's second pass — Christian's screenshots):
 the first sweep framed every render on the CELL BOX, which cropped exactly the
@@ -1166,7 +1364,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 918 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 963 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -1392,6 +1590,61 @@ independent cross-check inside a single fixture.
   vector then spin so the backbone points outward.
 
 ## Hard-won gotchas (don't re-learn these)
+- **An EDIT is not a rigid motion, so never measure a pose across one**
+  (round 43e). `cell_pose`/`rigid_from_reference` is a Kabsch fit over a
+  sample of the atoms; move one of those atoms and the fit dutifully reports a
+  rotation of the whole crystal that nobody performed. The cell box then
+  creeps a little further with every edit, which reads as the box slowly
+  rescaling. Capture the pose BEFORE the atoms move (`begin_model_edit`) and
+  re-pin the reference against cell-frame coordinates afterwards, so the error
+  cannot accumulate. Anything else derived from that fit has the same problem.
+- **"Is the base the asymmetric unit?" has TWO answers and both must be
+  checked** (round 43e). A `SymmetryModifier` is one route; the ❖ page's
+  "Asymmetric unit only" radio is the other, and it rebuilds the base while
+  adding no modifier at all. Round 43d tested only the first, so the obvious
+  route through the UI fell into the branch meant for a full cell and had its
+  space group re-derived from one asymmetric unit — P1, correctly, about
+  entirely the wrong question. When a state can be reached two ways, the
+  predicate belongs in one named function that knows both.
+- **Flattening by PROJECTION is not flattening** (round 43e). Projecting a
+  substituent's atoms onto the ring plane makes it coplanar and shortens every
+  bond that was out of the plane. The operation wanted is a RIGID one — swing
+  the attachment bond into the plane, then spin about it — which preserves
+  every internal coordinate exactly and can be verified as such. And note an
+  sp3 group can NEVER be coplanar: what lands in the plane is its attachment
+  atom, so say that rather than reporting a residual as a failure.
+- **A boundary copy's lattice shifts belong to the MOLECULE, not to the atom
+  that triggered it** (round 43b). A fragment sitting on a corner can have
+  atoms on the x, y and z faces with none carrying all three coordinates at
+  zero — so per-atom shift options generate three faces and three edges and
+  never the eighth corner. Pool the options over the group whenever the group
+  travels whole; keep them per-atom for a PERIODIC component, or rock salt
+  grows a slab (round 33).
+- **`geometric=` has to reach EVERY consumer of the fragment graph, and the
+  ones that cull are the dangerous ones** (round 43b). Round 42d added it to
+  `unwrap_molecules` and `fragment_info`; `expand`'s boundary branch and
+  `_reaches_into_cell` were missed, and the second is worse than the first —
+  it perceives its own bonds, so a shattered cage was culled SHARD BY SHARD
+  and came back as a truncated stump with a centroid off the lattice point.
+  When a rule says "keep the molecule if any atom is inside", a wrong notion
+  of "molecule" does not disable the rule, it silently applies it to the wrong
+  thing. Grep for every call that re-perceives bonds when adding such a flag.
+- **The union of two separately-capped bond lists is NOT capped** (round 43).
+  `_cap_hydrogens` picks each hydrogen's nearest heavy partner from whatever
+  list it is handed, so capping the KEPT bonds and the FULL candidate set
+  independently and then drawing both gives that hydrogen two sticks —
+  whenever its nearest neighbour is one of the refused contacts, which on a
+  disordered structure is most of them. 96 double-bonded hydrogens on
+  `2240539.cif`. Cap the second list AGAINST the first (nearest first, skip a
+  hydrogen that already has its stick), never separately. Applies to any
+  "restore what we filtered out" feature, not just this one.
+- **Check WHICH filter did the damage before building the override for it**
+  (round 43). "Tick impossible bonds" was the request, and the impossibly
+  short ones are only 96 of 528 refusals on the file in question — the valence
+  cap does the rest, because a disordered site's alternatives all bond to the
+  same neighbours. Building exactly what was asked would have shipped a tick
+  that left the picture just as broken. One `Counter` over the drop reasons
+  settled it in a second.
 - **De-duplication runs BEFORE occupancy, so a shared site loses its species**
   (round 42). Several elements on one crystallographic position are identical
   coordinates, which `expand`'s minimum-image merge discards on sight — the
@@ -2115,7 +2368,7 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 918 offline tests. `tests/conftest.py`
+1. `python -m pytest tests/ -q` — 963 offline tests. `tests/conftest.py`
    sandboxes QSettings, so a GUI test can drive a real control without
    writing into your own MoloM configuration.
 2. `python -m molom --selftest` — headless core sanity.

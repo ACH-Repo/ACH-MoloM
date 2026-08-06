@@ -136,7 +136,35 @@ class MolObject:
         if not modifiers.stack_is_active(self.modifiers):
             return s.symbols, coords, s.bonds
         return modifiers.evaluate_stack(self.modifiers, s.symbols, coords,
-                                        s.bonds)
+                                        s.bonds, pose=self.cell_pose(coords))
+
+    def cell_pose(self, coords=None):
+        # type: (object) -> Optional[tuple]
+        """The rigid motion from this crystal's OWN frame onto its atoms.
+
+        A cell is stored as lengths and angles, so its matrix is built in a
+        canonical orientation and every fractional-coordinate calculation
+        assumes the atoms are still in it. Rotate the crystal and that stops
+        being true — which is why a cell-based modifier has to be handed this
+        and undo it first.
+
+        Recovered from the same reference sample the cell BOX follows (round
+        19), so the box and the modifiers cannot disagree about which way the
+        crystal is facing. None when there is no cell, no reference, or the
+        fit is not determined.
+        """
+        from . import cif as cif_mod
+        meta = getattr(self.structure, "metadata", None) or {}
+        ref = meta.get("cell_ref_xyz")
+        idx = meta.get("cell_ref_idx")
+        if not ref or not idx:
+            return None
+        xyz = self.structure.coords if coords is None else np.asarray(coords)
+        try:
+            cur = np.asarray([xyz[int(i)] for i in idx], dtype=float)
+        except (IndexError, ValueError):
+            return None
+        return cif_mod.rigid_from_reference(np.asarray(ref, dtype=float), cur)
 
     def apply_modifiers(self):
         # type: () -> int

@@ -441,6 +441,24 @@ a grab or a rotation *during* the drag, not on commit.
 | Crystal: asymmetric unit / full unit cell / packing (supercell) | **Properties ▸ ❖ Crystal page**, View ▸ Crystal, or F3 |
 | Show unit cell box | the ❖ page's checkbox, View ▸ Crystal, or F3 |
 | Unit cell: cell parameters and space group | shown on the ❖ page; also F3 |
+| Show refused bonds (visualisation override) | the ❖ page's checkbox |
+| Crystal: edit the asymmetric unit (cell follows the symmetry) | F3 |
+| Crystal: re-derive the space group from the coordinates | F3 (also automatic on every edit to a full cell) |
+| Make the selected substituent coplanar with its ring | F3 |
+
+**Editing a crystal, and what happens to its symmetry.** Which of two things
+happens depends on whether a **symmetry modifier** is on the stack:
+
+* **with one** — the base molecule is the *asymmetric unit*, so an edit is
+  repeated by every operator and the **space group is kept**. `F3 ▸ Crystal:
+  edit the asymmetric unit` puts an ordinary `.cif` import into this state by
+  reducing the base first (to the file's own asymmetric unit, or to one atom
+  per symmetry orbit);
+* **without one** — the base is the whole cell, so an edit genuinely breaks
+  the symmetry. The operators are then **re-derived from the coordinates**
+  and the ❖ page says what happened; a structure with nothing left becomes
+  **P1**. An untouched cell is never re-derived, so the file's own setting is
+  not quietly respelled.
 
 **Each crystal carries its own switches in the outliner**: a `.cif` object
 gets one extra child row with **Cell** (unit cell box), **Poly**

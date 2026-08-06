@@ -281,15 +281,34 @@ def test_a_molecular_crystal_collects_no_modifier(win, tmp_path):
     assert win._boundary_modifier(obj) is None
 
 
-def test_the_crystal_page_checkbox_drives_the_modifier(win, tmp_path):
+def test_the_crystal_page_checkbox_leaves_the_modifier_alone(win, tmp_path):
+    """SUPERSEDES "the checkbox drives the modifier" (round 43c).
+
+    Driving both from one control conflated two different things. Closing the
+    bonds that cross a cell face is a CORRECTNESS fix a framework needs at
+    import whether or not anyone wants the neighbouring molecules drawn — so
+    `_autoclose_boundary` turned it on and set `cell_exterior = 1` with it,
+    leaving the box ticked over a picture that had no shell in it. The first
+    untick then disabled a modifier the user had never enabled, and atoms that
+    had been on screen since the file opened vanished. That is Christian's
+    "when it is unticked again, even more atoms disappear".
+
+    The modifier now belongs to the Modifiers page, and this checkbox means
+    exactly one thing: draw the neighbouring cells' molecules.
+    """
     obj = _open(win, tmp_path, CUT_RING)
     mod = win._boundary_modifier(obj)
     assert mod is not None and mod.enabled
+    drawn = len(obj.evaluated()[0])
+
     win._on_crystal_exterior(obj.id, False)
-    assert not mod.enabled
-    assert len(obj.evaluated()[0]) == obj.structure.n_atoms
+    assert mod.enabled                     # untouched...
+    assert len(obj.evaluated()[0]) == drawn  # ...and nothing was lost
+
     win._on_crystal_exterior(obj.id, True)
     assert mod.enabled
+    win._on_crystal_exterior(obj.id, False)
+    assert len(obj.evaluated()[0]) == drawn  # round trip is lossless
 
 
 def test_the_boundary_modifier_is_kept_last(win, tmp_path):

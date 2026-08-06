@@ -874,8 +874,16 @@ def expand(data, tol=0.1, wrap=True, whole_molecules=True, boundary=True,
     # present and would only have it search the same faces twice.
     content_symbols, content_frac = list(symbols), out
     if wrap and boundary:
-        groups = (fragment_info(symbols, out, data.cell) if whole_molecules
-                  else None)
+        # `geometric` here for the same reason as everywhere else in this
+        # function (round 42d): on a wholly disordered structure the chemistry
+        # graph shatters, so a boundary atom would carry a two-atom shard
+        # instead of its molecule. 2240539 has 18 atoms exactly on a face and
+        # four 70-atom cages; without this they carried 21 loose atoms and the
+        # corner cage was drawn ONCE instead of at all eight corners, which is
+        # Christian's "only one third of the CH polyhedra are shown".
+        groups = (fragment_info(symbols, out, data.cell,
+                                geometric=wholly_disordered)
+                  if whole_molecules else None)
         extra_symbols, extra_frac = boundary_images(symbols, out, groups)
         if extra_symbols:
             symbols = list(symbols) + extra_symbols
@@ -931,7 +939,8 @@ def expand(data, tol=0.1, wrap=True, whole_molecules=True, boundary=True,
         # hydrogens whose partner had just gone). Bounded, because each pass
         # must remove at least one atom to continue.
         for _pass in range(8):
-            keep = _reaches_into_cell(symbols, out, matrix, len(sites))
+            keep = _reaches_into_cell(symbols, out, matrix, len(sites),
+                                      geometric=wholly_disordered)
             if keep.all():
                 break
             symbols = [s for s, k in zip(symbols, keep) if k]
@@ -1360,8 +1369,9 @@ def direct_pairs(symbols, frac, cell, pairs, slack=0.45):
     return out
 
 
-def _reaches_into_cell(symbols, frac, matrix, n_content, tol=0.02):
-    # type: (list, np.ndarray, np.ndarray, int, float) -> np.ndarray
+def _reaches_into_cell(symbols, frac, matrix, n_content, tol=0.02,
+                       geometric=False):
+    # type: (list, np.ndarray, np.ndarray, int, float, bool) -> np.ndarray
     """Mask dropping any COPY whose whole fragment lies outside the cell.
 
     The final honesty check on the picture, and the one rule both reference
@@ -1383,6 +1393,16 @@ def _reaches_into_cell(symbols, frac, matrix, n_content, tol=0.02):
     Only COPIES are considered: the cell CONTENT is never touched, so Z, the
     ❖ page's count and anything counting formula units stay exactly as they
     were.
+
+    `geometric` groups on proximity rather than chemistry, for the wholly
+    disordered case — and it matters MORE here than anywhere else, because
+    this function decides what survives. On the chemistry graph a cage
+    shatters into shards, each judged separately, so the shards that happen to
+    lie outside are dropped and what is left is a TRUNCATED cage: 2240539 came
+    back with 45-, 19-, 18- and 17-atom stumps whose centroids sat at 0.93
+    instead of on a lattice point. A fragment must be judged as the whole
+    thing it is, or "keep the molecule if any atom is inside" is not the rule
+    being applied.
     """
     from . import bonding
     n = len(symbols)
@@ -1394,7 +1414,8 @@ def _reaches_into_cell(symbols, frac, matrix, n_content, tol=0.02):
     inside = np.all((frac > -tol) & (frac < 1.0 + tol), axis=1)
     if inside.all():
         return keep
-    bonds = bonding.perceive_bonds(list(symbols), cart)
+    bonds = bonding.perceive_bonds(list(symbols), cart,
+                                   sanity=not geometric)
     adj = {}
     for i, j, _order in bonds:
         adj.setdefault(i, []).append(j)
@@ -1545,17 +1566,24 @@ def boundary_images(symbols, frac, groups=None, tol=1e-4):
     out_frac = []
     seen = set()
     for index in range(len(frac)):
-        f = frac[index]
+        group, periodic = member.get(index, ([index], True))
+        carried = [index] if periodic else group
+        # Which lattice shifts this copy may take. For a PERIODIC component
+        # only the atom itself travels, so its own coordinates decide. For a
+        # whole molecule the question is about the MOLECULE, so the options
+        # are pooled over its atoms: a cage sitting on a corner has atoms on
+        # the x, y and z faces but NONE with all three coordinates at zero, so
+        # per-atom shifts can only ever produce seven of the eight corners.
+        # That was the last of Christian's missing polyhedra on 2240539.
+        probe = [index] if periodic else group
         options = []
         for axis in range(3):
             shifts = [0.0]
-            if abs(f[axis]) <= tol:
+            if any(abs(frac[k][axis]) <= tol for k in probe):
                 shifts.append(1.0)
-            elif abs(f[axis] - 1.0) <= tol:
+            if any(abs(frac[k][axis] - 1.0) <= tol for k in probe):
                 shifts.append(-1.0)
             options.append(shifts)
-        group, periodic = member.get(index, ([index], True))
-        carried = [index] if periodic else group
         for da in options[0]:
             for db in options[1]:
                 for dc in options[2]:
@@ -1835,7 +1863,8 @@ def reference_sample(coords, limit=24):
 
 def build_view(cell, asym_symbols, asym_frac, symops, mode="cell",
                na=1, nb=1, nc=1, tol=0.1, exterior=0, occupancy=None,
-               disorder=POLICY_DOMINANT, report=None, shell_molecules=False):
+               disorder=POLICY_DOMINANT, report=None, shell_molecules=False,
+               disorder_groups=None, disorder_assemblies=None):
     # type: (Cell, list, list, list, str, int, int, int, float, int, Optional[Sequence], str, Optional[dict]) -> Tuple[List[str], np.ndarray]
     """The atoms for one crystal display mode, in CARTESIAN coordinates.
 
@@ -1846,9 +1875,18 @@ def build_view(cell, asym_symbols, asym_frac, symops, mode="cell",
     `exterior` shells of VESTA-style bonded-outside-the-box atoms are added
     to the cell and packing modes (never to "asym", which is by definition
     the listed sites and nothing else).
+
+    The DISORDER COLUMNS have to be passed in alongside the occupancies, or
+    this rebuilds a different structure from the one the import produced.
+    `resolve_disorder` prefers the file's own group/assembly labels and only
+    falls back to geometric overlap without them, so dropping them here made
+    the first toggle of any control on the ❖ page silently re-resolve the
+    disorder: 7712836.cif went from 222 content atoms to 294, and from 999
+    drawn to 469. That is Christian's "atoms disappear when I untick it".
     """
     data = CifData(cell, symops, asym_symbols, np.asarray(asym_frac, float),
-                   occupancy=occupancy)
+                   occupancy=occupancy, disorder_groups=disorder_groups,
+                   disorder_assemblies=disorder_assemblies)
     if mode == "asym":
         # The asymmetric unit is BY DEFINITION the listed sites, so no
         # disorder resolution here — but say so, since "asym" is also the mode

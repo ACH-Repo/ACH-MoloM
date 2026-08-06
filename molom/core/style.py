@@ -170,3 +170,30 @@ def occupancy_wedges(composition, colour_of, max_wedges=MAX_OCCUPANCY_WEDGES):
     while len(wedges) < max_wedges:
         wedges.append(wedges[-1])
     return wedges
+
+
+# ------------------------------------------------- refused bonds (round 43)
+#: How a bond the chemistry REFUSED is drawn when the ❖ page's visualisation
+#: override is on: this fraction of the normal stick radius, blended this far
+#: toward grey. Both halves matter. MoloM's standing promise is that a stick
+#: means a bond, and the override deliberately breaks it — so a refused
+#: contact has to be visibly a weaker claim than the real bond beside it, or a
+#: figure made with the tick on would assert chemistry that nobody believes.
+REFUSED_BOND_SCALE = 0.45
+REFUSED_BOND_FADE = 0.55
+
+
+def muted(rgb, fade=REFUSED_BOND_FADE, grey=0.5):
+    # type: (object, float, float) -> tuple
+    """Blend a colour toward grey, for geometry drawn as a weaker claim.
+
+    Toward GREY, not toward the background: the element stays recognisable (a
+    refused C...C still reads as carbon), while the stick plainly is not
+    saying what its neighbours say. Fading to the background instead would
+    make the contact vanish against empty space and stay fully visible against
+    a molecule, which is exactly backwards — and it would depend on a
+    background colour that `core` is not allowed to know about.
+    """
+    f = max(0.0, min(1.0, float(fade)))
+    return tuple(float(c) * (1.0 - f) + float(grey) * f
+                 for c in tuple(rgb)[:3])

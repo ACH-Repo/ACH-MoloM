@@ -141,20 +141,31 @@ def cell_of(obj):
         return None
 
 
-def set_cell_reference(structure):
+def set_cell_reference(structure, coords=None):
     """Pin the cell frame to the atoms as they stand RIGHT NOW.
 
     Call after importing or rebuilding a crystal. From here the box follows
     whatever rigid motion the atoms undergo (see `cell_corners_world`).
+
+    `coords` pins the reference to a DIFFERENT set of positions than the ones
+    the structure is currently holding, and the only correct value for it is
+    the crystal in the CELL's own frame. A rebuild that preserves the user's
+    rotation stores rotated atoms, so pinning against those would make the fit
+    the identity — and the box would be drawn square-on while its atoms sit at
+    an angle. Pin against the unrotated coordinates and the fit recovers the
+    rotation, which is exactly what `cell_corners_world` needs.
     """
     from ..core import cif as cif_mod
     meta = structure.metadata
     if not meta.get("cell") or structure.n_atoms < 3:
         return
-    idx = cif_mod.reference_sample(structure.coords)
+    xyz = structure.coords if coords is None else np.asarray(coords,
+                                                             dtype=float)
+    if len(xyz) != structure.n_atoms:
+        xyz = structure.coords
+    idx = cif_mod.reference_sample(xyz)
     meta["cell_ref_idx"] = [int(i) for i in idx]
-    meta["cell_ref_xyz"] = [[float(v) for v in structure.coords[i]]
-                            for i in idx]
+    meta["cell_ref_xyz"] = [[float(v) for v in xyz[i]] for i in idx]
 
 
 def cell_corners_world(obj, cell=None):
@@ -756,6 +767,11 @@ class MolViewport(QOpenGLWidget):
         #: thing on screen that says otherwise.
         self.show_occupancy = True
         self.polyhedra_alpha = 0.55      # coordination-solid opacity
+        #: How a REFUSED bond is drawn when the ❖ page's override is on. The
+        #: defaults live in core.style so the viewport and the Blender export
+        #: cannot drift apart; these are the live, tweakable copies.
+        self.refused_bond_scale = style_mod.REFUSED_BOND_SCALE
+        self.refused_bond_fade = style_mod.REFUSED_BOND_FADE
         self.render_subdiv_bonus = 2     # extra sphere subdivisions on render
         self.render_scale = 2            # resolution multiplier on render
         self.adjust_h = True             # re-dress hydrogens on edits
@@ -2619,6 +2635,35 @@ class MolViewport(QOpenGLWidget):
                         cyl_ends += [m, b]
                         cyl_rads += [r, r]
                         cyl_cols += [colors[i], colors[j]]
+            if st.show_bonds and (s.metadata or {}).get("show_refused_bonds"):
+                # The visualisation override (round 43). These are contacts
+                # the chemistry REFUSED — impossibly short, or past the
+                # element's covalent valence — so they are drawn thinner and
+                # desaturated: a render must never claim a 0.5 A contact is an
+                # ordinary bond. They ride the ordinary cylinder buffer rather
+                # than a pass of their own, because they ARE scene geometry;
+                # only the overlays need their own buffers (round 35).
+                base_n = max(s.n_atoms, 1)
+                n_drawn = len(coords)
+                r_ref = st.bond_radius * self.refused_bond_scale
+                for i, j in (s.metadata.get("refused_bonds") or ()):
+                    if not (0 <= i < n_drawn and 0 <= j < n_drawn):
+                        continue
+                    if obj.atom_hidden and (i % base_n in obj.atom_hidden
+                                            or j % base_n in obj.atom_hidden):
+                        continue
+                    p1, p2 = coords[i], coords[j]
+                    mid = (p1 + p2) / 2.0
+                    c1 = style_mod.muted(colors[i], self.refused_bond_fade)
+                    c2 = style_mod.muted(colors[j], self.refused_bond_fade)
+                    if st.wireframe:
+                        wire_rows += [list(p1) + list(c1), list(mid) + list(c1),
+                                      list(mid) + list(c2), list(p2) + list(c2)]
+                        continue
+                    cyl_starts += [p1, mid]
+                    cyl_ends += [mid, p2]
+                    cyl_rads += [r_ref, r_ref]
+                    cyl_cols += [c1, c2]
 
         self._sphere.upload(
             np.array(sphere_mats) if sphere_mats else np.zeros((0, 4, 4)),
