@@ -56,6 +56,293 @@ the operator key table, CIF reading with symmetry, coordination polyhedra,
 meta atoms, the scene clock with a multi-track timeline, vibrational modes,
 per-element display control, and the symmetry modifier. 512 tests.
 
+Round 45f (2026-08-06, over-valence allowed + the boundary step): two more of
+Christian's, both in the sandbox only. **(1) Over-valence is now DRAWN.** "There
+should be a carbon with 6 connected hydrogens there. I think that's the better
+representation. VESTA and Mercury also do it" — and he is right: a methyl
+disordered over two orientations at full occupancy (`4-ABA-oxime.cif`, round
+41's file) is honestly depicted with six H, which reads as rotational dynamics
+rather than as an error. `bondgraph.build` gained `valence=` and
+`cap_hydrogens=` as separate flags from `sanity=`, because an impossibly short
+contact is never a bond (not a judgement call) while an over-valence atom may
+be exactly what a disordered site should look like. Defaults unchanged, so the
+shipping path is untouched; the sandbox passes both False. Measured: 6 carbons
+over four bonds, one of them C + 6 H exactly. **(2) A Boundary stage**, because
+the completion had nothing to work off for a framework: an atom with k of its
+coordinates on a boundary belongs to 2^k positions, and the WRAP CANNOT PRODUCE
+THEM (it is a function — 0 maps to 0, never to 1), which is precisely why it is
+its own step. `boundary_instances` returns `(atom, shift)` pairs so the round-44
+graph instantiates them with their own coordination spheres. The direction has
+to come from the coordinate and not from the wrapped residual: x = 1.0 has
+residual 0.0 but sits at the TOP of the cell, so its partner is at shift -1.
+**And the periodic branch of `complete_molecules` now closes each drawn atom's
+own coordination** — one bonded shell — since a framework has no "whole" to
+complete. That is what puts the oxygens on the metal sitting exactly on a face
+of `1547149.cif` (6 -> 15 -> 59 atoms), and it needs no chemistry-specific
+rule. Christian's related question about VESTA is worth recording: he observes
+it extends oxides past the boundary but not intermetallics, and wonders how
+much per-case logic is in there. A unified explanation that fits: VESTA draws
+no metal-metal bonds at all, so an intermetallic has nothing to extend ALONG,
+while an oxide's M-O bonds do. That does not explain `2108327.cif` (a Ba/Li
+fluoride-oxide, where he sees bonds but no extension), so it is a hypothesis,
+not an answer.
+**Round 45g, same day — three fixes to the shell growth**, all from Christian
+looking at the output. (1) The growth followed METAL-METAL bonds and dragged in
+a superfluous outer layer: `1547149.cif` came out with 19 Nb from a content of
+2. (2) It brought the partner ATOM only, so a ZIF's imidazolate N arrived as a
+blue dot with no ring (`2130251.cif`). (3) He asked for metal-metal to go
+entirely, as VESTA does. So the sandbox graph now DROPS every metal-metal edge
+(`_without_metal_metal`), and the growth carries the partner's whole COVALENT
+FRAGMENT (`_covalent_fragments`, which excludes metal-metal for the same
+reason). Measured: 1547149 59 -> 51 atoms and Nb 19 -> 11 with no M-M bonds;
+2130251 286 -> 368 with the rings complete; the Ni6Sn8 intermetallic now draws
+BARE, 28 atoms and zero bonds, which is exactly what VESTA shows. **Still open
+and worth a decision**: the remaining Nb come from completing the coordination
+of boundary OXYGENS, which legitimately bond to metal outside the box — the
+growth is symmetric while VESTA's looks asymmetric (it appears to add O to
+metals but not metals to O). 1025 tests.
+
+Round 45e (2026-08-06, the sandbox settles what a SITE is before drawing it):
+Christian's framing, and it is the right one — "sites are not atoms, they are
+statistically averaged electron densities explained by an atom type when the
+CIF was refined". So an **Occupancy** stage now sits between Dedupe and Bonds,
+splitting partial occupancies two ways because they need opposite treatment:
+**(A) spatially DISTINCT** alternatives are drawn as full atoms (his call, and
+a good one: a methyl over two orientations showing six hydrogens is an honest
+cue that it rotates in the solid state), **(B) SHARED** positions — several
+species on one Gitterplatz — collapse to one pie-chart atom. **The ordering
+flaw this stage exists to work around**: by the time atoms exist, case B has
+already been destroyed. `expand`'s minimum-image merge removes the co-located
+species BEFORE occupancy is consulted, so on `SodiumNicotinate.cif` the
+nitrogen sharing a position with a carbon comes back with multiplicity ZERO
+and is simply absent. The composition therefore cannot be read off the drawn
+atoms and is recomputed from the ASYMMETRIC UNIT via `cif.site_composition`
+(round 42's rule, reached again from the other end). Measured: sodium
+nicotinate 8 pie atoms (C 0.50 / N 0.50) plus 8 distinct partials as full
+atoms; `1547149.cif` 2 pie atoms (Nb 0.50 / Ti 0.25 / Ni 0.15 / Co 0.10).
+**No CIF tag declares case B** — `_atom_site_disorder_group`/`_assembly`
+declare case A — so it is recognised geometrically, identical coordinates with
+occupancies summing to about one. Worth knowing the converse also happens:
+`4-ABA-oxime.cif` writes a genuinely disordered methyl at FULL occupancy, so
+case A is invisible to an occupancy test there (round 41). `pipeline.Result`
+gained a `meta` field, merged into the drawn structure's metadata, which is how
+a stage hands the viewport something no coordinate implies — the pie spheres
+render from `metadata["site_occupancy"]` with no new drawing code. `cif.expand`
+gained `report["site_of"]` (informational only) so a caller can ask what a
+drawn atom's occupancy was without re-deriving the expansion. 1021 tests.
+
+Round 45d (2026-08-06, the SANDBOX rewritten — completion instead of
+relocation): Christian found the thing that had been bothering him, on
+`242083.cif` (two C60 + four Ni units + four chlorobenzenes, 312 atoms). After
+Wrap the picture matches VESTA exactly. At **Molecules** the four
+quarter-fullerenes sitting on the c-edges collapse into ONE fullerene hanging
+out of the box — and he is right that this is the wrong picture. The
+measurement: those four blobs are ONE C60 that the atom-by-atom wrap tore into
+four corners, 102 atoms move, and the count is unchanged. `unwrap_molecules`
+makes each fragment CONTIGUOUS and shifts it so its centroid is inside, which
+preserves the cell content exactly (312 = Z formula units, what the ❖ count,
+the density and the export all need) — **but once the molecule has moved it is
+no longer ON a face, so `boundary_images` has nothing to repeat for it**, and
+one fullerene gets completed where five belong. That is the whole bug: the
+relocation defeats the completion that follows it. Measured consequence:
+`Fragments` and `Complete` add exactly 0 atoms on that file, precisely because
+Molecules already relocated everything. So the SANDBOX was emptied of the
+round-45b/c experiment (overcomplete duplication, flat cuts, offsets, shifts)
+and rebuilt on his stated intuition: "if wrap is the correct placement of sites
+without atoms outside the boundary, then molecules should complete all four
+quarter fullerenes". Stages are now Cell / Sites / Operators / Wrap / Dedupe
+(all `pipeline.run`'s own) then **Bonds** — connectivity from the labelled
+PERIODIC graph, drawn only where both ends are in the cell, because the wrap
+tears molecules and straight-line bonds on wrapped coordinates are simply
+wrong — then **Molecules**, Mercury's packing rule: every fragment with an atom
+in the cell drawn WHOLE, nothing relocated. Result on 242083: **876 atoms, 5
+fullerenes, 12 + 12** — byte-identical to `expand(shell_molecules=True)`, which
+is the existing ❖ checkbox, reached by a completely different route. Ferrocene
+210 / 10 molecules, H2bdc 72 / 4, 4-ABA 376 / 16. **Open and deliberate: a
+periodic component has no "whole" to complete**, so ZIF-8 and ZnO keep only
+their in-cell atoms and the trace says so. `complete_molecules` pools its
+candidate translations PER AXIS over the whole group against the CLOSED cell —
+the first cut used `-floor(x)` per atom, which never proposes the +1 image for
+an atom at exactly 0, so a molecule on the origin corner drew once instead of
+eight times (round 43b's lesson, re-learned). 1016 tests.
+
+Round 45b (2026-08-06, the SANDBOX page — someone else's algorithm): a 🧪 tab
+next to 🐞, for Christian to "experiment if I can come up with a different
+algorithm that I can fully comprehend/survey". Nothing the app draws goes
+through it. Cell / Sites / Operators are the debug page's stages by CALLING
+`pipeline.run`, so the part not under experiment cannot drift; the divergence
+is one stage, **Duplicate**: instead of wrapping, repeat every atom at a
+lattice offset so the representation is OVERCOMPLETE and prune later. His
+words were "duplicated at (x+1,y+1,z+1)", and **measuring first showed that
+alone cannot work**: a diagonal shift never produces the image that needs +1
+on ONE axis, so on `SodiumNicotinate.cif` it reaches 76 of the cell's 172
+atoms — and since this scheme only ever widens, the missing 96 can never be
+pruned back in. So the offsets are a visible CHOICE (diagonal / {0,1}^3 /
+{-1,0,1}^3, 400 / 1600 / 5400 atoms) defaulting to what was asked for, and the
+trace states its own coverage: the page is for judging an idea, so it has to
+be able to say the idea is incomplete. `_coverage_lines` measures against
+MoloM's own wrapped-and-merged content atom by atom. **`pipeline.
+operator_images` is shared and returns FRACTIONS**, which is not fussiness: the
+first cut had the sandbox convert `base.coords` back through the cell matrix,
+and an exact 0.0 or 1.0 came back an epsilon off, so the "inside the box" count
+read 190 where an independent measurement said 200. `PipelinePage` in
+`ui/debug_page.py` is now the shared base (load / text / trace / freshness) with
+an `extra_controls` hook. Both pages own ONE scene object between them —
+alternative algorithms for the same thing, and seeing both at once is a picture
+of neither.
+**Two more stages (same day): Bonds and Prune.** Bonds is a HARD flat cut —
+Christian's "2.6 A, anything higher is no longer a bond" — with no radii and no
+chemistry, deliberately, so the picture is a property of one number. Non-
+periodic on purpose: every atom is an individual in space, which is coherent
+precisely because the duplicate stage already materialised the partners. Prune
+is Mercury's rule as the first NARROWING step: drop every fragment with no atom
+inside the cell. **Measured, and it decides the whole idea: 2.6 A is too
+generous by a mile.** Two atoms either side of a bond angle sit at ~2.4 A, so
+above ~2.3 A every 1,3 pair becomes a bond, the structure percolates into ONE
+fragment and Prune has nothing to discard — on `SodiumNicotinate.cif` at 2.6 A
+it is 1 fragment, 1600 of 1600 atoms kept, 860 of 1436 bonds 2.0 A or longer,
+88 of them H-H. Below the threshold the idea works exactly as he described:
+at 1.7-2.2 A it gives **224 fragments -> 42 kept -> 376 atoms**, all 172 cell
+atoms plus the fragments that reach in from outside. So the cutoff is a spin
+box next to the offsets, defaulting to the 2.6 A asked for, and the trace
+prints a bond-LENGTH HISTOGRAM plus the count of bonds 2.0 A and over, because
+that band is the whole diagnosis. **`prune_to_cell` needs a boundary
+tolerance**: a symmetry operator produces an exact 0 as `-0.0`, a bare
+`x >= 0` calls it outside, and an isolated Na (isolated once the cut excludes
+Na-O at 2.4 A) then loses its whole singleton fragment — 171 of 172 until the
+tolerance went in.
+**Round 45c, same day — the sandbox grows the real bond rule.** Christian
+pushed back on the metal-metal claim and was RIGHT: MoloM draws no Zn-Zn in
+MOF-5 (Zn radius 1.18 gives a 2.81 A window against a 3.18 A contact), so
+"metal-metal stays covalent so a Zn4O cluster survives" was wrong as stated —
+the reason `bond_kind` keeps it covalent is FRAGMENT CUTTING, not drawing. But
+metal-metal bonds do get drawn elsewhere: **8 of 36 files**, including 8 Na-Na
+at 3.4296 A in `SodiumNicotinate.cif` (Na radius 1.55 -> a 3.55 A window,
+uncapped because metals have no `MAX_COVALENT`). He noted VESTA draws none,
+even for lithium. So the sandbox gained: the **real MoloM rule** as the default
+bond mode (flat cut kept as the alternative), an **exclude metal-metal** tick,
+a **shift by a vector in cell units** tick, and — added because measuring
+showed the first two do not achieve the goal — **fragments over covalent bonds
+only**. That last one is the lever: sodium nicotinate is a COORDINATION
+POLYMER, one component through 594 Na-O bonds, so Prune discards nothing until
+the fragment walk is restricted (round 38's rule). Measured on that file at
+2x2x2: flat 2.6 A -> 1600 atoms 1 fragment; MoloM rule -> 1600, 1 fragment;
++ no metal-metal -> 1600, 1 fragment; **+ covalent fragments -> 376 atoms, 224
+fragments, 42 kept, covers 172/172** — the complete cell plus the fragments
+reaching in, which is exactly the baseline he described. **Also: the file's own
+`_geom_bond_` loop is NOT read and could not be trusted verbatim** — it lists
+Na...Na 3.43 A and Na...C 2.78 A as bonds, and `publ_flag` cannot filter them
+(a carboxylate C-O at 1.2586 A is flagged `?`). Its third column IS the n_pqr
+code though, i.e. a ready-made labelled graph, so it is worth a tier one day.
+**Bug worth remembering: `for shift in shifts` shadowed the `shift` PARAMETER**,
+so every atom was translated by the last offset (1,1,1). The trace agreed with
+itself because the coverage check shifts its reference by the same vector; only
+an outside measurement caught it (coverage 16/172 where the note said 172/172).
+1021 tests.
+
+Round 45 (2026-08-06, the DEBUG page — the pipeline one stage at a time):
+Christian, straight after round 44: "I want to try an iterative debugging
+approach that necessitates my step by step understanding of how unit cells are
+drawn." A sixth properties tab (🐞) where a CIF is loaded AS TEXT and a row of
+eleven buttons runs the pipeline up to that stage and no further. **The contract
+is that a stage is a PURE FUNCTION of (text, stage index)** — every click
+rebuilds from the text, the previous debug object is thrown away, and nothing
+carries over; a picture that could contain leftovers from a previous click is
+not evidence. Tested as such: run stage 9 (516 atoms on ZIF-8), then stage 2,
+and get 9 atoms. `core/pipeline.py` is UI-free and its stages 2-5 are
+**`cif.expand`'s own flags** rather than a reimplementation, so the page cannot
+describe a pipeline the app does not run — pinned by a test asserting the last
+stage equals an ordinary import plus its `BoundaryModifier`. Stage 1 is the
+cell box with NO atoms and stage 2 the raw `_atom_site_` rows with no symmetry
+and no bonds, which were Christian's two requests; the rest follow the real
+order. **The symmetry step is split three ways** — Christian spotted it doing
+more than it says on `SodiumNicotinate.cif`, where 24 of 25 sites are written
+with NEGATIVE fractional coordinates and yet the structure lands inside the
+box: `Operators` is `x' = Wx + w` alone (25 x 8 = 200 atoms, **132 of them
+outside [0,1)**), `Wrap` is `x - floor(x)` (the step that actually fills the
+box, and it wraps ATOM BY ATOM, which is why molecules are torn until the
+Molecules stage), `Dedupe` is the 0.1 A minimum-image merge (**-28**, leaving
+172). Only Dedupe corresponds to a `cif.expand` configuration; the first two
+are its inner loop split open, so a test pins Dedupe to `expand`'s own output.
+The Dedupe note prints the **per-site multiplicity breakdown**, which is the
+cheapest correctness check there is: 19 general positions, 5 special
+(multiplicity 4), one site contributing NOTHING — a symmetry-redundant row,
+the urea N1/N1C pattern that makes pymatgen report occupancy 2 — and a warning
+if any multiplicity fails to divide the operator count.
+Two details worth keeping: **the camera is not re-fitted between stages**
+(comparing two stages means seeing the same view twice) but IS fitted once per
+file, and it frames the **cell corners as well as the atoms**, because stage 1
+has none and `fit_view` would otherwise fall back to a 1 A radius at the origin
+and leave a 17 A box off screen. The nine buttons sit in a **wrapping** flow
+layout, not a QHBoxLayout — the dock is narrow and refuses horizontal
+scrolling, so a plain row would push the last stages off the edge with no hint
+they were there (the round-21 lesson). The page also prints a per-stage TRACE
+(atoms, bonds, and what each step did — how many duplicates the operators
+merged, what the disorder policy dropped, how many edges cross a cell face,
+the component ranks), which is most of the value on a file you are arguing
+with. 1003 tests.
+
+Round 44 (2026-08-06, the LABELLED PERIODIC BOND GRAPH — stage 4 at last):
+Christian brought a written CIF-visualisation spec ("I am no longer confident
+our visualisation algorithm is mathematically sound and chronologically
+logical") and asked whether it changed anything. It did, in two places, and
+both were MEASURED before a line was written — as MoloM against MoloM, so the
+same bond rules ran on both sides and only the architecture was under test.
+The metric: does the drawn coordination match a 3x3x3 supercell of the same
+cell, where the central cell's atoms have a complete environment? **10 of 36
+files. The sharpest failure was the spec's own regression test: every Zn in
+ZIF-8 drawn 3-coordinate, 12 of 12**, and on ZIF-4/7/62/67/zni/qtz too.
+**Two independent faults, neither of them the one first suspected.** (1)
+**Clip-then-bond.** Bonds were perceived from CARTESIAN coordinates after the
+structure had been clipped to the cell, with `boundary_images` and
+`BoundaryModifier` patching afterwards. An atom lying exactly ON a face is
+drawn twice, once per face — which is the right convention — and the two
+copies then SPLIT one coordination sphere between them. Traced on ZIF-8's Zn0
+at frac (0, 0.25, 0.5): four N at 1.982 A under the minimum image, only two of
+them near in a straight line, and the modifier patching one back. More
+boundary shells could not fix it (2 and 3 give byte-identical output) because
+the ATOMS were there all along; it was the bonds that were missing. Note the
+first hypothesis — `covalent_only` excluding the Zn-N coordination bond — was
+WRONG, and testing it cost one command: `covalent_only=False` gives identical
+output on all 17 files tried. (2) **`periodic_pairs` used the minimum image
+unguarded.** That convention is valid only while the cutoff is under half the
+smallest PERPENDICULAR width (not the smallest EDGE, the tempting mistake in a
+skewed cell), and it can never return more than one bond per pair of indices
+nor any bond from an atom to its own image. Six of 37 files violate the guard
+and five lose bonds against brute force: **alpha-iron 1 bond where there are
+8**, ZnO 4 of 8, 2108327 7 of 29, 2106093 30 of 50, 1547149 8 of 14. Worth
+knowing that NO ZIF is affected — their cells are 11-17 A perpendicular
+against a 2.8 A cutoff — so the spec frames this as a framework hazard and on
+this machine's files it is a dense-inorganic one. **New `core/bondgraph.py`**:
+`Edge(i, j, shift, dist)` where the shift IS the CIF `n_pqr` code, built over
+the translation shell derived from the perpendicular widths, with the
+chemistry unchanged (the same `bonding.prune_pairs`, plus a periodic hydrogen
+cap, because the molecular one measures straight lines from a coordinate array
+and here the partner is in the next cell). `PeriodicGraph.instantiate` is
+stage 5 and a pure LOOKUP: each drawn atom is labelled `(content index,
+lattice shift)` by `label_instances`, so a face atom's two copies carry
+different shifts and each gets its OWN complete sphere. Measured after:
+**stage 4 reproduces the complete-environment coordination on 34 of 36 files**
+(the two exceptions are ZIF-8's and ZIF-67's disordered methyl hydrogens,
+round 41's open issue, where the valence cap picks between over-provided H),
+and **every framework metal draws 4-coordinate with the component correctly
+rank 3**. ZIF-8 went from 18 mismatched atoms to 4, all hydrogens.
+**`missing_partners` is the bounded grow**, and WHICH bonds it may follow is
+the whole difficulty — both rules were re-learned rather than reasoned out. A
+covalent bond is followed only if it involves a NON-METAL (round 42b: metal-
+to-metal is covalent by design, and following it buried Ni6Sn8's cell); a
+COORDINATION bond only if the partner belongs to a covalent fragment of more
+than one atom, because `bond_kind` deliberately does not distinguish Zn-N from
+Na-Cl and the partner's own fragment is what separates a ZIF's imidazolate
+from rock salt's lone chloride. **Packing was stacking duplicates**: each cell
+carried its own boundary copies and the copy on a shared internal face is the
+same atom as its neighbour's, so ferrocene's 2x2x1 drew 1680 atoms with 1680
+coincident pairs — every atom twice. De-duplicated, NaCl's packings come out
+as the textbook grid, `(2na+1)(2nb+1)(2nc+1)`: 27, 45, 75 where the old code
+said 27, 54, 108. Three tests pinned those wrong numbers and were updated —
+round 38's lesson again, that a fixture is the first casualty of a rule about
+what is real. 984 tests.
+
 Round 43 (2026-08-05, the refused-bond override — closing round 42d's last
 gap): round 42d ended with VESTA drawing the contacts we refuse, so its cages
 read as solid polyhedra while ours were clouds of spheres in the right places.
@@ -1364,7 +1651,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 963 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 984 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -1449,6 +1736,34 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   minimum-image bond list, valence-sanitised), and `fragment_info` cutting a
   PERIODIC component at its coordination bonds — which is what makes a
   framework's linkers finite and completable at the boundary.
+- `core/sandbox.py` — an ALTERNATIVE pipeline for the 🧪 page (round 45d).
+  Nothing in the app reads it; it exists to try an algorithm on, and it gets
+  emptied and rebuilt whenever the idea changes. Shares Cell..Dedupe with
+  `core/pipeline.py` by calling it; diverges at `Bonds` (connectivity from the
+  periodic graph, drawn only where both ends are in the cell) and
+  `complete_molecules` (Mercury's packing: every fragment reaching into the
+  cell drawn whole, nothing relocated).
+- `core/pipeline.py` — the CIF pipeline exposed ONE STAGE AT A TIME, for the
+  🐞 debug page (round 45). `run(text, upto)` is a pure function returning the
+  atoms, the bonds and a per-stage TRACE. Stages 2-5 delegate to `cif.expand`'s
+  own flags on purpose: a debug view that drifts from the real path is worse
+  than none. Add a stage here and the page grows a button by itself.
+- `core/bondgraph.py` — **STAGE 4, the labelled periodic bond graph** (round
+  44). `Edge(i, j, shift, dist)`: the shift is the integer lattice translation
+  applied to `j`, i.e. the CIF `n_pqr` code (`npqr()`), and carrying it is
+  what makes the graph independent of the display window. Candidates come
+  from the TRANSLATION SHELL sized by `perpendicular_widths` — never the
+  minimum image, whose guard (`minimum_image_is_safe`) is kept only as a
+  named predicate because its absence was the bug. The chemistry is not
+  re-implemented: the same `bonding.prune_pairs`, plus a periodic hydrogen
+  cap. `label_instances` tags each DRAWN atom `(content index, shift)` and
+  `PeriodicGraph.instantiate` turns that into bonds by lookup — stage 5, and
+  the reason an atom on a cell face now keeps its whole coordination sphere
+  instead of splitting it between its two drawn copies. `components()`
+  returns each component's lattice RANK (0 molecule / 1 chain / 2 layer /
+  3 framework), which is the honest test for "can this be completed as a
+  molecule?". Anything that draws or exports a crystal should go through
+  `cif.display_bonds`, not `perceive_bonds`.
 - `core/spacegroups.py` — space-group SYMBOL -> operators, for the CIFs that
   name their group and omit the loop. spglib's **Hall database** (530
   settings) first, pymatgen second, both optional-at-runtime and both
@@ -1590,6 +1905,47 @@ independent cross-check inside a single fixture.
   vector then spin so the backbone points outward.
 
 ## Hard-won gotchas (don't re-learn these)
+- **CLIP THEN BOND splits a face atom's coordination sphere in half** (round
+  44). An atom lying exactly on a cell face is drawn twice, once per face —
+  correct, and what every viewer does — but if the bonds are then perceived
+  from CARTESIAN coordinates, each copy only picks up the partners on its own
+  side. The picture shows two atoms with half a sphere each instead of one
+  atom with a whole one: every Zn in ZIF-8 came out 3-coordinate. It cannot be
+  fixed by adding boundary shells, because the atoms were never missing, and
+  it is invisible to any check that counts atoms. Bond on the PERIODIC
+  structure first, label the edges, and instantiate.
+- **The minimum image needs a guard, and it is the PERPENDICULAR width**
+  (round 44). `d - round(d)` is valid only while the cutoff is under half of
+  `min(d_a, d_b, d_c)` where those are `V/|b x c|` and friends — strictly
+  smaller than the cell edges in a skewed cell, which is the tempting wrong
+  check. It also cannot express more than one bond per pair of indices, nor
+  any bond from an atom to its OWN image, so alpha-iron came back with one
+  bond where bcc has eight and simple cubic would have none at all. Six of 37
+  files here fail the guard, all of them dense inorganics — no ZIF does, so
+  the framework files will not warn you about this.
+- **A periodic graph must be invariant under how the atoms were written
+  down** (round 44). `unwrap_molecules` moves whole fragments by lattice
+  vectors to make them contiguous, so a shell of radius one around the
+  coordinates AS GIVEN simply does not reach an atom carried two cells out —
+  `bondgraph.build` came back with zero edges for a structure it had just
+  described correctly. Wrap internally for the search and correct the labels
+  back (`t - w[j] + w[i]`); a test drives it with an atom moved by (-1, 2, 0).
+- **`bond_kind` will not tell a ZIF from rock salt, and that is deliberate**
+  (round 44). Zn-N and Na-Cl are both metal-to-non-metal and both COORDINATION,
+  because for "does this hold a molecule together?" both answer no. So a rule
+  about whether to follow a bond OUT of the cell cannot be written in terms of
+  the kind alone: ask what is on the other end. A partner in a covalent
+  fragment of more than one atom carries a molecule worth completing (a ZIF's
+  imidazolate); a partner alone in its fragment is an ion in a lattice, and
+  completing it sprouts a slab.
+- **A packing stacks each cell's own boundary copies** (round 44). The copy on
+  a shared internal face is the same atom as its neighbour's, so a naive
+  supercell draws it twice at exactly the same point — ferrocene's 2x2x1 had
+  1680 coincident pairs in 1680 atoms, i.e. every atom doubled. Invisible in
+  an atom count, visible as z-fighting and doubled sticks, and it makes every
+  downstream measurement wrong. De-duplicated, NaCl's packings are the
+  textbook `(2na+1)(2nb+1)(2nc+1)`: 27, 45, 75 — the old 27, 54, 108 were
+  pinned by three tests, which had to be corrected with the code.
 - **An EDIT is not a rigid motion, so never measure a pose across one**
   (round 43e). `cell_pose`/`rigid_from_reference` is a Kabsch fit over a
   sample of the atoms; move one of those atoms and the fit dutifully reports a
@@ -2476,12 +2832,16 @@ batches. Known next items, rough order:
      with its entries, so Mercury frequently is not perceiving bonds at all —
      it is reading them, with types included. We never have that luxury, which
      is why our perception has to carry the chemistry itself.
-   - **displayed bonds are still non-periodic** — `unwrap_molecules` uses the
-     minimum image, but the `perceive_structure_bonds` that runs afterwards
-     does not, so a FRAMEWORK (as opposed to a molecular crystal) still shows
-     cut open at the cell faces. Round 32's boundary completion helps the
-     picture (the atoms are there now) but the bonds across a face are still
-     perceived non-periodically.
+   - ~~**displayed bonds are still non-periodic**~~ **DELIVERED round 44**
+     (`core/bondgraph.py` + `cif.display_bonds`): the bonds of a drawn crystal
+     are instantiated from a labelled periodic graph built once on the cell
+     content, so they no longer depend on the display window and a face atom's
+     copies each carry a full coordination sphere. Verified as 34 of 36 files
+     reproducing their complete-environment coordination, and every framework
+     metal 4-coordinate. Still open from this: the graph is rebuilt per call
+     rather than CACHED on (cell, ops, filtered sites, bond rules), so a
+     packing change still re-derives it — correct, but the spec's invalidation
+     table wants it keyed and kept.
    - packing as an ARRAY MODIFIER rather than the current destructive rebuild.
    - ~~SYMMETRY AS A MODIFIER~~ DELIVERED round 29 (`SymmetryModifier`): the
      base stays the asymmetric unit while the viewport and exporter see the

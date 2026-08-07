@@ -38,8 +38,12 @@ def test_symmetry_modifier_can_pack():
     cell, ops, data = _nacl_meta()
     mod = mod_mod.SymmetryModifier(cell=cell, symops=ops, na=2, nb=2, nc=1)
     coords = data.frac @ data.cell.matrix()
-    sym, _xyz, _b = mod.evaluate(list(data.symbols), coords, [])
-    assert len(sym) == 27 * 4
+    sym, xyz, _b = mod.evaluate(list(data.symbols), coords, [])
+    # 5 x 5 x 3, not 27 x 4: the cells share their internal faces, and the
+    # boundary copies on those faces are the same atoms seen from both sides.
+    assert len(sym) == 75
+    from scipy.spatial import cKDTree
+    assert not cKDTree(xyz).query_pairs(0.1)
 
 
 def test_symmetry_modifier_without_a_cell_is_a_no_op():

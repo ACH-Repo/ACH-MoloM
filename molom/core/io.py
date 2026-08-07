@@ -769,6 +769,11 @@ def _read_cif(path, disorder=None):
         # else means the reader derived them from the named group, and
         # `symmetry_note` is the sentence the UI has to show for it.
         "symmetry_source": data.symmetry_source,
+        # Where the cell CONTENT ends and the boundary copies begin. The
+        # periodic bond graph is built on the content alone, and every atom
+        # past this index is one of its lattice translates — see
+        # `cif.display_bonds`.
+        "cell_content": int(report.get("n_content", len(symbols))),
     }
     if report.get("site_occupancy"):
         # {drawn atom index (as a STRING, so it survives the JSON savepoint):

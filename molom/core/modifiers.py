@@ -178,10 +178,15 @@ class BoundaryModifier(Modifier):
     kind = "boundary"
 
     def __init__(self, cell=None, shells=1, name="", enabled=True,
-                 covalent_only=True, whole_molecules=True):
+                 covalent_only=True, whole_molecules=True, content=0):
         super().__init__(name or "Boundary bonds", enabled)
         self.cell = cell                 # dict, as stored in metadata
         self.shells = max(1, int(shells))
+        #: How many of the incoming atoms are the CELL CONTENT — everything
+        #: past it is a lattice copy. The periodic bond graph is built on the
+        #: content alone, so it needs to know where that ends; 0 means "not a
+        #: crystal import", and the old geometric path is used instead.
+        self.content = int(content or 0)
         #: Follow COVALENT bonds only. A molecule cut by a cell face is what
         #: needs closing; a coordination bond is where a framework is meant to
         #: be cut, and following those as well turns rock salt's 9-atom cell
@@ -218,7 +223,7 @@ class BoundaryModifier(Modifier):
         # viewport rebuild, and re-deriving a framework's boundary each frame
         # is the round-33 mistake in a new place.
         key = (xyz.tobytes(), tuple(symbols), self.shells,
-               self.covalent_only, self.whole_molecules,
+               self.covalent_only, self.whole_molecules, self.content,
                tuple(sorted(self.cell.items())))
         def to_world(local):
             """Cell frame -> the pose the atoms actually arrived in."""
@@ -242,17 +247,52 @@ class BoundaryModifier(Modifier):
             ex_symbols, ex_frac = cif_mod.bonded_exterior(
                 list(symbols), frac, cell, depth=self.shells,
                 covalent_only=self.covalent_only, finite_only=True)
+        ex_symbols, ex_frac = list(ex_symbols), list(ex_frac)
+        if self.content:
+            # Whatever the geometric completion above found, the GRAPH knows
+            # exactly which partners the picture is still missing — and on a
+            # framework those are the ones that matter, because the atom at a
+            # cell face is already drawn and only its bond is absent. Adding
+            # them here is what takes ZIF-8's Zn from three N to four.
+            add_symbols, add_frac = cif_mod.missing_partners(
+                list(symbols), xyz, cell, self.content,
+                covalent_only=self.covalent_only)
+            if len(add_symbols):
+                keep = cif_mod._unseen(
+                    add_symbols, add_frac,
+                    list(symbols) + ex_symbols,
+                    np.vstack([frac, np.asarray(ex_frac).reshape(-1, 3)])
+                    if ex_symbols else frac)
+                for s, f in zip(add_symbols, np.asarray(add_frac)[keep]):
+                    ex_symbols.append(s)
+                    ex_frac.append(f)
         if not ex_symbols:
+            out_symbols, out_xyz = list(symbols), xyz
+            out_bonds = list(bonds)
+        else:
+            out_symbols = list(symbols) + list(ex_symbols)
+            out_xyz = np.vstack([xyz,
+                                 np.asarray(ex_frac).reshape(-1, 3)
+                                 @ cell.matrix()])
+            out_bonds = list(bonds)
+        if self.content:
+            # Bonds by LOOKUP against the periodic graph, not by re-perceiving
+            # geometry: a copy carries its own lattice shift, so it gets its
+            # own complete coordination sphere instead of sharing one with the
+            # copy at the opposite face. The incoming bonds are passed through
+            # so user-drawn orders survive.
+            out_bonds = cif_mod.display_bonds(out_symbols, out_xyz, cell,
+                                              self.content, existing=out_bonds)
+        elif ex_symbols:
+            # No content count (an old savepoint, or not a crystal import):
+            # the round-39 behaviour, perceiving only the pairs that touch a
+            # new atom so bond edits are not quietly undone.
+            n = len(symbols)
+            fresh = bonding.perceive_bonds(out_symbols, out_xyz)
+            out_bonds = list(bonds) + [(i, j, o) for i, j, o in fresh
+                                       if i >= n or j >= n]
+        if not ex_symbols and not self.content:
             return symbols, coords, bonds
-        n = len(symbols)
-        out_symbols = list(symbols) + list(ex_symbols)
-        out_xyz = np.vstack([xyz, np.asarray(ex_frac) @ cell.matrix()])
-        # The incoming bonds are kept EXACTLY as they are — they may carry
-        # orders the user drew — and only the pairs that touch a new atom are
-        # perceived. Re-perceiving everything would quietly undo bond edits.
-        fresh = bonding.perceive_bonds(out_symbols, out_xyz)
-        out_bonds = list(bonds) + [(i, j, o) for i, j, o in fresh
-                                   if i >= n or j >= n]
         self._cache_key = key
         self._cache = (out_symbols, out_xyz, out_bonds)
         return out_symbols, to_world(out_xyz.copy()), list(out_bonds)
@@ -261,7 +301,8 @@ class BoundaryModifier(Modifier):
         d = super().to_dict()
         d.update({"cell": self.cell, "shells": int(self.shells),
                   "covalent_only": bool(self.covalent_only),
-                  "whole_molecules": bool(self.whole_molecules)})
+                  "whole_molecules": bool(self.whole_molecules),
+                  "content": int(self.content)})
         return d
 
 
@@ -289,7 +330,8 @@ def from_dict(d):
         return BoundaryModifier(d.get("cell"), d.get("shells", 1),
                                 d.get("name", ""), d.get("enabled", True),
                                 d.get("covalent_only", True),
-                                d.get("whole_molecules", True))
+                                d.get("whole_molecules", True),
+                                d.get("content", 0))
     return None
 
 

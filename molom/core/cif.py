@@ -946,6 +946,18 @@ def expand(data, tol=0.1, wrap=True, whole_molecules=True, boundary=True,
             symbols = [s for s, k in zip(symbols, keep) if k]
             out = out[keep]
     if report is not None:
+        # Where the CELL CONTENT ends and the copies begin. Everything past
+        # this index is a lattice translate of an atom before it — a boundary
+        # copy, an exterior shell atom — which is what lets `display_bonds`
+        # label the whole picture against the periodic graph without threading
+        # provenance through every function that appends atoms.
+        report["n_content"] = len(sites)
+        # Which ASYMMETRIC-UNIT site each content atom came from. Purely
+        # informational — nothing here behaves differently — but it is the
+        # only way a caller can ask "what was this atom's occupancy?" without
+        # re-deriving the expansion, and the 🧪 page needs exactly that to
+        # tell a spatially distinct partial occupancy from a shared site.
+        report["site_of"] = list(sites)
         # Which DRAWN atoms stand for a site shared by several species. Done
         # LAST, because everything above may have dropped atoms, renumbered
         # them, or appended copies — and a boundary copy of a solid-solution
@@ -1074,31 +1086,196 @@ def periodic_pairs(symbols, frac, cell, slack=0.45, sanity=True, report=None):
     clash). Without it one bad contact fuses four molecules into a chain that
     percolates, and the whole cell then reads as a framework.
     """
-    from . import bonding, elements
+    from . import bondgraph
     n = len(symbols)
     if n == 0:
         return [], np.zeros(0)
-    m = cell.matrix()
-    radii = np.array([elements.radius_covalent(elements.atomic_number(s))
-                      for s in symbols])
-    radii[radii <= 0] = 2.0
-    pairs, dists = [], []
-    for i in range(n):
-        d = frac[i + 1:] - frac[i]
-        d = d - np.round(d)                        # minimum image
-        dist = np.linalg.norm(d @ m, axis=1)
-        limit = radii[i + 1:] + radii[i] + slack
-        for off in np.nonzero((dist > 0.32) & (dist < limit))[0]:
-            pairs.append((i, i + 1 + int(off)))
-            dists.append(float(dist[off]))
-    dists = np.asarray(dists, dtype=float)
-    if sanity and pairs:
-        keep, dropped = bonding.prune_pairs(symbols, pairs, dists)
-        if report is not None:
-            report.setdefault("dropped_bonds", []).extend(dropped)
-        pairs = [pairs[k] for k in keep]
-        dists = dists[keep] if len(keep) else np.zeros(0)
-    return pairs, dists
+    graph = bondgraph.build(symbols, frac, cell, slack=slack, sanity=sanity,
+                            report=report)
+    # The graph carries one edge per (i, j, TRANSLATION), which is the honest
+    # periodic answer and what the drawn picture is instantiated from. This
+    # function answers the older, coarser question — "which atoms are bonded
+    # to which?" — for the fragment walks, so the images of one pair collapse
+    # to a single entry at the shortest of them, and an atom's bond to its own
+    # image is not a pair at all. (`_touches_own_image` is what tells
+    # `fragment_info` about those, and it needs no help from here.)
+    best = {}
+    for e in graph.edges:
+        if e.i == e.j:
+            continue
+        key = (min(e.i, e.j), max(e.i, e.j))
+        if key not in best or e.dist < best[key]:
+            best[key] = e.dist
+    pairs = sorted(best)
+    return pairs, np.asarray([best[k] for k in pairs], dtype=float)
+
+
+def display_bonds(symbols, coords, cell, n_content, slack=0.45, existing=None,
+                  report=None):
+    # type: (list, np.ndarray, Cell, int, float, Optional[list], Optional[dict]) -> List[Tuple[int, int, int]]
+    """The bonds of a DRAWN crystal, instantiated from the periodic graph.
+
+    Stage 5 of the pipeline, and the fix for the defect that made this whole
+    module's arithmetic look sound and its pictures wrong: bonds used to be
+    perceived from Cartesian coordinates AFTER the structure had been clipped
+    to the cell, so anything crossing a face was simply not there. An atom
+    lying exactly ON a face is drawn twice, once per face, and the two copies
+    then split one coordination sphere between them — every Zn in ZIF-8 came
+    out with three N instead of four, on all twelve, and adding boundary
+    shells could not fix it because the ATOMS were present all along.
+
+    Here the graph is built once on the cell content, every drawn atom is
+    labelled `(content index, lattice shift)`, and the bonds are a lookup. A
+    face atom's two copies carry different shifts, so each gets its own
+    complete set of neighbours.
+
+    `existing` bonds are kept verbatim (they may carry orders the user drew)
+    and the graph only ADDS to them. Anything that is not a lattice translate
+    of the content — a hand-drawn or edited atom — falls back to ordinary
+    perception, so this degrades to the old behaviour rather than dropping it.
+    """
+    from . import bondgraph, bonding
+    n = len(symbols)
+    if n == 0 or n_content <= 0:
+        return list(existing or [])
+    n_content = min(int(n_content), n)
+    xyz = np.asarray(coords, dtype=float).reshape(n, 3)
+    frac = cell.to_fractional(xyz)
+    graph = bondgraph.build(list(symbols)[:n_content], frac[:n_content], cell,
+                            slack=slack, report=report)
+    labels = bondgraph.label_instances(frac, cell, n_content)
+    bonds = [(int(i), int(j), 1) for i, j, _o in graph.instantiate(labels)]
+    loose = [k for k, entry in enumerate(labels) if entry is None]
+    if loose:
+        # Atoms the graph cannot account for: perceive their bonds the
+        # ordinary way rather than leaving them unbonded.
+        extra = bonding.perceive_bonds(list(symbols), xyz)
+        seen = {(i, j) for i, j, _o in bonds}
+        loose_set = set(loose)
+        bonds.extend((i, j, o) for i, j, o in extra
+                     if (i in loose_set or j in loose_set)
+                     and (i, j) not in seen)
+    if existing:
+        seen = {(min(int(i), int(j)), max(int(i), int(j)))
+                for i, j, _o in bonds}
+        # The graph is AUTHORITATIVE for the atoms it can label: a bond it
+        # does not have is a bond that does not exist. Taking the union with
+        # a separately perceived list instead is the round-43 trap one level
+        # up — both lists are valence-capped, but capped independently, so
+        # their union is not (a disordered ZIF methyl came out with five
+        # bonds on a carbon the graph had correctly capped at four).
+        #
+        # Only atoms the graph cannot account for keep their perceived bonds.
+        loose_set = set(loose)
+        keep = [(int(i), int(j), o) for i, j, o in existing
+                if (min(int(i), int(j)), max(int(i), int(j))) not in seen
+                and (int(i) in loose_set or int(j) in loose_set)]
+        # An order the user drew survives; the graph supplies connectivity.
+        orders = {(min(int(i), int(j)), max(int(i), int(j))): o
+                  for i, j, o in existing}
+        bonds = [(i, j, orders.get((min(i, j), max(i, j)), o))
+                 for i, j, o in bonds] + keep
+    return sorted({(min(i, j), max(i, j)): (min(i, j), max(i, j), o)
+                   for i, j, o in bonds}.values())
+
+
+def missing_partners(symbols, coords, cell, n_content, covalent_only=True,
+                     max_added=20000):
+    # type: (list, np.ndarray, Cell, int, bool, int) -> Tuple[List[str], np.ndarray]
+    """Atoms named by the graph as bonded to the picture but not drawn yet.
+
+    The bounded grow of stage 5: one shell, driven by the labelled edges
+    rather than by re-perceiving geometry, so it terminates by construction
+    even on a framework.
+
+    WHICH bonds may be followed is the whole difficulty, and both rules here
+    were learned the expensive way (round 42b) rather than reasoned out:
+
+    * a COVALENT bond is followed only if it involves a NON-METAL. That is
+      what separates a ZIF linker from an intermetallic, where metal-to-metal
+      is covalent by design (round 38, so an SBU is not dissected) and every
+      atom has 6-12 neighbours just outside any box you draw — Ni6Sn8 went
+      28 -> 55 atoms and buried a cell VESTA draws bare.
+    * a COORDINATION bond is followed only if the partner belongs to a
+      covalent fragment of more than one atom. A ZIF's N is part of an
+      imidazolate and carries a real molecule; rock salt's chloride is alone,
+      and completing it sprouts a slab. `bond_kind` deliberately does not
+      distinguish Zn-N from Na-Cl (both are metal-to-non-metal, and for
+      "does this hold a molecule together?" both answer no), so the partner's
+      own fragment is what has to be asked.
+
+    Returns `(symbols, FRACTIONAL coords)` for the atoms to append.
+    """
+    from . import bondgraph, bonding
+    n = len(symbols)
+    if n == 0 or n_content <= 0:
+        return [], np.zeros((0, 3))
+    n_content = min(int(n_content), n)
+    frac = cell.to_fractional(np.asarray(coords, dtype=float).reshape(n, 3))
+    graph = bondgraph.build(list(symbols)[:n_content], frac[:n_content], cell)
+    labels = bondgraph.label_instances(frac, cell, n_content)
+    have = {entry for entry in labels if entry is not None}
+    fragment_size = _covalent_fragment_sizes(graph)
+    wanted = {}
+    for entry in sorted(have):
+        site, shift = entry
+        for j, eshift, _dist in graph.neighbours(site):
+            kind = bonding.bond_kind(symbols[site], symbols[j])
+            if kind == bonding.COVALENT:
+                if covalent_only and not (
+                        not bonding.is_metal(symbols[site])
+                        or not bonding.is_metal(symbols[j])):
+                    continue
+            elif covalent_only and fragment_size[j] < 2:
+                continue
+            key = (int(j), tuple(int(s) + int(t)
+                                 for s, t in zip(shift, eshift)))
+            if key in have or key in wanted:
+                continue
+            wanted[key] = graph.frac[j] + np.array(key[1], dtype=float)
+            if len(wanted) >= int(max_added):
+                break
+    if not wanted:
+        return [], np.zeros((0, 3))
+    keys = sorted(wanted)
+    return ([symbols[k[0]] for k in keys],
+            np.asarray([wanted[k] for k in keys], dtype=float))
+
+
+def _covalent_fragment_sizes(graph):
+    # type: (object) -> np.ndarray
+    """How many atoms are in each atom's COVALENT fragment, periodically.
+
+    One atom means an ion in a lattice; more means a molecule worth carrying
+    across a cell face. Counted over the periodic graph, so a linker split by
+    the boundary still counts as one fragment.
+    """
+    from . import bonding
+    n = len(graph.symbols)
+    adjacency = [[] for _ in range(n)]
+    for e in graph.edges:
+        if bonding.bond_kind(graph.symbols[e.i],
+                             graph.symbols[e.j]) != bonding.COVALENT:
+            continue
+        adjacency[e.i].append(e.j)
+        adjacency[e.j].append(e.i)
+    sizes = np.ones(n, dtype=int)
+    seen = [False] * n
+    for seed in range(n):
+        if seen[seed]:
+            continue
+        seen[seed] = True
+        group, stack = [seed], [seed]
+        while stack:
+            i = stack.pop()
+            for j in adjacency[i]:
+                if not seen[j]:
+                    seen[j] = True
+                    group.append(j)
+                    stack.append(j)
+        for k in group:
+            sizes[k] = len(group)
+    return sizes
 
 
 def periodic_neighbours(symbols, frac, cell, slack=0.45, covalent_only=False,
@@ -1891,6 +2068,8 @@ def build_view(cell, asym_symbols, asym_frac, symops, mode="cell",
         # The asymmetric unit is BY DEFINITION the listed sites, so no
         # disorder resolution here — but say so, since "asym" is also the mode
         # someone switches to when the cell looks wrong.
+        if report is not None:
+            report["n_content"] = len(data.symbols)
         return list(data.symbols), data.frac @ cell.matrix()
     symbols, coords = expand(data, tol=tol, exterior=exterior,
                              disorder=disorder, report=report,
@@ -1903,6 +2082,7 @@ def build_view(cell, asym_symbols, asym_frac, symops, mode="cell",
     for off in offsets:
         out_syms.extend(symbols)
         blocks.append(coords + off[None, :])
+    out_xyz = np.vstack(blocks) if blocks else np.zeros((0, 3))
     if report is not None and report.get("site_occupancy"):
         # Every copy of the cell repeats the shared sites, so the index map
         # has to be repeated with it or only the first cell would be drawn
@@ -1912,8 +2092,58 @@ def build_view(cell, asym_symbols, asym_frac, symops, mode="cell",
         report["site_occupancy"] = {
             str(int(k) + n * stride): v
             for n in range(len(offsets)) for k, v in base.items()}
-    return out_syms, (np.vstack(blocks) if blocks
-                      else np.zeros((0, 3)))
+    # Each cell in the block carries its own BOUNDARY COPIES, and the copy on
+    # a shared internal face is the same atom as its neighbour's — so stacking
+    # them naively draws that atom twice, at exactly the same point. Ferrocene
+    # came out with 1680 coincident pairs in a 2x2x2 of 1680 atoms, i.e. every
+    # atom drawn twice: invisible as a count, visible as z-fighting and as
+    # doubled sticks, and it makes every downstream measurement wrong.
+    if len(offsets) > 1 and len(out_xyz):
+        keep = _first_of_coincident(out_xyz, tol=tol)
+        if not keep.all():
+            out_syms = [s for s, k in zip(out_syms, keep) if k]
+            out_xyz = out_xyz[keep]
+            if report is not None and report.get("site_occupancy"):
+                renumber = np.cumsum(keep) - 1
+                report["site_occupancy"] = {
+                    str(int(renumber[int(k)])): v
+                    for k, v in report["site_occupancy"].items()
+                    if int(k) < len(keep) and keep[int(k)]}
+    return out_syms, out_xyz
+
+
+def _first_of_coincident(xyz, tol=0.1):
+    # type: (np.ndarray, float) -> np.ndarray
+    """Keep-mask dropping any atom that repeats an EARLIER one's position.
+
+    Grid-hashed rather than an N^2 sweep, because a packing is the one place
+    the atom count runs into six figures. The 27 neighbouring buckets are
+    probed as well: two coincident points can straddle a bucket edge and land
+    on different keys, which is the round-43d lesson in a new place.
+    """
+    xyz = np.asarray(xyz, dtype=float)
+    size = max(float(tol), 1e-6)
+    keys = np.floor(xyz / size).astype(np.int64)
+    buckets = {}                      # type: dict
+    keep = np.ones(len(xyz), dtype=bool)
+    neighbourhood = [(a, b, c) for a in (-1, 0, 1) for b in (-1, 0, 1)
+                     for c in (-1, 0, 1)]
+    for index in range(len(xyz)):
+        key = tuple(int(v) for v in keys[index])
+        hit = False
+        for delta in neighbourhood:
+            probe = (key[0] + delta[0], key[1] + delta[1], key[2] + delta[2])
+            for other in buckets.get(probe, ()):
+                if float(np.linalg.norm(xyz[index] - xyz[other])) <= tol:
+                    hit = True
+                    break
+            if hit:
+                break
+        if hit:
+            keep[index] = False
+            continue
+        buckets.setdefault(key, []).append(index)
+    return keep
 
 
 def supercell_offsets(cell, na=1, nb=1, nc=1):
