@@ -328,6 +328,17 @@ def test_the_page_has_a_button_per_stage_and_the_checkbox(qapp):
     from molom.ui.sandbox_page import SandboxPage
     page = SandboxPage()
     assert len(page.stage_buttons) == len(sandbox.STAGES)
-    assert page.options() == {"outside": True}
+    assert page.options() == {"outside": True, "grow_from_copies": False}
     page.outside.setChecked(False)
-    assert page.options() == {"outside": False}
+    page.grow_copies.setChecked(True)
+    assert page.options() == {"outside": False, "grow_from_copies": True}
+
+
+def test_growing_from_copies_only_ever_adds():
+    """The trade-off is a knob, not a silent default: completing every
+    boundary copy makes a dense oxide look fuller and makes the magnesium
+    pyrophosphates balloon."""
+    lean = sandbox.run(NACL_CIF, len(sandbox.STAGES) - 1)
+    full = sandbox.run(NACL_CIF, len(sandbox.STAGES) - 1,
+                       grow_from_copies=True)
+    assert len(full.symbols) >= len(lean.symbols)

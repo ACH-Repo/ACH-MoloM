@@ -42,10 +42,23 @@ class SandboxPage(PipelinePage):
         self.outside.toggled.connect(self._rerun)
         lay.addWidget(self.outside)
 
+        self.grow_copies = QCheckBox("Complete the boundary copies too")
+        self.grow_copies.setToolTip(
+            "Off: only the atoms the wrap placed complete their coordination "
+            "outwards. On: every boundary copy does too, so an atom drawn at "
+            "eight corners is completed eight times.\n\n"
+            "This is a real trade-off, measured. On makes a dense oxide look "
+            "fuller (1547149: 21 -> 51 atoms) and makes the magnesium "
+            "pyrophosphates balloon (60 -> 351 instead of 189). The ZIFs are "
+            "unaffected either way.")
+        self.grow_copies.toggled.connect(self._rerun)
+        lay.addWidget(self.grow_copies)
+
     def options(self):
         # type: () -> dict
         """Everything `sandbox.run` needs, so the app does not have to know."""
-        return {"outside": self.outside.isChecked()}
+        return {"outside": self.outside.isChecked(),
+                "grow_from_copies": self.grow_copies.isChecked()}
 
     def _rerun(self, _checked=False):
         if self._current >= 0 and self.text.strip():

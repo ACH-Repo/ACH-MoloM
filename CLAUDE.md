@@ -115,13 +115,31 @@ out at three of its four positions instead of four. Both fixed by the one rule.
 **Still open**: bonds from the FULL-occupancy O to the partial ones survive
 (1.475 / 1.520 / 1.706 A) because the sum rule does not apply, and 1.475 A is
 exactly a peroxide bond — no distance rule can reject it.
-**Also open, measured not fixed**: the Mg pyrophosphates blow up 3.6-5.8x
+**Round 45i — the phosphate fix, chosen by measuring four policies rather than
+one.** The shell grew from EVERY drawn atom including the boundary copies, so a
+6-coordinate Mg with copies on three faces completed its sphere once per copy.
+Four combinations were measured (grow from copies or not, carry the partner's
+covalent fragment or not): growing from the in-cell atoms ONLY, still carrying
+the fragment, is the winner — `Mg2(P2O7)(H2O)3.5.cif` 351 -> 185 atoms,
+`Mg2(P2O7)(H2O)6.cif` 491 -> 255, and the ZIF ring completion is **unaffected**
+(2130251 identical either way), which is what rules out the alternatives:
+dropping the fragment carry halves the phosphates too but breaks the rings
+again (368 -> 286). A "grow only from METALS" variant was also tried, on the
+VESTA asymmetry hypothesis, and rejected — it barely touched the phosphates
+(351 -> 341) and cost the ZIF. **The trade-off is real and is therefore a
+CHECKBOX, not a silent default**: completing the boundary copies too makes a
+dense oxide look fuller (`1547149.cif` 21 -> 51) while ballooning the
+phosphates, so "Complete the boundary copies too" sits next to the outside
+tick, off by default. Molecular crystals are untouched either way (242083 is
+876 both ways). 1026 tests.
+
+~~**Also open, measured not fixed**: the Mg pyrophosphates blow up 3.6-5.8x
 (`Mg2(P2O7)(H2O)3.5.cif` 60 -> 347 atoms, 276 partners materialised). The
 periodic branch grows a shell from EVERY drawn atom including the boundary
 copies, and each carries the partner's whole covalent fragment — a P2O7 group
 is 9 atoms and Mg is 6-coordinate, so it multiplies. The likely fix is to grow
 only from atoms strictly INSIDE the cell, but that wants measuring against the
-ZIF cases before it is written. 1025 tests.
+ZIF cases before it is written.~~ **FIXED in round 45i above.**
 
 Round 45e (2026-08-06, the sandbox settles what a SITE is before drawing it):
 Christian's framing, and it is the right one — "sites are not atoms, they are

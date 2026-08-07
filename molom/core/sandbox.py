@@ -87,8 +87,8 @@ def stage_index(key):
     raise KeyError(key)
 
 
-def run(text, upto, outside=True, disorder=None):
-    # type: (str, int, bool, str) -> Result
+def run(text, upto, outside=True, disorder=None, grow_from_copies=False):
+    # type: (str, int, bool, str, bool) -> Result
     """Run the sandbox up to stage `upto`, from scratch.
 
     Stages 0-4 are `pipeline.run`'s own, so the part that is not under
@@ -157,7 +157,8 @@ def run(text, upto, outside=True, disorder=None):
 
     # ----------------------------------------------------- 8 molecules
     out_symbols, out_frac, out_bonds, info, source = complete_molecules(
-        symbols, frac, cell, graph=graph, outside=outside, seeds=instances)
+        symbols, frac, cell, graph=graph, outside=outside, seeds=instances,
+        grow_from_copies=grow_from_copies)
     # A copy of a shared site is still that site, so the composition has to
     # be carried onto the copies or the cell shows one pie sphere in the
     # middle and plain ones at every corner (round 42's rule).
@@ -301,8 +302,9 @@ def boundary_instances(frac, tol=1e-6):
 
 
 def complete_molecules(symbols, frac, cell, graph=None, outside=True,
-                       max_atoms=200000, seeds=None):
-    # type: (list, np.ndarray, object, object, bool, int, list) -> tuple
+                       max_atoms=200000, seeds=None, grow_from_copies=False,
+                       carry_fragment=True, metal_origins_only=False):
+    # type: (list, np.ndarray, object, object, bool, int, list, bool, bool) -> tuple
     """Draw every fragment that reaches into the cell, whole.
 
     Mercury's rule. For each connected component, the lattice translations
@@ -342,7 +344,18 @@ def complete_molecules(symbols, frac, cell, graph=None, outside=True,
             if outside:
                 place, families = _covalent_fragments(graph, symbols)
                 have = set(seeded)
-                for i, s in list(seeded):
+                # WHERE the shell grows from. Growing off every drawn atom
+                # including the boundary copies multiplies the work: a
+                # 6-coordinate Mg with copies on three faces completes its
+                # sphere once per copy.
+                origins = seeded if grow_from_copies else [
+                    (i, s) for i, s in seeded if not any(s)]
+                if metal_origins_only:
+                    # VESTA's apparent asymmetry: a metal gets its ligands
+                    # completed, a ligand does not pull in further metal.
+                    origins = [(i, s) for i, s in origins
+                               if bonding.is_metal(symbols[i])]
+                for i, s in list(origins):
                     for j, eshift, _d in graph.neighbours(i):
                         # NEVER follow metal to metal. Those are the bonds a
                         # 1.55 A sodium radius licenses between two cations
@@ -358,7 +371,8 @@ def complete_molecules(symbols, frac, cell, graph=None, outside=True,
                         # just the partner: an imidazolate N arriving alone
                         # is a blue dot with no ring (2130251).
                         root, rel_j = place[j]
-                        for k in families[root]:
+                        family = families[root] if carry_fragment else [j]
+                        for k in family:
                             offset = base + (place[k][1] - rel_j)
                             key = (k, tuple(int(v) for v in offset))
                             if key in have:
