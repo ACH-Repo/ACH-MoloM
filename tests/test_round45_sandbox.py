@@ -144,7 +144,9 @@ def test_the_composition_survives_dedupe_eating_the_site():
     drawn, _c = cif.expand(data, whole_molecules=False, boundary=False,
                            disorder=cif.POLICY_ALL)
     assert drawn.count("Ni") == 0          # merged away by Dedupe
-    composition, info = sandbox.classify_occupancy(data, len(drawn))
+    composition, info, occupancy = sandbox.classify_occupancy(data,
+                                                              len(drawn))
+    assert len(occupancy) == len(drawn)
     assert info["merged_away"] >= 1
     assert composition                      # recovered anyway
 

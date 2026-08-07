@@ -100,7 +100,28 @@ BARE, 28 atoms and zero bonds, which is exactly what VESTA shows. **Still open
 and worth a decision**: the remaining Nb come from completing the coordination
 of boundary OXYGENS, which legitimately bond to metal outside the box — the
 growth is symmetric while VESTA's looks asymmetric (it appears to add O to
-metals but not metals to O). 1025 tests.
+metals but not metals to O).
+**Round 45h — bonds between DISORDER ALTERNATIVES.** ZIF-7's guest water is
+modelled over four partial sites (occupancy 0.48-0.50) and MoloM drew bonds
+between them. Distance cannot possibly settle this: the alternatives sit
+**1.359 A** apart and a peroxide O-O bond is 1.48 A, so the geometry is
+indistinguishable — the information lives in the OCCUPANCY column.
+`_without_alternatives` refuses a bond between two atoms that are both partial
+and whose occupancies sum to about one or less, because they cannot both be
+there. It also fixed a second symptom Christian spotted independently: those
+spurious bonds fused the guest oxygens into one multi-atom fragment, and the
+completion computes lattice positions PER GROUP, so an oxygen on a c edge came
+out at three of its four positions instead of four. Both fixed by the one rule.
+**Still open**: bonds from the FULL-occupancy O to the partial ones survive
+(1.475 / 1.520 / 1.706 A) because the sum rule does not apply, and 1.475 A is
+exactly a peroxide bond — no distance rule can reject it.
+**Also open, measured not fixed**: the Mg pyrophosphates blow up 3.6-5.8x
+(`Mg2(P2O7)(H2O)3.5.cif` 60 -> 347 atoms, 276 partners materialised). The
+periodic branch grows a shell from EVERY drawn atom including the boundary
+copies, and each carries the partner's whole covalent fragment — a P2O7 group
+is 9 atoms and Mg is 6-coordinate, so it multiplies. The likely fix is to grow
+only from atoms strictly INSIDE the cell, but that wants measuring against the
+ZIF cases before it is written. 1025 tests.
 
 Round 45e (2026-08-06, the sandbox settles what a SITE is before drawing it):
 Christian's framing, and it is the right one — "sites are not atoms, they are

@@ -114,7 +114,8 @@ def run(text, upto, outside=True, disorder=None):
     trace = list(base.trace)
 
     # ----------------------------------------------------- 5 occupancy
-    composition, occ_info = classify_occupancy(data, len(symbols))
+    composition, occ_info, occupancy_of = classify_occupancy(data,
+                                                             len(symbols))
     meta = {"site_occupancy": composition} if composition else {}
     trace.append(StageInfo(
         "occupancy", "Occupancy", len(symbols), 0,
@@ -143,6 +144,7 @@ def run(text, upto, outside=True, disorder=None):
     graph = bondgraph.build(symbols, frac, cell, valence=False,
                             cap_hydrogens=False)
     graph = _without_metal_metal(graph)
+    graph, refused_alt = _without_alternatives(graph, occupancy_of)
 
     # --------------------------------------------------------- 7 bonds
     drawable = graph.instantiate(instances)
@@ -210,6 +212,10 @@ def classify_occupancy(data, n_drawn, tol=0.1):
             continue
         if site < len(occupancy) and occupancy[site] < 1.0 - 1e-6:
             distinct.add(k)
+    occupancy_of = np.array(
+        [occupancy[s] if s < len(occupancy) else 1.0
+         for s in site_of[:n_drawn]] + [1.0] * max(0, n_drawn - len(site_of)),
+        dtype=float)
     info = {
         "shared_atoms": len(composition),
         "shared_sites": len({tuple(v) for v in
@@ -221,7 +227,7 @@ def classify_occupancy(data, n_drawn, tol=0.1):
         "merged_away": sum(1 for s in shared
                            if s not in set(site_of)),
     }
-    return composition, info
+    return composition, info, occupancy_of
 
 
 def _contiguous(group, graph):
@@ -409,6 +415,38 @@ def complete_molecules(symbols, frac, cell, graph=None, outside=True,
     # atom index (a shared site's composition) can ride along.
     source = [i for i, _s in ordered]
     return out_symbols, out_frac, out_bonds, info, source
+
+
+def _without_alternatives(graph, occupancy, ceiling=1.05):
+    # type: (object, np.ndarray, float) -> tuple
+    """Drop bonds between atoms that cannot both be there.
+
+    Two partially occupied atoms whose occupancies sum to about one (or less)
+    are ALTERNATIVES — the same guest modelled in two orientations — so a
+    bond between them is never real, whatever the distance says. And distance
+    genuinely cannot settle it: ZIF-7's disordered water alternatives sit
+    1.359 A apart, which is squarely inside the O-O window (a peroxide bond
+    is 1.48 A). The information that separates them lives in the occupancy
+    column, not in the geometry.
+
+    It also fixes a second symptom. Those spurious bonds fuse the guest
+    oxygens into one multi-atom fragment, and the completion then computes
+    the fragment's lattice positions as a GROUP — so an oxygen on a cell edge
+    came out at three of its four positions instead of all four.
+    """
+    if occupancy is None or not len(occupancy):
+        return graph, 0
+    keep = []
+    dropped = 0
+    for e in graph.edges:
+        a = occupancy[e.i] if e.i < len(occupancy) else 1.0
+        b = occupancy[e.j] if e.j < len(occupancy) else 1.0
+        if a < 1.0 - 1e-6 and b < 1.0 - 1e-6 and a + b <= ceiling:
+            dropped += 1
+            continue
+        keep.append(e)
+    return bondgraph.PeriodicGraph(graph.symbols, graph.frac, graph.cell,
+                                   keep), dropped
 
 
 def _without_metal_metal(graph):
