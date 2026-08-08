@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(py:*)",
+      "Bash(pytest:*)",
+      "Bash(git status:*)",
+      "Bash(git log:*)",
+      "Bash(git diff:*)",
+      "Bash(git show:*)",
+      "Bash(git add:*)",
+      "Bash(git stash:*)",
+      "Bash(ls:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(wc:*)",
+      "Bash(grep:*)",
+      "Bash(find:*)",
+      "Bash(blender:*)",
+      "Grep",
+      "Glob",
+      "Read",
+      "Edit",
+      "Write"
+    ]
+  }
+}

@@ -451,6 +451,14 @@ class CrystalPage(QWidget):
     copies_toggled = Signal(bool)
     occupancy_toggled = Signal(bool)
     refused_toggled = Signal(bool)
+    symmetry_toggled = Signal(bool)
+    ghosts_toggled = Signal(bool)
+
+    #: Does the ACTIVE molecule have a cell? On the class so it exists from
+    #: the first instant the widget does — `_toggle_kinds` can be reached
+    #: during construction (round 34's rule about attributes an event handler
+    #: can see).
+    _has_cell = False
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -493,7 +501,7 @@ class CrystalPage(QWidget):
 
         self.box_check = QCheckBox("Show unit cell box")
         self.box_check.setChecked(True)
-        self.box_check.toggled.connect(self.box_toggled.emit)
+        self.box_check.toggled.connect(self._emit(self.box_toggled))
         lay.addWidget(self.box_check)
 
         lay.addWidget(QLabel("<b>Contents</b>"))
@@ -620,8 +628,13 @@ class CrystalPage(QWidget):
         # that could open the group. Swallow the argument so a click toggles.
         self.sym_arrow.clicked.connect(lambda _checked=False:
                                        self._toggle_kinds())
-        self.sym_check.toggled.connect(
-            lambda on: self._toggle_kinds(on) if on else None)
+        # Both directions. Ticking the box opens the per-kind filters, and
+        # UNticking closes them again — Christian: "if symmetry elements is
+        # unchecked, should it not auto un-expand?" It should: the filters
+        # choose between things none of which are being drawn.
+        self.sym_check.toggled.connect(self._toggle_kinds)
+        self.sym_check.toggled.connect(self._emit(self.symmetry_toggled))
+        self.ghost_check.toggled.connect(self._emit(self.ghosts_toggled))
         self._kind_holder.setVisible(False)
         dragcheck.install(self)
 
@@ -630,6 +643,7 @@ class CrystalPage(QWidget):
             "Draw a translucent solid through the donor atoms around each "
             "metal centre — how MOFs and framework structures are usually "
             "shown")
+        self.poly_check.toggled.connect(self._emit(self.poly_toggled))
         lay.insertWidget(lay.indexOf(self.box_check) + 1, self.poly_check)
 
         self.occupancy_check = QCheckBox("Occupancy pie spheres")
@@ -640,7 +654,8 @@ class CrystalPage(QWidget):
             "element, sized by its occupancy.\n\n"
             "A colour you set yourself in the outliner always wins: that atom "
             "stays solid in your colour.")
-        self.occupancy_check.toggled.connect(self.occupancy_toggled.emit)
+        self.occupancy_check.toggled.connect(
+            self._emit(self.occupancy_toggled))
         lay.insertWidget(lay.indexOf(self.poly_check) + 1,
                          self.occupancy_check)
 
@@ -658,13 +673,23 @@ class CrystalPage(QWidget):
             "They are drawn thinner and greyed, because they are not "
             "chemistry — a short contact between two disorder alternatives is "
             "two places one atom might be, not a bond.")
-        self.refused_check.toggled.connect(
-            lambda v: None if self._loading
-            else self.refused_toggled.emit(bool(v)))
+        self.refused_check.toggled.connect(self._emit(self.refused_toggled))
         lay.insertWidget(lay.indexOf(self.occupancy_check) + 1,
                          self.refused_check)
         dragcheck.install(self)
         self.set_cell(None)
+
+    def _emit(self, signal):
+        """A toggled handler that stays quiet while the page writes itself.
+
+        `set_cell` sets every per-crystal tick from the active object, and
+        `toggled` does not care who moved the box — unguarded, each refresh
+        fires back at the app as "the user asked for this" and writes the
+        previous molecule's state onto the new one. Round 30's TimelinePanel
+        bug, and it is why the guard belongs on the signal rather than at each
+        of half a dozen call sites.
+        """
+        return lambda on: None if self._loading else signal.emit(bool(on))
 
     def _toggle_kinds(self, force=None):
         """Expand/collapse the per-kind filters — and TICK the box on the way.
@@ -684,7 +709,12 @@ class CrystalPage(QWidget):
         show = self._kind_holder.isHidden() if force is None else bool(force)
         self._kind_holder.setVisible(show)
         self.sym_arrow.setText("▾" if show else "▸")
-        if show and self.sym_check.isEnabled() and not self.sym_check.isChecked():
+        # `_has_cell`, NOT `isEnabled()`: that folds in every ANCESTOR, and
+        # this page sits on a QStackedWidget inside a dock that is usually
+        # closed — so it reported False for a perfectly live control and the
+        # arrow quietly stopped ticking the box. Same family as the round-34
+        # `isVisible` trap, one property along.
+        if show and self._has_cell and not self.sym_check.isChecked():
             self.sym_check.setChecked(True)      # emits toggled -> app redraws
 
     def enabled_kinds(self):
@@ -804,7 +834,8 @@ class CrystalPage(QWidget):
     def set_cell(self, cell, spacegroup="", n_asym=0, n_atoms=0, mode="cell",
                  name="", exterior=0, chemistry="", symmetry="", naming=None,
                  bravais="", density=None, refused=0, refused_on=False,
-                 outside=True, copies=False):
+                 outside=True, copies=False, polyhedra=None, box=None,
+                 symmetry_on=None, ghosts=None, occupancy=None):
         """Refresh from the active molecule.
 
         `cell=None` greys every CONTROL but leaves the page itself readable —
@@ -813,6 +844,7 @@ class CrystalPage(QWidget):
         it has to say which molecule to pick instead.
         """
         has = cell is not None
+        self._has_cell = has
         for w in (self.asym_radio, self.cell_radio, self.pack_radio,
                   self.box_check, self.poly_check, self.sym_check,
                   self.ghost_check, self._kind_holder,
@@ -836,6 +868,25 @@ class CrystalPage(QWidget):
         self.outside_check.setChecked(bool(outside))
         self.copies_check.setChecked(bool(copies))
         self.refused_check.setChecked(bool(refused_on))
+        # EVERY per-crystal display tick, not just the two that happened to
+        # be threaded through first. They are all stored on the object, so a
+        # box left ticked from the previous molecule reads as "polyhedra are
+        # on" over a structure that has none — and the only way to get a
+        # picture is to untick and retick it, which is exactly what Christian
+        # had to do. `None` means "the caller does not know", which is what
+        # the greyed no-cell case passes.
+        for widget, value in ((self.poly_check, polyhedra),
+                              (self.box_check, box),
+                              (self.sym_check, symmetry_on),
+                              (self.ghost_check, ghosts),
+                              (self.occupancy_check, occupancy)):
+            if value is not None:
+                widget.setChecked(bool(value))
+        # ...and the per-kind filters follow the box they belong to, since
+        # `toggled` does not fire when the state does not change.
+        if symmetry_on is not None:
+            self._kind_holder.setVisible(bool(symmetry_on))
+            self.sym_arrow.setText("▾" if symmetry_on else "▸")
         self._loading = False
         if not has:
             self.summary.setText(

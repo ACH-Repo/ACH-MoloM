@@ -159,7 +159,15 @@ class MainWindow(QMainWindow):
         self.viewport.on_align_key = self._on_align_key
         self.viewport.on_align_confirm = self._on_align_confirm
         self.viewport.on_align_cancel = self._on_align_cancel
-        self.viewport.on_edit_begin = self.push_undo
+        # The CHEMISTRY edits (element change, draw, bond order, delete) go
+        # through this one, and it used to be `push_undo` alone — so round
+        # 43e's "capture the pose while it can still be read" never fired for
+        # any of them, only for the geometry modals above. `cell_pose` then
+        # got measured AFTER the atom had moved, read the move as a rotation
+        # of the whole crystal, and baked it into the cell reference: on
+        # MOF-5 one H -> F tilted the box by 1.2 degrees and grew the drawn
+        # cell by 144 carbons. `begin_model_edit` snapshots undo itself.
+        self.viewport.on_edit_begin = self.begin_model_edit
         self.viewport.on_mode_changed = self._on_mode_changed
         self.viewport.on_new_molecule = self.new_empty_molecule
         self.viewport.on_toggle_mode = \
@@ -266,13 +274,17 @@ class MainWindow(QMainWindow):
         self.crystal_page.copies_toggled.connect(
             lambda on: self._on_packing_option(self.active_id, "copies", on))
         self.crystal_page.box_toggled.connect(self._set_cell_box)
-        self.crystal_page.poly_check.toggled.connect(
+        # Through the page's GUARDED signals, never the raw `toggled`: these
+        # ticks are now written from the active object by `set_cell`, and an
+        # unguarded connection reads that refresh back as the user asking for
+        # it — which would carry one molecule's display state onto the next.
+        self.crystal_page.poly_toggled.connect(
             lambda on: self._set_obj_flag("polyhedra", on))
         self.crystal_page.refused_toggled.connect(
             lambda on: self._set_obj_flag("show_refused_bonds", on))
-        self.crystal_page.sym_check.toggled.connect(
+        self.crystal_page.symmetry_toggled.connect(
             lambda on: self._set_obj_flag("show_symmetry", on))
-        self.crystal_page.ghost_check.toggled.connect(
+        self.crystal_page.ghosts_toggled.connect(
             lambda on: self._set_obj_flag("show_ghosts", on))
         for _key, _box in self.crystal_page.kind_checks.items():
             _box.toggled.connect(lambda _on: self._sync_symmetry_kinds())
@@ -1871,7 +1883,7 @@ class MainWindow(QMainWindow):
                      "metallic_metals", "sphere_subdivisions", "bond_sides",
                      "shade_smooth", "unit_cell", "polyhedra",
                      "polyhedra_alpha", "output", "blender_exe", "engine",
-                     "samples", "view_transform", "clear_scene", "collection",
+                     "samples", "view_transform", "look", "clear_scene", "collection",
                      "style_key")
 
     def _blender_options(self):
@@ -2499,6 +2511,15 @@ class MainWindow(QMainWindow):
         # about the crystal that had just become active, which is precisely
         # the "greyed out even though a cif IS selected" complaint.
         self._sync_modifier_page()
+        # ...and the ❖ page itself, which round 34's comment above NAMES and
+        # then did not call — only the ribbon and the modifier page were.
+        # So an import left the whole page describing the PREVIOUS molecule,
+        # every per-crystal tick with it. That is Christian's "the
+        # coordination polyhedra tickbox needs to be cycled to show polyhedra
+        # even though it is on": the box carried the last structure's state,
+        # so his first click was the one that finally set the flag on this
+        # one. Same for the symmetry tick.
+        self._sync_crystal_page()
         self._sync_crystal_ribbon()
 
     @staticmethod
@@ -4422,6 +4443,51 @@ class MainWindow(QMainWindow):
             xyz = (xyz - np.asarray(shift)) @ np.asarray(rot)
         return cell.to_fractional(xyz)
 
+    def resync_derived_asymmetric_unit(self, obj, cell, frac):
+        # type: (object, object, object) -> int
+        """Re-derive the stored asymmetric unit to match re-derived operators.
+
+        A rebuild is `asym_symbols` + `asym_frac` expanded by `symops`, so
+        those three have to describe ONE structure. Round 43d re-derived the
+        operators after an edit and left the unit alone, which silently made
+        them describe two — and the rebuild believes the metadata, not the
+        atoms in front of it.
+
+        Taken from the cell CONTENT, never from the drawn atoms: everything
+        past `cell_content` is a boundary copy, and expanding a unit that
+        already contains copies puts them in twice.
+        """
+        s = obj.structure
+        meta = s.metadata
+        n = min(int(meta.get("cell_content") or 0) or s.n_atoms, s.n_atoms)
+        symbols = list(s.symbols)[:n]
+        content = np.asarray(frac, dtype=float).reshape(-1, 3)[:n]
+        reps = None
+        try:
+            reps = spacegroups.orbit_representatives(cell, symbols, content)
+        except Exception:
+            reps = None
+        # No dataset means P1, where every atom IS its own orbit — the cell
+        # content is the asymmetric unit, and that is the honest answer rather
+        # than a reason to leave a stale unit in place.
+        if not reps:
+            reps = list(range(n))
+        meta["asym_symbols"] = [symbols[i] for i in reps]
+        meta["asym_frac"] = [[float(v) for v in content[i]] for i in reps]
+        # Parallel columns describe the OLD sites; a silently mis-indexed
+        # occupancy is worse than none (round 43e), so they are dropped rather
+        # than guessed at. Labels go with them — they named other atoms.
+        for key in ("asym_occupancy", "asym_disorder_groups",
+                    "asym_disorder_assemblies", "asym_labels"):
+            meta.pop(key, None)
+        # Re-pin the cell frame against the CELL-frame coordinates, or the
+        # Kabsch fit keeps measuring the edit as a rotation of the whole
+        # crystal and the box creeps further with every atom moved (round
+        # 43e). The full-cell branch never did this; only the asymmetric one.
+        set_cell_reference(s, cell.to_cartesian(
+            np.asarray(frac, dtype=float).reshape(-1, 3)))
+        return len(reps)
+
     def reevaluate_symmetry(self, obj, announce=True):
         # type: (object, bool) -> Optional[str]
         """Re-derive the space group from where the atoms NOW are.
@@ -4466,6 +4532,14 @@ class MainWindow(QMainWindow):
         meta["spacegroup"] = symbol
         meta["it_number"] = int(number or 0)
         meta.pop("hall", None)
+        # The stored asymmetric unit belonged to the OLD operators, and every
+        # crystal rebuild regenerates from `asym_symbols` + `symops` together.
+        # Leaving the two inconsistent is what made a single H -> F on MOF-5
+        # destroy the structure the moment anything on the ❖ page was touched:
+        # 616 drawn atoms came back as 7, the file's asymmetric unit expanded
+        # by a 2-operator group. Where the new group has FEWER operators than
+        # the stored unit assumed, the same mismatch doubles the cell instead.
+        self.resync_derived_asymmetric_unit(obj, cell, frac)
         meta["symmetry_source"] = spacegroups.SOURCE_DERIVED
         meta["symmetry_note"] = (
             "symmetry re-derived from the edited coordinates: {} -> {} "
@@ -4796,6 +4870,17 @@ class MainWindow(QMainWindow):
             refused_on=bool(meta.get("show_refused_bonds")),
             outside=bool(meta.get("pack_outside", True)),
             copies=bool(meta.get("pack_copies", False)),
+            # Every per-crystal display flag, read back from the OBJECT. They
+            # are stored per molecule, so leaving the ticks where the last one
+            # left them makes the page describe a structure that is not on
+            # screen: "Coordination polyhedra" reads ticked over a crystal
+            # that has none, and the only way to get a picture is to untick
+            # and retick it (Christian). The box tick is a viewport-wide
+            # setting, so it is deliberately not in this list.
+            polyhedra=bool(meta.get("polyhedra")),
+            symmetry_on=bool(meta.get("show_symmetry")),
+            ghosts=bool(meta.get("show_ghosts")),
+            occupancy=bool(self.viewport.show_occupancy),
             name=obj.name)
         self.crystal_page.set_detail(
             info, naming=naming, site_occupancy=meta.get("site_occupancy"))

@@ -64,7 +64,25 @@ STUDIO_HDRIS = ("forest", "city", "courtyard", "interior", "night",
 LIGHT_RIGS = ("none", "key", "three_point", "sun")
 
 ENGINES = ("CYCLES", "BLENDER_EEVEE_NEXT")
-VIEW_TRANSFORMS = ("Standard", "Filmic", "AgX")
+
+#: View transforms, best first. **AgX, not Filmic** — Filmic was Blender's
+#: default through 2.8x-3.x, which is why every tutorial of that era says to
+#: use it, and AgX replaced it in 4.0 for good reasons: Filmic desaturates
+#: midtones toward grey (the "milky" look it is known for) while AgX rolls
+#: highlights off toward white and keeps the colour. Measured on a MOF-5
+#: render, Standard blows **4.9% of the molecule to pure white**; AgX and
+#: Filmic both clip nothing, and AgX holds more saturation (0.190 vs 0.187)
+#: and more contrast (0.160 vs 0.157) once a look is applied.
+VIEW_TRANSFORMS = ("AgX", "Filmic", "Standard")
+
+#: The LOOK is what puts back the contrast a roll-off takes away, and it is
+#: why "no clipping" need not mean "flat". Measured, same scene: bare AgX
+#: drops contrast from 0.165 to 0.120 (that IS the washed-out complaint),
+#: "High Contrast" restores it to 0.160 at the same mean brightness with
+#: nothing clipped. "Punchy" is a trap here — it came out DARKER (mean 0.405
+#: against 0.531) without buying any contrast back.
+LOOKS = ("High Contrast", "Medium High Contrast", "Punchy",
+         "Base Contrast", "None")
 
 
 class ExportOptions(object):
@@ -74,7 +92,7 @@ class ExportOptions(object):
 
     def __init__(self, **kw):
         # world
-        self.hdri = "forest"            # a STUDIO_HDRIS name, a path, or ""
+        self.hdri = "studio"            # a STUDIO_HDRIS name, a path, or ""
         self.hdri_strength = 1.0
         self.hdri_rotation = 0.0        # degrees about Z
         self.hdri_visible = False       # show it behind the molecule
@@ -105,7 +123,8 @@ class ExportOptions(object):
         # render
         self.engine = "CYCLES"
         self.samples = 128
-        self.view_transform = "Standard"
+        self.view_transform = "AgX"
+        self.look = "High Contrast"
         self.clear_scene = True
         self.collection = "MoloM"
         for k, v in kw.items():
@@ -757,6 +776,20 @@ def build_render():
         scene.view_settings.view_transform = OPTIONS["view_transform"]
     except TypeError:                        # not in this build's list
         pass
+    # The LOOK is what puts the contrast back. AgX and Filmic roll the
+    # highlights off, which is why nothing clips -- and the same roll-off
+    # flattens the midtones, which is what reads as "milky". A contrast look
+    # is the fix; without one, avoiding blown whites costs you the picture.
+    # Names are per view transform ("AgX - Punchy"), and Blender is strict
+    # about them, so the plain name is tried as a fallback.
+    look = OPTIONS.get("look") or "None"
+    for name in ("{0} - {1}".format(OPTIONS["view_transform"], look), look,
+                 "None"):
+        try:
+            scene.view_settings.look = name
+            break
+        except TypeError:
+            continue
     return engine
 
 
@@ -884,6 +917,7 @@ def build_script(data, options, title="scene", version="", basename="",
         "engine": str(options.engine),
         "samples": int(options.samples),
         "view_transform": str(options.view_transform),
+        "look": str(options.look),
         "clear_scene": bool(options.clear_scene),
         "collection": str(options.collection),
     }

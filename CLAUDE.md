@@ -56,6 +56,73 @@ the operator key table, CIF reading with symmetry, coordination polyhedra,
 meta atoms, the scene clock with a multi-track timeline, vibrational modes,
 per-element display control, and the symmetry modifier. 512 tests.
 
+Round 51 (2026-08-08, Christian's MOF-5 report — four bugs, one of them old):
+he changed a single H to an F in `938392.cif` (MOF-5) and the cell box came
+off the floor of the xy plane while the cell "doubled". Both reproduced, and
+they are the SAME fault seen twice.
+**(1) `on_edit_begin` was wired to `push_undo`, not to `begin_model_edit`.**
+Round 43e's whole mechanism — capture the crystal's pose BEFORE the atoms move
+— hangs off `on_model_edit_begin`, which only the GEOMETRY modals (G, R, the
+anchored tumble) use. Every CHEMISTRY edit — change element, draw, bond order,
+delete — goes through the other hook, so `cell_pose` was measured AFTER the
+atom had moved, read the move as a rotation of the whole crystal, and baked it
+into the cell reference. Measured on MOF-5: **a 1.2 degree tilt and a 0.10 A
+shift from one H -> F**, and since a rotated box has a larger axis-aligned
+extent, the box appears to move AND grow. The next rebuild then re-poses the
+regenerated atoms by that spurious rotation, which moves atoms that sat exactly
+ON a cell face off it and changes which ones get boundary copies: **616 drawn
+atoms became 760, with 144 extra carbons.** That is the "doubling". Round 43e's
+test passed throughout because it drove geometry edits.
+**(2) A re-derived space group left the stored asymmetric unit behind.** A
+rebuild is `asym_symbols` + `asym_frac` expanded by `symops`, so the three have
+to describe ONE structure; round 43d re-derived the operators after an edit to
+the full cell and left the unit alone, silently making them describe two — and
+a rebuild believes the metadata, not the atoms in front of it. Measured: one
+H -> F on the packed MOF-5, then touching ANY ❖ control, and **616 atoms came
+back as 7** (the file's asymmetric unit expanded by the 2-operator group spglib
+had just derived). `resync_derived_asymmetric_unit` takes the unit from the
+cell CONTENT via `orbit_representatives` at the same moment the operators
+change, drops the parallel columns rather than mis-indexing them (round 43e's
+rule), and re-pins the cell frame — which the full-cell branch never did, only
+the asymmetric one.
+**(3) `_sync_all` never refreshed the ❖ page.** Round 34's comment sitting
+directly above the call NAMES that page and then only calls
+`_sync_modifier_page` and `_sync_crystal_ribbon`. So an import left the whole
+page describing the PREVIOUS molecule, every per-crystal tick with it — which
+is exactly Christian's "the coordination polyhedra tickbox needs to be cycled
+to show polyhedra even though it is on": the box carried the last structure's
+state, so his first click was the one that finally set the flag on this one.
+Fixed, and `set_cell` now writes **every** per-crystal tick from the object
+(polyhedra, symmetry, ghosts, occupancy) rather than the two that happened to
+be threaded through first. Those ticks emit through a `_loading` guard now
+(`CrystalPage._emit`), because `toggled` does not care who moved the box and
+an unguarded refresh writes one molecule's state onto the next — round 30's
+TimelinePanel bug in a new costume.
+**(4) Unticking Symmetry elements now collapses its filters** ("should it not
+auto un-expand?" — it should: the filters choose between things none of which
+are drawn). Found while doing it: `_toggle_kinds` guarded on
+`self.sym_check.isEnabled()`, and **`isEnabled()` folds in every ANCESTOR** —
+this page sits on a QStackedWidget inside a dock that is usually closed, so it
+reported False for a perfectly live control and the arrow quietly stopped
+ticking the box. Its own `_has_cell` flag now. Same family as round 34's
+`isVisible` trap, one property along.
+**Also this round: the Blender render defaults, chosen by MEASURING renders.**
+"Everything looks super exposed and milky/washed out." Both halves are real and
+they are different faults. Rendering MOF-5 six ways and measuring luminance
+over the non-transparent pixels: **`Standard` blows 4.9% of the molecule to
+pure white** (the "exposed" half) while AgX and Filmic clip nothing — but bare
+AgX also **drops contrast from 0.165 to 0.120** (the "milky" half), which is
+what a highlight roll-off costs. The fix is a contrast LOOK, so the shipping
+default is **studio HDRI + AgX + "High Contrast"**: mean brightness 0.531
+(unchanged), **0.0% blown**, contrast 0.160 (unchanged). Christian asked
+whether Filmic should be the default instead — no, and the tutorials that say
+so are dated: Filmic was Blender's default through 2.8x-3.x and desaturates
+midtones toward grey, AgX replaced it in 4.0 and keeps the colour. Measured
+here too, AgX + High Contrast holds more saturation (0.190) and more contrast
+(0.160) than Filmic + High Contrast (0.187 / 0.157). **"Punchy" is a trap** —
+it came out DARKER (mean 0.405 against 0.531) and bought no contrast back.
+1118 tests.
+
 Round 50 (2026-08-08, the round-49 list, top to bottom): four of the five
 items, on the DESKTOP PC. **(0) The polyhedra perf item was real and it was
 the shading.** `shade_colors` ran a Python loop per TRIANGLE per FRAME and the
@@ -1873,7 +1940,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1102 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1118 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -2138,6 +2205,26 @@ independent cross-check inside a single fixture.
   vector then spin so the backbone points outward.
 
 ## Hard-won gotchas (don't re-learn these)
+- **Two edit-begin hooks, and the chemistry one was not doing the work**
+  (round 51). `on_model_edit_begin` is called by the geometry modals; every
+  CHEMISTRY edit (element change, draw, bond order, delete) calls
+  `on_edit_begin`, which was `push_undo` alone. Anything that must happen
+  before ATOMS MOVE — round 43e's pose capture above all — has to be on BOTH,
+  and the way to check is not to read the wiring but to drive a chemistry edit
+  and assert the invariant. A test that only drives G and R proves nothing
+  about this half.
+- **`isEnabled()` folds in every ANCESTOR** (round 51, and round 34 said the
+  same about `isVisible()`). A properties page lives on a QStackedWidget
+  inside a dock that is usually closed, so `widget.isEnabled()` is False for a
+  perfectly live control most of the time — and a guard written that way fails
+  silently and intermittently. Keep the state you actually mean as your own
+  flag (`CrystalPage._has_cell`).
+- **A comment naming a call is not the call** (round 51). `_sync_all`'s
+  comment explained at length why the ❖ page belongs there, and the line was
+  never added — so every per-crystal control kept the previous molecule's
+  state through an import, which reads as "the tick does nothing until you
+  cycle it". When adding a "refresh everything" function, enumerate the
+  panels in a list rather than by hand.
 - **"Cached on its inputs" is only half the job if the SHADING is not**
   (round 50). Round 48 cached the convex hulls and then computed the face
   normals, the centroids and the triangle soup per frame anyway, inside a

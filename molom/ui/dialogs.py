@@ -626,10 +626,26 @@ class BlenderExportDialog(QDialog):
         idx = self.view_transform.findText(opts.view_transform)
         self.view_transform.setCurrentIndex(max(idx, 0))
         self.view_transform.setToolTip(
-            "Standard keeps the viewport's colours literally; AgX and Filmic "
-            "roll the highlights off, which stops white hydrogens clipping in "
-            "a bright scene.")
+            "AgX and Filmic roll the highlights off, so white hydrogens stop "
+            "clipping; Standard keeps the colours literally and blew 4.9% of "
+            "a measured MOF-5 render to pure white.\n\n"
+            "AgX rather than Filmic: Filmic was the default through Blender "
+            "2.8x-3.x (which is why the tutorials say so) and desaturates "
+            "midtones toward grey. AgX replaced it in 4.0 and keeps the "
+            "colour.")
         form.addRow("View transform:", self.view_transform)
+
+        self.look = QComboBox()
+        for name in bx.LOOKS:
+            self.look.addItem(name)
+        idx = self.look.findText(opts.look)
+        self.look.setCurrentIndex(max(idx, 0))
+        self.look.setToolTip(
+            "Puts back the contrast the roll-off takes away - without one, "
+            "not clipping costs you the picture. Measured: bare AgX drops "
+            "contrast from 0.165 to 0.120, High Contrast restores it to 0.160 "
+            "at the same brightness with nothing clipped.")
+        form.addRow("Contrast look:", self.look)
 
         # ----------------------------------------------------------- lights
         form.addRow(QLabel("<b>Lights</b>"))
@@ -849,6 +865,7 @@ class BlenderExportDialog(QDialog):
             engine=self.engine_combo.currentData(),
             samples=self.samples.value(),
             view_transform=self.view_transform.currentText(),
+            look=self.look.currentText(),
             clear_scene=self.clear_scene.isChecked(),
             collection=self.collection.text().strip() or "MoloM",
         )
