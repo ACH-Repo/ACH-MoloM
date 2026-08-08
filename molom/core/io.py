@@ -744,6 +744,8 @@ def _read_cif(path, disorder=None):
         # `core/packing.py` for why, and for what the old path got wrong.
         symbols, coords, bonds, packed_meta = packing_mod.pack(
             data, disorder=disorder)
+        # Remembered so the crystal page's two ticks start where the import
+        # left them, and so a rebuild reproduces this picture.
         # Still needed for the cell CONTENT — Z, the density and the ❖ page
         # all count formula units, which the packed picture deliberately is
         # not. `expand` also fills `report` for the import message.
@@ -793,6 +795,8 @@ def _read_cif(path, disorder=None):
         #: This import went through `core.packing`, so the boundary is already
         #: complete and nothing downstream should try to close it again.
         "packed": True,
+        "pack_outside": True,
+        "pack_copies": False,
     }
     meta.update(packed_meta)
     if report.get("site_occupancy"):

@@ -252,8 +252,10 @@ class MainWindow(QMainWindow):
         self.crystal_page.view_changed.connect(self.on_crystal_view)
         self.crystal_page.occupancy_toggled.connect(
             self._on_occupancy_display)
-        self.crystal_page.exterior_toggled.connect(
-            lambda on: self._on_crystal_exterior(self.active_id, on))
+        self.crystal_page.outside_toggled.connect(
+            lambda on: self._on_packing_option(self.active_id, "outside", on))
+        self.crystal_page.copies_toggled.connect(
+            lambda on: self._on_packing_option(self.active_id, "copies", on))
         self.crystal_page.box_toggled.connect(self._set_cell_box)
         self.crystal_page.poly_check.toggled.connect(
             lambda on: self._set_obj_flag("polyhedra", on))
@@ -3960,6 +3962,22 @@ class MainWindow(QMainWindow):
         self.viewport.update()
         self._sync_crystal_page()
 
+    def _on_packing_option(self, obj_id, which, on):
+        # type: (int, str, bool) -> None
+        """A packing choice on the ❖ page: rebuild the view through it.
+
+        These replace the old "Bonded atoms outside the cell" tick, which
+        drove `BoundaryModifier`/`shell_molecules` — mechanisms the packed
+        pipeline no longer uses, so the control had quietly stopped doing
+        anything.
+        """
+        obj = self.scene.get(obj_id) if obj_id is not None else None
+        if obj is None or cell_of(obj) is None:
+            return
+        key = "pack_outside" if which == "outside" else "pack_copies"
+        obj.structure.metadata[key] = bool(on)
+        self.on_crystal_view(obj.structure.metadata.get("cell_view", "cell"))
+
     def _on_crystal_exterior(self, obj_id, on):
         """VESTA's boundary search, per crystal.
 
@@ -4052,6 +4070,8 @@ class MainWindow(QMainWindow):
             exterior=0,
             shell_molecules=bool(meta.get("cell_exterior", 0)),
             disorder=meta.get("disorder_policy") or self.disorder_policy,
+            outside=bool(meta.get("pack_outside", True)),
+            grow_from_copies=bool(meta.get("pack_copies", False)),
             report=report, **self._view_disorder_kwargs(meta))
         if not symbols:
             return
@@ -4626,6 +4646,8 @@ class MainWindow(QMainWindow):
             density=self._calculated_density(info, cell),
             refused=len(meta.get("refused_bonds") or ()),
             refused_on=bool(meta.get("show_refused_bonds")),
+            outside=bool(meta.get("pack_outside", True)),
+            copies=bool(meta.get("pack_copies", False)),
             name=obj.name)
         self.crystal_page.set_detail(
             info, naming=naming, site_occupancy=meta.get("site_occupancy"))
@@ -4745,6 +4767,8 @@ class MainWindow(QMainWindow):
             # with the object, so a rebuild resolves the disorder exactly as
             # the import did.
             disorder=meta.get("disorder_policy") or self.disorder_policy,
+            outside=bool(meta.get("pack_outside", True)),
+            grow_from_copies=bool(meta.get("pack_copies", False)),
             report=report, **self._view_disorder_kwargs(meta))
         if report.get("disorder"):
             meta["disorder"] = dict(report["disorder"])

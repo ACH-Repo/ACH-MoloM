@@ -115,7 +115,31 @@ out at three of its four positions instead of four. Both fixed by the one rule.
 **Still open**: bonds from the FULL-occupancy O to the partial ones survive
 (1.475 / 1.520 / 1.706 A) because the sum rule does not apply, and 1.475 A is
 exactly a peroxide bond — no distance rule can reject it.
-**Round 46 (2026-08-06, INSTALLABLE ADD-ONS — Blender's model): Christian, on the
+**Round 47b (2026-08-06, the ❖ page catches up with the packed pipeline):
+Christian: "'Bonded atoms outside the cell' doesn't seem to work and needs to
+go." Correct — it drove `shell_molecules`/`BoundaryModifier`, mechanisms the
+packed path no longer uses, so the tick had quietly become inert. Replaced by
+the sandbox's two, now that they are the real controls: **Draw atoms outside
+the cell boundary** and **Complete the boundary copies too**, stored per object
+as `pack_outside`/`pack_copies` and threaded through `build_view` ->
+`packing.pack`, so a rebuild reproduces the picture. Measured on ZIF-8:
+696 atoms with Zn coordination {4: 12, 3: 12} by default, **864 and {4: 24}**
+with the copies tick, 360 and {2: 24} with outside off.
+**Two of Christian's three points needed no code.** (1) "Asymmetric unit only
+seems to not include atoms of partial occupancy for ZIF-8" — it does: the
+parser reads all 9 `_atom_site_` rows including H00A/H00B/H00C at occupancy
+0.5, and the asym view draws 9 atoms (Zn 1, N 1, C 3, H 4). Nothing is
+dropped. (2) "Coordination polyhedra should always be closed" — the open ones
+were the 12 Zn that are boundary COPIES, which do not complete their
+coordination unless the copies tick is on; ticking it takes all 24 to four
+donors and closes every tetrahedron. **Still open, and the principled fix**:
+`polyhedra.build` takes its donors from the DRAWN bonds, so a polyhedron is
+only as complete as the picture. Building it from the periodic graph instead —
+the donor POSITIONS are known even when the donor atom is not drawn — would
+close it always, independently of any display option. That is the right
+answer to what he actually asked for.
+
+Round 46 (2026-08-06, INSTALLABLE ADD-ONS — Blender's model): Christian, on the
 debug and sandbox pages: "I just want them cordoned off somewhere so I don't
 need to worry about them", and on the API: "I don't see why an add-on should
 not have full access... If someone wants to brick their install with something

@@ -446,7 +446,9 @@ class CrystalPage(QWidget):
     view_changed = Signal(str, int, int, int)   # mode, na, nb, nc
     box_toggled = Signal(bool)
     poly_toggled = Signal(bool)
-    exterior_toggled = Signal(bool)
+    exterior_toggled = Signal(bool)          # legacy, no longer emitted
+    outside_toggled = Signal(bool)
+    copies_toggled = Signal(bool)
     occupancy_toggled = Signal(bool)
     refused_toggled = Signal(bool)
 
@@ -517,19 +519,37 @@ class CrystalPage(QWidget):
         lay.addLayout(row)
         self._pack_row = row
 
-        # VESTA's boundary search. Sits under Contents because that is what
-        # it changes — what is DRAWN, not the cell itself.
-        self.ext_check = QCheckBox("Bonded atoms outside the cell")
-        self.ext_check.setToolTip(
-            "Draw the atoms just beyond each face that are bonded to atoms "
-            "inside the cell, so chains and frameworks run on instead of "
-            "being cut off at the boundary (VESTA does this by default). "
-            "The cell content is unchanged — these are extra atoms in the "
-            "picture only.")
-        self.ext_check.toggled.connect(
+        # How far past the wall the picture goes. These replace the old
+        # "Bonded atoms outside the cell" tick, which drove a mechanism the
+        # packed pipeline no longer uses and had stopped doing anything.
+        self.outside_check = QCheckBox("Draw atoms outside the cell boundary")
+        self.outside_check.setToolTip(
+            "On: a molecule with any atom in the cell is completed outwards, "
+            "so a fullerene split across four corners is drawn as four whole "
+            "fullerenes and a framework's linkers are not cut at the wall.\n"
+            "Off: the same connectivity, but only the atoms inside the box.\n\n"
+            "The cell CONTENT is unchanged either way — this is the picture, "
+            "not the crystallography.")
+        self.outside_check.toggled.connect(
             lambda v: None if self._loading
-            else self.exterior_toggled.emit(bool(v)))
-        lay.addWidget(self.ext_check)
+            else self.outside_toggled.emit(bool(v)))
+        lay.addWidget(self.outside_check)
+
+        self.copies_check = QCheckBox("Complete the boundary copies too")
+        self.copies_check.setToolTip(
+            "An atom sitting exactly ON a face is drawn at every equivalent "
+            "face. Off, only the atoms the wrap placed complete their "
+            "coordination outwards; on, every copy does too.\n\n"
+            "On is what closes a coordination polyhedron whose metal sits on "
+            "a boundary — in ZIF-8 it takes 12 of the 24 Zn from three "
+            "neighbours to four. It also makes a dense oxide look fuller "
+            "(1547149: 21 -> 51 atoms) and makes the magnesium "
+            "pyrophosphates balloon (60 -> 351 instead of 185), which is why "
+            "it is a choice rather than a default.")
+        self.copies_check.toggled.connect(
+            lambda v: None if self._loading
+            else self.copies_toggled.emit(bool(v)))
+        lay.addWidget(self.copies_check)
         self._loading = False
 
         lay.addStretch(1)
@@ -783,7 +803,8 @@ class CrystalPage(QWidget):
 
     def set_cell(self, cell, spacegroup="", n_asym=0, n_atoms=0, mode="cell",
                  name="", exterior=0, chemistry="", symmetry="", naming=None,
-                 bravais="", density=None, refused=0, refused_on=False):
+                 bravais="", density=None, refused=0, refused_on=False,
+                 outside=True, copies=False):
         """Refresh from the active molecule.
 
         `cell=None` greys every CONTROL but leaves the page itself readable —
@@ -794,7 +815,8 @@ class CrystalPage(QWidget):
         has = cell is not None
         for w in (self.asym_radio, self.cell_radio, self.pack_radio,
                   self.box_check, self.poly_check, self.sym_check,
-                  self.ghost_check, self._kind_holder, self.ext_check,
+                  self.ghost_check, self._kind_holder,
+                  self.outside_check, self.copies_check,
                   self.occupancy_check):
             w.setEnabled(has)
         self._sync_pack_enabled()
@@ -811,7 +833,8 @@ class CrystalPage(QWidget):
         # is PER CRYSTAL, so it has to be read back from the active object or
         # it would carry one molecule's setting onto the next.
         self._loading = True
-        self.ext_check.setChecked(bool(exterior))
+        self.outside_check.setChecked(bool(outside))
+        self.copies_check.setChecked(bool(copies))
         self.refused_check.setChecked(bool(refused_on))
         self._loading = False
         if not has:

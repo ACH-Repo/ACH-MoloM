@@ -2041,7 +2041,8 @@ def reference_sample(coords, limit=24):
 def build_view(cell, asym_symbols, asym_frac, symops, mode="cell",
                na=1, nb=1, nc=1, tol=0.1, exterior=0, occupancy=None,
                disorder=POLICY_DOMINANT, report=None, shell_molecules=False,
-               disorder_groups=None, disorder_assemblies=None, packed=True):
+               disorder_groups=None, disorder_assemblies=None, packed=True,
+               outside=True, grow_from_copies=False):
     # type: (Cell, list, list, list, str, int, int, int, float, int, Optional[Sequence], str, Optional[dict]) -> Tuple[List[str], np.ndarray]
     """The atoms for one crystal display mode, in CARTESIAN coordinates.
 
@@ -2089,7 +2090,8 @@ def build_view(cell, asym_symbols, asym_frac, symops, mode="cell",
     else:
         from . import packing as packing_mod
         symbols, coords, bonds, packed_meta = packing_mod.pack(
-            data, disorder=disorder, tol=tol)
+            data, disorder=disorder, tol=tol, outside=outside,
+            grow_from_copies=grow_from_copies)
         if report is not None:
             report["packed_bonds"] = [[int(i), int(j), int(o)]
                                       for i, j, o in bonds]
