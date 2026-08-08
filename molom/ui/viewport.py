@@ -2813,7 +2813,7 @@ class MolViewport(QOpenGLWidget):
             if self._poly_edges is not None:
                 self._poly_edges.n_verts = 0
             return
-        eye = self._camera_frame()[0]
+        eye = self._camera_frame()["eye"]
         verts = np.vstack([poly_mod.triangle_soup([p])[0] for p in built])
         # The rim term is the only camera-dependent part, so it alone is
         # recomputed per frame; the hulls are cached above.

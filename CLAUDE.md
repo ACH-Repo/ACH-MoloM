@@ -2021,6 +2021,18 @@ independent cross-check inside a single fixture.
   vector then spin so the backbone points outward.
 
 ## Hard-won gotchas (don't re-learn these)
+- **An exception in `paintGL` kills everything drawn AFTER it, silently**
+  (round 48, and this is the round-34 lesson biting a second time). Qt catches
+  it, prints to stderr and carries on, so the window keeps working while the
+  grid and the compass simply stop appearing — which is what a one-character
+  mistake did: `self._camera_frame()[0]` on a dict raised `KeyError` inside
+  `_draw_polyhedra`, and the two passes that follow it vanished the moment
+  coordination polyhedra were switched on. **No headless test can see this**:
+  the offscreen platform never runs paintGL, so `repaint()` returns happily and
+  every assertion passes. `tools/smoke_gui.py` exists for exactly this — it
+  opens a REAL window, wraps every `_draw*`/`_paint*` method so a raise is
+  recorded rather than swallowed, grabs a frame per overlay, and exits
+  non-zero. Run it whenever you touch a paint path.
 - **CLIP THEN BOND splits a face atom's coordination sphere in half** (round
   44). An atom lying exactly on a cell face is drawn twice, once per face —
   correct, and what every viewer does — but if the bonds are then perceived
@@ -2844,7 +2856,9 @@ independent cross-check inside a single fixture.
    sandboxes QSettings, so a GUI test can drive a real control without
    writing into your own MoloM configuration.
 2. `python -m molom --selftest` — headless core sanity.
-3. GUI smoke: a scripted QTimer run that opens examples, switches styles,
+3. GUI smoke: `python tools/smoke_gui.py` — a REAL window (never
+   offscreen), which is the only thing that can catch a paintGL
+   exception. Historically: a scripted QTimer run that opens examples, switches styles,
    selects atoms, drives the trajectory bar, and grabs framebuffers lives in
    the session scratchpad pattern (`smoke_gui.py`) — recreate as needed; the
    `grabFramebuffer()` PNGs are how rendering was verified without manual

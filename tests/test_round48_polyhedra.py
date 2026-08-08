@@ -118,3 +118,24 @@ def test_a_real_framework_closes_every_metal(tmp_path):
     zinc = [p for p in built if p["symbol"] == "Zn"]
     assert len(zinc) == 24
     assert all(len(p["vertices"]) == 4 for p in zinc)
+
+
+# ------------------------------------------------------- the paint contract
+def test_camera_frame_is_a_mapping_not_a_tuple():
+    """Pinned because indexing it positionally is exactly what broke the
+    viewport: `_camera_frame()[0]` raised KeyError inside `_draw_polyhedra`,
+    Qt swallowed it, and everything drawn AFTER polyhedra — the grid and the
+    compass — silently stopped. Nothing headless could see it, because the
+    offscreen platform never runs paintGL at all."""
+    import os
+    import pytest as _pytest
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    _pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+    from molom.ui.viewport import MolViewport
+    QApplication.instance() or QApplication([])
+    view = MolViewport()
+    frame = view._camera_frame()
+    assert isinstance(frame, dict)
+    assert {"eye", "view", "proj"} <= set(frame)
+    assert len(frame["eye"]) == 3
