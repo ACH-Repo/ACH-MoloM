@@ -1977,8 +1977,9 @@ class MainWindow(QMainWindow):
                     script_path, out[-2000:] if out else "no output"))
             return
         self.statusBar().showMessage(
-            "Wrote {} - open it and press F12".format(
-                os.path.basename(path)), 10000)
+            "Wrote {} - open it and press F12. The build script is beside it "
+            "as {}".format(os.path.basename(path),
+                           os.path.basename(script_path)), 12000)
 
     def blender_script(self, options, basename=""):
         # type: (blender_mod.ExportOptions, str) -> str

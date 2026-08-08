@@ -56,6 +56,106 @@ the operator key table, CIF reading with symmetry, coordination polyhedra,
 meta atoms, the scene clock with a multi-track timeline, vibrational modes,
 per-element display control, and the symmetry modifier. 512 tests.
 
+Round 50 (2026-08-08, the round-49 list, top to bottom): four of the five
+items, on the DESKTOP PC. **(0) The polyhedra perf item was real and it was
+the shading.** `shade_colors` ran a Python loop per TRIANGLE per FRAME and the
+triangle soup was rebuilt beside it with one `triangle_soup` call per
+polyhedron: **53 ms a frame at 400 octahedra** (19 fps before a single pixel
+is drawn), 1.4 ms at the ten `1547149.cif` has. The normals, the centroids,
+the base colours and the soup are all camera-independent, so they moved into
+`face_arrays` next to the cached hulls and only `shade_from_faces` runs per
+frame — four array operations over the whole scene. **53 -> 0.32 ms (168x)**,
+262 -> 1.3 ms at 2000 octahedra, and BYTE-IDENTICAL output, which is what
+makes it a performance change rather than a look change. Also removed a dead
+`glDisable(GL_BLEND)` sitting after a `return` (so the pass now restores the
+blend state it turns on) and left culling alone, since off IS the default here.
+**(0b) A hull face is a PLANE, not a triple.** Emitting one triangle per
+accepted triple stacked FOUR of them on every square face — a cubic
+8-coordinate centre came out **24 triangles over its 12**, which blends twice
+in the viewport (a square face reads more opaque than a triangular one) and is
+straight z-fighting in a render. The triples are grouped by the SET OF POINTS
+ON THEIR PLANE — an exact integer key, where a rounded normal lets two triples
+of one face disagree — and each face is fan-triangulated once in a
+right-handed basis, which is what keeps the winding outward with no
+per-triangle check. Pinned on the five standard coordination solids and on 50
+random hulls.
+**(1) The Blender export carries coordination polyhedra.** It returned atoms,
+bonds, camera, centre, lights, materials and radius, so a MOF figure lost
+exactly the thing that makes it readable. One closed mesh per centre, FLAT
+shaded (a coordination polyhedron has real creases), on a translucent material
+that is **never metallic** — a translucent metal renders as a chrome shell
+with nothing visible inside it. `polyhedra.for_object` is now the ONE place
+that decides which solids an object shows, called by both the viewport and the
+exporter, so the render cannot disagree with the screen (round 37's rule).
+Note `collect` must always be handed `cell_of`, not `cell_of if
+options.unit_cell` — gating it on the box tick would silently drop the
+polyhedra back to the drawn bonds and open them.
+**(4) It writes a `.blend` now.** Christian: "I don't like having to load it in
+every time... all I have to do is press F12." Blender IS installed, so the
+export INVOKES it: the same generated script, run headlessly as `blender -b
+--factory-startup --python build.py -- --save out.blend`. **The scene is BUILT
+before the file is saved, so the .blend opens complete** — no auto-run, no
+"Allow Execution" prompt, no trust dialog — and the script rides along as a
+text datablock for re-running after a tweak, plus stays on disk beside the
+.blend. The path is a SETTING with discovery (the stored hint, then PATH, then
+the usual install locations newest-first), and **a `blender-launcher.exe`
+resolves to the `blender.exe` beside it** because the launcher is a GUI shim
+that cannot be scripted — which is the path Christian actually has. A failed
+build leaves the script and says so; the script remains an output format on
+its own, since it is diffable and needs no Blender at all.
+Verified BY RUNNING IT (round 37's rule): Blender 5.1 headless on
+`cod_1547149_solid_solution.cif` writes a 131 kB .blend with 10 Nb octahedra,
+and rendering **that file** with no script involved gives the VESTA picture.
+**(2) A real CIF writer** (`core/cif_write.py`) — see the round-50 entry below
+for the whole of it. **(3) Editing a packed crystal is now FLAGGED** rather
+than silently desynchronising the boundary copies. 1102 tests.
+
+Round 50b (2026-08-08, `core/cif_write.py` — a written .cif is a crystal
+again): there was no CIF writer at all. `io.write_structure_file` handed
+OpenBabel an xyz block for any non-xyz extension, so a `.cif` carried
+coordinates and nothing else — measured on a ZIF-8 export: no
+`_cell_length_a`, no symmetry, no occupancies, and **MoloM's own parser
+rejected the file MoloM had just written**. A CIF's content is cell +
+operators + asymmetric unit, so the whole question is where those three come
+from, and the choice is made **by measurement, not by a flag**: if the stored
+asymmetric unit still reproduces the drawn cell CONTENT — i.e. nothing has
+been edited — the file's own unit, operators, occupancies, disorder columns,
+site labels and space-group spelling go straight back out (`_covered` asks it
+that way round on purpose, since the disorder policy may legitimately have
+dropped alternatives while a MOVED atom is simply not in the expansion).
+Otherwise the symmetry is re-derived from the coordinates by spglib
+(round 43d's `from_structure` + `orbit_representatives`) and the content
+reduced to one atom per orbit, because operators that no longer describe the
+structure would expand it into a cell that never existed.
+Five details that had to be right: **the SETTING is preserved** (all nine
+settings of number 14 share the standard short symbol, so writing `P2_1/c` for
+a file that says `P 21/a` reads as an outright error — round 41 — hence the
+file's own spelling is kept whenever the re-derived group is the SAME group,
+compared as geometry via `operators_match` and never as text); **only the cell
+CONTENT is written**, since everything past `cell_content` is a boundary copy
+and writing those claims a cell with every face atom in it twice (ferrocene:
+210 drawn, 42 content, 11 sites); **the pose is undone first**, or a rotated
+crystal's coordinates ARE the rotation — pinned at 10, 37 and 90 degrees
+writing a byte-identical file; **the operator loop is written ONCE**, because
+putting both synonymous tags in one loop doubles the count for any reader that
+knows them and the first cut read its own 16-operation file back as 32; and
+**occupancy is never invented** — it cannot survive a re-derivation, so that
+path writes 1.0 and SAYS so, the same discipline as round 38's chemistry
+notes. A molecule with no cell gets a P1 box round it, reported as invented,
+because a CIF without a cell is not a CIF and refusing outright is less useful
+than writing one honestly labelled (geometry survives to 1.2e-4 A, which is
+the 5-decimal fractional precision on a 15 A box). Verified against
+independent readers: **ASE and pymatgen both read the written files exactly as
+they read the originals**, and pymatgen warns on the ORIGINAL ferrocene (it
+has no operator loop) and not on ours. `asym_labels` is now carried in the
+import metadata so "C12A" is still called C12A after a round trip.
+**Editing a packed crystal** (round-49 item 3) is flagged once per object with
+the route that does work: the copies are ordinary independent atoms — on
+ZIF-8 atom 0 has a copy at index 348 and moving one does not move the other —
+and no existing guard covers it, since `begin_model_edit` handles the cell-box
+drift (round 43e) and `sync_asymmetric_unit` only fires when the base IS the
+asymmetric unit, which a packed import's base is not.
+
 Round 45f (2026-08-06, over-valence allowed + the boundary step): two more of
 Christian's, both in the sandbox only. **(1) Over-valence is now DRAWN.** "There
 should be a carbon with 6 connected hydrogens there. I think that's the better
@@ -1773,7 +1873,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 984 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1102 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -1924,11 +2024,22 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   so it can never accumulate; pitch is still clamped short of vertical.
 - `core/blender_export.py` — the scene as a Blender BUILD SCRIPT: geometry
   (following `viewport._rebuild`'s rules exactly — modifier output, per-atom
-  colours/sizes, hidden atoms, the multi-bond layout), materials, camera,
-  lamp rig, world/HDRI and render settings. `collect()` returns plain data and
-  `build_script()` renders it into source, so the data and the text are
-  testable separately (and a .blend writer could reuse `collect` unchanged).
-  The emitted script is deliberately **ASCII only** and must stay that way.
+  colours/sizes, hidden atoms, the multi-bond layout), **coordination
+  polyhedra** (round 50, via `polyhedra.for_object` so the render and the
+  viewport cannot diverge), materials, camera, lamp rig, world/HDRI and render
+  settings. `collect()` returns plain data and `build_script()` renders it into
+  source, so the data and the text are testable separately. The emitted script
+  is deliberately **ASCII only** and must stay that way. It also carries a
+  `--save` handler, which is what `find_blender` + `write_blend` use to build a
+  **.blend** headlessly — the scene is complete before the file is written, so
+  nothing runs on load.
+- `core/cif_write.py` — the CIF WRITER (round 50). `cif_text` is pure
+  formatting; `from_object` makes every decision, and makes them by
+  MEASUREMENT: the stored asymmetric unit goes back out verbatim if it still
+  reproduces the drawn content, otherwise spglib re-derives the group from the
+  coordinates. Writes only the cell CONTENT (never the boundary copies), undoes
+  the cell pose first, and reports what it decided — including when occupancy
+  could not be carried and when a cell had to be invented.
 - `core/orient.py` — crystallographic view orientations for the ❖ ribbon:
   direct and RECIPROCAL axis directions (the latter from the inverse
   transpose — a normal is covariant), `look_along`, and the classical
@@ -2027,6 +2138,33 @@ independent cross-check inside a single fixture.
   vector then spin so the backbone points outward.
 
 ## Hard-won gotchas (don't re-learn these)
+- **"Cached on its inputs" is only half the job if the SHADING is not**
+  (round 50). Round 48 cached the convex hulls and then computed the face
+  normals, the centroids and the triangle soup per frame anyway, inside a
+  Python loop over triangles — 53 ms a frame at 400 octahedra, which is the
+  round-33 rule broken by the very commit that quoted it. The test for
+  "does this belong in the paint path?" is not "is it expensive?" but **"does
+  it change when the camera moves?"**. Split the two halves into separate
+  functions (`face_arrays` / `shade_from_faces`) so the boundary is visible in
+  the API rather than remembered, and pin them as identical to the combined
+  one — a performance change that alters the picture is a different change.
+- **A convex-hull face is a PLANE, not a triple** (round 50). Accepting each
+  candidate triple independently emits one triangle per triple, so any face
+  with more than three points on it is covered several times over: a cubic
+  8-coordinate centre gave 24 triangles over its 12, four stacked on each
+  square face. Invisible in a wireframe and in a face COUNT nobody checks;
+  visible as a square face blending twice in the viewport, and as z-fighting
+  the moment the same geometry reaches a renderer. Group by the set of points
+  on the plane (an exact integer key — a rounded normal lets two triples of
+  one face disagree) and fan-triangulate once, in a basis built right-handed
+  with the outward normal so the winding needs no per-triangle check.
+- **`blender-launcher.exe` cannot be scripted** (round 50). It is the GUI shim
+  Windows installs put beside `blender.exe`, and it is what a user will hand
+  you when asked where Blender is — `-b --python` needs the real binary, which
+  is in the same directory. Resolve it rather than trusting the path, and
+  remember the path itself must be a SETTING with discovery: this project has
+  two dev machines with Blender in different places, which is the whole reason
+  round 16 happened.
 - **An exception in `paintGL` kills everything drawn AFTER it, silently**
   (round 48, and this is the round-34 lesson biting a second time). Qt catches
   it, prints to stderr and carries on, so the window keeps working while the
@@ -2910,7 +3048,9 @@ Options for publication-quality output, in the order they are worth doing:
 1. ~~**Blender export**~~ **DELIVERED round 37** (`core/blender_export.py`,
    Ctrl+Shift+B) — materials, camera, HDRI, lamps, unit cell, render setup,
    behind a pre-configuration dialog. Verified by running the output in
-   Blender 5.1 headless and comparing the render with the viewport.
+   Blender 5.1 headless and comparing the render with the viewport. **Round 50
+   added coordination polyhedra and a `.blend` output**: Blender is invoked to
+   build the scene, so the saved file opens complete and F12 renders it.
 2. **Offscreen supersampling** — render the existing GL scene into an FBO at
    4-8x and downsample. Cheap to add, no new dependency, no new look.
 3. **POV-Ray** — what Avogadro 1 used. Still works and produces nice CPU
@@ -2919,61 +3059,54 @@ Options for publication-quality output, in the order they are worth doing:
    maintain. Only worth it if a specific journal-style look is wanted.
 NOT recommended: bundling a Python ray tracer (slow, another dependency).
 
-## NEXT UP — measured issues, in priority order (2026-08-06)
-Logged at the end of the round-49 session, all of them either measured here or
-read straight off the code. Christian is continuing on the DESKTOP PC.
+## NEXT UP — measured issues, in priority order (2026-08-08)
+Round 49's list is DONE except for one item; what is left, plus what round 50
+turned up while doing it. Christian is on the DESKTOP PC.
 
-0. **PERFORMANCE: `polyhedra.shade_colors` runs a Python loop per TRIANGLE
-   per FRAME.** It is the likeliest cause of the slowdown he noticed after
-   round 48 and it is straightforwardly vectorisable — the face normals and
-   the eye vector are two array operations, and only the `|N.V|` term changes
-   between frames. Note the hulls themselves are already cached
-   (`_polyhedra_plan`); it is only the shading that is not. Measure a frame
-   time before and after rather than assuming this is the whole of it.
+~~0. PERFORMANCE: `polyhedra.shade_colors` runs a Python loop per TRIANGLE per
+FRAME.~~ **FIXED in round 50** — 53 ms -> 0.32 ms at 400 octahedra, output
+byte-identical. Worth re-measuring a real frame with a packed MOF on screen
+before calling the slowdown closed: this was the biggest single cost in the
+paint path but it need not have been the only one.
 
-1. **The Blender export drops COORDINATION POLYHEDRA.** Measured:
-   `collect()` returns `atoms, bonds, camera, centre, lights, materials,
-   radius` and the only mention of the module is `polyhedra.is_metal` for
-   picking metallic materials. Sphere sizes ARE carried, per atom and global
-   (`r * obj.atom_scale_for(i)`), as are per-atom colours, hidden atoms and
-   the unit cell. So a MOF figure loses exactly the thing that makes it
-   readable. The geometry is already a triangle soup with per-face colours,
-   so this is a contained addition — one mesh per polyhedron, or one merged
-   mesh per object with a translucent material.
+~~1. The Blender export drops COORDINATION POLYHEDRA.~~ **DELIVERED round 50.**
 
-2. **There is NO CIF WRITER, and a written `.cif` is not a crystal.**
-   `write_structure_file` hands OpenBabel an xyz block for any non-xyz
-   extension, so the file contains coordinates and nothing else. Measured on
-   a ZIF-8 export: no `_cell_length_a`, no symmetry, and **MoloM's own parser
-   rejects the file it just wrote** ("no unit cell in this CIF"). Mercury and
-   VESTA would read it as a molecule at best. Editing first is irrelevant —
-   the crystallography was never written. The fix is a real writer: cell,
-   operators (spglib re-deriving the group after an edit, which round 43d
-   already does), occupancies and the asymmetric unit.
+~~2. There is NO CIF WRITER.~~ **DELIVERED round 50** (`core/cif_write.py`).
+Still open on it: **occupancy is lost whenever the symmetry has to be
+re-derived**, because a drawn atom does not know which site it came from once
+the cell has been rebuilt. The fix is a site index carried per drawn atom
+through `packing.pack` — round 45e's `report["site_of"]` is exactly that
+mapping for the expansion path, so the work is threading it through the packed
+one and keeping it valid across the boundary completion (round 42's "build the
+map AFTER everything that renumbers" applies). Also worth doing once there is
+a test set: run every CIF on the machine through read -> write -> read and
+diff, which is a stronger check than the two vendored fixtures can give.
 
-3. **Editing a PACKED crystal desynchronises the boundary copies.** They are
-   ordinary independent atoms in the list: measured on ZIF-8, atom 0 has a
-   copy at index 348, and moving one does not move the other. `edits.
-   adjust_bond_lengths` is also cell-unaware — it moves atoms by pure
-   geometry and can push one across a face. The existing guards do not cover
-   this: `begin_model_edit` handles the cell-box drift (round 43e) and
-   `sync_asymmetric_unit` only fires when the base IS the asymmetric unit,
-   which a packed import's base is not. Treat "edit a packed crystal" as
-   unsupported until editing operates on the CONTENT and re-packs.
+~~3. Editing a PACKED crystal desynchronises the boundary copies.~~
+**FLAGGED, not fixed, in round 50**: the edit now says so once per object and
+points at "Asymmetric unit only". The real fix is unchanged and still wanted —
+edits should operate on the CONTENT and re-pack. `edits.adjust_bond_lengths`
+is also still cell-unaware and can push an atom across a face.
 
-4. **Write a `.blend`, not a script** (Christian, 2026-08-06: "I don't like
-   having to load it in every time... all I have to do is press F12").
-   Round 37 chose a `.py` because writing .blend needs Blender itself — but
-   Blender IS installed, so the answer is to INVOKE it: `blender -b --python
-   build.py -- --save out.blend` runs the generated script headlessly and
-   saves the result. **The scene is then already built, so nothing has to run
-   on load at all** — no auto-run, no "Allow Execution" prompt, no trust
-   dialog, and F12 just renders. That is strictly better than what was asked
-   for, and it is worth saying so rather than wiring up a registered text
-   block. Still worth EMBEDDING the script as a text datablock for re-running
-   after a tweak; register-on-load is then an option, not the mechanism.
-   Blender lives at `C:\Program Files\Blender Foundation\Blender 4.4   blender-launcher.exe` on the laptop and elsewhere on the PC, so the path
-   must be a SETTING with discovery, never a constant.
+~~4. Write a `.blend`, not a script.~~ **DELIVERED round 50**, verified by
+running Blender 5.1 headless and rendering the saved file with no script
+involved. Blender is at `C:\Program Files\Blender Foundation\Blender 5.1\`
+on the PC (5.1 and 4.4 both installed) and under `Blender 4.4` on the laptop;
+`blender_export.find_blender` discovers it, and the export dialog stores the
+choice.
+
+5. **The polyhedra could be MERGED per object in the Blender export.** They
+   are one mesh per centre today, which is right for selecting them
+   individually and wrong for a framework with 500 nodes. A "merge into one
+   mesh" tick is a few lines and would matter on a big packing. Not urgent —
+   measure a real ZIF export first, since 500 small meshes may be perfectly
+   fine.
+
+6. **The `.blend` export cannot render on the spot.** It saves and stops,
+   which is the right default, but "and render it now" is one more
+   `subprocess` call (`blender -b out.blend -o //render_ -f 1`) and would
+   close the loop for someone making a figure. Wanted only if Christian asks:
+   he specifically said the point is that F12 works.
 
 ## Roadmap
 Round-1 skeleton and round-2 Blender batch: DELIVERED (see "What this is").
@@ -2993,10 +3126,11 @@ batches. Known next items, rough order:
      settings only (it is kept as a backstop tier). spglib is a hard
      dependency; pymatgen still is not. Verified on Christian's 37-file set:
      35/35 files with their own loop reproduce it exactly from their symbol.
-     Still open from the original scoping: **`.cif` EXPORT with a space group
-     re-derived by spglib** — and note there is no CIF writer at all today,
-     `io.write_structure_file` hands OpenBabel an xyz block, so a written
-     `.cif` loses the cell, the symmetry AND the occupancies together.
+     ~~Still open from the original scoping: `.cif` EXPORT with a space group
+     re-derived by spglib.~~ **DELIVERED round 50** (`core/cif_write.py`) —
+     an unedited file round-trips its own operators and setting verbatim, an
+     edited one has the group re-derived from the coordinates. Occupancy
+     survives the first case and not the second; see NEXT UP.
    - ~~**BOND TYPING is the missing hierarchy**~~ **DELIVERED round 38**, all
      three parts (kinds, valence sanity, occupancy). The scoping is kept
      below because the reasoning is what matters, and because the two files
@@ -3048,8 +3182,9 @@ batches. Known next items, rough order:
      (`cif.resolve_disorder`, Settings > CIF disorder). Occupancy and the
      disorder GROUP/ASSEMBLY columns are read and applied, with three
      policies and a report of what was dropped. Still open on this:
-     **occupancy is not carried into EXPORT** (a written .cif claims full
-     occupancy for everything), and the policy is applied at IMPORT so
+     **occupancy is carried into export only on the LOSSLESS path**
+     (round 50: a re-derived cell writes 1.0 and says so), and the policy is
+     applied at IMPORT so
      switching it re-reads the file rather than re-resolving in place.
      Christian's wish for a large disordered test set also stands — the two
      MIL-53 files on this machine are the only real fixtures so far.
