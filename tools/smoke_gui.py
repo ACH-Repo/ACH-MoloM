@@ -123,4 +123,12 @@ if __name__ == "__main__":
         guess = r"C:\Users\chris\Desktop\test cifs"
         given = [os.path.join(guess, f) for f in
                  ("ZIF-8.cif", "1547149.cif", "242083.cif")]
+        # Christian's set is CCDC data and is not in the repo, so on a machine
+        # without it every crystal overlay would be skipped and the run would
+        # pass having exercised nothing. The vendored fixtures cover the same
+        # paint paths — a framework metal with polyhedra, and symmetry.
+        data = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "tests", "data")
+        given += [os.path.join(data, f) for f in sorted(os.listdir(data))
+                  if f.endswith(".cif")]
     raise SystemExit(main(given))

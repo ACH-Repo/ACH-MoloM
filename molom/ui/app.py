@@ -1825,8 +1825,9 @@ class MainWindow(QMainWindow):
     _BLENDER_KEYS = ("hdri", "hdri_strength", "hdri_rotation", "hdri_visible",
                      "lights", "light_strength", "roughness",
                      "metallic_metals", "sphere_subdivisions", "bond_sides",
-                     "shade_smooth", "unit_cell", "engine", "samples",
-                     "view_transform", "clear_scene", "collection",
+                     "shade_smooth", "unit_cell", "polyhedra",
+                     "polyhedra_alpha", "output", "blender_exe", "engine",
+                     "samples", "view_transform", "clear_scene", "collection",
                      "style_key")
 
     def _blender_options(self):
@@ -1853,11 +1854,14 @@ class MainWindow(QMainWindow):
         return opts
 
     def on_export_blender(self):
-        """Pre-configure, then write a Blender build script.
+        """Pre-configure, then write a .blend — or the build script.
 
-        A script rather than a .blend because writing .blend needs Blender
-        itself; this way there is nothing to find, nothing to shell out to,
-        and the result is editable text. See core/blender_export.py.
+        Round 37 wrote a script because a .blend needs Blender itself. It
+        does, so the export INVOKES it: the script is built as before and run
+        headlessly with `--save`, which means the saved scene is already
+        complete and F12 renders it (Christian: "I don't like having to load
+        it in every time"). No auto-run, no trust prompt. The script remains
+        an option — it is diffable, editable, and needs no Blender at all.
         """
         vis = [o for o in self.scene.visible_objects() if o.structure.n_atoms]
         if not vis:
@@ -1879,30 +1883,58 @@ class MainWindow(QMainWindow):
         base = (os.path.splitext(os.path.basename(self.project_path))[0]
                 if self.project_path else (vis[0].name or "molom"))
         start = self.settings.value("last_dir", "")
+        blend = opts.output == "blend" and bool(opts.blender_exe)
+        suffix = ".blend" if blend else ".py"
         path, _f = QFileDialog.getSaveFileName(
-            self, "Export Blender script",
-            blender_mod.default_path(start, base),
-            "Blender Python script (*.py);;All files (*)")
+            self, "Export to Blender",
+            blender_mod.default_path(start, base, suffix),
+            "Blender file (*.blend)" if blend
+            else "Blender Python script (*.py);;All files (*)")
         if not path:
             return
         try:
-            source = self.blender_script(opts, os.path.basename(path))
+            script_path = (os.path.splitext(path)[0] + "_build.py" if blend
+                           else path)
+            source = self.blender_script(opts, os.path.basename(script_path))
         except Exception as e:
             QMessageBox.critical(self, "Export failed", str(e))
             return
         try:
             # UTF-8 explicitly: Blender reads scripts as UTF-8, and Windows
             # would otherwise write cp1252 and hand it a byte it refuses.
-            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            with open(script_path, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(source)
         except OSError as e:
             QMessageBox.critical(self, "Export failed",
-                                 "Could not write {}\n{}".format(path, e))
+                                 "Could not write {}\n{}".format(script_path,
+                                                                 e))
             return
         self.settings.setValue("last_dir", os.path.dirname(path))
+        if not blend:
+            self.statusBar().showMessage(
+                "Wrote {} - open it in Blender's Scripting workspace and press "
+                "Run".format(os.path.basename(path)), 10000)
+            return
+        self.statusBar().showMessage("Building {} in Blender...".format(
+            os.path.basename(path)))
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            ok, out = blender_mod.write_blend(opts.blender_exe, script_path,
+                                              path)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not ok:
+            # The script is still on disk and still valid, so say so — the
+            # user can run it by hand rather than having to export again.
+            QMessageBox.warning(
+                self, "Blender could not build the file",
+                "The build script was written to\n{}\n\nBut Blender did not "
+                "produce the .blend:\n\n{}".format(
+                    script_path, out[-2000:] if out else "no output"))
+            return
         self.statusBar().showMessage(
-            "Wrote {} - open it in Blender's Scripting workspace and press "
-            "Run".format(os.path.basename(path)), 10000)
+            "Wrote {} - open it and press F12".format(
+                os.path.basename(path)), 10000)
 
     def blender_script(self, options, basename=""):
         # type: (blender_mod.ExportOptions, str) -> str
@@ -1918,7 +1950,11 @@ class MainWindow(QMainWindow):
             self.scene, style, options,
             camera=vp.camera if options.match_viewport else None,
             width=options.resolution[0], height=options.resolution[1],
-            cell_of=cell_of if options.unit_cell else None)
+            # ALWAYS the cell lookup, whatever the box option says: the
+            # polyhedra need it to build from the periodic graph, and gating
+            # it on the box tick would silently make them fall back to the
+            # drawn bonds and come out open.
+            cell_of=cell_of)
         title = ", ".join(o.name for o in self.scene.visible_objects()
                           if o.structure.n_atoms) or "scene"
         return blender_mod.build_script(

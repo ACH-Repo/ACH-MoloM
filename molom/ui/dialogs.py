@@ -496,15 +496,40 @@ class BlenderExportDialog(QDialog):
         area.setWidget(body)
         outer.addWidget(area, 1)
 
-        head = QLabel("Writes a Blender <b>Python script</b>. Open it in "
-                      "Blender's Scripting workspace and press Run, or "
-                      "<tt>blender --python &lt;file&gt;</tt>.")
-        head.setWordWrap(True)
-        form.addRow(head)
+        self.head = QLabel()
+        self.head.setWordWrap(True)
+        form.addRow(self.head)
         if summary:
             note = QLabel(summary)
             note.setWordWrap(True)
             form.addRow("", note)
+
+        # ----------------------------------------------------------- output
+        # A .blend is built by running the script in Blender headlessly, so
+        # the scene is already there when the file opens: no auto-run, no
+        # "Allow Execution" prompt, F12 renders. The script stays on offer
+        # because it is diffable, editable and needs no Blender to produce.
+        self.output_combo = QComboBox()
+        self.output_combo.addItem("Blender file (.blend) - open and press F12",
+                                  "blend")
+        self.output_combo.addItem("Python script (.py) - run it in Blender",
+                                  "script")
+        self._select_data(self.output_combo, opts.output)
+        self.output_combo.currentIndexChanged.connect(self._output_changed)
+        form.addRow("Write:", self.output_combo)
+
+        exe_row = QHBoxLayout()
+        self.blender_exe = QLineEdit(bx.find_blender(opts.blender_exe))
+        self.blender_exe.setToolTip(
+            "Only needed for a .blend, which Blender itself has to build. "
+            "Found automatically where it can be; a launcher is resolved to "
+            "the real executable beside it.")
+        browse = QPushButton("Browse...")
+        browse.clicked.connect(lambda _c=False: self._pick_blender())
+        exe_row.addWidget(self.blender_exe, 1)
+        exe_row.addWidget(browse)
+        self.exe_row_widgets = (self.blender_exe, browse)
+        form.addRow("Blender:", exe_row)
 
         # ------------------------------------------------------------ world
         form.addRow(QLabel("<b>World</b>"))
@@ -668,6 +693,25 @@ class BlenderExportDialog(QDialog):
         self.unit_cell.setChecked(bool(opts.unit_cell))
         form.addRow("", self.unit_cell)
 
+        self.polyhedra = QCheckBox("Coordination polyhedra (whichever "
+                                   "molecules have them switched on)")
+        self.polyhedra.setChecked(bool(opts.polyhedra))
+        self.polyhedra.setToolTip(
+            "The solids through each metal's donors - what makes a framework "
+            "figure readable. One closed mesh per centre, flat shaded, on a "
+            "translucent material you can adjust as a group.")
+        form.addRow("", self.polyhedra)
+
+        self.polyhedra_alpha = QDoubleSpinBox()
+        self.polyhedra_alpha.setRange(0.05, 1.0)
+        self.polyhedra_alpha.setSingleStep(0.05)
+        self.polyhedra_alpha.setValue(float(opts.polyhedra_alpha))
+        self.polyhedra_alpha.setToolTip(
+            "1.0 hides everything inside the solid; the viewport uses 0.55.")
+        form.addRow("Polyhedron opacity:", self.polyhedra_alpha)
+        self.polyhedra.toggled.connect(self.polyhedra_alpha.setEnabled)
+        self.polyhedra_alpha.setEnabled(self.polyhedra.isChecked())
+
         self.clear_scene = QCheckBox("Clear the Blender scene first (removes "
                                      "the default cube)")
         self.clear_scene.setChecked(bool(opts.clear_scene))
@@ -690,7 +734,37 @@ class BlenderExportDialog(QDialog):
         brow.addWidget(buttons)
         outer.addLayout(brow)
         self._hdri_changed()
+        self._output_changed()
         self.resize(560, min(720, self.sizeHint().height() + 40))
+
+    def _output_changed(self, _index=0):
+        blend = self.output_combo.currentData() == "blend"
+        for w in self.exe_row_widgets:
+            w.setEnabled(blend)
+        if not blend:
+            self.head.setText(
+                "Writes a Blender <b>Python script</b>. Open it in Blender's "
+                "Scripting workspace and press Run, or "
+                "<tt>blender --python &lt;file&gt;</tt>.")
+        elif self.blender_exe.text().strip():
+            self.head.setText(
+                "Runs Blender headlessly to build the scene, then saves it as "
+                "a <b>.blend</b> - open it and press F12. The build script "
+                "rides along as a text datablock.")
+        else:
+            self.head.setText(
+                "<b>No Blender found.</b> Point at the executable, or write "
+                "the Python script instead.")
+
+    def _pick_blender(self):
+        from PySide6.QtWidgets import QFileDialog
+        path, _f = QFileDialog.getOpenFileName(
+            self, "Blender executable", self.blender_exe.text(),
+            "Blender (blender.exe blender);;All files (*)")
+        if path:
+            # A launcher is a GUI shim; headless wants the binary beside it.
+            self.blender_exe.setText(bx.find_blender(path))
+            self._output_changed()
 
     # ------------------------------------------------------------- helpers
     @staticmethod
@@ -768,6 +842,10 @@ class BlenderExportDialog(QDialog):
             bond_sides=self.bond_sides.value(),
             shade_smooth=self.shade_smooth.isChecked(),
             unit_cell=self.unit_cell.isChecked(),
+            polyhedra=self.polyhedra.isChecked(),
+            polyhedra_alpha=self.polyhedra_alpha.value(),
+            output=self.output_combo.currentData(),
+            blender_exe=self.blender_exe.text().strip(),
             engine=self.engine_combo.currentData(),
             samples=self.samples.value(),
             view_transform=self.view_transform.currentText(),

@@ -676,6 +676,8 @@ class MolViewport(QOpenGLWidget):
     _poly_key = None
     _poly_cache = None
     _poly_edge_cache = None
+    _poly_faces = None
+    _poly_edge_colors = None
     _fly_pending = None
     _internal = None
     _grab = None
@@ -2814,11 +2816,12 @@ class MolViewport(QOpenGLWidget):
                 self._poly_edges.n_verts = 0
             return
         eye = self._camera_frame()["eye"]
-        verts = np.vstack([poly_mod.triangle_soup([p])[0] for p in built])
-        # The rim term is the only camera-dependent part, so it alone is
-        # recomputed per frame; the hulls are cached above.
-        cols = poly_mod.shade_colors(built, eye)
-        self._poly_tris.upload(np.hstack([verts, cols]))
+        faces = self._poly_faces
+        # The |N.V| term is the only camera-dependent part, so it alone is
+        # recomputed per frame; the hulls, the triangle soup, the face normals
+        # and the centroids are all cached above.
+        cols = poly_mod.shade_from_faces(faces, eye)
+        self._poly_tris.upload(np.hstack([faces["vertices"], cols]))
         GL.glEnable(GL.GL_BLEND)
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
         GL.glDepthMask(GL.GL_FALSE)
@@ -2830,15 +2833,18 @@ class MolViewport(QOpenGLWidget):
         # coloured smudge however it is shaded.
         edge_pts = self._poly_edge_cache
         if edge_pts is not None and len(edge_pts):
-            bright = np.tile(np.array([[0.92, 0.92, 0.96]]),
-                             (len(edge_pts), 1))
-            self._poly_edges.upload(np.hstack([edge_pts, bright]))
+            self._poly_edges.upload(np.hstack([edge_pts,
+                                               self._poly_edge_colors]))
             # NO glLineWidth: a GL 3.3 CORE profile only guarantees 1.0, and
             # anything else raises GL_INVALID_VALUE — which aborts the rest
             # of paintGL and blanks every pass that follows.
             self._draw_lines(self._poly_edges, view, proj, mode=GL.GL_LINES,
                              alpha=min(1.0, self.polyhedra_alpha + 0.3))
         GL.glDepthMask(GL.GL_TRUE)
+        # Culling is OFF by default here (only the selection hull turns it on,
+        # and it restores), so leaving it disabled IS the restore. Blend is
+        # not: the pass turned it on, so it has to turn it back off.
+        GL.glDisable(GL.GL_BLEND)
 
     def _polyhedra_plan(self, poly_mod):
         """Built hulls for every visible object, CACHED on their inputs.
@@ -2862,23 +2868,14 @@ class MolViewport(QOpenGLWidget):
             return self._poly_cache
         built = []
         for obj, sym, xyz, bonds in objects:
-            meta = obj.structure.metadata or {}
-            cell = cell_of(obj)
-            content = int(meta.get("cell_content") or 0)
-            made = []
-            if cell is not None and content:
-                # From the periodic graph, so the solid is complete whatever
-                # the display options are doing (Christian: "should be
-                # complete no matter which combination of modes is applied").
-                made = poly_mod.build_periodic(sym, xyz, cell, content)
-            if not made:
-                made = poly_mod.build(sym, xyz, bonds)
-            built.extend(made)
+            built.extend(poly_mod.for_object(obj, cell_of(obj)))
         self._poly_key = key
         self._poly_cache = built
+        self._poly_faces = poly_mod.face_arrays(built)
         self._poly_edge_cache = poly_mod.hull_edges(built)
+        self._poly_edge_colors = np.tile(np.array([[0.92, 0.92, 0.96]]),
+                                         (len(self._poly_edge_cache), 1))
         return built
-        GL.glDisable(GL.GL_BLEND)
 
     def _paint_meta_glow(self, view, proj):
         """Layered translucent shells around every meta centre.

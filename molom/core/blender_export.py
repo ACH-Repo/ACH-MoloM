@@ -97,6 +97,11 @@ class ExportOptions(object):
         self.shade_smooth = True
         self.unit_cell = True
         self.cell_radius = 0.04
+        self.polyhedra = True           # follow the ❖ toggle into the render
+        self.polyhedra_alpha = 0.55     # matches the viewport default
+        # output — a .blend needs Blender to build it, so it carries the path
+        self.output = "blend"           # "blend" or "script"
+        self.blender_exe = ""
         # render
         self.engine = "CYCLES"
         self.samples = 128
@@ -168,7 +173,7 @@ def object_geometry(obj, style, atom_scale=1.0):
         rgb = tuple(custom) if custom is not None else elements.color_f(z)
         sym = elements.symbol(z)
         name = material_name(sym, rgb, custom is not None)
-        materials[name] = (rgb, sym)
+        materials[name] = (rgb, sym, 1.0)
         colors.append(rgb)
         names.append(name)
         r = style.atom_radius(elements.radius_vdw(z))
@@ -220,7 +225,8 @@ def object_geometry(obj, style, atom_scale=1.0):
                     rgb = style_mod.muted(colors[atom])
                     name = "MoloM {} refused".format(
                         elements.symbol(zs[atom]))
-                    materials[name] = (rgb, elements.symbol(zs[atom]))
+                    materials[name] = (rgb, elements.symbol(zs[atom]),
+                                      1.0)
                     bonds.append((name, _xyz(a), _xyz(b),
                                   round(float(r_ref), 6)))
     return atoms, bonds, materials
@@ -228,6 +234,36 @@ def object_geometry(obj, style, atom_scale=1.0):
 
 def _xyz(v):
     return [round(float(x), 6) for x in np.asarray(v, dtype=float)[:3]]
+
+
+def object_polyhedra(obj, cell, alpha=0.55):
+    # type: (object, object, float) -> Tuple[list, dict]
+    """Coordination solids as real MESHES, one per centre.
+
+    Without these a MOF figure loses exactly the thing that makes it
+    readable — the whole reason the framework community draws polyhedra at
+    all. They come from `polyhedra.for_object`, the same call the viewport
+    makes, so the render cannot show a different set from the screen.
+
+    One mesh per polyhedron rather than one merged blob per object: they are
+    then individually selectable, and a translucent surface renders far better
+    when its faces belong to a closed convex solid than when a hundred of them
+    share a datablock.
+    """
+    out, materials = [], {}
+    built = polyhedra.for_object(obj, cell)
+    for poly in built:
+        sym = poly["symbol"]
+        rgb = tuple(poly["color"])[:3]
+        name = "MoloM {} polyhedron".format(sym)
+        materials[name] = (rgb, sym, float(alpha))
+        out.append({
+            "name": "poly.{}.{}".format(sym, int(poly["centre"])),
+            "material": name,
+            "vertices": [_xyz(v) for v in poly["vertices"]],
+            "faces": [[int(i) for i in tri] for tri in poly["faces"]],
+        })
+    return out, materials
 
 
 def cell_edges(cell, radius=0.04):
@@ -250,7 +286,7 @@ def cell_edges(cell, radius=0.04):
         d = np.abs(frac[j] - frac[i])
         axis = int(np.argmax(d))
         name = "MoloM cell {}".format("abc"[axis])
-        materials[name] = (axis_rgb[axis], "abc"[axis])
+        materials[name] = (axis_rgb[axis], "abc"[axis], 1.0)
         out.append((name, _xyz(corners[i]), _xyz(corners[j]),
                     round(float(radius), 6)))
     return out, materials
@@ -348,7 +384,7 @@ def collect(scene, style, options, camera=None, width=1920, height=1080,
     without reading generated source, and so a future .blend writer or a
     different renderer could reuse it unchanged.
     """
-    atoms, bonds, materials = [], [], {}
+    atoms, bonds, solids, materials = [], [], [], {}
     pts = []
     for obj in scene.visible_objects():
         st = style
@@ -364,6 +400,13 @@ def collect(scene, style, options, camera=None, width=1920, height=1080,
             bonds += ce
             materials.update(cm)
             pts += [e[1] for e in ce] + [e[2] for e in ce]
+        if options.polyhedra:
+            cell = cell_of(obj) if cell_of is not None else None
+            pe, pm = object_polyhedra(obj, cell, options.polyhedra_alpha)
+            solids += pe
+            materials.update(pm)
+            for solid in pe:
+                pts += solid["vertices"]
     if pts:
         arr = np.asarray(pts, dtype=float)
         centre = (arr.max(axis=0) + arr.min(axis=0)) / 2.0
@@ -373,19 +416,26 @@ def collect(scene, style, options, camera=None, width=1920, height=1080,
     cam = camera_setup(camera, width, height) if camera is not None else None
     mats = []
     for name in sorted(materials):
-        rgb, sym = materials[name]
-        metallic = (options.metallic_metals and polyhedra.is_metal(sym))
+        rgb, sym, alpha = materials[name]
+        # A translucent solid must not also be a mirror: a metallic polyhedron
+        # renders as a chrome shell with nothing readable inside it.
+        solid = alpha >= 0.999
+        metallic = (options.metallic_metals and polyhedra.is_metal(sym)
+                    and solid)
         mats.append({
             "name": name,
             "color": [round(srgb_to_linear(c), 6) for c in rgb],
             "roughness": round(float(options.roughness)
                                * (0.7 if metallic else 1.0), 4),
             "metallic": 1.0 if metallic else 0.0,
-            "display": [round(float(c), 4) for c in rgb] + [1.0],
+            "alpha": round(float(alpha), 4),
+            "display": [round(float(c), 4) for c in rgb] + [round(float(alpha),
+                                                                 4)],
         })
     return {
         "atoms": atoms,
         "bonds": bonds,
+        "polyhedra": solids,
         "materials": mats,
         "camera": cam,
         # HALF POWER when a world HDRI is doing half the work. An environment
@@ -417,6 +467,7 @@ meant to be edited. One Angstrom = one Blender unit.
 
 import math
 import os
+import sys
 
 import bpy
 import bmesh
@@ -436,6 +487,12 @@ ATOMS = [
 
 BONDS = [
 {bonds}
+]
+
+# Coordination polyhedra: one closed convex solid per metal centre, as
+# (name, material, vertices, triangles).
+POLYHEDRA = [
+{polyhedra}
 ]
 '''
 
@@ -483,11 +540,24 @@ def make_material(spec):
             if node.type == "BSDF_PRINCIPLED":
                 bsdf = node
                 break
+    alpha = spec.get("alpha", 1.0)
     if bsdf is not None:
         r, g, b = spec["color"]
         bsdf.inputs["Base Color"].default_value = (r, g, b, 1.0)
         bsdf.inputs["Roughness"].default_value = spec["roughness"]
         bsdf.inputs["Metallic"].default_value = spec["metallic"]
+        if alpha < 1.0:
+            bsdf.inputs["Alpha"].default_value = alpha
+            # EEVEE needs telling; Cycles honours Alpha on its own. The
+            # property moved to a per-material enum in 4.2 and the older
+            # spelling is a plain string, so both are tried.
+            for attr, value in (("surface_render_method", "BLENDED"),
+                                ("blend_method", "BLEND")):
+                try:
+                    setattr(mat, attr, value)
+                except (AttributeError, TypeError):
+                    pass
+            mat.use_backface_culling = False
     mat.diffuse_color = spec["display"]      # solid-shading colour too
     return mat
 
@@ -539,6 +609,27 @@ def new_object(name, mesh, material, matrix, collection):
         ob.material_slots[0].link = "OBJECT"
         ob.material_slots[0].material = material
     return ob
+
+
+def build_polyhedra(coll, mats):
+    """Coordination solids as their own meshes.
+
+    FLAT shaded on purpose — a coordination polyhedron has real creases, and
+    smoothing them rounds an octahedron into a blob. Each solid gets its own
+    mesh (they are all different shapes), so nothing is shared here.
+    """
+    for name, mat_name, verts, faces in POLYHEDRA:
+        mesh = bpy.data.meshes.new(name)
+        mesh.from_pydata([Vector(v) for v in verts], [], faces)
+        mesh.update()
+        for poly in mesh.polygons:
+            poly.use_smooth = False
+        ob = bpy.data.objects.new(name, mesh)
+        coll.objects.link(ob)
+        mat = mats.get(mat_name)
+        if mat is not None:
+            mesh.materials.append(mat)
+    return len(POLYHEDRA)
 
 
 def studio_hdri(name):
@@ -705,18 +796,53 @@ def main():
         new_object("bond.{0}".format(n), cylinder, mats.get(mat_name), m,
                    bond_coll)
 
+    if POLYHEDRA:
+        build_polyhedra(sub_collection(root, "polyhedra"), mats)
+
     rig = sub_collection(root, "rig")
     build_camera(rig)
     n_lights = build_lights(rig)
     build_world()
     engine = build_render()
-    print("MoloM: {0} atoms, {1} bond segments, {2} materials, {3} lights, "
-          "engine {4}".format(len(ATOMS), len(BONDS), len(MATERIALS),
-                              n_lights, engine))
+    print("MoloM: {0} atoms, {1} bond segments, {2} polyhedra, {3} materials, "
+          "{4} lights, engine {5}".format(len(ATOMS), len(BONDS),
+                                          len(POLYHEDRA), len(MATERIALS),
+                                          n_lights, engine))
+
+
+def save_blend(path):
+    """Write the built scene to a .blend.
+
+    This is what makes the export a FILE you open and press F12 in, rather
+    than a script you have to run every time — and because the scene is
+    already built when it is saved, the .blend needs no auto-run, no "Allow
+    Execution" prompt and no trust dialog.
+    """
+    path = os.path.abspath(path)
+    directory = os.path.dirname(path)
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+    # The script itself rides along as a text datablock, so the scene can be
+    # rebuilt after a tweak without going back to MoloM.
+    try:
+        source = os.path.abspath(__file__)
+        if os.path.exists(source):
+            name = os.path.basename(source)
+            text = bpy.data.texts.get(name) or bpy.data.texts.new(name)
+            with open(source, "r", encoding="utf-8", errors="replace") as fh:
+                text.from_string(fh.read())
+    except (OSError, NameError):
+        pass
+    bpy.ops.wm.save_as_mainfile(filepath=path)
+    print("MoloM: saved " + path)
 
 
 if __name__ == "__main__":
     main()
+    # `blender -b --python this.py -- --save out.blend`
+    _argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
+    if "--save" in _argv:
+        save_blend(_argv[_argv.index("--save") + 1])
 '''
 
 
@@ -754,6 +880,7 @@ def build_script(data, options, title="scene", version="", basename="",
         "sphere_subdivisions": int(options.sphere_subdivisions),
         "bond_sides": int(options.bond_sides),
         "shade_smooth": bool(options.shade_smooth),
+        "polyhedra_alpha": float(options.polyhedra_alpha),
         "engine": str(options.engine),
         "samples": int(options.samples),
         "view_transform": str(options.view_transform),
@@ -774,6 +901,10 @@ def build_script(data, options, title="scene", version="", basename="",
         radius=repr(float(data["radius"])),
         atoms="\n".join("    {},".format(_row(a)) for a in data["atoms"]),
         bonds="\n".join("    {},".format(_row(b)) for b in data["bonds"]),
+        polyhedra="\n".join(
+            "    {},".format(_row((p["name"], p["material"], p["vertices"],
+                                   p["faces"])))
+            for p in data.get("polyhedra") or ()),
     ) + _BODY)
 
 
@@ -802,12 +933,128 @@ def _pretty(value):
 def summarise(data):
     # type: (dict) -> str
     """One line for the file header — and for the status bar."""
-    return ("{} atoms, {} bond segments, {} materials, {} lights"
-            .format(len(data["atoms"]), len(data["bonds"]),
-                    len(data["materials"]), len(data["lights"])))
+    out = "{} atoms, {} bond segments".format(len(data["atoms"]),
+                                              len(data["bonds"]))
+    if data.get("polyhedra"):
+        out += ", {} polyhedra".format(len(data["polyhedra"]))
+    return out + ", {} materials, {} lights".format(len(data["materials"]),
+                                                    len(data["lights"]))
 
 
-def default_path(directory, base):
-    # type: (str, str) -> str
-    return os.path.join(directory or "", "{}_blender.py".format(base or
-                                                                "molom"))
+def default_path(directory, base, suffix=".py"):
+    # type: (str, str, str) -> str
+    return os.path.join(directory or "",
+                        "{}_blender{}".format(base or "molom", suffix))
+
+
+# ------------------------------------------------------- running Blender
+#: Where an install usually is, per platform. Only ever a starting point for
+#: `find_blender` — the answer is a SETTING, because this is exactly the sort
+#: of path that differs between two machines belonging to the same person.
+_SEARCH_GLOBS = {
+    "win32": (r"C:\Program Files\Blender Foundation\Blender */blender.exe",
+              r"C:\Program Files\Blender Foundation\blender.exe",
+              r"C:\Program Files (x86)\Steam\steamapps\common\Blender"
+              r"\blender.exe"),
+    "darwin": ("/Applications/Blender.app/Contents/MacOS/Blender",
+               "/Applications/Blender*/Blender.app/Contents/MacOS/Blender"),
+}
+_SEARCH_GLOBS_POSIX = ("/usr/bin/blender", "/usr/local/bin/blender",
+                       "/snap/bin/blender", "/opt/blender*/blender")
+
+
+def _version_key(path):
+    """Sort candidates newest-first by whatever digits are in the path."""
+    import re
+    nums = [int(n) for n in re.findall(r"\d+", os.path.basename(
+        os.path.dirname(path)) or "")]
+    return nums or [0]
+
+
+def find_blender(hint=""):
+    # type: (str) -> str
+    """A usable Blender executable, or "".
+
+    `hint` (the stored setting) wins if it exists. Otherwise: whatever is on
+    PATH, then the usual install locations, newest version first.
+
+    **A launcher is not the executable to script.** Windows installs ship
+    `blender-launcher.exe` next to `blender.exe`, and the launcher is a
+    GUI shim — for `-b --python` you want the real binary, which is right
+    beside it. Christian's own path points at the launcher, so this is the
+    normal case rather than an edge one.
+    """
+    import glob
+    import shutil
+    import sys
+    candidates = []
+    if hint:
+        candidates.append(hint)
+    on_path = shutil.which("blender")
+    if on_path:
+        candidates.append(on_path)
+    globs = _SEARCH_GLOBS.get(sys.platform, _SEARCH_GLOBS_POSIX)
+    found = []
+    for pattern in globs:
+        found.extend(glob.glob(pattern))
+    candidates.extend(sorted(found, key=_version_key, reverse=True))
+    for path in candidates:
+        real = _real_executable(path)
+        if real:
+            return real
+    return ""
+
+
+def _real_executable(path):
+    # type: (str) -> str
+    if not path or not os.path.isfile(path):
+        return ""
+    directory, name = os.path.split(path)
+    if "launcher" in name.lower():
+        for sibling in ("blender.exe", "blender"):
+            candidate = os.path.join(directory, sibling)
+            if os.path.isfile(candidate):
+                return candidate
+    return path
+
+
+def blend_command(exe, script_path, blend_path):
+    # type: (str, str, str) -> list
+    """The headless invocation, as a list for `subprocess`.
+
+    `--` is what separates Blender's own arguments from the script's; without
+    it Blender tries to parse `--save` itself and refuses to start.
+    """
+    return [exe, "-b", "--factory-startup", "--python", script_path,
+            "--", "--save", blend_path]
+
+
+def write_blend(exe, script_path, blend_path, timeout=600):
+    # type: (str, str, str, float) -> Tuple[bool, str]
+    """Run the generated script in Blender and save the result as a .blend.
+
+    This is the answer to "I don't like having to load it in every time": the
+    scene is BUILT before the file is written, so the .blend opens with
+    everything already in it — no auto-run, no "Allow Execution" prompt, no
+    trust dialog, and F12 just renders.
+
+    Returns (ok, combined output). Failure is reported, never raised: Blender
+    is optional, and an export that cannot find it should still leave the
+    script behind.
+    """
+    import subprocess
+    exe = _real_executable(exe)
+    if not exe:
+        return False, "No Blender executable"
+    try:
+        proc = subprocess.run(blend_command(exe, script_path, blend_path),
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+    out = (proc.stdout or b"").decode("utf-8", "replace")
+    if proc.returncode != 0:
+        return False, "Blender exited {}\n{}".format(proc.returncode, out)
+    if not os.path.exists(blend_path):
+        return False, "Blender ran but wrote no file\n" + out
+    return True, out

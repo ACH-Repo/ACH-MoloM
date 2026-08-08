@@ -62,13 +62,21 @@ def hull_faces(points):
     with all remaining points strictly on one side. At n <= 12 that is a few
     hundred cheap tests — far less than the cost of taking a scipy
     dependency, and it degrades gracefully on degenerate (planar) input.
+
+    A hull face is a PLANE, not a triple. Emitting one triangle per accepted
+    triple double-covers any face with more than three points on it: a cubic
+    8-coordinate centre came out as 24 triangles over its 12, four of them
+    stacked on each square face. In the viewport that blends a square face
+    twice (so it reads more opaque than a triangular one) and in a render it
+    is straight z-fighting. So the accepted triples are grouped by the set of
+    points lying ON their plane, and each face is fan-triangulated once.
     """
     pts = np.asarray(points, dtype=float).reshape(-1, 3)
     n = len(pts)
     if n < 4:
         return [(0, 1, 2)] if n == 3 else []
     centre = pts.mean(axis=0)
-    faces = []
+    planes = {}                                 # frozenset(indices) -> normal
     for a in range(n):
         for b in range(a + 1, n):
             for c in range(b + 1, n):
@@ -85,14 +93,48 @@ def hull_faces(points):
                 rest = side[mask]
                 if rest.size == 0:
                     continue
-                if np.all(rest <= 1e-7) or np.all(rest >= -1e-7):
-                    # Wind the triangle so its normal points AWAY from the
-                    # centre; a renderer with backface culling needs that.
-                    if float(normal @ (pts[a] - centre)) < 0.0:
-                        faces.append((a, c, b))
-                    else:
-                        faces.append((a, b, c))
+                if not (np.all(rest <= 1e-7) or np.all(rest >= -1e-7)):
+                    continue
+                # Orient AWAY from the centre; a renderer with backface
+                # culling needs that, and it is what makes the fan below
+                # wind outward.
+                if float(normal @ (pts[a] - centre)) < 0.0:
+                    normal = -normal
+                # The face's vertices are every point on its plane — keying on
+                # that integer set rather than on a rounded normal means two
+                # triples of the same face can never disagree.
+                key = frozenset(int(k) for k in
+                                np.flatnonzero(np.abs(side) <= 1e-7))
+                planes.setdefault(key, normal)
+    faces = []
+    for key in sorted(planes, key=lambda s: sorted(s)):
+        faces.extend(_fan(pts, sorted(key), planes[key]))
     return faces
+
+
+def _fan(pts, indices, normal):
+    # type: (np.ndarray, list, np.ndarray) -> List[Tuple[int, int, int]]
+    """Triangulate one planar convex face, wound to face along `normal`.
+
+    The points are extreme points of a convex hull face, so sorting them by
+    angle about their centroid IS the polygon — no general triangulation
+    needed. The 2D basis is built right-handed with the normal, which is what
+    makes the fan come out facing the right way with no per-triangle check.
+    """
+    if len(indices) < 3:
+        return []
+    w = np.asarray(normal, dtype=float)
+    seed = np.array([0.0, 0.0, 1.0]) if abs(w[2]) < 0.9 \
+        else np.array([1.0, 0.0, 0.0])
+    u = np.cross(w, seed)
+    u = u / float(np.linalg.norm(u))
+    v = np.cross(w, u)                          # (u, v, w) right-handed
+    local = pts[indices]
+    mid = local.mean(axis=0)
+    angles = np.arctan2((local - mid) @ v, (local - mid) @ u)
+    order = [indices[k] for k in np.argsort(angles)]
+    return [(order[0], order[k], order[k + 1])
+            for k in range(1, len(order) - 1)]
 
 
 def build(symbols, coords, bonds, min_donors=3, max_donors=12):
@@ -185,6 +227,31 @@ def build_periodic(symbols, coords, cell, n_content, min_donors=3,
     return out
 
 
+def for_object(obj, cell, min_donors=3, max_donors=12):
+    # type: (object, object, int, int) -> List[dict]
+    """The polyhedra one MolObject shows — [] when the toggle is off.
+
+    The one place that decides it, so the viewport and the Blender export
+    cannot disagree about what a figure contains (round 37's rule: an export
+    that quietly differs from the picture on screen is worse than none).
+    """
+    meta = obj.structure.metadata or {}
+    if not meta.get("polyhedra"):
+        return []
+    symbols, coords, bonds = obj.evaluated()
+    content = int(meta.get("cell_content") or 0)
+    made = []
+    if cell is not None and content:
+        # From the periodic graph, so the solid is complete whatever the
+        # display options are doing (Christian: "should be complete no matter
+        # which combination of modes is applied").
+        made = build_periodic(symbols, coords, cell, content,
+                              min_donors, max_donors)
+    if not made:
+        made = build(symbols, coords, bonds, min_donors, max_donors)
+    return made
+
+
 def hull_edges(polys):
     # type: (List[dict]) -> np.ndarray
     """Every distinct hull EDGE as a pair of points, for a wireframe pass.
@@ -210,6 +277,66 @@ def hull_edges(polys):
     return np.asarray(segments, dtype=float)
 
 
+def face_arrays(polys):
+    # type: (List[dict]) -> dict
+    """Everything about the faces that does NOT depend on the camera.
+
+    Split out from the shading because it is the whole of the per-frame cost:
+    the normals, the face centroids and the base colours are fixed the moment
+    the hulls are, so they belong next to the cached hulls and not in the
+    paint path (round 33's rule, which round 48 broke again by computing them
+    per triangle per frame — 49 ms a frame on a packed framework).
+
+    Returns the triangle soup in `vertices` (3 per face, ready to upload) plus
+    per-face `normals`, `centroids` and `base` colours.
+    """
+    verts, normals, centroids, base = [], [], [], []
+    for poly in polys:
+        pts = np.asarray(poly["vertices"], dtype=float).reshape(-1, 3)
+        faces = np.asarray(poly["faces"], dtype=int).reshape(-1, 3)
+        if not len(faces):
+            continue
+        tri = pts[faces]                      # (F, 3, 3): face, corner, xyz
+        verts.append(tri.reshape(-1, 3))
+        normals.append(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]))
+        centroids.append(tri.mean(axis=1))
+        base.append(np.tile(np.asarray(poly["color"], dtype=float)[:3],
+                            (len(faces), 1)))
+    if not verts:
+        return {"vertices": np.zeros((0, 3)), "normals": np.zeros((0, 3)),
+                "centroids": np.zeros((0, 3)), "base": np.zeros((0, 3))}
+    return {"vertices": np.vstack(verts), "normals": np.vstack(normals),
+            "centroids": np.vstack(centroids), "base": np.vstack(base)}
+
+
+def shade_from_faces(faces, eye, ambient=0.35):
+    # type: (dict, np.ndarray, float) -> np.ndarray
+    """The camera-dependent half of `shade_colors`, from `face_arrays` output.
+
+    Four array operations over the whole scene, so it costs the same at 3200
+    faces as at 80.
+    """
+    normals = np.asarray(faces["normals"], dtype=float).reshape(-1, 3)
+    if not len(normals):
+        return np.zeros((0, 3))
+    eye = np.asarray(eye, dtype=float).reshape(3)
+    ambient = float(ambient)
+    view = np.asarray(faces["centroids"], dtype=float).reshape(-1, 3) - eye
+    n_len = np.linalg.norm(normals, axis=1)
+    v_len = np.linalg.norm(view, axis=1)
+    scale = n_len * v_len
+    ok = scale > 1e-12
+    facing = np.ones(len(normals), dtype=float)
+    # A degenerate (zero-area) face or a centroid exactly at the eye has no
+    # angle to measure; leave those fully lit rather than dividing by zero and
+    # blanking the pass with a NaN.
+    facing[ok] = np.abs(np.einsum("ij,ij->i", normals[ok], view[ok])
+                        / scale[ok])
+    colour = np.asarray(faces["base"], dtype=float).reshape(-1, 3) \
+        * (ambient + (1.0 - ambient) * facing)[:, None]
+    return np.clip(np.repeat(colour, 3, axis=0), 0.0, 1.0)
+
+
 def shade_colors(polys, eye, ambient=0.35):
     # type: (List[dict], np.ndarray, float) -> np.ndarray
     """Per-vertex colours with FLAT FACE SHADING, VESTA's look.
@@ -229,28 +356,11 @@ def shade_colors(polys, eye, ambient=0.35):
     Flat, not smooth: the three vertices of a triangle all get the face's
     colour, because a coordination polyhedron has real creases and
     interpolating across them would round the shape off.
+
+    A paint path should hold on to `face_arrays` and call `shade_from_faces`
+    instead — this convenience wrapper redoes the fixed half every call.
     """
-    eye = np.asarray(eye, dtype=float).reshape(3)
-    ambient = float(ambient)
-    out = []
-    for poly in polys:
-        verts = np.asarray(poly["vertices"], dtype=float)
-        base = np.asarray(poly["color"], dtype=float)[:3]
-        for tri in poly["faces"]:
-            a, b, c = verts[tri[0]], verts[tri[1]], verts[tri[2]]
-            normal = np.cross(b - a, c - a)
-            length = float(np.linalg.norm(normal))
-            view = (a + b + c) / 3.0 - eye
-            view_len = float(np.linalg.norm(view))
-            if length < 1e-12 or view_len < 1e-12:
-                facing = 1.0
-            else:
-                facing = abs(float(normal @ view) / (length * view_len))
-            colour = base * (ambient + (1.0 - ambient) * facing)
-            out.extend([colour, colour, colour])
-    if not out:
-        return np.zeros((0, 3))
-    return np.clip(np.asarray(out, dtype=float), 0.0, 1.0)
+    return shade_from_faces(face_arrays(polys), eye, ambient)
 
 
 def triangle_soup(polys):
