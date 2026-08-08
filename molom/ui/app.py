@@ -2443,7 +2443,15 @@ class MainWindow(QMainWindow):
                 cell = cif_mod.Cell.from_dict(cell_dict)
             except (KeyError, TypeError, ValueError, cif_mod.CifError):
                 cell = None
-        if cell is not None:
+        packed = s.metadata.pop("packed_bonds", None)
+        if packed is not None:
+            # The packing already instantiated the bonds from the periodic
+            # graph over exactly these atoms — including the ones it
+            # materialised outside the wall, which no straight-line pass over
+            # this coordinate array could get right.
+            s.bonds = sorted({(min(int(i), int(j)), max(int(i), int(j)),
+                               int(o)) for i, j, o in packed})
+        elif cell is not None:
             s.bonds = cif_mod.display_bonds(s.symbols, s.coords, cell, content,
                                             existing=s.bonds)
         if report.get("dropped_bonds"):
@@ -4415,6 +4423,11 @@ class MainWindow(QMainWindow):
         cell = cell_of(obj)
         s = obj.structure
         if cell is None or s.n_atoms == 0 or self._boundary_modifier(obj):
+            return False
+        if s.metadata.get("packed"):
+            # `core.packing` already completed every fragment reaching into
+            # the cell and instantiated its bonds. Running the modifier on top
+            # would grow a shell of a shell.
             return False
         mod = self._new_boundary_modifier(obj)
         try:
