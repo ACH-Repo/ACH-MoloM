@@ -2041,7 +2041,7 @@ def reference_sample(coords, limit=24):
 def build_view(cell, asym_symbols, asym_frac, symops, mode="cell",
                na=1, nb=1, nc=1, tol=0.1, exterior=0, occupancy=None,
                disorder=POLICY_DOMINANT, report=None, shell_molecules=False,
-               disorder_groups=None, disorder_assemblies=None):
+               disorder_groups=None, disorder_assemblies=None, packed=True):
     # type: (Cell, list, list, list, str, int, int, int, float, int, Optional[Sequence], str, Optional[dict]) -> Tuple[List[str], np.ndarray]
     """The atoms for one crystal display mode, in CARTESIAN coordinates.
 
@@ -2071,9 +2071,34 @@ def build_view(cell, asym_symbols, asym_frac, symops, mode="cell",
         if report is not None:
             report["n_content"] = len(data.symbols)
         return list(data.symbols), data.frac @ cell.matrix()
-    symbols, coords = expand(data, tol=tol, exterior=exterior,
-                             disorder=disorder, report=report,
-                             shell_molecules=shell_molecules)
+    # The CELL and PACKING modes go through `core.packing`, the same route an
+    # import takes — otherwise opening a file gave one picture and switching
+    # to "Full unit cell" gave another (NaCl 39 against 27), which is drift
+    # nobody would ever attribute to the right cause. `SymmetryModifier` calls
+    # this too, so it shows the same thing as well, which is the point.
+    #
+    # `packed=False` is for `SymmetryModifier`, which is a different feature:
+    # stacking operations on a plain FRAGMENT to watch it become a cell
+    # (round 33). Completing whole molecules there draws the fragment at all
+    # eight corners of the invented cell, which buries the thing the user is
+    # trying to see — 16 atoms became 128.
+    if not packed:
+        symbols, coords = expand(data, tol=tol, exterior=exterior,
+                                 disorder=disorder, report=report,
+                                 shell_molecules=shell_molecules)
+    else:
+        from . import packing as packing_mod
+        symbols, coords, bonds, packed_meta = packing_mod.pack(
+            data, disorder=disorder, tol=tol)
+        if report is not None:
+            report["packed_bonds"] = [[int(i), int(j), int(o)]
+                                      for i, j, o in bonds]
+            report["packed"] = True
+            report.update(packed_meta)
+            # The cell CONTENT is a different question from what is drawn,
+            # and the crystal page's count and the density both need it.
+            expand(data, whole_molecules=False, boundary=False,
+                   disorder=disorder, tol=tol, report=report)
     if mode != "packing":
         return symbols, coords
     offsets = supercell_offsets(cell, na, nb, nc)

@@ -4752,6 +4752,13 @@ class MainWindow(QMainWindow):
         # periodic bond graph is built on has to be replaced with it. In a
         # PACKING the content is still the first cell's — every other cell is
         # a lattice translate of it, which is exactly what the graph labels.
+        if report.get("packed_bonds") is not None:
+            # Carried the same way an import does, so `_perceive_fresh` uses
+            # the graph's answer rather than re-perceiving straight lines.
+            meta["packed_bonds"] = report["packed_bonds"]
+            meta["packed"] = True
+        if report.get("site_occupancy"):
+            meta["site_occupancy"] = dict(report["site_occupancy"])
         if report.get("n_content"):
             meta["cell_content"] = int(report["n_content"])
             # A boundary modifier already on the stack holds the OLD count,

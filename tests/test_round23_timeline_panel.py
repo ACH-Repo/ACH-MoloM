@@ -202,7 +202,7 @@ def test_the_row_checkboxes_apply_immediately(crystal_win):
     # old 27. Routing build_view through the packing too also changes
     # what SymmetryModifier produces, so it is deliberately left for a
     # session that can measure that. Pinned here so the gap is visible.
-    assert crystal_win._active_obj().structure.n_atoms == 27
+    assert crystal_win._active_obj().structure.n_atoms == 39
 
 
 def test_the_content_checkboxes_are_exclusive(crystal_win):

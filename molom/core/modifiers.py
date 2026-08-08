@@ -133,10 +133,15 @@ class SymmetryModifier(Modifier):
             return symbols, coords, bonds
         origin = np.asarray(self.origin, dtype=float).reshape(3)
         frac = cell.to_fractional(np.asarray(coords, dtype=float) - origin)
+        # `packed=False`: this modifier is also how a plain FRAGMENT is grown
+        # into a cell one operation at a time (round 33), and completing whole
+        # molecules there draws it at all eight corners of the invented cell —
+        # 16 atoms became 128, burying the thing the user is watching for.
         out_symbols, out_coords = cif_mod.build_view(
             cell, list(symbols), frac, ops,
             mode="packing" if max(self.na, self.nb, self.nc) > 1 else "cell",
-            na=self.na, nb=self.nb, nc=self.nc, exterior=self.exterior)
+            na=self.na, nb=self.nb, nc=self.nc, exterior=self.exterior,
+            packed=False)
         if not out_symbols:
             return symbols, coords, bonds
         # Bonds are NOT carried: the copies are new atoms whose connectivity

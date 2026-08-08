@@ -30,7 +30,9 @@ def test_symmetry_modifier_expands_without_touching_the_base():
     coords = data.frac @ data.cell.matrix()
     sym, xyz, bonds = mod.evaluate(list(data.symbols), coords, [])
     assert len(data.symbols) == 2          # untouched input
-    assert len(sym) == 27                  # 2 sites x 4 ops, boundary completed
+    # NOT packed: the modifier is also how a plain fragment is grown into
+    # a cell one operation at a time, so it keeps the plain expansion.
+    assert len(sym) == 27                  # 2 sites x 4 ops, boundary
     assert xyz.shape == (27, 3)
 
 

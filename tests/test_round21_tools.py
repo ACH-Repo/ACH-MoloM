@@ -142,7 +142,7 @@ def test_crystal_page_switches_the_view(tmp_path, win):
     QApplication.processEvents()
     # 5 x 3 x 3, not 2 x 27: the two cells share a face, and each was
     # carrying its own boundary copy of the atoms on it.
-    assert win._active_obj().structure.n_atoms == 45
+    assert win._active_obj().structure.n_atoms == 65
 
 
 def test_cell_box_checkbox_drives_the_viewport(win):
