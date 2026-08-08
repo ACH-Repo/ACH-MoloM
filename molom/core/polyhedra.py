@@ -210,16 +210,28 @@ def hull_edges(polys):
     return np.asarray(segments, dtype=float)
 
 
-def fresnel_colors(polys, eye, power=2.0, rim=0.85):
-    # type: (List[dict], np.ndarray, float, float) -> np.ndarray
-    """Per-vertex colours with a rim (Fresnel) term baked in.
+def shade_colors(polys, eye, ambient=0.35):
+    # type: (List[dict], np.ndarray, float) -> np.ndarray
+    """Per-vertex colours with FLAT FACE SHADING, VESTA's look.
 
-    The face shader carries no normals and a single alpha uniform, so the
-    grazing-angle brightening is computed here instead: a face seen edge-on
-    is lightened toward white, one seen flat-on keeps the element colour.
-    That is what gives a translucent solid a readable silhouette.
+    Each face gets a brightness from how squarely it faces the camera —
+    `ambient + (1 - ambient) * |N.V|`, the light sitting at the eye. A face
+    turned toward you is the full element colour; one seen obliquely is
+    darker. That is what makes a solid read as a solid: neighbouring faces of
+    an octahedron differ in brightness, so the silhouette and the creases are
+    both visible.
+
+    The first attempt brightened grazing faces toward WHITE instead (a rim /
+    Fresnel term). It is the right effect for a glassy surface and the wrong
+    one here: it washes the element colour out exactly where two faces meet,
+    which is the edge you most need to see.
+
+    Flat, not smooth: the three vertices of a triangle all get the face's
+    colour, because a coordination polyhedron has real creases and
+    interpolating across them would round the shape off.
     """
     eye = np.asarray(eye, dtype=float).reshape(3)
+    ambient = float(ambient)
     out = []
     for poly in polys:
         verts = np.asarray(poly["vertices"], dtype=float)
@@ -228,15 +240,13 @@ def fresnel_colors(polys, eye, power=2.0, rim=0.85):
             a, b, c = verts[tri[0]], verts[tri[1]], verts[tri[2]]
             normal = np.cross(b - a, c - a)
             length = float(np.linalg.norm(normal))
-            centroid = (a + b + c) / 3.0
-            view = centroid - eye
+            view = (a + b + c) / 3.0 - eye
             view_len = float(np.linalg.norm(view))
             if length < 1e-12 or view_len < 1e-12:
                 facing = 1.0
             else:
                 facing = abs(float(normal @ view) / (length * view_len))
-            edge = (1.0 - facing) ** float(power)
-            colour = base + (1.0 - base) * (float(rim) * edge)
+            colour = base * (ambient + (1.0 - ambient) * facing)
             out.extend([colour, colour, colour])
     if not out:
         return np.zeros((0, 3))

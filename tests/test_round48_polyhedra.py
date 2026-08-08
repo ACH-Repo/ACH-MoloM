@@ -78,26 +78,38 @@ def test_no_polyhedra_means_no_edges():
     assert polyhedra.hull_edges([]).shape == (0, 3)
 
 
-def test_fresnel_brightens_the_grazing_faces():
-    """A face seen edge-on is lightened toward white; one seen flat-on keeps
-    the element colour. Without it the solid has no readable silhouette."""
+def test_shading_varies_with_the_view_angle():
+    """VESTA's look: a face turned toward you is the full element colour, an
+    oblique one is darker, so neighbouring faces of an octahedron differ and
+    the creases read."""
     symbols, frac, cell = _octahedron()
     built = polyhedra.build_periodic(symbols, frac @ cell.matrix(), cell,
                                      len(symbols))
     eye = np.array([0.0, 0.0, 40.0])
-    colours = polyhedra.fresnel_colors(built, eye)
+    colours = polyhedra.shade_colors(built, eye)
     assert len(colours) == 3 * sum(len(p["faces"]) for p in built)
     assert np.all(colours >= 0.0) and np.all(colours <= 1.0)
     # some faces are grazing and some are not, so the term actually varies
     assert colours.max() > colours.min() + 0.05
 
 
-def test_fresnel_is_stable_for_a_degenerate_triangle():
+def test_shading_never_brightens_past_the_element_colour():
+    """The first attempt lightened grazing faces toward WHITE, which washes
+    the colour out exactly at the edge you need to see."""
+    symbols, frac, cell = _octahedron()
+    built = polyhedra.build_periodic(symbols, frac @ cell.matrix(), cell,
+                                     len(symbols))
+    base = np.asarray(built[0]["color"][:3], dtype=float)
+    colours = polyhedra.shade_colors(built, np.array([0.0, 0.0, 40.0]))
+    assert np.all(colours <= base + 1e-9)
+
+
+def test_shading_is_stable_for_a_degenerate_triangle():
     """A zero-area face must not produce a NaN colour and blank the pass."""
     poly = [{"vertices": np.zeros((3, 3)), "faces": [(0, 1, 2)],
              "color": (0.5, 0.5, 0.5), "centre": 0, "symbol": "Mg",
              "donors": []}]
-    colours = polyhedra.fresnel_colors(poly, np.array([0.0, 0.0, 10.0]))
+    colours = polyhedra.shade_colors(poly, np.array([0.0, 0.0, 10.0]))
     assert np.all(np.isfinite(colours))
 
 

@@ -129,9 +129,15 @@ ticks**; `1547149.cif` 3 partial solids -> 10 complete octahedra. A metal
 neighbour is never a vertex: a polyhedron is drawn through its LIGANDS.
 **(2) A translucent solid has no readable silhouette**, so two things were
 added: a **Fresnel rim** (`fresnel_colors`, grazing faces lightened toward
-white) and an explicit **hull-edge wireframe** (`hull_edges`) drawn on top. The
-rim is computed on the CPU because the line shader carries no normals and a
-single alpha uniform; it is the only camera-dependent part, so the HULLS are
+white) and an explicit **hull-edge wireframe** (`hull_edges`) drawn on top. The rim
+was WRONG and Christian said so with a VESTA screenshot: brightening grazing
+faces toward white washes the element colour out exactly where two faces meet,
+which is the edge you most need to see. `shade_colors` replaces it with flat
+FACE SHADING — `ambient + (1 - ambient) * |N.V|`, the light at the eye — so a
+face turned toward you is the full colour and an oblique one is darker, which
+is what makes neighbouring faces of an octahedron distinguishable. Flat, not
+smooth: a coordination polyhedron has real creases. It is computed on the CPU
+because the line shader carries no normals and a single alpha uniform; it is the only camera-dependent part, so the HULLS are
 now cached on their inputs (`_polyhedra_plan`) — rebuilding a convex hull per
 metal per repaint was the round-33 mistake sitting in the paint path unnoticed.
 1047 tests.
@@ -2033,6 +2039,12 @@ independent cross-check inside a single fixture.
   opens a REAL window, wraps every `_draw*`/`_paint*` method so a raise is
   recorded rather than swallowed, grabs a frame per overlay, and exits
   non-zero. Run it whenever you touch a paint path.
+- **`glLineWidth` is INVALID in a GL 3.3 core profile** (round 48) for any
+  value but 1.0: it raises `GL_INVALID_VALUE`, PyOpenGL turns that into a
+  `GLError`, and by the gotcha above that aborts the frame — which showed as
+  the polyhedra pass tearing holes in everything and the picture flashing.
+  Core profiles dropped wide lines; if a thicker outline is ever wanted it has
+  to be geometry (a quad strip or a screen-space shader), not a state call.
 - **CLIP THEN BOND splits a face atom's coordination sphere in half** (round
   44). An atom lying exactly on a cell face is drawn twice, once per face —
   correct, and what every viewer does — but if the bonds are then perceived

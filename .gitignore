@@ -7,3 +7,6 @@ dist/
 .venv/
 venv/
 *.log
+
+# GUI smoke-test frame grabs
+tools/_smoke/

@@ -2817,7 +2817,7 @@ class MolViewport(QOpenGLWidget):
         verts = np.vstack([poly_mod.triangle_soup([p])[0] for p in built])
         # The rim term is the only camera-dependent part, so it alone is
         # recomputed per frame; the hulls are cached above.
-        cols = poly_mod.fresnel_colors(built, eye)
+        cols = poly_mod.shade_colors(built, eye)
         self._poly_tris.upload(np.hstack([verts, cols]))
         GL.glEnable(GL.GL_BLEND)
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
@@ -2833,7 +2833,9 @@ class MolViewport(QOpenGLWidget):
             bright = np.tile(np.array([[0.92, 0.92, 0.96]]),
                              (len(edge_pts), 1))
             self._poly_edges.upload(np.hstack([edge_pts, bright]))
-            GL.glLineWidth(1.4)
+            # NO glLineWidth: a GL 3.3 CORE profile only guarantees 1.0, and
+            # anything else raises GL_INVALID_VALUE — which aborts the rest
+            # of paintGL and blanks every pass that follows.
             self._draw_lines(self._poly_edges, view, proj, mode=GL.GL_LINES,
                              alpha=min(1.0, self.polyhedra_alpha + 0.3))
         GL.glDepthMask(GL.GL_TRUE)
