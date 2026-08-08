@@ -32,6 +32,8 @@ class ViewportToolbar(QWidget):
     # (id, glyph, tooltip, checkable)
     TOOLS = [
         ("select", "⬚", "Select — box select by dragging (default)", True),
+        ("lasso", "◌", "Lasso select — drag a freehand loop round the "
+                       "atoms you want (Shift+Space, L; Esc exits)", True),
         ("draw", "✎", "Draw atoms — click to change an element, drag from an "
                       "atom to add one, drag onto another to close a ring "
                       "(E, edit mode)", True),

@@ -56,6 +56,59 @@ the operator key table, CIF reading with symmetry, coordination polyhedra,
 meta atoms, the scene clock with a multi-track timeline, vibrational modes,
 per-element display control, and the symmetry modifier. 512 tests.
 
+Round 53 (2026-08-09, VESTA's sheen, and three things that were hiding):
+**(1) A SPECULAR highlight on the coordination polyhedra**, Christian's
+request — "shows up when you rotate the view so that the normal of a face is
+directed straight at the observer". Blinn-Phong with the light AT the eye, so
+the half-vector is the view vector and `N.H` is the `|N.V|` the diffuse term
+already computes: `specular * |N.V| ** shininess`, one power over the scene.
+It earns its place beyond looks — a highlight appearing and sliding off as the
+solid turns is what tells you the faces are flat and which way each one
+points, which a translucent silhouette cannot.
+**Drawn as its OWN ADDITIVE pass**, not added to the face colour, and the
+reason is measurable: the solid is drawn at 0.55 alpha, so a highlight mixed
+in is more than half gone before it reaches the screen, and on a pale element
+colour (niobium is nearly white) it then clips to nothing. Additive is also
+the right model — a reflection is light ADDED over what is behind the surface.
+**The trap this hit**: an ordinary additive blend accumulates the ALPHA
+channel too, which is invisible on screen and wrong everywhere else. A grabbed
+frame came back with 24% of the picture DARKER, every one of those pixels
+scaled by a uniform 0.643 in all three channels — the signature of colour
+divided by an alpha that had crept up, not of a lighting change.
+`glBlendFuncSeparate(SRC_ALPHA, ONE, ZERO, ONE)` leaves alpha alone: 0.00%
+darker afterwards. **Defaults chosen by rendering the same frame six ways and
+differencing**: 0.30/24 lit 15.6% of the frame at a peak gain of 0.89, which
+washes the colour out of the faces you most need to read (round 48's Fresnel
+mistake from the other side); **0.15/32 is 11% lit at 0.61** and ships.
+Tunable per VIEWPORT, not per module — a default ARGUMENT binds its value once
+at import, which is why the first A/B attempt produced two identical frames.
+**(2) The lasso was not lost, it was hidden.** `Shift+Space, L` and F3 only,
+with a plain left-drag being box select — so nothing on screen said it still
+existed. It has a toolbar button now.
+**(3) The ❖ contents RADIO never followed the active crystal.** Set once at
+construction, so with two CIFs open it kept whichever mode the LAST one was
+put into — and a radio that is already checked emits nothing, so clicking the
+mode you wanted did nothing. That is "I cannot toggle the different view
+states of cifs when multiple cifs are imported", and it is round 51's tick bug
+one control along.
+**(4) `graphics_info()` + `F3 > Report the graphics device`.** Christian asked
+whether PySide uses the dedicated GPU. It does — a QOpenGLWidget is a real GL
+context — but WHICH adapter a process gets is the driver's decision, so the
+only honest answer is `GL_RENDERER`. On the desktop PC it reads **AMD Radeon
+RX 7900 XTX**, i.e. the discrete card. Found while adding it:
+`QSurfaceFormat.setDefaultFormat` runs only in `molom/__main__.py`, so
+anything else that builds a window — the smoke tool, a test, an embedder — got
+the driver default (compatibility profile, no multisampling).
+`MolViewport.__init__` now calls `setFormat` itself.
+**MEASURED AND STILL OPEN: multisampling is requested but NOT granted.** The
+format asks for 4 samples and the live context reports `samples: 0` on this
+machine, so the 4x MSAA CLAUDE.md has claimed since round 1 is not actually
+happening. QOpenGLWidget renders into an FBO and the sample count is not being
+honoured; fixing it means an explicit multisample FBO with a resolve blit.
+Worth doing — it is the cheapest available improvement to how the viewport
+looks — but it is its own piece of work.
+1157 tests.
+
 Round 52 (2026-08-08, Christian's second MOF-5 batch — an edited cell is P1,
 and a shared site can be STATED):
 **(1) Adding atoms in the full cell then switching views destroyed the
@@ -2015,7 +2068,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1142 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1157 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -2285,6 +2338,24 @@ independent cross-check inside a single fixture.
   vector then spin so the backbone points outward.
 
 ## Hard-won gotchas (don't re-learn these)
+- **An additive blend accumulates ALPHA as well as colour** (round 53), which
+  is invisible on screen and wrong in every export. The symptom is not subtle
+  once you look for it: a grabbed frame came back with the whole solid scaled
+  by a uniform factor across all three channels — colour divided by an alpha
+  that had crept up. `glBlendFuncSeparate(SRC_ALPHA, ONE, ZERO, ONE)` adds
+  light and leaves alpha exactly as it was. Any additive pass over a scene
+  that can be grabbed or rendered to a transparent PNG needs it.
+- **A module constant used as a DEFAULT ARGUMENT cannot be tuned at run time**
+  (round 53). `def f(x, spec=SPECULAR)` binds the value once at import, so
+  setting `module.SPECULAR = 0.3` afterwards changes nothing — and an A/B
+  harness written that way produces two byte-identical frames and looks like
+  the feature does not work. Put anything meant to be adjustable on the OBJECT
+  that owns the drawing.
+- **`QSurfaceFormat.setDefaultFormat` is an entry-point call** (round 53), so
+  it only happens under `python -m molom`. Every other way of building a
+  window — the smoke tool, a test, an embedder — got the driver's default
+  instead. Set the format on the WIDGET as well; it costs nothing and cannot
+  be bypassed.
 - **"A group was found" is not "this unit rebuilds this cell"** (round 52).
   spglib answered `R3m` for an edited MOF-5 and `orbit_representatives` gave 7
   orbits for it — 7 x 6 operators is 42 atoms, and the cell holds 424. Both

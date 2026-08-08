@@ -716,6 +716,10 @@ class MainWindow(QMainWindow):
           category="Crystal", aliases=("occupancy", "solid solution",
                                        "shared site", "mixed", "doping",
                                        "substitution", "pie", "partial"))
+        r("graphics_info", "Report the graphics device (which GPU is drawing)",
+          lambda c: c.on_graphics_info(), category="App",
+          aliases=("gpu", "opengl", "renderer", "driver", "video card",
+                   "performance", "hardware"))
         r("cell_info", "Unit cell: report cell parameters and space group",
           lambda c: c.on_cell_info(),
           enabled=lambda c: c._active_cell() is not None,
@@ -4095,6 +4099,17 @@ class MainWindow(QMainWindow):
             vp.set_select_tool(None)
             vp.set_measure_tool(False)
             self.toolbar.set_active("select")
+        elif tool_id == "lasso":
+            # It was reachable only by `Shift+Space, L` or F3, which is why it
+            # felt like it had been removed — a plain left-drag is box select,
+            # so nothing on screen said the lasso still existed.
+            on = vp._select_tool != "lasso"
+            if on:
+                vp.set_draw_tool(False)
+                vp.set_origin_active(False)
+                vp.set_measure_tool(False)
+            vp.set_select_tool("lasso" if on else None)
+            self.toolbar.set_active("lasso" if on else "select")
         elif tool_id == "draw":
             vp.set_origin_active(False)
             vp.set_measure_tool(False)
@@ -4420,6 +4435,38 @@ class MainWindow(QMainWindow):
             "{}: editing the asymmetric unit — {}. The cell is regenerated "
             "from it, so the space group is kept.".format(obj.name, note),
             8000)
+
+    def on_graphics_info(self):
+        """Which GPU is drawing the viewport, and at what GL version.
+
+        Not idle curiosity: a QOpenGLWidget draws on the GPU, but on a machine
+        with an integrated adapter AND a discrete one, which of the two a
+        given process gets is the driver's decision, not the program's — and
+        a Python process usually lands on the integrated one unless told
+        otherwise. `GL_RENDERER` is the only way to know, and if it names the
+        integrated chip the fix is a per-application setting in the graphics
+        control panel rather than anything in MoloM.
+        """
+        info = self.viewport.graphics_info()
+        if not info:
+            self.statusBar().showMessage(
+                "The OpenGL context is not up yet", 5000)
+            return
+        body = "<br>".join(
+            "<b>{}</b>: {}".format(k.upper() if k == "glsl" else k.title(),
+                                   info[k])
+            for k in ("renderer", "vendor", "version", "glsl", "profile",
+                      "samples") if k in info)
+        QMessageBox.information(
+            self, "Graphics device",
+            "MoloM draws through OpenGL, so the viewport runs on the GPU "
+            "named below.<br><br>{}<br><br>"
+            "If that is an integrated chip and the machine also has a "
+            "discrete card, the choice is made by the driver, not by MoloM — "
+            "set a per-application preference for <tt>python.exe</tt> in the "
+            "graphics control panel to change it.".format(body))
+        self.statusBar().showMessage(
+            "Drawing on: {}".format(info.get("renderer", "unknown")), 10000)
 
     def on_site_occupancy(self):
         """F3: say what a shared crystallographic site is made of.

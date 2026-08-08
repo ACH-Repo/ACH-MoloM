@@ -879,6 +879,15 @@ class CrystalPage(QWidget):
         # is PER CRYSTAL, so it has to be read back from the active object or
         # it would carry one molecule's setting onto the next.
         self._loading = True
+        # The CONTENTS radio, from the object. It was set once at construction
+        # and never again, so with two crystals open it kept whichever mode
+        # the LAST one was put into — and a radio that is already checked
+        # emits nothing, so clicking the mode you wanted did nothing at all.
+        # Christian: "I cannot toggle the different view states of cifs when
+        # multiple cifs are imported." Same family as the display ticks, one
+        # control along.
+        {"asym": self.asym_radio, "packing": self.pack_radio}.get(
+            str(mode), self.cell_radio).setChecked(True)
         self.outside_check.setChecked(bool(outside))
         self.copies_check.setChecked(bool(copies))
         self.refused_check.setChecked(bool(refused_on))

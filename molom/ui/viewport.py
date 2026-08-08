@@ -46,7 +46,8 @@ from PySide6.QtWidgets import QApplication
 from .choice_popup import ChoicePopup
 from ..core import (bonding, edits, elements, flight, grid as grid_mod,
                     input_map, internal,
-                    manipulate, measure, meshes, picking, rotations,
+                    manipulate, measure, meshes, picking,
+                    polyhedra as poly_mod, rotations,
                     selection2d, style as style_mod)
 from ..core.camera import Camera, quat_from_mat3, quat_mul, quat_to_mat3
 
@@ -706,6 +707,13 @@ class MolViewport(QOpenGLWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # The format is requested HERE as well as globally in `__main__`.
+        # `QSurfaceFormat.setDefaultFormat` only runs when MoloM is started as
+        # `python -m molom`, so anything else that builds a window — the GUI
+        # smoke tool, a test, an embedder — silently got the driver's default
+        # instead: a compatibility profile with NO multisampling, measured as
+        # `samples: 0` by `graphics_info`. Per-widget, it cannot be missed.
+        self.setFormat(default_surface_format())
         self.scene = None                # set via set_scene
         self.style = style_mod.BALL_AND_STICK
         self.camera = Camera()
@@ -789,6 +797,12 @@ class MolViewport(QOpenGLWidget):
         #: thing on screen that says otherwise.
         self.show_occupancy = True
         self.polyhedra_alpha = 0.55      # coordination-solid opacity
+        # VESTA's sheen. Strength and exponent, tunable per viewport so a
+        # settings slider (or a test) can drive them — module-level
+        # constants cannot be, since a default ARGUMENT binds its value
+        # once at import and never looks at the name again.
+        self.polyhedra_specular = poly_mod.SPECULAR
+        self.polyhedra_shininess = poly_mod.SHININESS
         #: How a REFUSED bond is drawn when the ❖ page's override is on. The
         #: defaults live in core.style so the viewport and the Blender export
         #: cannot drift apart; these are the live, tweakable copies.
@@ -1027,6 +1041,44 @@ class MolViewport(QOpenGLWidget):
         if s is None:
             return False
         return (pos.x() - s[0]) ** 2 + (pos.y() - s[1]) ** 2 <= radius ** 2
+
+    def graphics_info(self):
+        # type: () -> dict
+        """Who is actually drawing: the GL vendor, renderer and version.
+
+        Worth being able to see. A QOpenGLWidget renders through a real
+        OpenGL context on the GPU, but on a machine with both an integrated
+        and a discrete adapter, WHICH GPU a given process gets is decided by
+        the driver and the OS, not by the program — and the usual default for
+        a Python process is the integrated one. `GL_RENDERER` is the only
+        honest answer, and it costs three string queries.
+
+        Empty when the context is not up yet: this is only meaningful from
+        inside a live GL context.
+        """
+        out = {}
+        if not self.isValid() or self.context() is None:
+            return out
+        self.makeCurrent()
+        try:
+            for key, token in (("vendor", GL.GL_VENDOR),
+                               ("renderer", GL.GL_RENDERER),
+                               ("version", GL.GL_VERSION),
+                               ("glsl", GL.GL_SHADING_LANGUAGE_VERSION)):
+                try:
+                    value = GL.glGetString(token)
+                except Exception:
+                    continue
+                if value:
+                    out[key] = bytes(value).decode("utf-8", "replace")
+        finally:
+            self.doneCurrent()
+        fmt = self.format()
+        out["samples"] = fmt.samples()
+        out["profile"] = ("core"
+                          if fmt.profile() == QSurfaceFormat.CoreProfile
+                          else "compatibility")
+        return out
 
     def set_atom_scale(self, scale):
         # type: (float) -> None
@@ -2516,6 +2568,7 @@ class MolViewport(QOpenGLWidget):
         self._wire_lines = _LineBuffer()
         self._poly_tris = _LineBuffer()   # same layout, GL_TRIANGLES
         self._poly_edges = _LineBuffer()  # hull outlines, GL_LINES
+        self._poly_glint = _LineBuffer()  # the specular pass, additive
         self._grid_quad = _GridQuad()
         self._gl_ready = True
         self._needs_rebuild = True
@@ -2864,7 +2917,6 @@ class MolViewport(QOpenGLWidget):
         """
         if self.scene is None:
             return
-        from ..core import polyhedra as poly_mod
         built = self._polyhedra_plan(poly_mod)
         if not built:
             if self._poly_tris is not None:
@@ -2878,20 +2930,60 @@ class MolViewport(QOpenGLWidget):
         # recomputed per frame; the hulls, the triangle soup, the face normals
         # and the centroids are all cached above.
         cols = poly_mod.shade_from_faces(faces, eye)
+        # EVERY upload first, then every draw. Interleaving them means a
+        # buffer upload runs between two draw calls with a VAO still bound,
+        # and the result was the diffuse solid losing a blend layer — pixels
+        # scaled by a uniform 0.643 across all three channels, which is a
+        # missing pass and not a lighting change. Round 35's rule about
+        # overlay passes and buffers, one step along.
         self._poly_tris.upload(np.hstack([faces["vertices"], cols]))
+        glint = None
+        if self.polyhedra_specular > 0.0:
+            values = poly_mod.specular_from_faces(
+                faces, eye, self.polyhedra_specular, self.polyhedra_shininess)
+            if len(values) and float(values.max()) > 1e-3:
+                self._poly_glint.upload(np.hstack([faces["vertices"], values]))
+                glint = self._poly_glint
+        edge_pts = self._poly_edge_cache
+        if edge_pts is not None and len(edge_pts):
+            self._poly_edges.upload(np.hstack([edge_pts,
+                                               self._poly_edge_colors]))
         GL.glEnable(GL.GL_BLEND)
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
         GL.glDepthMask(GL.GL_FALSE)
         GL.glDisable(GL.GL_CULL_FACE)
         self._draw_lines(self._poly_tris, view, proj, mode=GL.GL_TRIANGLES,
                          alpha=self.polyhedra_alpha)
+        # THE SHEEN, as its own ADDITIVE pass. VESTA puts a highlight on a
+        # face whose normal comes into line with the view, and it is worth
+        # more than the look: a highlight appearing and sliding off as the
+        # solid turns is what tells you the faces are flat and which way each
+        # one points — which a translucent silhouette cannot.
+        #
+        # Additive rather than mixed into the colour above, for two reasons.
+        # The solid is drawn at about half alpha, so a highlight blended with
+        # it is more than half gone before it reaches the screen and on a pale
+        # element colour (niobium is nearly white already) clips to nothing
+        # visible. And it is the right model anyway: a reflection is light
+        # ADDED on top of whatever is behind the surface, not a tint stirred
+        # into it. Same geometry, same buffer layout, one more upload.
+        if glint is not None:
+            # RGB adds; ALPHA is left exactly as it was. An ordinary additive
+            # blend accumulates the alpha channel as well, which is invisible
+            # on screen and wrong everywhere else: `render_image` writes a
+            # transparent PNG, and a grabbed frame came back with the whole
+            # solid scaled by a uniform 0.643 in every channel — the tell-tale
+            # of colour divided by an alpha that had crept up, not of a
+            # lighting change.
+            GL.glBlendFuncSeparate(GL.GL_SRC_ALPHA, GL.GL_ONE,
+                                   GL.GL_ZERO, GL.GL_ONE)
+            self._draw_lines(glint, view, proj, mode=GL.GL_TRIANGLES,
+                             alpha=1.0)
+            GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
         # ...and the hull EDGES on top, which is what actually makes the
         # shape legible: a translucent solid with no outline reads as a
         # coloured smudge however it is shaded.
-        edge_pts = self._poly_edge_cache
         if edge_pts is not None and len(edge_pts):
-            self._poly_edges.upload(np.hstack([edge_pts,
-                                               self._poly_edge_colors]))
             # NO glLineWidth: a GL 3.3 CORE profile only guarantees 1.0, and
             # anything else raises GL_INVALID_VALUE — which aborts the rest
             # of paintGL and blanks every pass that follows.
