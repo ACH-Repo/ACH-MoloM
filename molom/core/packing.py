@@ -79,6 +79,11 @@ def pack(data, disorder=None, outside=True, grow_from_copies=False, tol=0.1):
         grow_from_copies=grow_from_copies)
 
     meta = {}
+    # How many atoms the packing DREW. `cell_content` counts the cell's own
+    # content, which is deliberately smaller — so the two differing proves
+    # nothing, and only this number can say whether an edit has since added or
+    # removed an atom.
+    meta["packed_n"] = len(out_symbols)
     # `complete_molecules` REORDERS and duplicates, so anything keyed by the
     # content index has to be remapped through `source` — an index-based map
     # carried across it silently describes the wrong atoms.

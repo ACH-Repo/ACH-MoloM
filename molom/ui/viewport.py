@@ -141,6 +141,23 @@ def cell_of(obj):
         return None
 
 
+def is_crystal(obj):
+    """Does this object carry a unit cell?
+
+    The test behind "do not silently move an atom in a crystal". A site in a
+    crystal is not a free atom: it usually sits ON a symmetry element, its
+    position was refined against diffraction data, and the automatic
+    bond-length adjustment that makes `H -> Zn` sensible in a molecule is
+    exactly what pushed a MOF-5 hydrogen 0.44 A off its site and had the cell
+    box measure the move as a rotation. Christian's call, and it is the right
+    one: changing what an atom IS should not change where it is.
+    """
+    try:
+        return bool((obj.structure.metadata or {}).get("cell"))
+    except AttributeError:
+        return False
+
+
 def set_cell_reference(structure, coords=None):
     """Pin the cell frame to the atoms as they stand RIGHT NOW.
 
@@ -986,7 +1003,26 @@ class MolViewport(QOpenGLWidget):
             return None
         return float(xy[0, 0]), float(xy[0, 1])
 
+    @property
+    def select_tool_active(self):
+        # type: () -> bool
+        """Edit mode with NO tool armed — the plain state where a click picks.
+
+        Blender's name for this is the Tweak tool; MoloM's toolbar calls it
+        Select, which is what the status line says. Worth having a name at
+        all, because things belong to it: the origin handle is the first, and
+        anything else that competes with a drawing gesture will be the next.
+        """
+        return (self.mode == MODE_EDIT and not self.draw_tool_active
+                and not self.measure_active)
+
     def _origin_dot_hit(self, pos, radius=11.0):
+        # The origin handle belongs to the SELECT tool alone. With the draw
+        # tool armed every click is a drawing gesture, so a handle sitting in
+        # the middle of the molecule is a trap: you reach to draw an atom and
+        # pick up the origin instead (Christian).
+        if not self.select_tool_active:
+            return False
         s = self._origin_screen()
         if s is None:
             return False
@@ -1445,10 +1481,17 @@ class MolViewport(QOpenGLWidget):
         if on == self.draw_tool_active:
             return
         self.draw_tool_active = on
+        # Arming a tool PUTS THE ORIGIN DOWN. Leaving it picked up would mean
+        # G and R silently moved the origin while the user thought they were
+        # drawing — the round-18 rule that a tool flag must never outlive the
+        # state that owns it, applied the other way round.
+        if on and self._origin_active:
+            self.set_origin_active(False)
         self.status_message.emit(
             "Draw tool ON — click an atom to change it, click empty space or "
             "drag from an atom to add {}".format(self.draw_element)
-            if on else "Draw tool off — clicks select")
+            if on else "Select tool — clicks pick atoms; the origin handle is "
+            "live again")
         if self.on_tool_changed is not None:
             self.on_tool_changed(on)
         self.update()
@@ -1550,16 +1593,20 @@ class MolViewport(QOpenGLWidget):
         rows = [i for o, i in self.selection if obj is not None and o == obj.id]
         if obj is not None and rows:
             self._begin_edit()
+            crystal = is_crystal(obj)
             added, removed = edits.set_element_adjusted(
-                obj.structure, rows, symbol, adjust_h=self.adjust_h)
+                obj.structure, rows, symbol,
+                adjust_h=self.adjust_h and not crystal,
+                adjust_lengths=not crystal)
             # Converted atoms are DESELECTED: they are already the element
             # that was asked for, so keeping them selected turns the next
             # element pick into a second, unintended conversion of the same
             # atoms (Christian's report — draw an Li, pick Cd, lose the Li).
             self.set_selection([])
             self.status_message.emit(
-                "{} atom(s) -> {}{}   (draw element is now {})".format(
-                    len(rows), symbol, _h_note(added, removed), symbol))
+                "{} atom(s) -> {}{}   (draw element is now {}){}".format(
+                    len(rows), symbol, _h_note(added, removed), symbol,
+                    "   — geometry left alone (crystal)" if crystal else ""))
             self.edit_committed.emit()
         else:
             self.status_message.emit("Draw element: {}".format(symbol))
@@ -1584,12 +1631,15 @@ class MolViewport(QOpenGLWidget):
                 self.set_selection([(obj_id, idx)])
                 return
             self._begin_edit()
+            crystal = is_crystal(obj)
             added, removed = edits.set_element_adjusted(
                 obj.structure, [idx], self.draw_element,
-                adjust_h=self.adjust_h)
-            self.status_message.emit("{} -> {}{}".format(
+                adjust_h=self.adjust_h and not crystal,
+                adjust_lengths=not crystal)
+            self.status_message.emit("{} -> {}{}{}".format(
                 self.scene.pick_label((obj_id, idx)), self.draw_element,
-                _h_note(added, removed)))
+                _h_note(added, removed),
+                "   — geometry left alone (crystal)" if crystal else ""))
             self.set_selection([(obj_id, idx)])
         else:
             origin, direction = self._ray_at(pos)
@@ -2433,6 +2483,13 @@ class MolViewport(QOpenGLWidget):
         obj = self.edit_object()
         if obj is None:
             return
+        # The handle belongs to the SELECT tool, so Alt+O disarms whatever is
+        # holding clicks rather than putting up a handle that cannot be
+        # grabbed.
+        if self.draw_tool_active:
+            self.set_draw_tool(False)
+        if self.measure_active:
+            self.set_measure_tool(False)
         pts = [self.scene.pick_coords(p) for p in self.selection
                if p[0] == obj.id]
         pts = [p for p in pts if p is not None]
@@ -3244,6 +3301,10 @@ class MolViewport(QOpenGLWidget):
         p.drawEllipse(x - 8, y - 8, 16, 16)
 
     def _paint_origin_dot(self, p):
+        # Not drawn while another tool owns clicks: a control you can see and
+        # cannot use is worse than one that is simply absent.
+        if not self.select_tool_active:
+            return
         s = self._origin_screen()
         if s is None:
             return

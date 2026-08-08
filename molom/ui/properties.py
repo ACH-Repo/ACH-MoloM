@@ -454,6 +454,9 @@ class CrystalPage(QWidget):
     symmetry_toggled = Signal(bool)
     ghosts_toggled = Signal(bool)
 
+    #: Has the ACTIVE molecule's cell been edited into P1?
+    _frozen = False
+
     #: Does the ACTIVE molecule have a cell? On the class so it exists from
     #: the first instant the widget does — `_toggle_kinds` can be reached
     #: during construction (round 34's rule about attributes an event handler
@@ -835,7 +838,8 @@ class CrystalPage(QWidget):
                  name="", exterior=0, chemistry="", symmetry="", naming=None,
                  bravais="", density=None, refused=0, refused_on=False,
                  outside=True, copies=False, polyhedra=None, box=None,
-                 symmetry_on=None, ghosts=None, occupancy=None):
+                 symmetry_on=None, ghosts=None, occupancy=None,
+                 frozen=False):
         """Refresh from the active molecule.
 
         `cell=None` greys every CONTROL but leaves the page itself readable —
@@ -845,12 +849,22 @@ class CrystalPage(QWidget):
         """
         has = cell is not None
         self._has_cell = has
+        # An edited full cell is P1 and its atoms ARE the structure, so
+        # there is nothing left for these to regenerate. Greyed with the
+        # reason in the tooltip, rather than live and refusing.
+        self._frozen = bool(frozen)
         for w in (self.asym_radio, self.cell_radio, self.pack_radio,
                   self.box_check, self.poly_check, self.sym_check,
                   self.ghost_check, self._kind_holder,
                   self.outside_check, self.copies_check,
                   self.occupancy_check):
             w.setEnabled(has)
+        for w in (self.asym_radio, self.cell_radio, self.pack_radio):
+            w.setEnabled(has and not self._frozen)
+            w.setToolTip(
+                "This cell was edited, so it is P1: the atoms you see "
+                "ARE the structure. Repeat it with an Array modifier."
+                if self._frozen else "")
         self._sync_pack_enabled()
         # Nothing was refused on this molecule, so there is nothing to
         # override — greyed, and the count says why rather than leaving a

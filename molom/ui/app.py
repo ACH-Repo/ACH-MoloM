@@ -42,6 +42,7 @@ from ..core import style as style_mod
 from ..core.undo import UndoStack
 from .choice_popup import ChoicePopup
 from .dialogs import (BlenderExportDialog, MetaAtomDialog,
+                      SiteOccupancyDialog,
                       OperatorSearchDialog, ResolveNameDialog, SettingsDialog)
 from .crystal_ribbon import CrystalRibbon
 from .optimize_panel import OptimizeDock, OptimizeWorker, TASK_SELECTION
@@ -709,6 +710,12 @@ class MainWindow(QMainWindow):
           lambda c: c.on_reevaluate_symmetry(), enabled=has_cell,
           category="Crystal", aliases=("cif", "symmetry", "space group",
                                        "spglib", "triclinic", "P1"))
+        r("crystal_site_occupancy",
+          "Crystal: set the occupancies of a shared site",
+          lambda c: c.on_site_occupancy(), enabled=has_cell,
+          category="Crystal", aliases=("occupancy", "solid solution",
+                                       "shared site", "mixed", "doping",
+                                       "substitution", "pie", "partial"))
         r("cell_info", "Unit cell: report cell parameters and space group",
           lambda c: c.on_cell_info(),
           enabled=lambda c: c._active_cell() is not None,
@@ -1096,11 +1103,87 @@ class MainWindow(QMainWindow):
                 # itself and the group is untouched.
                 self.sync_asymmetric_unit(obj)
                 return
-            changed = self.reevaluate_symmetry(obj)
+            changed = self.demote_to_p1(obj)
         except Exception:                    # never let this break an edit
             return
         if changed:
             self._sync_crystal_page()
+
+    def demote_to_p1(self, obj):
+        # type: (object) -> Optional[str]
+        """An edit to a FULL CELL makes it P1, with the content as its unit.
+
+        Christian's call, and the measurements back it: automatically
+        re-deriving a group from edited coordinates and then REBUILDING from
+        it is fragile, because the operators spglib reports and the orbits it
+        reports have to reconstruct the cell exactly and nothing guarantees
+        they do. Adding two carbons to MOF-5 got `R3m` with 6 operators and 7
+        orbits — 42 atoms where the cell holds 424 — so the next view switch
+        drew 13 atoms and called it a crystal.
+
+        **P1, not P-1.** P-1 asserts an inversion centre through the origin,
+        and an arbitrary edit preserves no such thing; writing it would make
+        every downstream expansion invent a second half of the structure that
+        is not there. P1 is the one group true of every arrangement of atoms,
+        so it can never be wrong — and it makes the rebuild an identity,
+        which is what stops the picture changing under the user.
+
+        Deriving the real group is still available, deliberately, as
+        `F3 > Crystal: re-derive the space group` — and that route now checks
+        the reconstruction before it accepts an answer.
+        """
+        s = obj.structure
+        meta = s.metadata
+        cell = cell_of(obj)
+        if cell is None or not meta.get("symops"):
+            return None
+        frac = self._crystal_fractional(obj)
+        if frac is None:
+            return None
+        was = str(meta.get("spacegroup", ""))
+        n_before = int(meta.get("cell_content") or 0)
+        # Atoms ADDED land after the boundary copies, so the "first N are the
+        # content" split stops meaning anything the moment the count changes —
+        # the added carbons were outside the content entirely, which is why
+        # they never reached the asymmetric unit. Once that happens the object
+        # is a box of atoms, not a packed cell, and saying so beats keeping a
+        # split that is quietly wrong.
+        # NOT `cell_content != n_atoms`: those differ by design on a packed
+        # crystal (424 content, 616 drawn). `packed_n` is what the packing
+        # actually drew, so only that can say an atom has been added or
+        # deleted since.
+        drawn = int(meta.get("packed_n") or 0)
+        grew = bool(drawn) and drawn != s.n_atoms
+        if grew or not n_before:
+            meta["cell_content"] = s.n_atoms
+            meta["packed"] = False
+            meta["packed_n"] = s.n_atoms
+        meta["symops"] = ["x,y,z"]
+        meta["spacegroup"] = "P 1"
+        meta["it_number"] = 1
+        meta.pop("hall", None)
+        meta["symmetry_source"] = spacegroups.SOURCE_DERIVED
+        # From here the ❖ contents radio stops REGENERATING this object: in
+        # P1 the asymmetric unit is the cell content, so there is nothing left
+        # to expand, and re-packing atoms the packing has already relocated
+        # does not give the same picture back.
+        meta["cell_frozen"] = True
+        meta["symmetry_note"] = (
+            "edited in the full cell, so the symmetry no longer holds: "
+            "written as P1 with {} site(s){}".format(
+                meta["cell_content"],
+                " (the boundary copies are now ordinary atoms)"
+                if grew else ""))
+        self.resync_derived_asymmetric_unit(obj, cell, frac, identity=True)
+        if was and spacegroups.canonical_key(was) != spacegroups.canonical_key(
+                "P 1"):
+            self.statusBar().showMessage(
+                "Edited the full cell, so the symmetry no longer holds — "
+                "{} is now P1 with {} site(s). F3 \"re-derive the space "
+                "group\" looks for a real one.".format(was,
+                                                       meta["cell_content"]),
+                10000)
+        return "P 1"
 
     def sync_asymmetric_unit(self, obj):
         # type: (object) -> bool
@@ -4338,6 +4421,59 @@ class MainWindow(QMainWindow):
             "from it, so the space group is kept.".format(obj.name, note),
             8000)
 
+    def on_site_occupancy(self):
+        """F3: say what a shared crystallographic site is made of.
+
+        The one thing no derivation can recover — the co-located species are
+        merged away at import before occupancy is consulted (round 45e), so
+        the composition lives in a table and nothing in the coordinates
+        implies it. Letting the user state it is the only honest answer, and
+        it closes the gap the CIF writer had to report as a limit.
+        """
+        from ..core import occupancy as occ_mod
+        obj = self._active_obj()
+        if obj is None or cell_of(obj) is None:
+            self.statusBar().showMessage(
+                "Select a crystal — a shared site is a crystallographic "
+                "position, so this needs a unit cell", 6000)
+            return
+        rows = sorted({i for o, i in self.viewport.selection if o == obj.id})
+        if not rows:
+            self.statusBar().showMessage(
+                "Select one atom of the site whose composition you want to "
+                "set", 6000)
+            return
+        s = obj.structure
+        meta = s.metadata
+        index = rows[0]
+        orbit = occ_mod.orbit_of(meta, index, s.n_atoms)
+        # The picked atoms always count, even where there is no `site_of` to
+        # give the orbit — otherwise selecting three atoms and getting one
+        # edited would be a silent surprise.
+        orbit = sorted(set(orbit) | set(rows))
+        parts = occ_mod.composition_of(meta, index)
+        if not parts:
+            parts = [(s.symbols[index], float(s.occupancy_of(index) or 1.0)
+                      if hasattr(s, "occupancy_of") else 1.0)]
+        dlg = SiteOccupancyDialog(self, parts,
+                                  label=self.scene.pick_label((obj.id, index)),
+                                  n_atoms=len(orbit))
+        if not dlg.exec():
+            return
+        self.push_undo()
+        chosen = dlg.parts()
+        occ_mod.set_composition(meta, orbit, chosen)
+        # Marks the stored asymmetric unit as no longer the whole truth: it is
+        # the FILE's unit, from before the user said otherwise, so the writer
+        # has to build from the drawn atoms instead of round-tripping it.
+        meta["site_occupancy_edited"] = True
+        self.viewport.refresh_geometry()
+        self._sync_crystal_page()
+        self.statusBar().showMessage(
+            "{}: {} atom(s) set to {}".format(
+                obj.name, len(orbit),
+                occ_mod.describe(chosen) or "a plain full atom"), 8000)
+
     def on_reevaluate_symmetry(self):
         """F3: re-derive the space group, on demand rather than on edit."""
         obj = self._active_obj()
@@ -4444,8 +4580,28 @@ class MainWindow(QMainWindow):
             xyz = (xyz - np.asarray(shift)) @ np.asarray(rot)
         return cell.to_fractional(xyz)
 
-    def resync_derived_asymmetric_unit(self, obj, cell, frac):
-        # type: (object, object, object) -> int
+    @staticmethod
+    def _reconstructs(obj, meta, frac, n_content):
+        # type: (object, dict, object, int) -> bool
+        """Do the stored unit and operators actually rebuild this cell?
+
+        The invariant every crystal rebuild depends on, and the one thing
+        nobody was checking. `cif_write` asks the same question of a file it
+        is about to write, so the two share the machinery.
+        """
+        unit = list(meta.get("asym_symbols") or [])
+        if not unit:
+            return False
+        expanded_s, expanded_f = cif_write._expand(
+            unit, np.asarray(meta.get("asym_frac") or [], dtype=float),
+            [str(t) for t in (meta.get("symops") or ["x,y,z"])])
+        return cif_write._covered(
+            list(obj.structure.symbols)[:n_content],
+            np.asarray(frac, dtype=float).reshape(-1, 3)[:n_content],
+            expanded_s, expanded_f)
+
+    def resync_derived_asymmetric_unit(self, obj, cell, frac, identity=False):
+        # type: (object, object, object, bool) -> int
         """Re-derive the stored asymmetric unit to match re-derived operators.
 
         A rebuild is `asym_symbols` + `asym_frac` expanded by `symops`, so
@@ -4464,17 +4620,29 @@ class MainWindow(QMainWindow):
         symbols = list(s.symbols)[:n]
         content = np.asarray(frac, dtype=float).reshape(-1, 3)[:n]
         reps = None
-        try:
-            reps = spacegroups.orbit_representatives(cell, symbols, content)
-        except Exception:
-            reps = None
-        # No dataset means P1, where every atom IS its own orbit — the cell
-        # content is the asymmetric unit, and that is the honest answer rather
-        # than a reason to leave a stale unit in place.
+        if not identity:
+            try:
+                reps = spacegroups.orbit_representatives(cell, symbols,
+                                                         content)
+            except Exception:
+                reps = None
+        # Under P1 every atom IS its own orbit, so the cell content is the
+        # asymmetric unit — which is also the honest answer when no dataset
+        # came back, rather than a reason to leave a stale unit in place.
+        # `identity=True` says so up front and skips the search: asking spglib
+        # and then ignoring the answer is how the two ended up disagreeing.
         if not reps:
             reps = list(range(n))
         meta["asym_symbols"] = [symbols[i] for i in reps]
-        meta["asym_frac"] = [[float(v) for v in content[i]] for i in reps]
+        # WRAPPED into [0,1). The drawn content is not: `packing.pack` unwraps
+        # molecules to keep them whole, so 34 of ferrocene's 42 content atoms
+        # sit between -0.43 and 1.43. Storing those as the unit means the next
+        # rebuild wraps them itself, tearing the molecules apart before the
+        # completion runs — 210 drawn atoms came back as 168. Wrapping here
+        # makes the stored unit the canonical cell content, which is what
+        # `expand` would have produced, so the rebuild reproduces the picture.
+        meta["asym_frac"] = [[float(v) for v in (content[i] % 1.0)]
+                             for i in reps]
         # The parallel columns describe the OLD sites, so they cannot be
         # sliced — but they need not be thrown away either: `packing.pack`
         # records which asymmetric-unit site each DRAWN atom came from, so
@@ -4545,18 +4713,40 @@ class MainWindow(QMainWindow):
                 and spacegroups.canonical_key(symbol)
                 == spacegroups.canonical_key(was)):
             return None                      # unbroken; nothing to report
-        meta["symops"] = list(ops)
-        meta["spacegroup"] = symbol
-        meta["it_number"] = int(number or 0)
-        meta.pop("hall", None)
         # The stored asymmetric unit belonged to the OLD operators, and every
         # crystal rebuild regenerates from `asym_symbols` + `symops` together.
         # Leaving the two inconsistent is what made a single H -> F on MOF-5
         # destroy the structure the moment anything on the ❖ page was touched:
         # 616 drawn atoms came back as 7, the file's asymmetric unit expanded
-        # by a 2-operator group. Where the new group has FEWER operators than
-        # the stored unit assumed, the same mismatch doubles the cell instead.
-        self.resync_derived_asymmetric_unit(obj, cell, frac)
+        # by a 2-operator group.
+        keep = dict(meta)
+        meta["symops"] = list(ops)
+        meta["spacegroup"] = symbol
+        meta["it_number"] = int(number or 0)
+        meta.pop("hall", None)
+        n_reps = self.resync_derived_asymmetric_unit(obj, cell, frac)
+        # ...and then CHECK IT. "spglib found a group" is not the same claim as
+        # "this unit and these operators rebuild this cell", and the two came
+        # apart on MOF-5: R3m with 6 operators over 7 orbits, i.e. 42 atoms
+        # where the cell holds 424. A group that cannot reconstruct the
+        # structure is not an answer, so it is refused rather than stored.
+        n_content = min(int(meta.get("cell_content") or 0)
+                        or obj.structure.n_atoms, obj.structure.n_atoms)
+        if not self._reconstructs(obj, meta, frac, n_content):
+            for key in ("symops", "spacegroup", "it_number", "hall",
+                        "asym_symbols", "asym_frac", "asym_occupancy",
+                        "asym_labels", "asym_disorder_groups",
+                        "asym_disorder_assemblies", "site_of"):
+                meta.pop(key, None)
+                if key in keep:
+                    meta[key] = keep[key]
+            if announce:
+                self.statusBar().showMessage(
+                    "{}: spglib offered {} ({} operator(s), {} site(s)), but "
+                    "that does not rebuild this cell's {} atoms — keeping {}"
+                    .format(obj.name, symbol, len(ops), n_reps, n_content,
+                            was or "the stored symmetry"), 9000)
+            return None
         meta["symmetry_source"] = spacegroups.SOURCE_DERIVED
         meta["symmetry_note"] = (
             "symmetry re-derived from the edited coordinates: {} -> {} "
@@ -4898,6 +5088,7 @@ class MainWindow(QMainWindow):
             symmetry_on=bool(meta.get("show_symmetry")),
             ghosts=bool(meta.get("show_ghosts")),
             occupancy=bool(self.viewport.show_occupancy),
+            frozen=bool(meta.get("cell_frozen")),
             name=obj.name)
         self.crystal_page.set_detail(
             info, naming=naming, site_occupancy=meta.get("site_occupancy"))
@@ -4998,6 +5189,31 @@ class MainWindow(QMainWindow):
         if sym_mods:
             self._crystal_view_via_modifier(obj, sym_mods[0], mode,
                                             na, nb, nc)
+            return
+        # A cell the user has EDITED is not regenerated. In P1 the asymmetric
+        # unit IS the cell content, so there is no symmetry left to apply —
+        # and re-running the packing on atoms it has already relocated does
+        # not reproduce the picture: round 45d's trap, measured here as
+        # ferrocene coming back with 4 complete molecules where it had 5, and
+        # 210 drawn atoms as 168. The atoms in front of us ARE the cell.
+        if meta.get("cell_frozen"):
+            if mode == "packing":
+                # A supercell has to REGENERATE, which is the one thing an
+                # edited cell cannot survive — and there would then be no way
+                # back to the single cell, since the frozen atoms are the only
+                # copy of it. Refused rather than offered and then lost.
+                self.statusBar().showMessage(
+                    "{} was edited in the full cell, so it cannot be packed "
+                    "into a supercell — the edit is the structure now. Use an "
+                    "Array modifier to repeat it.".format(obj.name), 9000)
+                self._sync_crystal_page()
+                return
+            meta["cell_view"] = mode
+            self.statusBar().showMessage(
+                "{} was edited in the full cell, so it is P1 — the "
+                "asymmetric unit and the cell are the same atoms".format(
+                    obj.name), 7000)
+            self._sync_all()
             return
         symops = [cif_mod.SymOp.from_xyz(t) for t in meta.get("symops")
                   or ["x,y,z"]]

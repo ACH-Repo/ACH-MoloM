@@ -52,6 +52,7 @@ import numpy as np
 
 from . import cif as cif_mod
 from . import elements, spacegroups
+from . import occupancy as occupancy_mod
 
 #: How the crystallography for the written file is arrived at.
 POLICY_ASYMMETRIC = "asymmetric"
@@ -336,6 +337,14 @@ def from_object(obj, policy=None, version="", report=None):
     chosen = policy
     if chosen not in POLICIES:
         chosen = None
+    # A composition the USER has set is not in the stored unit — that unit is
+    # the file's own, from before they said otherwise. So it stops being a
+    # verbatim round trip and the file has to be built from the drawn atoms,
+    # where the edited compositions live.
+    if chosen is None and meta.get("site_occupancy_edited"):
+        chosen = POLICY_CELL
+        notes.append("Site occupancies were edited in MoloM, so the sites "
+                     "are written from the current structure.")
     if chosen in (None, POLICY_ASYMMETRIC) and len(asym_symbols):
         expanded_symbols, expanded_frac = _expand(asym_symbols, asym_frac,
                                                   file_ops)
@@ -345,6 +354,12 @@ def from_object(obj, policy=None, version="", report=None):
             report["n_sites"] = len(asym_symbols)
             report["spacegroup"] = meta.get("spacegroup") or "P 1"
             report["symops"] = len(file_ops)
+            # NO shared-site expansion here. The stored unit is the file's
+            # own, and a file that HAS a shared site already lists each
+            # species as its own `_atom_site_` row — the solid solution's
+            # asymmetric unit is [Nb, Ti, Ni, Co, O], five rows for four
+            # species on one position. Expanding again writes Ti, Ni and Co
+            # twice. This path is a verbatim round trip and needs no help.
             return cif_text(
                 cell, asym_symbols, asym_frac, symops=file_ops,
                 spacegroup=meta.get("spacegroup") or "P 1", name=name,
@@ -398,13 +413,15 @@ def from_object(obj, policy=None, version="", report=None):
                              "every site; those are written as fully "
                              "occupied.")
                 report["occupancy_lost"] = True
+            rows = _split_shared(meta, [content_symbols[i] for i in reps],
+                                 content_frac[list(reps)], columns,
+                                 list(reps), report, notes)
             return cif_text(
-                cell, [content_symbols[i] for i in reps],
-                content_frac[list(reps)], symops=symops,
+                cell, rows["symbols"], rows["frac"], symops=symops,
                 spacegroup=spacegroup, name=name,
                 it_number=int(derived.number or 0) if not same
                 else int(meta.get("it_number") or 0),
-                info=info, notes=notes, version=version, **columns)
+                info=info, notes=notes, version=version, **rows["columns"])
 
     if chosen != POLICY_P1:
         notes.append("No space group could be derived from the coordinates; "
@@ -415,6 +432,42 @@ def from_object(obj, policy=None, version="", report=None):
     report["n_sites"] = len(content_symbols)
     return cif_text(cell, content_symbols, content_frac, name=name,
                     info=info, notes=notes, version=version)
+
+
+def _split_shared(meta, symbols, frac, columns, indices, report, notes):
+    # type: (dict, list, object, dict, list, dict, list) -> dict
+    """One `_atom_site_` row per SPECIES on a shared site.
+
+    A CIF has no way to put a composition in a single row: several species on
+    one position are several rows at the same fractional coordinates, which is
+    how the files that carry them are written. Without this a solid solution
+    goes out as a pure compound — the site MoloM draws as a Nb/Ti/Ni/Co pie
+    would be written as plain niobium.
+    """
+    shared = (meta or {}).get("site_occupancy") or {}
+    out = {"symbols": list(symbols),
+           "frac": np.asarray(frac, dtype=float).reshape(-1, 3),
+           "columns": dict(columns)}
+    if not shared:
+        return out
+    n = len(symbols)
+    occ = list(columns.get("occupancy") or [1.0] * n)
+    labels = list(columns.get("labels") or [""] * n)
+    occ += [1.0] * max(0, n - len(occ))
+    labels += [""] * max(0, n - len(labels))
+    new_s, new_f, new_o, new_l = occupancy_mod.expand_shared(
+        list(symbols), out["frac"], occ, labels, shared, indices)
+    if len(new_s) == n:
+        return out                      # nothing on these rows was shared
+    out["symbols"], out["frac"] = new_s, new_f
+    # The disorder columns described the OLD rows and there is no meaningful
+    # value for a species that has just been split out, so they go rather
+    # than being stretched to fit.
+    out["columns"] = {"occupancy": new_o, "labels": new_l}
+    report["shared_sites"] = len(new_s) - n + 1
+    notes.append("Shared sites are written as one row per species at the "
+                 "same position, which is how a CIF expresses them.")
+    return out
 
 
 def _site_columns(meta, indices, n_drawn):

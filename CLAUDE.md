@@ -56,6 +56,68 @@ the operator key table, CIF reading with symmetry, coordination polyhedra,
 meta atoms, the scene clock with a multi-track timeline, vibrational modes,
 per-element display control, and the symmetry modifier. 512 tests.
 
+Round 52 (2026-08-08, Christian's second MOF-5 batch — an edited cell is P1,
+and a shared site can be STATED):
+**(1) Adding atoms in the full cell then switching views destroyed the
+structure** (618 atoms came back as 13). Two causes, one rule. Added atoms are
+appended AFTER the boundary copies, so "the first `cell_content` are the
+content" stops meaning anything the moment the count changes — the new carbons
+were outside the content entirely and never reached the asymmetric unit. And
+round 51's automatic re-derivation kept finding groups that could not rebuild
+the cell: on MOF-5, `R3m` with **6 operators over 7 orbits — 42 atoms where the
+cell holds 424**. "spglib found a group" is not "this unit and these operators
+rebuild this cell", and nothing was checking the second claim.
+**So an edit to a FULL CELL now demotes it to P1**, which is Christian's own
+proposal. **P1 and not P-1**: P-1 asserts an inversion centre through the
+origin, an arbitrary edit preserves no such thing, and writing it would make
+every downstream expansion invent a half of the structure that is not there.
+P1 is the one group true of every arrangement of atoms. Deriving the real group
+is still available deliberately (`F3 > Crystal: re-derive the space group`),
+and that route now REFUSES an answer that cannot reconstruct the cell —
+`_reconstructs`, sharing `cif_write`'s `_expand`/`_covered`.
+**(1b) P1 alone was not enough, and the reason is round 45d from the other
+side.** The drawn content is not the canonical cell content: `packing.pack`
+unwraps molecules to keep them whole, so **34 of ferrocene's 42 content atoms
+sit outside [0,1)**, between -0.43 and 1.43. Storing those as the unit means
+the next rebuild wraps them itself, tearing the molecules before the completion
+runs — 210 drawn atoms came back as **168, four complete molecules where there
+were five**. Wrapping them first fixes the tearing and not the completion,
+because the relocation has already defeated it. So an edited cell is **FROZEN**:
+`cell_frozen` stops the ❖ contents radio regenerating it at all, the atoms in
+front of you ARE the structure, and Packing is greyed with the reason (a
+supercell has to regenerate, and there would then be no way back to the single
+cell). An Array modifier is the route to repeating it.
+**(2) No automatic geometry change when an element changes in a CRYSTAL**
+(Christian: "too risky" — he is right). A site in a crystal is not a free atom:
+its position was refined against diffraction data and it usually sits ON a
+symmetry element. `adjust_bond_lengths` is what pushed the MOF-5 hydrogen
+0.44 A off its site in the first place. `viewport.is_crystal` gates both the
+length adjustment and the hydrogen re-dressing; a molecule is untouched, where
+`H -> Zn` lengthening its bond is the whole point of the draw tool.
+**(3) The origin handle belongs to the SELECT tool.** With the draw tool armed
+every click is a drawing gesture, so a handle in the middle of the molecule is
+a trap. `MolViewport.select_tool_active` is the name for "edit mode, no tool
+armed" — Blender calls it Tweak, MoloM's toolbar calls it Select. The handle is
+not drawn and not pickable outside it, arming a tool puts it DOWN (or G would
+silently move the origin), and Alt+O disarms whatever is holding clicks rather
+than putting up a handle that cannot be grabbed.
+**(4) `core/occupancy.py` + `F3 > Crystal: set the occupancies of a shared
+site`** — the honest limit, closed. A shared position is destroyed at import
+before occupancy is consulted (round 45e), nothing in the coordinates implies
+it and no derivation can recover it, so the only honest answer is to let the
+user say what the site is. Edits apply to the whole symmetry ORBIT via
+`site_of` (a cubic cell draws one site 24 times). The writer splits a shared
+site into **one `_atom_site_` row per species** at the same coordinates, which
+is how a CIF expresses them — but ONLY on the rebuilt path: a file that has a
+shared site already lists each species as its own row (the solid solution's
+unit is [Nb, Ti, Ni, Co, O], five rows for four species on one position), so
+expanding the verbatim round trip would write Ti, Ni and Co twice. A
+user-edited composition sets `site_occupancy_edited`, which takes the writer
+off the verbatim path because the stored unit is the FILE's, from before they
+said otherwise. Measured: stating O 0.8 / N 0.2 on the oxide writes both rows
+and keeps the file's own Nb/Ti/Ni/Co site intact.
+1142 tests.
+
 Round 51 (2026-08-08, Christian's MOF-5 report — four bugs, one of them old):
 he changed a single H to an F in `938392.cif` (MOF-5) and the cell box came
 off the floor of the xy plane while the cell "doubled". Both reproduced, and
@@ -1953,7 +2015,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1120 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1142 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -2113,6 +2175,11 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   `--save` handler, which is what `find_blender` + `write_blend` use to build a
   **.blend** headlessly — the scene is complete before the file is written, so
   nothing runs on load.
+- `core/occupancy.py` — shared crystallographic SITES: read, edit, write.
+  The composition of a solid solution is the one thing no derivation can
+  recover (round 45e), so round 52 made it something the user can state.
+  `orbit_of` uses `site_of` to apply an edit to the whole site;
+  `expand_shared` splits it into one `_atom_site_` row per species.
 - `core/cif_write.py` — the CIF WRITER (round 50). `cif_text` is pure
   formatting; `from_object` makes every decision, and makes them by
   MEASUREMENT: the stored asymmetric unit goes back out verbatim if it still
@@ -2218,6 +2285,21 @@ independent cross-check inside a single fixture.
   vector then spin so the backbone points outward.
 
 ## Hard-won gotchas (don't re-learn these)
+- **"A group was found" is not "this unit rebuilds this cell"** (round 52).
+  spglib answered `R3m` for an edited MOF-5 and `orbit_representatives` gave 7
+  orbits for it — 7 x 6 operators is 42 atoms, and the cell holds 424. Both
+  answers come from the same dataset and are individually defensible; only
+  their PRODUCT is the thing a rebuild depends on, and nothing was checking
+  it. Check the reconstruction before storing derived symmetry, and prefer P1
+  when the check fails: P1 always reconstructs.
+- **The drawn cell content is not the canonical cell content** (round 52).
+  `packing.pack` unwraps molecules to keep them whole, so a "content" atom can
+  sit anywhere from -0.43 to 1.43 in fractional coordinates — 34 of
+  ferrocene's 42. Feeding those back in as an asymmetric unit re-wraps them
+  (tearing the molecules) and re-runs a completion that has already been
+  defeated by the relocation (round 45d). If a structure has been through the
+  packing, the way to preserve it is to STOP regenerating it, not to find
+  better coordinates to regenerate from.
 - **Two edit-begin hooks, and the chemistry one was not doing the work**
   (round 51). `on_model_edit_begin` is called by the geometry modals; every
   CHEMISTRY edit (element change, draw, bond order, delete) calls

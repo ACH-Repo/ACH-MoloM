@@ -1137,3 +1137,112 @@ class ResolveNameDialog(QDialog):
         self.edit.setText(item.text())
         self.suggestions.setVisible(False)
         self._start_resolve()
+
+
+class SiteOccupancyDialog(QDialog):
+    """Say what a crystallographic SITE is made of.
+
+    The one thing no derivation can recover. A shared position — several
+    species on one Gitterplatz — is destroyed at import before occupancy is
+    ever consulted: `expand`'s minimum-image merge removes the co-located
+    species, so on the solid solution the nitrogen sharing a position with a
+    carbon comes back with multiplicity zero (round 45e). The composition is
+    then only in a table, and a rebuild loses it. Since nothing in the
+    coordinates implies it, the honest answer is to let the user state it —
+    Christian's suggestion.
+
+    Edits apply to the whole symmetry ORBIT, not to the one atom picked: a
+    cubic cell draws a site twenty-four times and nobody would do that
+    twenty-four times over.
+    """
+
+    def __init__(self, parent, parts, label="", n_atoms=1):
+        super().__init__(parent)
+        from ..core import occupancy as occ_mod
+        self._occ = occ_mod
+        self.setWindowTitle("Site occupancy"
+                            + (" — {}".format(label) if label else ""))
+        outer = QVBoxLayout(self)
+        head = QLabel(
+            "Several species on ONE position — a substitutional solid "
+            "solution. Applies to all <b>{}</b> atom(s) of this site."
+            .format(int(n_atoms)))
+        head.setWordWrap(True)
+        head.setTextFormat(Qt.RichText)
+        outer.addWidget(head)
+
+        self._rows = []
+        self.body = QVBoxLayout()
+        self.body.setSpacing(3)
+        outer.addLayout(self.body)
+
+        add = QPushButton("+ Add a species")
+        add.setToolTip("Another element sharing this position")
+        add.clicked.connect(lambda _c=False: self._add_row("", 0.0))
+        outer.addWidget(add)
+
+        self.total = QLabel("")
+        self.total.setWordWrap(True)
+        outer.addWidget(self.total)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok
+                                   | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        outer.addWidget(buttons)
+        self._ok = buttons.button(QDialogButtonBox.Ok)
+
+        for sym, occ in (parts or [("", 1.0)]):
+            self._add_row(sym, occ)
+        self._retotal()
+        self.resize(340, self.sizeHint().height())
+
+    def _add_row(self, symbol, value):
+        row = QHBoxLayout()
+        edit = QLineEdit(str(symbol or ""))
+        edit.setPlaceholderText("element")
+        edit.setMaximumWidth(80)
+        edit.textChanged.connect(lambda _t: self._retotal())
+        spin = QDoubleSpinBox()
+        spin.setRange(0.0, 1.0)
+        spin.setDecimals(3)
+        spin.setSingleStep(0.05)
+        spin.setValue(float(value))
+        spin.valueChanged.connect(lambda _v: self._retotal())
+        gone = QPushButton("✕")
+        gone.setMaximumWidth(28)
+        gone.setToolTip("Remove this species")
+        holder = QWidget()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(edit)
+        row.addWidget(spin, 1)
+        row.addWidget(gone)
+        holder.setLayout(row)
+        entry = (edit, spin, holder)
+        self._rows.append(entry)
+        gone.clicked.connect(lambda _c=False, e=entry: self._drop(e))
+        self.body.addWidget(holder)
+
+    def _drop(self, entry):
+        if entry not in self._rows:
+            return
+        self._rows.remove(entry)
+        entry[2].setParent(None)
+        entry[2].deleteLater()
+        self._retotal()
+
+    def parts(self):
+        """`[(element, occupancy), ...]`, cleaned. Unreadable symbols are
+        dropped by `normalise`, which is also what validates them."""
+        return self._occ.normalise(
+            [(e.text(), s.value()) for e, s, _h in self._rows])
+
+    def _retotal(self):
+        parts = self.parts()
+        note = self._occ.total_note(parts)
+        over = self._occ.total(parts) > 1.0 + 1e-6
+        self.total.setText(note or "Nothing entered — the site becomes an "
+                                   "ordinary full atom.")
+        self.total.setStyleSheet("color: #e08a6a;" if over else "")
+        if self._ok is not None:
+            self._ok.setEnabled(not over)
