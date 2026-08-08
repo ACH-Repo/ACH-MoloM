@@ -142,6 +142,25 @@ def cell_of(obj):
         return None
 
 
+def _with_boundary_copies(obj, rows):
+    """(rows plus every drawn image of them, how many were added).
+
+    An atom lying on a cell face is DRAWN twice, once per face, and one at a
+    corner eight times — correct, and what every crystallography viewer does.
+    But they are independent entries in the atom list, so changing one used to
+    leave the others saying something else: on ZIF-8, atom 0 has a copy at
+    index 348, and one face of the cell read F while the opposite face still
+    read H. An edit is made to a SITE, not to whichever image was clicked.
+    """
+    from ..core import packing as packing_mod
+    rows = sorted({int(i) for i in rows})
+    meta = getattr(obj.structure, "metadata", None) or {}
+    if not meta.get("content_of"):
+        return rows, 0
+    full = packing_mod.images_of(meta, rows, obj.structure.n_atoms)
+    return full, len(full) - len(rows)
+
+
 def is_crystal(obj):
     """Does this object carry a unit cell?
 
@@ -1071,10 +1090,22 @@ class MolViewport(QOpenGLWidget):
                     continue
                 if value:
                     out[key] = bytes(value).decode("utf-8", "replace")
+            # The AUTHORITATIVE sample count, from the framebuffer that is
+            # actually bound. `format().samples()` is NOT it: a QOpenGLWidget
+            # renders into an FBO of Qt's making and the surface format
+            # describes the window rather than that FBO, so it reads 0 on a
+            # perfectly multisampled context. Believing it cost a round —
+            # 4x MSAA was reported as missing while `GL_SAMPLES` said 4.
+            try:
+                out["samples"] = int(GL.glGetIntegerv(GL.GL_SAMPLES))
+                out["sample_buffers"] = int(
+                    GL.glGetIntegerv(GL.GL_SAMPLE_BUFFERS))
+            except Exception:
+                pass
         finally:
             self.doneCurrent()
         fmt = self.format()
-        out["samples"] = fmt.samples()
+        out["requested_samples"] = default_surface_format().samples()
         out["profile"] = ("core"
                           if fmt.profile() == QSurfaceFormat.CoreProfile
                           else "compatibility")
@@ -1646,6 +1677,7 @@ class MolViewport(QOpenGLWidget):
         if obj is not None and rows:
             self._begin_edit()
             crystal = is_crystal(obj)
+            rows, copies = _with_boundary_copies(obj, rows)
             added, removed = edits.set_element_adjusted(
                 obj.structure, rows, symbol,
                 adjust_h=self.adjust_h and not crystal,
@@ -1656,9 +1688,11 @@ class MolViewport(QOpenGLWidget):
             # atoms (Christian's report — draw an Li, pick Cd, lose the Li).
             self.set_selection([])
             self.status_message.emit(
-                "{} atom(s) -> {}{}   (draw element is now {}){}".format(
+                "{} atom(s) -> {}{}   (draw element is now {}){}{}".format(
                     len(rows), symbol, _h_note(added, removed), symbol,
-                    "   — geometry left alone (crystal)" if crystal else ""))
+                    "   — geometry left alone (crystal)" if crystal else "",
+                    "   + {} boundary copy/copies".format(copies)
+                    if copies else ""))
             self.edit_committed.emit()
         else:
             self.status_message.emit("Draw element: {}".format(symbol))
@@ -1684,8 +1718,9 @@ class MolViewport(QOpenGLWidget):
                 return
             self._begin_edit()
             crystal = is_crystal(obj)
+            targets, _copies = _with_boundary_copies(obj, [idx])
             added, removed = edits.set_element_adjusted(
-                obj.structure, [idx], self.draw_element,
+                obj.structure, targets, self.draw_element,
                 adjust_h=self.adjust_h and not crystal,
                 adjust_lengths=not crystal)
             self.status_message.emit("{} -> {}{}{}".format(
@@ -3169,6 +3204,29 @@ class MolViewport(QOpenGLWidget):
         GL.glDepthMask(GL.GL_TRUE)
 
     # ------------------------------------------------------------ 2D overlays
+    def _paint_export_overlays(self, image, view, proj, w, h):
+        """The cell box and labels onto an EXPORTED image.
+
+        The overlay painters all work in widget coordinates (they project
+        through `self.width()`/`height()`), so the painter is scaled by the
+        resolution multiplier rather than the painters being rewritten to
+        take a size. That keeps ONE implementation of where the cell box goes
+        — two would drift, and the export disagreeing with the screen is the
+        round-37 rule.
+        """
+        p = QPainter(image)
+        try:
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setRenderHint(QPainter.TextAntialiasing)
+            p.scale(float(w) / max(self.width(), 1),
+                    float(h) / max(self.height(), 1))
+            if self.show_cell:
+                self._paint_cells(p)
+            self._paint_symmetry(p)
+            self._paint_labels(p)
+        finally:
+            p.end()
+
     def _paint_overlays(self, view, proj, empty):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
@@ -4909,7 +4967,8 @@ class MolViewport(QOpenGLWidget):
             self._orbit_input(-dx, -dy, cursor_pos=ev.position())
         self.update()
 
-    def render_image(self, scale=None, subdiv_bonus=None, transparent=True):
+    def render_image(self, scale=None, subdiv_bonus=None,
+                     transparent=True, furniture=False):
         """Offscreen render for image export.
 
         Differs from a framebuffer grab in three ways that matter for a
@@ -4917,6 +4976,12 @@ class MolViewport(QOpenGLWidget):
         selection halos — none of it belongs in a published image), finer
         meshes (the interactive icosphere is deliberately cheap), and a
         resolution multiplier. Returns a QImage.
+
+        `furniture` puts back the things a FIGURE usually does not want but an
+        ANIMATION often does — the unit cell box above all, since a crystal
+        rotating inside nothing is hard to read. It is deliberately not the
+        default: round 13 excluded them because a published still is better
+        without them, and that has not changed.
         """
         from PySide6.QtGui import QImage
         from PySide6.QtOpenGL import (QOpenGLFramebufferObject,
@@ -4966,7 +5031,18 @@ class MolViewport(QOpenGLWidget):
                                   1, GL.GL_TRUE, proj)
             self._sphere.draw()
             self._cylinder.draw()
-            image = fbo.toImage()
+            if furniture:
+                self._draw_occupancy(view, proj)
+                self._draw_lines(self._wire_lines, view, proj)
+                self._draw_polyhedra(view, proj)
+                # The cell box and the labels are QPainter overlays, so they
+                # go on AFTER the GL passes and against the FBO's image —
+                # painting into the FBO directly would need a paint device
+                # this function does not own.
+                image = fbo.toImage()
+                self._paint_export_overlays(image, view, proj, w, h)
+            else:
+                image = fbo.toImage()
         finally:
             fbo.release()
             self._sphere, self._cylinder = saved

@@ -26,7 +26,9 @@ from ..core import modifiers as modifiers_mod
 from ..core import (bonding, edits, input_map, internal, io, measure, project,
                     rotations)
 from ..core import cif as cif_mod
+from ..core import animation as anim_mod
 from ..core import cif_write
+from ..core import packing as packing_mod
 from ..core import coplanar
 from ..core import spacegroups
 from ..core import templates as tpl_mod
@@ -41,7 +43,8 @@ from ..core.structure import Structure
 from ..core import style as style_mod
 from ..core.undo import UndoStack
 from .choice_popup import ChoicePopup
-from .dialogs import (BlenderExportDialog, MetaAtomDialog,
+from .dialogs import (AnimationExportDialog, BlenderExportDialog,
+                      MetaAtomDialog,
                       SiteOccupancyDialog,
                       OperatorSearchDialog, ResolveNameDialog, SettingsDialog)
 from .crystal_ribbon import CrystalRibbon
@@ -716,6 +719,12 @@ class MainWindow(QMainWindow):
           category="Crystal", aliases=("occupancy", "solid solution",
                                        "shared site", "mixed", "doping",
                                        "substitution", "pie", "partial"))
+        r("export_animation", "Export the animation (PNG sequence or video)",
+          lambda c: c.on_export_animation(),
+          enabled=lambda c: c.timeline.duration > 0.0,
+          category="File", shortcut="Ctrl+Shift+A", key="Ctrl+Shift+A",
+          aliases=("movie", "video", "mp4", "gif", "render", "frames",
+                   "trajectory", "playback", "sequence"))
         r("graphics_info", "Report the graphics device (which GPU is drawing)",
           lambda c: c.on_graphics_info(), category="App",
           aliases=("gpu", "opengl", "renderer", "driver", "video card",
@@ -3610,6 +3619,12 @@ class MainWindow(QMainWindow):
             if obj is None:
                 continue
             rows = [i for o, i in sel if o == obj_id]
+            # A boundary copy is the same crystallographic atom, so deleting
+            # one deletes them all — leaving the copies behind is exactly the
+            # desynchronisation that made an edited packed cell disagree with
+            # itself across its own faces.
+            rows = packing_mod.images_of(obj.structure.metadata or {}, rows,
+                                         obj.structure.n_atoms)
             # take the hanging hydrogens with them
             edits.delete_atoms(obj.structure, rows, with_hydrogens=True)
             meta_mod.prune(obj.structure)
@@ -4436,6 +4451,125 @@ class MainWindow(QMainWindow):
             "from it, so the space group is kept.".format(obj.name, note),
             8000)
 
+    def on_export_animation(self):
+        """Seek, render, write — the scene clock as a file.
+
+        Everything needed was already here: the clock steps deterministically
+        and `render_image` renders one frame offscreen at a resolution
+        multiplier. What this adds is the frame PLAN (`core/animation.py`),
+        which is where the mistakes live — an off-by-one at a loop boundary
+        makes a video that hitches once per cycle and is invisible in any
+        single frame.
+        """
+        clock = self.timeline
+        if clock.duration <= 0.0:
+            self.statusBar().showMessage(
+                "Nothing to animate — open a trajectory, or bake a "
+                "vibrational mode from the modes page", 7000)
+            return
+        vp = self.viewport
+        times = anim_mod.frame_times(clock)
+        have_video = anim_mod.video_available()
+        dlg = AnimationExportDialog(self, len(times), clock.fps,
+                                    (vp.width(), vp.height()), have_video)
+        if not dlg.exec():
+            return
+        opts = dlg.options()
+        times = anim_mod.frame_times(clock, loops=opts["loops"])
+        if not times:
+            return
+        start = self.settings.value("last_dir", "")
+        base = (os.path.splitext(os.path.basename(self.project_path))[0]
+                if self.project_path else "molom")
+        suffix = ".png" if opts["format"] == anim_mod.FORMAT_PNG \
+            else "." + opts["format"]
+        path, _f = QFileDialog.getSaveFileName(
+            self, "Export animation", os.path.join(start, base + suffix),
+            "Animation (*{})".format(suffix))
+        if not path:
+            return
+        self.settings.setValue("last_dir", os.path.dirname(path))
+        try:
+            written, message = self.write_animation(path, times, opts)
+        except Exception as e:                # a long render must not vanish
+            QMessageBox.critical(self, "Animation export failed", str(e))
+            return
+        if written:
+            self.statusBar().showMessage(message, 15000)
+        else:
+            QMessageBox.warning(self, "Animation export", message)
+
+    def write_animation(self, path, times, opts, progress=True):
+        # type: (str, list, dict, bool) -> tuple
+        """Render `times` and write them out. Split from the dialog plumbing
+        so the whole export is testable without a file dialog."""
+        vp = self.viewport
+        where = anim_mod.plan(path, opts["format"], len(times))
+        directory = where["directory"] or "."
+        if where["format"] == anim_mod.FORMAT_PNG:
+            os.makedirs(where["path"], exist_ok=True)
+            directory = where["path"]
+        elif directory and not os.path.isdir(directory):
+            os.makedirs(directory)
+        # A video is assembled from a sequence, so the frames go to a scratch
+        # folder beside the output and are cleared afterwards. Writing PNGs
+        # and encoding from them (rather than piping raw frames) means a
+        # failed encode still leaves every rendered frame on disk.
+        temp = None
+        if where["format"] != anim_mod.FORMAT_PNG:
+            temp = os.path.join(directory or ".",
+                                "." + where["base"] + "_frames")
+            os.makedirs(temp, exist_ok=True)
+            directory = temp
+        keep = clock_time = self.timeline.time
+        n = 0
+        width, height = opts["size"]
+        scale = max(width / max(vp.width(), 1), height / max(vp.height(), 1))
+        try:
+            if progress:
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+            for index, when in enumerate(times):
+                self.timeline.seek(when)
+                self._apply_timeline()
+                image = vp.render_image(scale=max(scale, 1.0),
+                                        transparent=opts["transparent"],
+                                        furniture=opts["furniture"])
+                image = image.scaled(int(width), int(height),
+                                     Qt.IgnoreAspectRatio,
+                                     Qt.SmoothTransformation)
+                out = anim_mod.sequence_path(directory, where["base"], index,
+                                             where["digits"])
+                if not image.save(out):
+                    raise IOError("could not write " + out)
+                n += 1
+                if progress and index % 5 == 0:
+                    self.statusBar().showMessage(
+                        "Rendering {} / {}...".format(index + 1, len(times)))
+                    QApplication.processEvents()
+        finally:
+            if progress:
+                QApplication.restoreOverrideCursor()
+            self.timeline.seek(keep)
+            self._apply_timeline()
+        if where["format"] == anim_mod.FORMAT_PNG:
+            return True, "Wrote {} frame(s) to {}".format(
+                n, os.path.basename(where["path"]))
+        pattern = anim_mod.sequence_path(directory, where["base"], 0,
+                                         where["digits"]).replace(
+                                             "_{:0{}d}".format(
+                                                 0, where["digits"]),
+                                             "_%0{}d".format(where["digits"]))
+        ok, note = anim_mod.encode(pattern, where["path"], opts["fps"],
+                                   where["format"])
+        if ok:
+            import shutil as _sh
+            if temp:
+                _sh.rmtree(temp, ignore_errors=True)
+            return True, "Wrote {} ({} frames at {:g} fps)".format(
+                os.path.basename(where["path"]), n, opts["fps"])
+        return False, ("The {} frames rendered to\n{}\n\nbut the encode "
+                       "failed:\n\n{}".format(n, directory, note))
+
     def on_graphics_info(self):
         """Which GPU is drawing the viewport, and at what GL version.
 
@@ -4457,6 +4591,8 @@ class MainWindow(QMainWindow):
                                    info[k])
             for k in ("renderer", "vendor", "version", "glsl", "profile",
                       "samples") if k in info)
+        body += ("<br><i>Samples is the LIVE multisampling of the framebuffer "
+                 "being drawn into, not what the surface format claims.</i>")
         QMessageBox.information(
             self, "Graphics device",
             "MoloM draws through OpenGL, so the viewport runs on the GPU "

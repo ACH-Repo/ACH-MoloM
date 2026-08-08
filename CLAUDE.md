@@ -56,6 +56,51 @@ the operator key table, CIF reading with symmetry, coordination polyhedra,
 meta atoms, the scene clock with a multi-track timeline, vibrational modes,
 per-element display control, and the symmetry modifier. 512 tests.
 
+Round 54 (2026-08-09, the animation export, copies that follow, and a
+CORRECTION):
+**(0) I was wrong about MSAA, and the retraction is the useful part.** Round
+53 reported "4x multisampling requested but NOT granted" on the strength of
+`format().samples()` returning 0. That property describes the WINDOW, and a
+QOpenGLWidget renders into an FBO of Qt's own making — so it reads 0 on a
+perfectly multisampled context. Queried properly from inside the live context,
+`GL_SAMPLES` is **4** and `GL_SAMPLE_BUFFERS` is **1**: MSAA has been on all
+along, and `render_image` sets `setSamples(4)` on its own FBO too, so exports
+have it as well. `graphics_info()` now reports the framebuffer's real count
+and labels it as such. Nothing needed fixing; only the instrument was wrong.
+**(1) ANIMATION EXPORT** (`core/animation.py`, `Ctrl+Shift+A`) — the roadmap's
+1d, asked for on 2026-08-02: "it sucks to have nice animations in a viewport
+but not being able to render them". The pieces all existed (a clock that steps
+deterministically, `render_image` at a resolution multiplier), so the export is
+seek/render/write and the real work is the frame PLAN. **A PNG sequence is the
+primary format and takes no dependency**; video is the optional tier through
+`imageio-ffmpeg`, with a system `ffmpeg` preferred where there is one. The
+frames are always written as a numbered sequence and the video encoded FROM
+them, so a failed encode still leaves every rendered frame on disk.
+Three decisions worth keeping: **the last image of a loop is dropped** (it is
+the same picture as the first of the next, and keeping it hitches once per
+revolution — invisible in any single frame, which is why it is a test); **the
+plan follows the transport bar's own loop range**, since an independent export
+range would be two sources of truth for one interval; and a sequence goes into
+a FOLDER named after the chosen file rather than beside it. `render_image`
+gained `furniture=` — a still figure is better without the cell box, an
+animation of a rotating crystal is not — and the overlays are painted onto the
+exported QImage through a SCALED painter, so there is still one implementation
+of where the cell box goes. Verified end to end: a 12-frame spin exported 33
+PNGs and a 28 kB MP4, with the scratch folder cleaned up and the playhead put
+back where it was.
+**(2) An edit to a packed crystal now reaches its own COPIES** (round-49 item
+3, properly). An atom on a cell face is drawn twice and one at a corner eight
+times, as independent entries in the atom list — so changing one left the
+others as they were, and one face of the cell said F while the opposite face
+still said H. `packing.pack` now records `content_of` (which cell-content atom
+each drawn atom is an image of) and `images_of` turns that into the set to
+edit. Element changes and deletions both go through it. Measured on ferrocene:
+one H -> F changes 8 drawn atoms, deleting an Fe removes all of its images.
+Where there is no mapping the input is returned unchanged — without it there
+is nothing to say two atoms are the same SITE rather than merely the same
+element, and guessing would silently change atoms nobody selected.
+1176 tests.
+
 Round 53 (2026-08-09, VESTA's sheen, and three things that were hiding):
 **(1) A SPECULAR highlight on the coordination polyhedra**, Christian's
 request — "shows up when you rotate the view so that the normal of a face is
@@ -100,13 +145,10 @@ RX 7900 XTX**, i.e. the discrete card. Found while adding it:
 anything else that builds a window — the smoke tool, a test, an embedder — got
 the driver default (compatibility profile, no multisampling).
 `MolViewport.__init__` now calls `setFormat` itself.
-**MEASURED AND STILL OPEN: multisampling is requested but NOT granted.** The
-format asks for 4 samples and the live context reports `samples: 0` on this
-machine, so the 4x MSAA CLAUDE.md has claimed since round 1 is not actually
-happening. QOpenGLWidget renders into an FBO and the sample count is not being
-honoured; fixing it means an explicit multisample FBO with a resolve blit.
-Worth doing — it is the cheapest available improvement to how the viewport
-looks — but it is its own piece of work.
+**~~MEASURED AND STILL OPEN: multisampling is requested but NOT granted.~~
+WRONG, retracted in round 54**: `format().samples()` describes the window, not
+the FBO a QOpenGLWidget draws into. `GL_SAMPLES` from inside the context is 4.
+MSAA was on the whole time.
 1157 tests.
 
 Round 52 (2026-08-08, Christian's second MOF-5 batch — an edited cell is P1,
@@ -2068,7 +2110,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1157 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1176 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -2217,6 +2259,11 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   is the separated aiming mark. Roll is an explicit angle here and an explicit
   PARAMETER on `Camera.fly_look`, applied after the azimuth/elevation rebuild
   so it can never accumulate; pitch is still clamped short of vertical.
+- `core/animation.py` — the scene clock as a FILE (round 54). `frame_times`
+  is the plan and is where the mistakes live (a repeated loop boundary hitches
+  once per cycle and is invisible in a single frame); PNG sequences need no
+  dependency, video goes through ffmpeg and is always encoded FROM a written
+  sequence so a failed encode still leaves the frames.
 - `core/blender_export.py` — the scene as a Blender BUILD SCRIPT: geometry
   (following `viewport._rebuild`'s rules exactly — modifier output, per-atom
   colours/sizes, hidden atoms, the multi-bond layout), **coordination
@@ -2338,6 +2385,12 @@ independent cross-check inside a single fixture.
   vector then spin so the backbone points outward.
 
 ## Hard-won gotchas (don't re-learn these)
+- **`format().samples()` is not the sample count** (round 54). It describes
+  the window; a QOpenGLWidget draws into an FBO Qt owns, so it reads 0 on a
+  fully multisampled context. `glGetIntegerv(GL_SAMPLES)` from inside the
+  live context is the only answer that means anything — and reporting the
+  wrong one cost a round and a false claim in this file. Whenever a GL
+  capability looks missing, query the FRAMEBUFFER, not the surface format.
 - **An additive blend accumulates ALPHA as well as colour** (round 53), which
   is invisible on screen and wrong in every export. The symptom is not subtle
   once you look for it: a grabbed frame came back with the whole solid scaled

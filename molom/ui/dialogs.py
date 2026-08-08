@@ -1246,3 +1246,130 @@ class SiteOccupancyDialog(QDialog):
         self.total.setStyleSheet("color: #e08a6a;" if over else "")
         if self._ok is not None:
             self._ok.setEnabled(not over)
+
+
+class AnimationExportDialog(QDialog):
+    """Pre-configure an animation export: format, size, speed, how many loops.
+
+    A PNG SEQUENCE is the default and takes no dependency — it works
+    everywhere, it is what feeds Blender or a journal, and a failed export
+    leaves the frames that did render rather than a corrupt container. Video
+    is offered only when there is an ffmpeg to do it, and says so when there
+    is not, rather than failing at the end of a long render.
+    """
+
+    def __init__(self, parent, n_images=0, fps=30.0, size=(1280, 720),
+                 have_video=True):
+        super().__init__(parent)
+        from ..core import animation as anim
+        self._anim = anim
+        self.setWindowTitle("Export animation")
+        form = QFormLayout(self)
+
+        self.head = QLabel("")
+        self.head.setWordWrap(True)
+        form.addRow(self.head)
+
+        self.format_combo = QComboBox()
+        self.format_combo.addItem("PNG image sequence (a folder of frames)",
+                                  anim.FORMAT_PNG)
+        self.format_combo.addItem("MP4 video (H.264)", anim.FORMAT_MP4)
+        self.format_combo.addItem("Animated GIF", anim.FORMAT_GIF)
+        if not have_video:
+            for row in (1, 2):
+                self.format_combo.model().item(row).setEnabled(False)
+        self.format_combo.setToolTip(
+            "A sequence is the safe choice and needs nothing installed. "
+            "Video goes through ffmpeg - the `imageio-ffmpeg` wheel brings a "
+            "self-contained one, so there is nothing to install system-wide.")
+        self.format_combo.currentIndexChanged.connect(self._refresh)
+        form.addRow("Format:", self.format_combo)
+
+        res = QHBoxLayout()
+        self.res_x = QSpinBox()
+        self.res_x.setRange(64, 8192)
+        self.res_x.setValue(int(size[0]))
+        self.res_y = QSpinBox()
+        self.res_y.setRange(64, 8192)
+        self.res_y.setValue(int(size[1]))
+        for box in (self.res_x, self.res_y):
+            box.valueChanged.connect(self._refresh)
+        res.addWidget(self.res_x)
+        res.addWidget(QLabel("x"))
+        res.addWidget(self.res_y)
+        form.addRow("Resolution:", res)
+        self.res_note = QLabel("")
+        self.res_note.setWordWrap(True)
+        form.addRow("", self.res_note)
+
+        self.fps = QDoubleSpinBox()
+        self.fps.setRange(1.0, 240.0)
+        self.fps.setValue(float(fps))
+        self.fps.setSuffix(" fps")
+        self.fps.setToolTip(
+            "Playback rate of the FILE. The scene clock decides how many "
+            "images there are; this decides how fast they go past.")
+        self.fps.valueChanged.connect(self._refresh)
+        form.addRow("Frame rate:", self.fps)
+
+        self.loops = QDoubleSpinBox()
+        self.loops.setRange(0.25, 100.0)
+        self.loops.setValue(1.0)
+        self.loops.setSingleStep(0.5)
+        self.loops.setToolTip(
+            "How many times round the loop. The last image of a cycle is "
+            "dropped, since it is the same picture as the first of the next - "
+            "keeping it makes a hitch once per revolution.")
+        self.loops.valueChanged.connect(self._refresh)
+        form.addRow("Loops:", self.loops)
+
+        self.furniture = QCheckBox("Include the unit cell box and labels")
+        self.furniture.setToolTip(
+            "Off renders the molecule alone on a transparent background, "
+            "which is what a figure usually wants. On keeps what the viewport "
+            "draws around it.")
+        form.addRow("", self.furniture)
+
+        self.transparent = QCheckBox("Transparent background")
+        self.transparent.setChecked(True)
+        self.transparent.toggled.connect(self._refresh)
+        form.addRow("", self.transparent)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok
+                                   | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Choose file...")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+        self._n_images = int(n_images)
+        self._have_video = bool(have_video)
+        self._refresh()
+
+    def _refresh(self, *_a):
+        fmt = self.format_combo.currentData()
+        total = max(int(round(self._n_images * self.loops.value())), 1)
+        bits = [self._anim.summarise(total, self.fps.value(), fmt)]
+        if not self._have_video:
+            bits.append("No ffmpeg found, so only a PNG sequence can be "
+                        "written. `pip install imageio-ffmpeg` adds video.")
+        self.head.setText("  ".join(bits))
+        # H.264 refuses odd dimensions, with a message nobody reads to the end
+        odd = fmt in self._anim.EVEN_DIMENSIONS and (
+            self.res_x.value() % 2 or self.res_y.value() % 2)
+        self.res_note.setText(
+            "H.264 needs even dimensions — {} x {} will be used."
+            .format(self._anim.even(self.res_x.value()),
+                    self._anim.even(self.res_y.value())) if odd else "")
+        # a transparent background cannot survive an MP4
+        self.transparent.setEnabled(fmt != self._anim.FORMAT_MP4)
+
+    def options(self):
+        fmt = self.format_combo.currentData()
+        w, h = self.res_x.value(), self.res_y.value()
+        if fmt in self._anim.EVEN_DIMENSIONS:
+            w, h = self._anim.even(w), self._anim.even(h)
+        return {"format": fmt, "size": (w, h), "fps": self.fps.value(),
+                "loops": self.loops.value(),
+                "furniture": self.furniture.isChecked(),
+                "transparent": (self.transparent.isChecked()
+                                and fmt != self._anim.FORMAT_MP4)}

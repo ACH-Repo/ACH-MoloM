@@ -84,6 +84,13 @@ def pack(data, disorder=None, outside=True, grow_from_copies=False, tol=0.1):
     # nothing, and only this number can say whether an edit has since added or
     # removed an atom.
     meta["packed_n"] = len(out_symbols)
+    # WHICH CELL-CONTENT ATOM each drawn atom is an image of. The boundary
+    # copies are otherwise indistinguishable from independent atoms — on
+    # ZIF-8, drawn atom 0 has a copy at index 348 and changing one used to
+    # leave the other as it was, so one face of the cell said F and the
+    # opposite face still said H. This is what lets an edit reach every image
+    # of the site it was made on (`images_of`).
+    meta["content_of"] = [int(i) for i in source]
     # `complete_molecules` REORDERS and duplicates, so anything keyed by the
     # content index has to be remapped through `source` — an index-based map
     # carried across it silently describes the wrong atoms.
@@ -99,6 +106,33 @@ def pack(data, disorder=None, outside=True, grow_from_copies=False, tol=0.1):
         if table:
             meta["site_occupancy"] = table
     return out_symbols, out_frac @ cell.matrix(), out_bonds, meta
+
+
+def images_of(meta, indices, n_atoms):
+    # type: (dict, object, int) -> list
+    """Every drawn atom that is the same CELL-CONTENT atom as one of these.
+
+    A packed crystal draws an atom on a cell face twice and one on a corner
+    eight times, as independent entries in the atom list — so an edit made on
+    one of them left the others saying something else, which is the
+    desynchronisation Christian hit. `content_of` records which content atom
+    each drawn atom is an image of, so the images are a lookup.
+
+    Returns the input unchanged when there is no mapping (an unpacked
+    structure, or one edited since): without it there is nothing to say two
+    atoms are the same site rather than merely the same element, and guessing
+    would silently change atoms nobody selected.
+    """
+    wanted = sorted({int(i) for i in indices})
+    mapping = (meta or {}).get("content_of") or []
+    if not mapping or len(mapping) < n_atoms:
+        return wanted
+    sources = {int(mapping[i]) for i in wanted
+               if 0 <= i < len(mapping) and int(mapping[i]) >= 0}
+    if not sources:
+        return wanted
+    return sorted(set(wanted) | {i for i in range(min(n_atoms, len(mapping)))
+                                 if int(mapping[i]) in sources})
 
 
 def boundary_instances(frac, tol=1e-6):
