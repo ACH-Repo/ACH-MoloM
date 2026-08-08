@@ -121,7 +121,20 @@ midtones toward grey, AgX replaced it in 4.0 and keeps the colour. Measured
 here too, AgX + High Contrast holds more saturation (0.190) and more contrast
 (0.160) than Filmic + High Contrast (0.187 / 0.157). **"Punchy" is a trap** —
 it came out DARKER (mean 0.405 against 0.531) and bought no contrast back.
-1118 tests.
+**And the round-50 leftover, done: OCCUPANCY now survives a re-derivation.**
+`packing.pack` already recorded `site_of` — which asymmetric-unit site each
+DRAWN atom came from — so a rebuilt cell can be looked up in the old column
+rather than written as fully occupied. Used in two places, `cif_write.
+_site_columns`: by the writer's `cell` policy, and by
+`resync_derived_asymmetric_unit`, which used to drop the columns outright.
+Measured on the solid solution: editing one O to N re-derives P4_2/mnm as
+Amm2 and the exported file still carries Nb at 0.5 rather than claiming 1.0.
+`site_of` is DROPPED afterwards, because it described the unit that has just
+been replaced (round 42's rule about a per-atom map surviving a renumbering),
+and where there is no mapping at all the column goes and the loss is reported
+— a mis-indexed occupancy being worse than none. Two round-50/51 tests
+asserted the old "occupancy is lost" behaviour and moved with the code, which
+is round 38's lesson about fixtures again. 1120 tests.
 
 Round 50 (2026-08-08, the round-49 list, top to bottom): four of the five
 items, on the DESKTOP PC. **(0) The polyhedra perf item was real and it was
@@ -1940,7 +1953,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1118 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1120 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -3158,16 +3171,16 @@ paint path but it need not have been the only one.
 
 ~~1. The Blender export drops COORDINATION POLYHEDRA.~~ **DELIVERED round 50.**
 
-~~2. There is NO CIF WRITER.~~ **DELIVERED round 50** (`core/cif_write.py`).
-Still open on it: **occupancy is lost whenever the symmetry has to be
-re-derived**, because a drawn atom does not know which site it came from once
-the cell has been rebuilt. The fix is a site index carried per drawn atom
-through `packing.pack` — round 45e's `report["site_of"]` is exactly that
-mapping for the expansion path, so the work is threading it through the packed
-one and keeping it valid across the boundary completion (round 42's "build the
-map AFTER everything that renumbers" applies). Also worth doing once there is
-a test set: run every CIF on the machine through read -> write -> read and
-diff, which is a stronger check than the two vendored fixtures can give.
+~~2. There is NO CIF WRITER.~~ **DELIVERED round 50** (`core/cif_write.py`),
+and round 51 closed its one gap: occupancy now survives a re-derivation, via
+the `site_of` map `packing.pack` was already recording. Still worth doing once
+there is a test set: run every CIF on the machine through read -> write -> read
+and diff, which is a stronger check than the two vendored fixtures can give.
+And note what a re-derivation still cannot recover — a SHARED site whose other
+species were merged away at import (round 45e's ordering flaw): the solid
+solution exports Nb 0.5 twice rather than Nb/Ti/Ni/Co, because Ti, Ni and Co
+are not in the drawn structure to begin with. The unedited path writes all
+four correctly, since it writes the stored asymmetric unit verbatim.
 
 ~~3. Editing a PACKED crystal desynchronises the boundary copies.~~
 **FLAGGED, not fixed, in round 50**: the edit now says so once per object and

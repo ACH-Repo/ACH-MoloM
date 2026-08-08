@@ -203,8 +203,25 @@ def test_an_edit_re_derives_the_symmetry_instead_of_keeping_it(tmp_path):
     path, report = _write(obj, tmp_path)
     assert report["policy"] == cif_write.POLICY_CELL
     assert report["symops"] == 1                    # P1: the symmetry is gone
-    assert report["occupancy_lost"] is True         # ...and it says so
     assert io.read_structures(path)                 # still a readable crystal
+    # ...and the OCCUPANCIES survive it: `packing.pack` records which
+    # asymmetric-unit site each drawn atom came from, so a rebuilt cell can
+    # still say what its occupancies were. (Round 50 wrote 1.0 here and said
+    # so; carrying them is strictly better and this test moved with it.)
+    assert report.get("occupancy_lost") is None
+    written = cif.parse_cif(open(path, encoding="utf-8").read())
+    assert any(o < 1.0 for o in written.occupancy)
+
+
+def test_occupancy_is_only_declared_lost_when_it_really_is(tmp_path):
+    """With no `site_of` mapping there is nothing to look the occupancies up
+    in, and saying 1.0 is then a claim — so it is reported."""
+    obj = _load(OXIDE)
+    obj.structure.metadata.pop("site_of")
+    obj.structure.frames[0][0] += np.array([0.31, 0.17, 0.09])
+    _path, report = _write(obj, tmp_path)
+    assert report["policy"] == cif_write.POLICY_CELL
+    assert report["occupancy_lost"] is True
 
 
 def test_an_unedited_cell_keeps_the_files_own_operators(tmp_path):

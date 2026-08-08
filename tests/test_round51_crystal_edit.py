@@ -118,17 +118,36 @@ def test_the_re_derived_unit_matches_the_re_derived_operators(win):
     assert len(meta["asym_frac"]) == n_asym
 
 
-def test_stale_parallel_columns_are_dropped_not_reindexed(win):
-    """Occupancies and disorder labels described the OLD sites. A silently
-    mis-indexed occupancy is worse than none (round 43e)."""
+def test_the_parallel_columns_are_looked_up_not_sliced(win):
+    """Occupancies described the OLD sites, so they cannot be sliced — but
+    they need not be thrown away either: `packing.pack` records which
+    asymmetric-unit site each drawn atom came from, so each new
+    representative can be looked up in the old column. Without it, a
+    re-exported solid solution silently claims full occupancy."""
     win.open_path(OXIDE)
     obj = win._active_obj()
-    assert obj.structure.metadata.get("asym_occupancy")
+    before = list(obj.structure.metadata["asym_occupancy"])
+    assert any(o < 1.0 for o in before)
     _change_element(win, obj, _first(obj.structure.symbols, "O"), "N")
     meta = win.scene.get(obj.id).structure.metadata
-    for key in ("asym_occupancy", "asym_disorder_groups",
-                "asym_disorder_assemblies", "asym_labels"):
-        assert key not in meta, key
+    after = meta["asym_occupancy"]
+    assert len(after) == len(meta["asym_symbols"])
+    assert any(o < 1.0 for o in after)         # the partial site survived
+    assert set(after) <= set(before)           # ...and no value was invented
+    # `site_of` described the unit that has just been replaced, so nothing
+    # downstream may believe it any more (round 42's renumbering rule).
+    assert "site_of" not in meta
+
+
+def test_a_column_with_no_mapping_is_dropped_not_guessed(win):
+    """A silently mis-indexed occupancy is worse than none (round 43e)."""
+    win.open_path(OXIDE)
+    obj = win._active_obj()
+    obj.structure.metadata.pop("site_of")
+    _change_element(win, obj, _first(obj.structure.symbols, "O"), "N")
+    meta = win.scene.get(obj.id).structure.metadata
+    assert "asym_occupancy" not in meta
+    assert len(meta["asym_symbols"]) == len(meta["asym_frac"])
 
 
 def test_editing_the_asymmetric_unit_still_keeps_the_group(win):

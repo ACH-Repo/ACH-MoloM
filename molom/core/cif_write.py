@@ -385,12 +385,18 @@ def from_object(obj, policy=None, version="", report=None):
             report["spacegroup"] = spacegroup
             report["symops"] = len(symops)
             report["n_sites"] = len(reps)
-            # Occupancy cannot be carried here: a drawn atom does not know
-            # which site it came from once the cell has been rebuilt. Saying
-            # 1.0 is a claim, so it is reported rather than left silent.
-            if any(float(o) < 1.0 for o in (meta.get("asym_occupancy") or ())):
-                notes.append("Partial occupancies were NOT carried over; "
-                             "every site is written as fully occupied.")
+            # Occupancy DOES survive here, as long as the drawn atoms still
+            # know which asymmetric-unit site they came from — which is
+            # exactly what `packing.pack` records in `site_of`. Carrying it is
+            # the difference between a re-exported solid solution and one that
+            # silently claims full occupancy for every species on a shared
+            # site. Where the mapping is absent (an edit that added atoms, a
+            # non-packed import) it is REPORTED rather than guessed at.
+            columns, missing = _site_columns(meta, reps, len(symbols))
+            if missing:
+                notes.append("Partial occupancies could not be carried for "
+                             "every site; those are written as fully "
+                             "occupied.")
                 report["occupancy_lost"] = True
             return cif_text(
                 cell, [content_symbols[i] for i in reps],
@@ -398,7 +404,7 @@ def from_object(obj, policy=None, version="", report=None):
                 spacegroup=spacegroup, name=name,
                 it_number=int(derived.number or 0) if not same
                 else int(meta.get("it_number") or 0),
-                info=info, notes=notes, version=version)
+                info=info, notes=notes, version=version, **columns)
 
     if chosen != POLICY_P1:
         notes.append("No space group could be derived from the coordinates; "
@@ -409,6 +415,45 @@ def from_object(obj, policy=None, version="", report=None):
     report["n_sites"] = len(content_symbols)
     return cif_text(cell, content_symbols, content_frac, name=name,
                     info=info, notes=notes, version=version)
+
+
+def _site_columns(meta, indices, n_drawn):
+    # type: (dict, list, int) -> Tuple[dict, bool]
+    """Occupancy, labels and the disorder columns for chosen DRAWN atoms.
+
+    `packing.pack` records `site_of` — which asymmetric-unit site each drawn
+    atom came from — so a rebuilt cell can still say what its occupancies
+    were. Round 42's rule applies and is why this is a lookup rather than a
+    slice: everything between the file and the picture renumbers, and an index
+    into the wrong list is exactly the silent wrongness that round worked on.
+
+    Returns (kwargs for `cif_text`, whether anything had to be left out).
+    """
+    site_of = meta.get("site_of") or []
+    columns = {}
+    if not site_of or len(site_of) < n_drawn:
+        # No mapping, so nothing can be claimed. Only actually a LOSS when
+        # the file had partial occupancies to lose.
+        return columns, any(float(o) < 1.0
+                            for o in (meta.get("asym_occupancy") or ()))
+    sites = [int(site_of[i]) if i < len(site_of) else -1 for i in indices]
+    missing = any(s < 0 for s in sites)
+    for key, source, fill in (("occupancy", "asym_occupancy", 1.0),
+                              ("labels", "asym_labels", ""),
+                              ("disorder_groups", "asym_disorder_groups", ""),
+                              ("disorder_assemblies", "asym_disorder_assemblies",
+                               "")):
+        values = meta.get(source)
+        if not values:
+            if source == "asym_occupancy":
+                missing = True
+            continue
+        columns[key] = [values[s] if 0 <= s < len(values) else fill
+                        for s in sites]
+    # Two images of one site would take the same label, and a repeated
+    # `_atom_site_label` is not legal CIF — `site_labels` falls back on its
+    # own when they collide, so hand it the file's names and let it decide.
+    return columns, missing
 
 
 def _expand(symbols, frac, symops):

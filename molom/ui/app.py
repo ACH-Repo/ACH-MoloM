@@ -26,6 +26,7 @@ from ..core import modifiers as modifiers_mod
 from ..core import (bonding, edits, input_map, internal, io, measure, project,
                     rotations)
 from ..core import cif as cif_mod
+from ..core import cif_write
 from ..core import coplanar
 from ..core import spacegroups
 from ..core import templates as tpl_mod
@@ -3351,7 +3352,7 @@ class MainWindow(QMainWindow):
         quietly lost its symmetry or gained an invented cell is exactly the
         kind of wrongness that looks right.
         """
-        from ..core import cif_write
+
         objects = objects or [o for o in self.scene.visible_objects()
                               if o.structure.n_atoms]
         if not objects:
@@ -3376,7 +3377,7 @@ class MainWindow(QMainWindow):
         what it writes, and either one going unmentioned is indistinguishable
         from a bug.
         """
-        from ..core import cif_write
+
         bits = []
         for report in reports:
             who = report.get("name") or "?"
@@ -4474,12 +4475,28 @@ class MainWindow(QMainWindow):
             reps = list(range(n))
         meta["asym_symbols"] = [symbols[i] for i in reps]
         meta["asym_frac"] = [[float(v) for v in content[i]] for i in reps]
-        # Parallel columns describe the OLD sites; a silently mis-indexed
-        # occupancy is worse than none (round 43e), so they are dropped rather
-        # than guessed at. Labels go with them — they named other atoms.
-        for key in ("asym_occupancy", "asym_disorder_groups",
-                    "asym_disorder_assemblies", "asym_labels"):
-            meta.pop(key, None)
+        # The parallel columns describe the OLD sites, so they cannot be
+        # sliced — but they need not be thrown away either: `packing.pack`
+        # records which asymmetric-unit site each DRAWN atom came from, so
+        # each new representative can be looked up in the old columns. That
+        # is what stops a re-exported solid solution silently claiming full
+        # occupancy for every species on a shared site. Where the mapping is
+        # absent the column goes, because a mis-indexed occupancy is worse
+        # than none (round 43e).
+        columns, _missing = cif_write._site_columns(meta, reps, s.n_atoms)
+        for key, source in (("occupancy", "asym_occupancy"),
+                            ("labels", "asym_labels"),
+                            ("disorder_groups", "asym_disorder_groups"),
+                            ("disorder_assemblies",
+                             "asym_disorder_assemblies")):
+            if key in columns:
+                meta[source] = list(columns[key])
+            else:
+                meta.pop(source, None)
+        # `site_of` described the unit that has just been replaced, so it is
+        # dropped rather than left to be believed by the next caller — the
+        # round-42 rule about a per-atom map surviving a renumbering.
+        meta.pop("site_of", None)
         # Re-pin the cell frame against the CELL-frame coordinates, or the
         # Kabsch fit keeps measuring the edit as a rotation of the whole
         # crystal and the box creeps further with every atom moved (round
