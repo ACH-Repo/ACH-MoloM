@@ -190,12 +190,18 @@ def test_only_a_cif_object_gets_crystal_controls(crystal_win):
 def test_the_row_checkboxes_apply_immediately(crystal_win):
     from PySide6.QtWidgets import QApplication
     ctrl = _controls(crystal_win)[0]
-    assert crystal_win._active_obj().structure.n_atoms == 27
+    assert crystal_win._active_obj().structure.n_atoms == 39
     ctrl.asym_check.setChecked(True)          # no Apply button pressed
     QApplication.processEvents()
     assert crystal_win._active_obj().structure.n_atoms == 2
     ctrl.full_check.setChecked(True)
     QApplication.processEvents()
+    # KNOWN INCONSISTENCY (round 47): the import path is packed and
+    # gives 39, but the crystal page's asym/cell/packing switch still
+    # rebuilds through `cif.build_view` -> `cif.expand`, which gives the
+    # old 27. Routing build_view through the packing too also changes
+    # what SymmetryModifier produces, so it is deliberately left for a
+    # session that can measure that. Pinned here so the gap is visible.
     assert crystal_win._active_obj().structure.n_atoms == 27
 
 

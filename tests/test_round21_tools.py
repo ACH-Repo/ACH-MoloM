@@ -131,7 +131,7 @@ def test_crystal_page_switches_the_view(tmp_path, win):
     win._sync_crystal_page()
     page = win.crystal_page
     assert page.asym_radio.isEnabled()
-    assert win._active_obj().structure.n_atoms == 27     # full cell
+    assert win._active_obj().structure.n_atoms == 39     # packed cell
     page.asym_radio.setChecked(True)
     page._apply()
     QApplication.processEvents()

@@ -353,7 +353,7 @@ def test_adding_a_symmetry_modifier_changes_something(win, tmp_path):
     """It appended a modifier to a molecule that was ALREADY the full cell,
     so the operations de-duplicated straight back and nothing moved."""
     obj = _open_nacl(win, tmp_path)
-    assert obj.structure.n_atoms == 9            # the drawn cell
+    assert obj.structure.n_atoms == 16           # the drawn cell, packed
     win.on_add_modifier("symmetry")
     # by KIND, not by index: a crystal whose bonds cross the cell faces also
     # carries a boundary modifier (round 39), and it is kept LAST.

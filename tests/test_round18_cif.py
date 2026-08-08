@@ -312,7 +312,7 @@ def test_read_structures_keeps_the_crystallography(tmp_path):
     records = io.read_structures(str(path))
     assert len(records) == 1
     atoms, meta = records[0]
-    assert len(atoms) == 27               # the drawn cell, boundary completed
+    assert len(atoms) == 39               # the drawn cell, boundary completed
     assert meta["source"] == "cif"
     assert meta["cell"]["a"] == pytest.approx(5.6402)
     assert meta["spacegroup"] == "F m -3 m"
