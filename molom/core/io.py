@@ -732,12 +732,24 @@ def _read_cif(path, disorder=None):
     from . import cif as _cif
     disorder = disorder or _cif.POLICY_DOMINANT
     from . import cif as cif_mod
+    from . import packing as packing_mod
     report = {}
+    bonds = []
+    packed_meta = {}
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             data = cif_mod.parse_cif(fh.read())
-        symbols, coords = cif_mod.expand(data, disorder=disorder,
-                                         report=report)
+        # The PACKED path: wrap atom by atom, then complete every fragment
+        # that reaches into the cell instead of relocating it. See
+        # `core/packing.py` for why, and for what the old path got wrong.
+        symbols, coords, bonds, packed_meta = packing_mod.pack(
+            data, disorder=disorder)
+        # Still needed for the cell CONTENT — Z, the density and the ❖ page
+        # all count formula units, which the packed picture deliberately is
+        # not. `expand` also fills `report` for the import message.
+        content, _content_xyz = cif_mod.expand(
+            data, whole_molecules=False, boundary=False, disorder=disorder,
+            report=report)
     except (cif_mod.CifError, ValueError, OSError):
         return None
     if not symbols:
@@ -769,7 +781,20 @@ def _read_cif(path, disorder=None):
         # else means the reader derived them from the named group, and
         # `symmetry_note` is the sentence the UI has to show for it.
         "symmetry_source": data.symmetry_source,
+        # Where the cell CONTENT ends and the boundary copies begin. The
+        # periodic bond graph is built on the content alone, and every atom
+        # past this index is one of its lattice translates — see
+        # `cif.display_bonds`.
+        "cell_content": int(report.get("n_content", len(content))),
+        # Connectivity comes from the packing, not from a later straight-line
+        # perception: the wrap tears molecules and the graph already knows
+        # which images are bonded. `MainWindow._perceive_fresh` honours this.
+        "packed_bonds": [[int(i), int(j), int(o)] for i, j, o in bonds],
+        #: This import went through `core.packing`, so the boundary is already
+        #: complete and nothing downstream should try to close it again.
+        "packed": True,
     }
+    meta.update(packed_meta)
     if report.get("site_occupancy"):
         # {drawn atom index (as a STRING, so it survives the JSON savepoint):
         #  [(element, occupancy), ...]} for sites shared by several species.

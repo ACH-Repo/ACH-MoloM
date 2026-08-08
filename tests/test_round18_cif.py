@@ -265,9 +265,16 @@ def test_build_view_modes():
     pack, coords = cif.build_view(d.cell, d.symbols, d.frac, symops,
                                   mode="packing", na=2, nb=2, nc=1)
     assert len(asym) == 2                 # the asymmetric unit as listed
-    assert len(cell_syms) == 27           # one full cell, boundary completed
-    assert len(pack) == 27 * 4            # 2 x 2 x 1 blocks of it
-    assert coords.shape == (27 * 4, 3)
+    assert len(cell_syms) == 39           # one full cell, PACKED
+    # NOT 27 x 4. Each cell in the block carries its own boundary copies, and
+    # the copy on a shared internal face is the same atom as its neighbour's,
+    # so stacking them naively draws it twice at exactly the same point. The
+    # deduplicated count is the textbook grid: rock salt boundary-completed
+    # over na x nb x nc cells is (2na+1)(2nb+1)(2nc+1), here 5 x 5 x 3.
+    assert len(pack) == 107
+    assert coords.shape == (107, 3)
+    from scipy.spatial import cKDTree
+    assert not cKDTree(coords).query_pairs(0.1)   # and no atom drawn twice
 
 
 def test_rigid_from_reference_recovers_a_translation():
@@ -305,7 +312,7 @@ def test_read_structures_keeps_the_crystallography(tmp_path):
     records = io.read_structures(str(path))
     assert len(records) == 1
     atoms, meta = records[0]
-    assert len(atoms) == 27               # the drawn cell, boundary completed
+    assert len(atoms) == 39               # the drawn cell, boundary completed
     assert meta["source"] == "cif"
     assert meta["cell"]["a"] == pytest.approx(5.6402)
     assert meta["spacegroup"] == "F m -3 m"

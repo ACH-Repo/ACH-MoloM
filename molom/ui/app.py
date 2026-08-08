@@ -351,6 +351,9 @@ class MainWindow(QMainWindow):
         self._build_statusbar()
         self.setAcceptDrops(True)
         self.resize(1100, 740)
+        # LAST: an add-on's register() is handed this window and reaches
+        # straight into it, so everything it might touch has to exist first.
+        self._init_addons()
 
     def load_default_scene(self):
         """Blender opens on a cube; MoloM opens on cubane — centred on the
@@ -739,6 +742,9 @@ class MainWindow(QMainWindow):
         r("settings", "Settings...", lambda c: c.on_settings(),
           category="App", aliases=("preferences", "mouse", "trackpad",
                                    "input", "options"))
+        r("addons", "Add-ons...", lambda c: c.on_addons(), category="App",
+          aliases=("plugins", "extensions", "preferences", "install",
+                   "debug pipeline", "sandbox"))
         r("about", "About MoloM", lambda c: c.on_about(), category="App",
           aliases=("shortcuts", "keys", "navigation", "help"))
         r("quit", "Quit MoloM", lambda c: c.close(), category="App",
@@ -881,6 +887,7 @@ class MainWindow(QMainWindow):
         # one key is the ambiguity that killed F3.
         self._add_op(m_app, "operator_search", "&Search operations...")
         self._add_op(m_app, "settings", "&Settings...")
+        self._add_op(m_app, "addons", "&Add-ons...")
         self._add_op(m_app, "about", "&About MoloM")
 
     def _check_menu_mnemonics(self):
@@ -2421,6 +2428,32 @@ class MainWindow(QMainWindow):
         ever change on explicit user action."""
         report = {}
         bonding.perceive_structure_bonds(s, report=report)
+        # A CRYSTAL's bonds come from the labelled periodic graph instead:
+        # perception measures straight lines, so every bond crossing a cell
+        # face is missing, and an atom drawn twice at opposite faces ends up
+        # sharing one coordination sphere between its two copies (ZIF-8's Zn
+        # came out 3-coordinate on all twelve). The perception above still
+        # runs, because it is what reports the refusals below — the graph
+        # replaces the connectivity, not the chemistry.
+        cell_dict = s.metadata.get("cell")
+        content = int(s.metadata.get("cell_content") or 0)
+        cell = None
+        if cell_dict and content:
+            try:
+                cell = cif_mod.Cell.from_dict(cell_dict)
+            except (KeyError, TypeError, ValueError, cif_mod.CifError):
+                cell = None
+        packed = s.metadata.pop("packed_bonds", None)
+        if packed is not None:
+            # The packing already instantiated the bonds from the periodic
+            # graph over exactly these atoms — including the ones it
+            # materialised outside the wall, which no straight-line pass over
+            # this coordinate array could get right.
+            s.bonds = sorted({(min(int(i), int(j)), max(int(i), int(j)),
+                               int(o)) for i, j, o in packed})
+        elif cell is not None:
+            s.bonds = cif_mod.display_bonds(s.symbols, s.coords, cell, content,
+                                            existing=s.bonds)
         if report.get("dropped_bonds"):
             # Kept on the structure so the import message, the crystal page
             # and a later "why is that atom not bonded?" all have the same
@@ -4338,8 +4371,16 @@ class MainWindow(QMainWindow):
     def _new_boundary_modifier(obj, shells=1):
         # type: (object, int) -> object
         cell = cell_of(obj)
+        # The content count travels with the modifier so it can build the
+        # periodic bond graph on the cell's own atoms rather than on the
+        # picture, which already carries copies.
+        try:
+            content = int(obj.structure.metadata.get("cell_content") or 0)
+        except AttributeError:
+            content = 0
         return modifiers_mod.BoundaryModifier(
-            cell=cell.to_dict() if cell is not None else None, shells=shells)
+            cell=cell.to_dict() if cell is not None else None, shells=shells,
+            content=content)
 
     @staticmethod
     def _boundary_modifier(obj):
@@ -4382,6 +4423,11 @@ class MainWindow(QMainWindow):
         cell = cell_of(obj)
         s = obj.structure
         if cell is None or s.n_atoms == 0 or self._boundary_modifier(obj):
+            return False
+        if s.metadata.get("packed"):
+            # `core.packing` already completed every fragment reaching into
+            # the cell and instantiated its bonds. Running the modifier on top
+            # would grow a shell of a shell.
             return False
         mod = self._new_boundary_modifier(obj)
         try:
@@ -4702,6 +4748,25 @@ class MainWindow(QMainWindow):
             report=report, **self._view_disorder_kwargs(meta))
         if report.get("disorder"):
             meta["disorder"] = dict(report["disorder"])
+        # A rebuilt view renumbers everything, so the content boundary the
+        # periodic bond graph is built on has to be replaced with it. In a
+        # PACKING the content is still the first cell's — every other cell is
+        # a lattice translate of it, which is exactly what the graph labels.
+        if report.get("packed_bonds") is not None:
+            # Carried the same way an import does, so `_perceive_fresh` uses
+            # the graph's answer rather than re-perceiving straight lines.
+            meta["packed_bonds"] = report["packed_bonds"]
+            meta["packed"] = True
+        if report.get("site_occupancy"):
+            meta["site_occupancy"] = dict(report["site_occupancy"])
+        if report.get("n_content"):
+            meta["cell_content"] = int(report["n_content"])
+            # A boundary modifier already on the stack holds the OLD count,
+            # and a stale one would label the new picture against the wrong
+            # atoms — silently, since every index still exists.
+            existing = self._boundary_modifier(obj)
+            if existing is not None:
+                existing.content = int(report["n_content"])
         # Rebuilt views renumber the atoms, so the shared-site map has to be
         # replaced (or cleared) with them — a stale one would paint the pie
         # slices onto whichever atom happens to hold that index now.
@@ -4771,6 +4836,42 @@ class MainWindow(QMainWindow):
         dlg = OperatorSearchDialog(self, self.ops, self)
         if dlg.exec() and dlg.chosen is not None:
             dlg.chosen.run(self)
+
+    # ------------------------------------------------------------- add-ons
+    def _init_addons(self):
+        """Discover add-ons and enable the ones that were on last time.
+
+        Runs LAST in `__init__`, after every dock and page exists, because an
+        add-on's `register()` is handed this window and will reach straight
+        into it. A failure disables the add-on and is reported — it must
+        never stop MoloM starting.
+        """
+        from ..core import addons as addons_mod
+        self.addons = addons_mod.AddOnManager()
+        wanted = [a for a in (self.settings.value("addons/enabled", [])
+                              or []) if a]
+        if isinstance(wanted, str):          # QSettings collapses a 1-element
+            wanted = [wanted]                # list to a bare string
+        failed = self.addons.enable_all(wanted, self)
+        if failed:
+            self.statusBar().showMessage(
+                "{} add-on(s) failed to load — see App > Add-ons".format(
+                    len(failed)), 10000)
+
+    def save_enabled_addons(self):
+        self.settings.setValue("addons/enabled",
+                               sorted(self.addons.enabled))
+
+    def on_addons(self):
+        from .addons_dialog import AddOnsDialog
+        dialog = getattr(self, "_addons_dialog", None)
+        if dialog is None:
+            dialog = AddOnsDialog(self, self)
+            self._addons_dialog = dialog
+        dialog.rebuild()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def on_settings(self):
         """Settings is MODELESS — it has live-applying sliders, so being
