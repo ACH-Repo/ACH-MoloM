@@ -124,6 +124,125 @@ def build(symbols, coords, bonds, min_donors=3, max_donors=12):
     return out
 
 
+def build_periodic(symbols, coords, cell, n_content, min_donors=3,
+                   max_donors=12):
+    # type: (list, np.ndarray, object, int, int, int) -> List[dict]
+    """Polyhedra from the PERIODIC GRAPH, so they are always complete.
+
+    `build` takes its donors from the drawn bonds, which makes a polyhedron
+    only as complete as the picture: a metal sitting on a cell face is drawn
+    as a boundary copy whose coordination is not completed unless the user
+    ticks for it, so half of ZIF-8's zinc came out as flat triangles instead
+    of tetrahedra.
+
+    A coordination polyhedron is a property of the coordination SPHERE, not
+    of what happens to be on screen. Here the donor POSITIONS come from the
+    labelled graph — which knows where the fourth nitrogen is even when no
+    atom is drawn there — so the solid closes whatever the display options
+    say.
+    """
+    from . import bondgraph
+    n = len(symbols)
+    if n == 0 or n_content <= 0 or cell is None:
+        return []
+    n_content = min(int(n_content), n)
+    xyz = np.asarray(coords, dtype=float).reshape(n, 3)
+    frac = cell.to_fractional(xyz)
+    matrix = np.asarray(cell.matrix(), dtype=float)
+    graph = bondgraph.build(list(symbols)[:n_content], frac[:n_content], cell,
+                            valence=False, cap_hydrogens=False)
+    labels = bondgraph.label_instances(frac, cell, n_content)
+    out = []
+    for index in range(n):
+        if not is_metal(symbols[index]):
+            continue
+        entry = labels[index] if index < len(labels) else None
+        if entry is None:
+            continue
+        site, shift = entry
+        points = []
+        for j, eshift, _dist in graph.neighbours(site):
+            if is_metal(symbols[j]):
+                continue          # a polyhedron is drawn through its LIGANDS
+            where = graph.frac[j] + np.array(
+                [s + t for s, t in zip(shift, eshift)], dtype=float)
+            points.append(where @ matrix)
+        if len(points) < int(min_donors) or len(points) > int(max_donors):
+            continue
+        verts = np.asarray(points, dtype=float)
+        faces = hull_faces(verts)
+        if not faces:
+            continue
+        z = elements.atomic_number(symbols[index])
+        out.append({
+            "centre": int(index),
+            "symbol": elements.symbol(z),
+            "color": elements.color_f(z),
+            "vertices": verts,
+            "faces": faces,
+            "donors": [],
+        })
+    return out
+
+
+def hull_edges(polys):
+    # type: (List[dict]) -> np.ndarray
+    """Every distinct hull EDGE as a pair of points, for a wireframe pass.
+
+    A translucent solid alone does not read as a shape — Christian's "edges
+    are not visible enough". Outlining it is what makes a tetrahedron look
+    like a tetrahedron rather than a coloured smudge.
+    """
+    segments = []
+    for poly in polys:
+        verts = np.asarray(poly["vertices"], dtype=float)
+        seen = set()
+        for tri in poly["faces"]:
+            for a, b in ((tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])):
+                key = (min(a, b), max(a, b))
+                if key in seen:
+                    continue
+                seen.add(key)
+                segments.append(verts[key[0]])
+                segments.append(verts[key[1]])
+    if not segments:
+        return np.zeros((0, 3))
+    return np.asarray(segments, dtype=float)
+
+
+def fresnel_colors(polys, eye, power=2.0, rim=0.85):
+    # type: (List[dict], np.ndarray, float, float) -> np.ndarray
+    """Per-vertex colours with a rim (Fresnel) term baked in.
+
+    The face shader carries no normals and a single alpha uniform, so the
+    grazing-angle brightening is computed here instead: a face seen edge-on
+    is lightened toward white, one seen flat-on keeps the element colour.
+    That is what gives a translucent solid a readable silhouette.
+    """
+    eye = np.asarray(eye, dtype=float).reshape(3)
+    out = []
+    for poly in polys:
+        verts = np.asarray(poly["vertices"], dtype=float)
+        base = np.asarray(poly["color"], dtype=float)[:3]
+        for tri in poly["faces"]:
+            a, b, c = verts[tri[0]], verts[tri[1]], verts[tri[2]]
+            normal = np.cross(b - a, c - a)
+            length = float(np.linalg.norm(normal))
+            centroid = (a + b + c) / 3.0
+            view = centroid - eye
+            view_len = float(np.linalg.norm(view))
+            if length < 1e-12 or view_len < 1e-12:
+                facing = 1.0
+            else:
+                facing = abs(float(normal @ view) / (length * view_len))
+            edge = (1.0 - facing) ** float(power)
+            colour = base + (1.0 - base) * (float(rim) * edge)
+            out.extend([colour, colour, colour])
+    if not out:
+        return np.zeros((0, 3))
+    return np.clip(np.asarray(out, dtype=float), 0.0, 1.0)
+
+
 def triangle_soup(polys):
     # type: (List[dict]) -> Tuple[np.ndarray, np.ndarray]
     """Flatten built polyhedra into (Nx3 vertices, Nx3 colours) triangles,

@@ -115,7 +115,28 @@ out at three of its four positions instead of four. Both fixed by the one rule.
 **Still open**: bonds from the FULL-occupancy O to the partial ones survive
 (1.475 / 1.520 / 1.706 A) because the sum rule does not apply, and 1.475 A is
 exactly a peroxide bond — no distance rule can reject it.
-**Round 47b (2026-08-06, the ❖ page catches up with the packed pipeline):
+**Round 48 (2026-08-06, polyhedra that close, and can be seen): two more of
+Christian's, both about the same picture. **(1) "Coordination polyhedra should
+be complete no matter which combination of modes is applied."** They were built
+from the DRAWN bonds, so a polyhedron was only ever as complete as the picture:
+half of ZIF-8's zinc are boundary copies whose coordination is not completed
+unless the copies tick is on, and those came out as flat triangles.
+`polyhedra.build_periodic` takes the donor POSITIONS from the labelled graph
+instead — it knows where the fourth nitrogen is even when no atom is drawn
+there — so the solid closes independently of both checkboxes. Measured:
+ZIF-8 {4: 12, 3: 12} -> **{4: 24} under all four combinations of the two
+ticks**; `1547149.cif` 3 partial solids -> 10 complete octahedra. A metal
+neighbour is never a vertex: a polyhedron is drawn through its LIGANDS.
+**(2) A translucent solid has no readable silhouette**, so two things were
+added: a **Fresnel rim** (`fresnel_colors`, grazing faces lightened toward
+white) and an explicit **hull-edge wireframe** (`hull_edges`) drawn on top. The
+rim is computed on the CPU because the line shader carries no normals and a
+single alpha uniform; it is the only camera-dependent part, so the HULLS are
+now cached on their inputs (`_polyhedra_plan`) — rebuilding a convex hull per
+metal per repaint was the round-33 mistake sitting in the paint path unnoticed.
+1047 tests.
+
+Round 47b (2026-08-06, the ❖ page catches up with the packed pipeline):
 Christian: "'Bonded atoms outside the cell' doesn't seem to work and needs to
 go." Correct — it drove `shell_molecules`/`BoundaryModifier`, mechanisms the
 packed path no longer uses, so the tick had quietly become inert. Replaced by

@@ -673,6 +673,9 @@ class MolViewport(QOpenGLWidget):
     # exception", which points nowhere near the real cause. Defaults on the
     # class mean the attributes exist from the first instant the object does.
     _fly = None
+    _poly_key = None
+    _poly_cache = None
+    _poly_edge_cache = None
     _fly_pending = None
     _internal = None
     _grab = None
@@ -2453,6 +2456,7 @@ class MolViewport(QOpenGLWidget):
         self._split_sphere = _SplitMesh(*meshes.icosphere(2))
         self._wire_lines = _LineBuffer()
         self._poly_tris = _LineBuffer()   # same layout, GL_TRIANGLES
+        self._poly_edges = _LineBuffer()  # hull outlines, GL_LINES
         self._grid_quad = _GridQuad()
         self._gl_ready = True
         self._needs_rebuild = True
@@ -2802,20 +2806,18 @@ class MolViewport(QOpenGLWidget):
         if self.scene is None:
             return
         from ..core import polyhedra as poly_mod
-        chunks = []
-        for obj in self.scene.visible_objects():
-            if not (obj.structure.metadata or {}).get("polyhedra"):
-                continue
-            sym, xyz, bonds = obj.evaluated()
-            built = poly_mod.build(sym, xyz, bonds)
-            if built:
-                chunks.append(poly_mod.triangle_soup(built))
-        if not chunks:
+        built = self._polyhedra_plan(poly_mod)
+        if not built:
             if self._poly_tris is not None:
                 self._poly_tris.n_verts = 0
+            if self._poly_edges is not None:
+                self._poly_edges.n_verts = 0
             return
-        verts = np.vstack([c[0] for c in chunks])
-        cols = np.vstack([c[1] for c in chunks])
+        eye = self._camera_frame()[0]
+        verts = np.vstack([poly_mod.triangle_soup([p])[0] for p in built])
+        # The rim term is the only camera-dependent part, so it alone is
+        # recomputed per frame; the hulls are cached above.
+        cols = poly_mod.fresnel_colors(built, eye)
         self._poly_tris.upload(np.hstack([verts, cols]))
         GL.glEnable(GL.GL_BLEND)
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
@@ -2823,7 +2825,57 @@ class MolViewport(QOpenGLWidget):
         GL.glDisable(GL.GL_CULL_FACE)
         self._draw_lines(self._poly_tris, view, proj, mode=GL.GL_TRIANGLES,
                          alpha=self.polyhedra_alpha)
+        # ...and the hull EDGES on top, which is what actually makes the
+        # shape legible: a translucent solid with no outline reads as a
+        # coloured smudge however it is shaded.
+        edge_pts = self._poly_edge_cache
+        if edge_pts is not None and len(edge_pts):
+            bright = np.tile(np.array([[0.92, 0.92, 0.96]]),
+                             (len(edge_pts), 1))
+            self._poly_edges.upload(np.hstack([edge_pts, bright]))
+            GL.glLineWidth(1.4)
+            self._draw_lines(self._poly_edges, view, proj, mode=GL.GL_LINES,
+                             alpha=min(1.0, self.polyhedra_alpha + 0.3))
         GL.glDepthMask(GL.GL_TRUE)
+
+    def _polyhedra_plan(self, poly_mod):
+        """Built hulls for every visible object, CACHED on their inputs.
+
+        Rebuilding a convex hull per metal on every repaint is the round-33
+        mistake (nothing camera-independent belongs in a paint path); only
+        the Fresnel term above depends on the camera.
+        """
+        key = []
+        objects = []
+        for obj in self.scene.visible_objects():
+            if not (obj.structure.metadata or {}).get("polyhedra"):
+                continue
+            sym, xyz, bonds = obj.evaluated()
+            key.append((obj.id, len(sym), len(bonds),
+                        float(xyz[0][0]) if len(xyz) else 0.0,
+                        float(xyz[-1][-1]) if len(xyz) else 0.0))
+            objects.append((obj, sym, xyz, bonds))
+        key = tuple(key)
+        if key == self._poly_key:
+            return self._poly_cache
+        built = []
+        for obj, sym, xyz, bonds in objects:
+            meta = obj.structure.metadata or {}
+            cell = cell_of(obj)
+            content = int(meta.get("cell_content") or 0)
+            made = []
+            if cell is not None and content:
+                # From the periodic graph, so the solid is complete whatever
+                # the display options are doing (Christian: "should be
+                # complete no matter which combination of modes is applied").
+                made = poly_mod.build_periodic(sym, xyz, cell, content)
+            if not made:
+                made = poly_mod.build(sym, xyz, bonds)
+            built.extend(made)
+        self._poly_key = key
+        self._poly_cache = built
+        self._poly_edge_cache = poly_mod.hull_edges(built)
+        return built
         GL.glDisable(GL.GL_BLEND)
 
     def _paint_meta_glow(self, view, proj):
