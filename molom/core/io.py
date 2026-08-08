@@ -397,6 +397,28 @@ def write_structure_file(path, atoms, name=""):
     if ext == "xyz":
         write_xyz(path, atoms, {"name": name} if name else None)
         return "native"
+    if ext in ("cif", "mmcif"):
+        # NEVER through OpenBabel: it is handed an xyz block, so the file came
+        # out with coordinates and nothing else — no cell, no symmetry, no
+        # occupancies, and MoloM's own parser rejected it. This route has only
+        # plain atoms to work with, so it writes a P1 box round them and says
+        # so; the crystallography-preserving path is `cif_write.from_object`,
+        # which the app uses because it has the metadata.
+        import numpy as np
+
+        from . import cif_write
+        coords = np.asarray([[a[1], a[2], a[3]] for a in atoms], dtype=float)
+        cell = cif_write.invented_cell(coords)
+        shift = coords.min(axis=0) - cif_write.INVENTED_PADDING \
+            if len(coords) else np.zeros(3)
+        text = cif_write.cif_text(
+            cell, [a[0] for a in atoms],
+            cell.to_fractional(coords - shift) if len(coords) else coords,
+            name=name or "molom",
+            notes=("No unit cell: a molecule in an invented P1 box.",))
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        return "native"
     xyz_text = _xyz_block(atoms, name) + "\n"
     errors = []
     try:
@@ -770,6 +792,10 @@ def _read_cif(path, disorder=None):
         "asym_symbols": list(data.symbols),
         "asym_frac": [[float(v) for v in row] for row in data.frac],
         "asym_occupancy": [float(o) for o in data.occupancy],
+        # The file's OWN site labels. Carried for the writer: "C12A" is what
+        # the crystallographer calls that atom, and a structure that survives
+        # a round trip through MoloM should still be referred to the same way.
+        "asym_labels": [str(x) for x in data.labels],
         # The disorder GROUP and ASSEMBLY labels, alongside the occupancies
         # and for exactly the same reason: `resolve_disorder` uses them in
         # preference to geometric overlap, so a rebuild without them resolves

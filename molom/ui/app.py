@@ -93,8 +93,17 @@ def apply_dark_theme(app):
 
 class MainWindow(QMainWindow):
 
+    #: What the last CIF export decided, for the status bar. On the CLASS so
+    #: it exists before any export has happened — the round-34 rule.
+    _cif_export_note = ""
+    _cif_export_reports = ()
+
     def __init__(self):
         super().__init__()
+        #: Objects already warned about editing a packed crystal — the hazard
+        #: is real every time, but a message on every drag drowns out
+        #: everything else the status bar has to say.
+        self._packed_edit_warned = set()
         self.setWindowTitle("MoloM")
         self.settings = QSettings("ACH", "MoloM")
         self.scene = Scene()
@@ -1016,6 +1025,40 @@ class MainWindow(QMainWindow):
             return True
         return str(meta.get("cell_view", "cell")) == "asym"
 
+    @staticmethod
+    def packed_crystal_edit(obj):
+        # type: (object) -> bool
+        """Is this an edit to a PACKED crystal, where the copies won't follow?
+
+        A packed import's boundary copies are ordinary independent atoms in
+        the list — measured on ZIF-8, atom 0 has a copy at index 348 and
+        moving one does not move the other — so an edit desynchronises them
+        silently. The existing guards do not cover it: `begin_model_edit`
+        handles the cell-box drift (round 43e) and `sync_asymmetric_unit`
+        only fires when the base IS the asymmetric unit, which a packed
+        import's base is not.
+
+        Editing that way is unsupported until edits operate on the CONTENT and
+        re-pack. Until then the honest thing is to SAY so — a structure that
+        quietly disagrees with itself is the worst of the options.
+        """
+        meta = getattr(obj.structure, "metadata", None) or {}
+        if not meta.get("packed"):
+            return False
+        content = int(meta.get("cell_content") or 0)
+        return 0 < content < obj.structure.n_atoms
+
+    def _warn_packed_edit(self, obj):
+        if not self.packed_crystal_edit(obj):
+            return
+        if obj.id in self._packed_edit_warned:
+            return
+        self._packed_edit_warned.add(obj.id)
+        self.statusBar().showMessage(
+            "Edited a PACKED crystal: the boundary copies are separate atoms "
+            "and do not follow. Switch the crystal page to \"Asymmetric unit "
+            "only\" to edit the structure itself.", 15000)
+
     def _reevaluate_edited_crystal(self):
         """After an edit: keep the asymmetric unit, or re-derive the cell."""
         obj_id = getattr(self.viewport, "edit_obj_id", None)
@@ -1024,6 +1067,7 @@ class MainWindow(QMainWindow):
             obj = self._active_obj()
         if obj is None or not (obj.structure.metadata or {}).get("symops"):
             return
+        self._warn_packed_edit(obj)
         try:
             if self.base_is_asymmetric_unit(obj):
                 # NEVER re-derive here. The atoms in front of us are one
@@ -3210,17 +3254,21 @@ class MainWindow(QMainWindow):
         path, _f = QFileDialog.getSaveFileName(
             self, "Export {} visible molecule(s)".format(len(vis)),
             os.path.join(start, default + ".xyz"),
-            "XYZ (*.xyz);;MDL SDF (*.sdf);;MDL MOL (*.mol);;PDB (*.pdb);;"
-            "Sybyl MOL2 (*.mol2);;All files (*)")
+            "XYZ (*.xyz);;Crystallographic CIF (*.cif);;MDL SDF (*.sdf);;"
+            "MDL MOL (*.mol);;PDB (*.pdb);;Sybyl MOL2 (*.mol2);;"
+            "All files (*)")
         if not path:
             return
         try:
+            self._cif_export_note = ""
             backend, n_obj, n_atoms = self.export_visible(path)
             self.settings.setValue("last_dir", os.path.dirname(path))
             self._push_recent(path)
             self.statusBar().showMessage(
-                "Exported {} molecule(s), {} atoms to {} ({})".format(
-                    n_obj, n_atoms, os.path.basename(path), backend), 7000)
+                "Exported {} molecule(s), {} atoms to {} ({}){}".format(
+                    n_obj, n_atoms, os.path.basename(path), backend,
+                    " — " + self._cif_export_note
+                    if self._cif_export_note else ""), 12000)
         except (ValueError, OSError) as e:
             QMessageBox.critical(self, "Save failed", str(e))
 
@@ -3233,6 +3281,8 @@ class MainWindow(QMainWindow):
         if not vis:
             raise ValueError("no visible molecules to export")
         name = " + ".join(o.name for o in vis)
+        if path.lower().endswith((".cif", ".mmcif")):
+            return self.export_cif(path, vis)
         single = vis[0].structure
         if len(vis) == 1 and single.n_frames > 1 \
                 and path.lower().endswith(".xyz"):
@@ -3264,6 +3314,67 @@ class MainWindow(QMainWindow):
             backend = io.write_structure_file(path, atoms, name=name)
             return backend, len(vis), total
         return backend, len(vis), sum(o.structure.n_atoms for o in vis)
+
+    def export_cif(self, path, objects=None):
+        # type: (str, list) -> tuple
+        """Write a real CIF — cell, operators, asymmetric unit, occupancies.
+
+        Its own path rather than a branch of `write_structure_file`, because
+        that function is handed plain atoms and the whole content of a CIF is
+        the crystallography hanging off the OBJECT. Before this, a `.cif`
+        export went to OpenBabel as an xyz block: the file had coordinates and
+        nothing else, and MoloM's own reader rejected it.
+
+        The report is put in front of the user, not swallowed: a file that
+        quietly lost its symmetry or gained an invented cell is exactly the
+        kind of wrongness that looks right.
+        """
+        from ..core import cif_write
+        objects = objects or [o for o in self.scene.visible_objects()
+                              if o.structure.n_atoms]
+        if not objects:
+            raise ValueError("no visible molecules to export")
+        reports = []
+        text = cif_write.scene_text(objects, version=__version__,
+                                    reports=reports)
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        self._cif_export_reports = reports
+        self._cif_export_note = self.cif_export_note(reports)
+        return "cif", len(objects), sum(len(o.evaluated()[0])
+                                        for o in objects)
+
+    @staticmethod
+    def cif_export_note(reports):
+        # type: (list) -> str
+        """What the writer decided, in one phrase for the status bar.
+
+        Same discipline as `chemistry_note` (round 38): the reader has three
+        ways to refuse what a file says and the writer has two ways to change
+        what it writes, and either one going unmentioned is indistinguishable
+        from a bug.
+        """
+        from ..core import cif_write
+        bits = []
+        for report in reports:
+            who = report.get("name") or "?"
+            if report.get("invented_cell"):
+                bits.append("{}: no unit cell, written in an invented P1 box"
+                            .format(who))
+            elif report.get("policy") == cif_write.POLICY_ASYMMETRIC:
+                bits.append("{}: {}, {} operations, {} sites".format(
+                    who, report.get("spacegroup"), report.get("symops"),
+                    report.get("n_sites")))
+            elif report.get("policy") == cif_write.POLICY_CELL:
+                bits.append("{}: symmetry re-derived as {} ({} operations)"
+                            .format(who, report.get("spacegroup"),
+                                    report.get("symops")))
+            else:
+                bits.append("{}: written as P1, {} sites".format(
+                    who, report.get("n_sites")))
+            if report.get("occupancy_lost"):
+                bits[-1] += " — partial occupancies NOT carried over"
+        return "; ".join(bits)
 
     def on_clear_scene(self):
         if self.scene.n_objects == 0:
