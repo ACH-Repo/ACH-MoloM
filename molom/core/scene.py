@@ -108,7 +108,59 @@ class MolObject:
             return str(i)
         if mode == "element_index":
             return "{}{}".format(sym, i)
+        if mode == "occupancy":
+            return self.occupancy_text(i)
         return sym
+
+    def site_composition(self, index):
+        # type: (int) -> list
+        """`[(element, occupancy), ...]` for this atom's SITE, or [].
+
+        A shared position — several species on one Gitterplatz — is drawn as
+        one atom carrying the whole composition (round 42), so the question
+        "what is this atom?" has more than one answer and the readout should
+        give all of them.
+        """
+        table = (self.structure.metadata or {}).get("site_occupancy") or {}
+        entry = table.get(str(int(index)))
+        if not entry:
+            return []
+        return [(str(sym), float(occ)) for sym, occ in entry]
+
+    def occupancy_text(self, index):
+        # type: (int) -> str
+        """Occupancy as a label: `0.50` for a partial site, `Nb.50/Ti.25` for
+        a shared one, and nothing at all for an ordinary full atom — a label
+        reading "1.00" on every atom of an ordered structure is noise."""
+        parts = self.site_composition(index)
+        if parts:
+            return " ".join("{}{:.2f}".format(sym, occ)
+                            for sym, occ in parts)
+        occ = self.occupancy_of(index)
+        if occ is None or occ >= 1.0 - 1e-6:
+            return ""
+        return "{:.2f}".format(occ)
+
+    def occupancy_of(self, index):
+        # type: (int) -> Optional[float]
+        """This atom's occupancy, or None when the file did not say.
+
+        Read from the asymmetric unit through the drawn atom's site, which is
+        the only place it survives: `expand`'s de-duplication drops the
+        co-located species before occupancy is ever consulted (round 42).
+        """
+        meta = self.structure.metadata or {}
+        parts = self.site_composition(index)
+        if parts:
+            return float(sum(o for _s, o in parts))
+        occupancy = meta.get("asym_occupancy")
+        sites = meta.get("site_of")
+        i = int(index)
+        if occupancy and sites and i < len(sites):
+            site = int(sites[i])
+            if 0 <= site < len(occupancy):
+                return float(occupancy[site])
+        return None
 
     def display_coords(self):
         # type: () -> np.ndarray
@@ -374,6 +426,12 @@ class Scene:
             return "?"
         obj, i = r
         tag = "{}{}".format(obj.structure.symbols[i], i)
+        # Occupancy rides in the readout whenever it is not a plain full
+        # site: "which atom is this?" has a different answer on a shared
+        # position, and the picture alone cannot say so.
+        occupancy = obj.occupancy_text(i)
+        if occupancy:
+            tag = "{} [{}]".format(tag, occupancy)
         if with_object is None:
             with_object = self.n_objects > 1
         return "{}:{}".format(obj.name, tag) if with_object else tag

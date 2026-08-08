@@ -29,7 +29,22 @@ from ..core import style as style_mod
 _STYLE_CHOICES = [("", "(app style)")] + [(s.key, s.label)
                                           for s in style_mod.STYLES]
 LABEL_MODES = [("element", "Element"), ("index", "Index"),
-               ("element_index", "Element + index"), ("custom", "Custom")]
+               ("element_index", "Element + index"),
+               ("occupancy", "Occupancy"), ("custom", "Custom")]
+
+#: Label modes that only mean anything on a crystal. Greyed elsewhere rather
+#: than hidden, so it is visible that the option exists and why it is off.
+CRYSTAL_ONLY_MODES = {"occupancy"}
+
+
+def _mode_is_available(key, obj):
+    # type: (str, object) -> bool
+    if key not in CRYSTAL_ONLY_MODES:
+        return True
+    try:
+        return bool((obj.structure.metadata or {}).get("cell"))
+    except AttributeError:
+        return False
 
 ROLE_KIND = Qt.UserRole          # "object" | "element" | "atom" | "add"
 ROLE_OBJ = Qt.UserRole + 1
@@ -383,6 +398,10 @@ class RowControls(QWidget):
         menu = QMenu(self)
         for key, text in LABEL_MODES:
             act = QAction(text, menu)
+            act.setEnabled(_mode_is_available(key, self._obj))
+            if not act.isEnabled():
+                act.setToolTip("This molecule has no unit cell, so it has no "
+                               "site occupancies to label.")
             act.triggered.connect(lambda _c=False, k=key: self._set_mode(k))
             menu.addAction(act)
         menu.addSeparator()

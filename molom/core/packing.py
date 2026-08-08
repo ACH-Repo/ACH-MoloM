@@ -55,9 +55,11 @@ def pack(data, disorder=None, outside=True, grow_from_copies=False, tol=0.1):
     off by default (measured both ways; see CLAUDE.md round 45i).
     """
     cell = data.cell
+    content_report = {}
     symbols, cart = cif_mod.expand(
         data, whole_molecules=False, boundary=False,
-        disorder=disorder or cif_mod.POLICY_ALL, tol=tol)
+        disorder=disorder or cif_mod.POLICY_ALL, tol=tol,
+        report=content_report)
     if not symbols:
         return [], np.zeros((0, 3)), [], {}
     frac = cell.to_fractional(cart)
@@ -77,6 +79,13 @@ def pack(data, disorder=None, outside=True, grow_from_copies=False, tol=0.1):
         grow_from_copies=grow_from_copies)
 
     meta = {}
+    # `complete_molecules` REORDERS and duplicates, so anything keyed by the
+    # content index has to be remapped through `source` — an index-based map
+    # carried across it silently describes the wrong atoms.
+    site_of = content_report.get("site_of") or []
+    if site_of:
+        meta["site_of"] = [int(site_of[i]) if i < len(site_of) else -1
+                           for i in source]
     if composition:
         # A copy of a shared site is still that site (round 42), or the cell
         # shows one pie sphere in the middle and plain ones at the corners.
