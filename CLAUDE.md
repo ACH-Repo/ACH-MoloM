@@ -2919,6 +2919,62 @@ Options for publication-quality output, in the order they are worth doing:
    maintain. Only worth it if a specific journal-style look is wanted.
 NOT recommended: bundling a Python ray tracer (slow, another dependency).
 
+## NEXT UP — measured issues, in priority order (2026-08-06)
+Logged at the end of the round-49 session, all of them either measured here or
+read straight off the code. Christian is continuing on the DESKTOP PC.
+
+0. **PERFORMANCE: `polyhedra.shade_colors` runs a Python loop per TRIANGLE
+   per FRAME.** It is the likeliest cause of the slowdown he noticed after
+   round 48 and it is straightforwardly vectorisable — the face normals and
+   the eye vector are two array operations, and only the `|N.V|` term changes
+   between frames. Note the hulls themselves are already cached
+   (`_polyhedra_plan`); it is only the shading that is not. Measure a frame
+   time before and after rather than assuming this is the whole of it.
+
+1. **The Blender export drops COORDINATION POLYHEDRA.** Measured:
+   `collect()` returns `atoms, bonds, camera, centre, lights, materials,
+   radius` and the only mention of the module is `polyhedra.is_metal` for
+   picking metallic materials. Sphere sizes ARE carried, per atom and global
+   (`r * obj.atom_scale_for(i)`), as are per-atom colours, hidden atoms and
+   the unit cell. So a MOF figure loses exactly the thing that makes it
+   readable. The geometry is already a triangle soup with per-face colours,
+   so this is a contained addition — one mesh per polyhedron, or one merged
+   mesh per object with a translucent material.
+
+2. **There is NO CIF WRITER, and a written `.cif` is not a crystal.**
+   `write_structure_file` hands OpenBabel an xyz block for any non-xyz
+   extension, so the file contains coordinates and nothing else. Measured on
+   a ZIF-8 export: no `_cell_length_a`, no symmetry, and **MoloM's own parser
+   rejects the file it just wrote** ("no unit cell in this CIF"). Mercury and
+   VESTA would read it as a molecule at best. Editing first is irrelevant —
+   the crystallography was never written. The fix is a real writer: cell,
+   operators (spglib re-deriving the group after an edit, which round 43d
+   already does), occupancies and the asymmetric unit.
+
+3. **Editing a PACKED crystal desynchronises the boundary copies.** They are
+   ordinary independent atoms in the list: measured on ZIF-8, atom 0 has a
+   copy at index 348, and moving one does not move the other. `edits.
+   adjust_bond_lengths` is also cell-unaware — it moves atoms by pure
+   geometry and can push one across a face. The existing guards do not cover
+   this: `begin_model_edit` handles the cell-box drift (round 43e) and
+   `sync_asymmetric_unit` only fires when the base IS the asymmetric unit,
+   which a packed import's base is not. Treat "edit a packed crystal" as
+   unsupported until editing operates on the CONTENT and re-packs.
+
+4. **Write a `.blend`, not a script** (Christian, 2026-08-06: "I don't like
+   having to load it in every time... all I have to do is press F12").
+   Round 37 chose a `.py` because writing .blend needs Blender itself — but
+   Blender IS installed, so the answer is to INVOKE it: `blender -b --python
+   build.py -- --save out.blend` runs the generated script headlessly and
+   saves the result. **The scene is then already built, so nothing has to run
+   on load at all** — no auto-run, no "Allow Execution" prompt, no trust
+   dialog, and F12 just renders. That is strictly better than what was asked
+   for, and it is worth saying so rather than wiring up a registered text
+   block. Still worth EMBEDDING the script as a text datablock for re-running
+   after a tweak; register-on-load is then an option, not the mechanism.
+   Blender lives at `C:\Program Files\Blender Foundation\Blender 4.4   blender-launcher.exe` on the laptop and elsewhere on the PC, so the path
+   must be a SETTING with discovery, never a constant.
+
 ## Roadmap
 Round-1 skeleton and round-2 Blender batch: DELIVERED (see "What this is").
 Christian said "there will be heaps more" — expect further Blender-parity
