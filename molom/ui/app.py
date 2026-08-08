@@ -45,8 +45,6 @@ from .dialogs import (BlenderExportDialog, MetaAtomDialog,
 from .crystal_ribbon import CrystalRibbon
 from .optimize_panel import OptimizeDock, OptimizeWorker, TASK_SELECTION
 from . import properties as properties_mod
-from .debug_page import DebugPage
-from .sandbox_page import SandboxPage
 from .properties import (CrystalPage, ModifierPage,
                          PropertiesDock, VibrationPage)
 from .timeline_panel import TimelinePanel
@@ -62,15 +60,6 @@ _MAX_RECENT = 8
 # (MolViewport._paint_edit_header draws it at y = 8). Floating overlays start
 # below this so they never cover the molecule's name.
 _VIEWPORT_HEADER_H = 36
-#: The debug and sandbox pages own exactly one scene object between them and
-#: replace it on every stage click, so it is found by NAME rather than by a
-#: stored id — an undo between two clicks rebuilds the scene and every id with
-#: it. ONE object for both pages on purpose: the two are alternative
-#: algorithms for the same thing, and seeing them at once would be a picture
-#: of neither.
-_DEBUG_NAME = "Debug pipeline"
-_SANDBOX_NAME = "Sandbox pipeline"
-_PIPELINE_NAMES = (_DEBUG_NAME, _SANDBOX_NAME)
 
 
 def apply_dark_theme(app):
@@ -284,14 +273,6 @@ class MainWindow(QMainWindow):
         # ONE right-hand dock for everything: scene tree, modifiers, force
         # field. Separate docks were fighting each other for the same edge
         # and each one cost vertical space it did not need.
-        self.debug_page = DebugPage()
-        self.debug_page.stage_requested.connect(self.on_debug_stage)
-        self.debug_page.file_loaded.connect(
-            lambda _p: setattr(self, "_debug_needs_fit", True))
-        self.sandbox_page = SandboxPage()
-        self.sandbox_page.stage_requested.connect(self.on_sandbox_stage)
-        self.sandbox_page.file_loaded.connect(
-            lambda _p: setattr(self, "_debug_needs_fit", True))
         self.properties = PropertiesDock(
             [("outliner", "🗂", "Scene outliner", self.outliner),
              ("modifiers", "🔧", "Modifiers", self.modifier_page),
@@ -300,12 +281,7 @@ class MainWindow(QMainWindow):
              ("vibrations", "∿", "Vibrational normal modes (ORCA FREQ)",
               self.vibration_page),
              ("forcefield", "⚛", "Force field",
-              self.optimize_panel.widget()),
-             ("debug", "🐞", "Debug: the CIF pipeline one stage at a time",
-              self.debug_page),
-             ("sandbox", "🧪",
-              "Sandbox: an alternative pipeline, for experimenting",
-              self.sandbox_page)], self)
+              self.optimize_panel.widget())], self)
         self.addDockWidget(Qt.RightDockWidgetArea, self.properties)
         self._panel_drag_active = False
         self.transform_panel.drag_started.connect(self._on_panel_drag_started)
@@ -375,6 +351,9 @@ class MainWindow(QMainWindow):
         self._build_statusbar()
         self.setAcceptDrops(True)
         self.resize(1100, 740)
+        # LAST: an add-on's register() is handed this window and reaches
+        # straight into it, so everything it might touch has to exist first.
+        self._init_addons()
 
     def load_default_scene(self):
         """Blender opens on a cube; MoloM opens on cubane — centred on the
@@ -763,6 +742,9 @@ class MainWindow(QMainWindow):
         r("settings", "Settings...", lambda c: c.on_settings(),
           category="App", aliases=("preferences", "mouse", "trackpad",
                                    "input", "options"))
+        r("addons", "Add-ons...", lambda c: c.on_addons(), category="App",
+          aliases=("plugins", "extensions", "preferences", "install",
+                   "debug pipeline", "sandbox"))
         r("about", "About MoloM", lambda c: c.on_about(), category="App",
           aliases=("shortcuts", "keys", "navigation", "help"))
         r("quit", "Quit MoloM", lambda c: c.close(), category="App",
@@ -905,6 +887,7 @@ class MainWindow(QMainWindow):
         # one key is the ambiguity that killed F3.
         self._add_op(m_app, "operator_search", "&Search operations...")
         self._add_op(m_app, "settings", "&Settings...")
+        self._add_op(m_app, "addons", "&Add-ons...")
         self._add_op(m_app, "about", "&About MoloM")
 
     def _check_menu_mnemonics(self):
@@ -4796,105 +4779,6 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "{}: {} — {} atoms".format(obj.name, label, s.n_atoms), 6000)
 
-    # ------------------------------------------------------- debug pipeline
-    def on_debug_stage(self, index, text):
-        # type: (int, str) -> None
-        """Run the CIF pipeline up to one stage and put THAT on screen.
-
-        Completely fresh every time (Christian's requirement): the previous
-        debug object is thrown away and the structure is rebuilt from the
-        text, so a stage can never show something a later stage added. Only
-        the CIF text persists, and it lives on the page.
-
-        Deliberately does NOT call `_perceive_fresh` — bonds are part of what
-        is under inspection, and stages before 7 are supposed to have none.
-        """
-        from ..core import pipeline as pipeline_mod
-        result = pipeline_mod.run(text, index,
-                                  disorder=self.disorder_policy)
-        self._show_pipeline_result(result, index, pipeline_mod.STAGES,
-                                   self.debug_page, _DEBUG_NAME)
-
-    def on_sandbox_stage(self, index, text):
-        # type: (int, str) -> None
-        """The same, for the EXPERIMENTAL pipeline on the 🧪 page.
-
-        Its own handler rather than a flag on the debug one, because the two
-        take different parameters and are meant to diverge — that is the
-        point of the page.
-        """
-        from ..core import sandbox as sandbox_mod
-        result = sandbox_mod.run(text, index, **self.sandbox_page.options())
-        self._show_pipeline_result(result, index, sandbox_mod.STAGES,
-                                   self.sandbox_page, _SANDBOX_NAME)
-
-    def _show_pipeline_result(self, result, index, stages, page, name):
-        """Put a pipeline stage's output on screen, replacing the last one."""
-        self.push_undo()
-        previous = self._debug_object()
-        keep_camera = previous is not None and not getattr(
-            self, "_debug_needs_fit", False)
-        if previous is not None:
-            self.scene.remove(previous.id)
-        s = Structure(list(result.symbols), result.coords, name=name)
-        s.bonds = [(int(i), int(j), int(o)) for i, j, o in result.bonds]
-        # A stage can hand the viewport something no coordinate implies — the
-        # composition of a shared site, which is what draws a pie sphere.
-        s.metadata.update(getattr(result, "meta", None) or {})
-        if result.cell is not None:
-            s.metadata["cell"] = result.cell.to_dict()
-            # Needs three atoms to fit a pose; below that the box is simply
-            # drawn in the cell's own frame, which is exactly right for the
-            # cell-only stage.
-            set_cell_reference(s)
-        obj = self.scene.add(s, name=name)
-        self.active_id = obj.id
-        self.viewport.show_cell = True
-        self.viewport.set_selection([])
-        self._sync_all()
-        if not keep_camera:
-            # Frame it ONCE per file. Re-fitting on every stage would move
-            # the camera between the two pictures you are trying to compare.
-            self._fit_debug_view(obj, result)
-            self._debug_needs_fit = False
-        page.show_result(result)
-        stage = stages[max(0, min(int(index), len(stages) - 1))]
-        self.statusBar().showMessage(
-            "{} stage {} — {}: {} atoms, {} bonds".format(
-                name.split()[0], int(index) + 1, stage.label,
-                len(result.symbols), len(result.bonds)), 8000)
-
-    def _fit_debug_view(self, obj, result):
-        """Frame the CELL as well as the atoms.
-
-        `fit_view` frames atoms, and the first stage deliberately has none —
-        it would fall back to a 1 A radius at the origin and leave a 17 A box
-        entirely off screen. The box is the subject here, so it is part of
-        what gets framed (the roadmap's open `fit_view` note, in the one place
-        it currently bites).
-        """
-        points = []
-        if result.cell is not None:
-            points.append(np.asarray(result.cell.corners(), dtype=float))
-        if len(result.symbols):
-            points.append(np.asarray(result.coords, dtype=float))
-        if not points:
-            self.viewport.fit_view()
-            return
-        arr = np.vstack(points)
-        center = arr.mean(axis=0)
-        radius = float(np.linalg.norm(arr - center, axis=1).max()) + 1.5
-        self.viewport.camera.fit(center, radius)
-        self.viewport.update()
-
-    def _debug_object(self):
-        """The one object either pipeline page owns, whichever made it."""
-        for obj in self.scene.objects:
-            for name in _PIPELINE_NAMES:
-                if obj.name == name or obj.name.startswith(name + "."):
-                    return obj
-        return None
-
     def on_crystal_packing(self):
         na, ok = QInputDialog.getInt(self, "Packing", "Cells along a:", 2, 1, 12)
         if not ok:
@@ -4932,6 +4816,42 @@ class MainWindow(QMainWindow):
         dlg = OperatorSearchDialog(self, self.ops, self)
         if dlg.exec() and dlg.chosen is not None:
             dlg.chosen.run(self)
+
+    # ------------------------------------------------------------- add-ons
+    def _init_addons(self):
+        """Discover add-ons and enable the ones that were on last time.
+
+        Runs LAST in `__init__`, after every dock and page exists, because an
+        add-on's `register()` is handed this window and will reach straight
+        into it. A failure disables the add-on and is reported — it must
+        never stop MoloM starting.
+        """
+        from ..core import addons as addons_mod
+        self.addons = addons_mod.AddOnManager()
+        wanted = [a for a in (self.settings.value("addons/enabled", [])
+                              or []) if a]
+        if isinstance(wanted, str):          # QSettings collapses a 1-element
+            wanted = [wanted]                # list to a bare string
+        failed = self.addons.enable_all(wanted, self)
+        if failed:
+            self.statusBar().showMessage(
+                "{} add-on(s) failed to load — see App > Add-ons".format(
+                    len(failed)), 10000)
+
+    def save_enabled_addons(self):
+        self.settings.setValue("addons/enabled",
+                               sorted(self.addons.enabled))
+
+    def on_addons(self):
+        from .addons_dialog import AddOnsDialog
+        dialog = getattr(self, "_addons_dialog", None)
+        if dialog is None:
+            dialog = AddOnsDialog(self, self)
+            self._addons_dialog = dialog
+        dialog.rebuild()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def on_settings(self):
         """Settings is MODELESS — it has live-applying sliders, so being

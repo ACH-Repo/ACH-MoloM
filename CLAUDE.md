@@ -115,7 +115,39 @@ out at three of its four positions instead of four. Both fixed by the one rule.
 **Still open**: bonds from the FULL-occupancy O to the partial ones survive
 (1.475 / 1.520 / 1.706 A) because the sum rule does not apply, and 1.475 A is
 exactly a peroxide bond — no distance rule can reject it.
-**Round 45i — the phosphate fix, chosen by measuring four policies rather than
+**Round 46 (2026-08-06, INSTALLABLE ADD-ONS — Blender's model): Christian, on the
+debug and sandbox pages: "I just want them cordoned off somewhere so I don't
+need to worry about them", and on the API: "I don't see why an add-on should
+not have full access... If someone wants to brick their install with something
+they made themselves, that's on them." So there is no sandbox and no capability
+list — `register(window)` is handed the live `MainWindow` and may do anything
+the app can. Four decisions, all his: **bundled + user folder** (`molom/addons/`
+ships with MoloM, `~/.molom/addons/` is scanned too, both listed together, a
+user id SHADOWING a bundled one so a shipped page can be patched without
+editing the install); **`register()`/`unregister()` plus an `ADDON` dict**, the
+bl_info shape, because it is what any Blender user already knows and it caps
+nothing; **live enable, restart to fully remove** — unticking calls
+`unregister()` and says a restart is needed, rather than promising a teardown
+MoloM cannot enforce on third-party code; and **the two pipeline pages become
+bundled add-ons, off by default**, which is the cordoning-off and simultaneously
+the proof that the API carries a real page. `app.py` no longer mentions either
+one — the shared plumbing moved to `molom/addons/_pipeline_host.py`, so nothing
+you reason about while working on MoloM proper has to know they exist.
+**Metadata is parsed with `ast`, never imported**: listing add-ons must not
+execute third-party code, or one broken module takes the whole preferences
+dialog with it. A test writes an add-on with an import-time side effect and
+asserts it never fires. Enabling catches everything (`BaseException` on the
+import path, so a partially executed module is removed from `sys.modules`), and
+a failure disables that add-on and reports it rather than stopping startup.
+`PropertiesDock` gained `add_page`/`remove_page` since the tab strip was a fixed
+list built in the constructor. **Gotcha worth keeping**: `_import` caches in
+`sys.modules` deliberately (enabling twice must not re-execute), which makes a
+loaded add-on SHARED ACROSS THE TEST SUITE — the round-37 circuit-breaker trap
+in a new place, and it presented the same way, one test failing only in the full
+run. `tests/test_round46_addons.py` purges `molom_addon_*` around every test.
+1042 tests.
+
+Round 45i — the phosphate fix, chosen by measuring four policies rather than
 one.** The shell grew from EVERY drawn atom including the boundary copies, so a
 6-coordinate Mg with copies on three faces completed its sphere once per copy.
 Four combinations were measured (grow from copies or not, carry the partner's

@@ -10,6 +10,8 @@ import numpy as np
 import pytest
 
 from molom.core import pipeline
+from molom.addons._pipeline_host import (
+    pipeline_object as _pipeline_object)
 from tests.test_round18_cif import NACL_CIF
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -224,11 +226,16 @@ def test_the_page_emits_the_stage_and_the_text(qapp):
 
 def test_the_window_runs_a_stage_and_keeps_the_camera(win):
     """Only the CIF text persists — and the camera, so two stages can be
-    compared without the view jumping between them."""
+    compared without the view jumping between them.
+
+    The page is an ADD-ON now, so it has to be enabled first; that it can be
+    driven exactly as before afterwards is half the point of this test."""
+    ok, message = win.addons.enable("debug_pipeline", win)
+    assert ok, message
     win.debug_page.set_text(NACL_CIF, name="nacl.cif")
-    win._debug_needs_fit = True
+    win._pipeline_needs_fit = True
     win.debug_page.run_stage(0)
-    obj = win._debug_object()
+    obj = _pipeline_object(win)
     assert obj is not None
     assert obj.structure.n_atoms == 0            # the cell alone
     assert obj.structure.metadata.get("cell")
@@ -236,7 +243,7 @@ def test_the_window_runs_a_stage_and_keeps_the_camera(win):
     assert distance > 1.0                        # framed the BOX, not nothing
 
     win.debug_page.run_stage(1)
-    assert win._debug_object().structure.n_atoms == 2
+    assert _pipeline_object(win).structure.n_atoms == 2
     assert win.viewport.camera.distance == pytest.approx(distance)
 
     # and exactly one debug object, however many times it is run

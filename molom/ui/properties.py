@@ -1203,11 +1203,59 @@ class PropertiesDock(QDockWidget):
             scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
             self.stack.addWidget(scroll)
         strip.addStretch(1)
+        self._strip = strip
         lay.addLayout(strip)
         lay.addWidget(self.stack, 1)
         self.setWidget(root)
         if pages:
             self.show_page(pages[0][0])
+
+    def add_page(self, key, glyph, tip, widget):
+        """Append a page after construction — this is what an ADD-ON uses.
+
+        The tab lands above the stretch that keeps the strip top-aligned, so
+        added tabs sit under the built-in ones rather than floating at the
+        bottom of the dock.
+        """
+        if key in self.buttons:
+            return
+        index = self.stack.count()
+        b = QToolButton()
+        b.setText(glyph)
+        b.setToolTip(tip)
+        b.setCheckable(True)
+        b.setFixedSize(28, 28)
+        b.setStyleSheet(_TAB_STYLE)
+        b.setCursor(Qt.PointingHandCursor)
+        b.clicked.connect(lambda _c=False, k=key: self.show_page(k))
+        self._strip.insertWidget(self._strip.count() - 1, b)
+        self.buttons[key] = (b, index)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(widget)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.stack.addWidget(scroll)
+
+    def remove_page(self, key):
+        """Take a page away again. Best effort — see `AddOnManager.disable`."""
+        entry = self.buttons.pop(key, None)
+        if entry is None:
+            return
+        button, index = entry
+        self._strip.removeWidget(button)
+        button.deleteLater()
+        widget = self.stack.widget(index)
+        if widget is not None:
+            self.stack.removeWidget(widget)
+            widget.deleteLater()
+        # Indices after the removed one have shifted down by one.
+        for k, (b, i) in list(self.buttons.items()):
+            if i > index:
+                self.buttons[k] = (b, i - 1)
+        if self.buttons:
+            self.show_page(sorted(self.buttons, key=lambda k:
+                                  self.buttons[k][1])[0])
 
     def show_page(self, key):
         entry = self.buttons.get(key)
