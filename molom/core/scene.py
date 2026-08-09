@@ -12,6 +12,7 @@ import numpy as np
 
 from . import elements, modifiers
 from .camera import quat_identity, quat_to_mat3
+from . import cameras as cameras_mod
 from .structure import Structure
 
 
@@ -249,7 +250,16 @@ class Scene:
 
     def __init__(self):
         self.objects = []          # type: List[MolObject]
+        #: Saved viewpoints. A separate list from `objects` on purpose: a
+        #: camera has no atoms, so every loop that draws, picks, exports or
+        #: perceives bonds would have to learn to skip it. Keeping them apart
+        #: means none of that code changes at all, and the outliner shows the
+        #: two as separate sections because that is what they are.
+        self.cameras = []          # type: List[cameras_mod.CameraObject]
+        #: Which camera Numpad 0 goes back to.
+        self.active_camera_id = None    # type: Optional[int]
         self._next_id = 1
+        self._next_camera_id = 1
 
     # -------------------------------------------------------------- lookup
     def get(self, obj_id):
@@ -266,6 +276,62 @@ class Scene:
     @property
     def n_objects(self):
         return len(self.objects)
+
+    # --------------------------------------------------------------- cameras
+    def camera(self, cam_id):
+        # type: (int) -> Optional[object]
+        for c in self.cameras:
+            if c.id == cam_id:
+                return c
+        return None
+
+    def add_camera(self, name="", camera=None, width=None, height=None):
+        # type: (str, object, int, int) -> object
+        """A new saved viewpoint, optionally capturing the live camera."""
+        cam = cameras_mod.CameraObject(
+            self._next_camera_id,
+            self.unique_camera_name(name or "Camera"))
+        self._next_camera_id += 1
+        if camera is not None:
+            cam.capture(camera, width, height)
+        self.cameras.append(cam)
+        self.active_camera_id = cam.id
+        return cam
+
+    def remove_camera(self, cam_id):
+        # type: (int) -> bool
+        cam = self.camera(cam_id)
+        if cam is None:
+            return False
+        self.cameras.remove(cam)
+        if self.active_camera_id == cam_id:
+            self.active_camera_id = (self.cameras[-1].id if self.cameras
+                                     else None)
+        return True
+
+    def unique_camera_name(self, base, ignore=None):
+        # type: (str, Optional[int]) -> str
+        taken = {c.name for c in self.cameras if c.id != ignore}
+        if base not in taken:
+            return base
+        n = 1
+        while "{}.{:03d}".format(base, n) in taken:
+            n += 1
+        return "{}.{:03d}".format(base, n)
+
+    def rename_camera(self, cam_id, new_name):
+        # type: (int, str) -> Optional[str]
+        cam = self.camera(cam_id)
+        if cam is None:
+            return None
+        cam.name = self.unique_camera_name(
+            (new_name or "Camera").strip() or "Camera", ignore=cam_id)
+        return cam.name
+
+    def active_camera(self):
+        # type: () -> Optional[object]
+        return (self.camera(self.active_camera_id)
+                if self.active_camera_id is not None else None)
 
     # ------------------------------------------------------------- mutation
     def add(self, structure, name=""):
@@ -482,7 +548,16 @@ class Scene:
                                 for k, v in o.atom_scales.items()},
                 "label_mode": o.label_mode,
             })
-        return {"objects": objs, "next_id": self._next_id}
+        return {"objects": objs, "next_id": self._next_id,
+                # Cameras ride the snapshot stack and the savefile like
+                # everything else, which is the whole point of them being
+                # scene objects: "a savefile can retain previously used
+                # angles". `to_dict` is already JSON-safe, so `to_dict` and
+                # `snapshot` need no separate handling here (round 31's
+                # four-place checklist, satisfied by having one shape).
+                "cameras": [c.to_dict() for c in self.cameras],
+                "active_camera_id": self.active_camera_id,
+                "next_camera_id": self._next_camera_id}
 
     def to_dict(self):
         # type: () -> dict
@@ -499,7 +574,14 @@ class Scene:
 
     def from_dict(self, d):
         # type: (dict) -> None
-        snap = {"next_id": int(d.get("next_id", 1)), "objects": []}
+        # Everything `snapshot` produces has to be carried, not just the
+        # objects: this function rebuilds the dict by hand, so anything added
+        # to the snapshot and not added HERE is silently lost on load. That
+        # is how the cameras vanished from the first savefile that had them.
+        snap = {"next_id": int(d.get("next_id", 1)), "objects": [],
+                "cameras": d.get("cameras", []),
+                "active_camera_id": d.get("active_camera_id"),
+                "next_camera_id": d.get("next_camera_id", 1)}
         for o in d.get("objects", []):
             snap["objects"].append(dict(
                 o,
@@ -513,6 +595,12 @@ class Scene:
 
     def restore(self, snap):
         # type: (dict) -> None
+        self.cameras = [cameras_mod.CameraObject.from_dict(c)
+                        for c in snap.get("cameras", [])]
+        self.active_camera_id = snap.get("active_camera_id")
+        self._next_camera_id = int(
+            snap.get("next_camera_id",
+                     max([c.id for c in self.cameras] or [0]) + 1))
         self.objects = []
         for d in snap["objects"]:
             s = Structure(d["symbols"], d["frames"][0], name=d["sname"],

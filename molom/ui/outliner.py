@@ -15,12 +15,12 @@ and looking costs nothing.
 
 from typing import Optional
 
-from PySide6.QtCore import QEvent, QPoint, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, QSize, Qt, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QPalette
 from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox,
                                QHBoxLayout, QHeaderView, QInputDialog,
                                QLabel, QMenu, QStyledItemDelegate,
-                               QToolButton, QTreeWidget,
+                               QFrame, QToolButton, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from ..core import elements
@@ -54,6 +54,21 @@ ROLE_HIDDEN = Qt.UserRole + 3    # this molecule has hidden atoms
 # Short codes for the label-type square
 _MODE_CODE = {"element": "El", "index": "#", "element_index": "E#",
               "custom": "✎"}
+
+
+class _Divider(QFrame):
+    """A hairline between the molecules and the cameras.
+
+    A widget rather than a styled row: a QTreeWidgetItem cannot draw a line
+    across the full width without a delegate, and this is one line of code
+    that reads as what it is.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.HLine)
+        self.setFrameShadow(QFrame.Sunken)
+        self.setStyleSheet("color: rgba(255,255,255,45);")
 
 
 class _HiddenMarkDelegate(QStyledItemDelegate):
@@ -447,6 +462,10 @@ class OutlinerPanel(QWidget):
     activated = Signal(int)
     add_requested = Signal()
     merge_requested = Signal(list)
+    camera_activated = Signal(int)       # double-clicked: look through it
+    camera_renamed = Signal(int, str)
+    camera_delete_requested = Signal(int)
+    camera_add_requested = Signal()
     atom_display_changed = Signal()          # colours / labels edited
     atom_picked = Signal(int, int)           # obj_id, atom index
     crystal_view_changed = Signal(int, str)  # obj_id, 'asym' | 'cell'
@@ -562,9 +581,50 @@ class OutlinerPanel(QWidget):
         add.setFlags(Qt.ItemIsEnabled)
         add.setForeground(0, QColor(150, 190, 240))
         self.tree.addTopLevelItem(add)
+        self._add_camera_section(scene)
         self._restore_expanded(expanded)
         self._loading = False
         self._sync_label_combo(active_id)
+
+    def _add_camera_section(self, scene):
+        """Saved viewpoints, under a divider.
+
+        A camera is not a molecule — it has no atoms, no style and no
+        elements — so it goes below its own rule rather than in the same list
+        pretending to be one. Christian asked for the divider explicitly, and
+        it is the same device the F3 palette uses between categories.
+        """
+        cams = list(getattr(scene, "cameras", []) or [])
+        if not cams and not getattr(scene, "cameras", None):
+            # Still show the "+ Camera" row: a feature nobody can find is one
+            # nobody has. It is one line and it explains itself.
+            pass
+        rule = QTreeWidgetItem(["", "", ""])
+        rule.setData(0, ROLE_KIND, "divider")
+        rule.setFlags(Qt.ItemIsEnabled)
+        rule.setSizeHint(0, QSize(1, 9))
+        self.tree.addTopLevelItem(rule)
+        self.tree.setItemWidget(rule, 0, _Divider())
+
+        active = getattr(scene, "active_camera_id", None)
+        for cam in cams:
+            item = QTreeWidgetItem(["\U0001F3A5  " + cam.name, "", ""])
+            item.setData(0, ROLE_KIND, "camera")
+            item.setData(0, ROLE_OBJ, cam.id)
+            item.setFlags(item.flags() | Qt.ItemIsEditable)
+            item.setToolTip(
+                0, "{:.0f} mm {}, {}x{} at {:g}x\n\nDouble-click to look "
+                   "through it (Numpad 0 toggles the last one)".format(
+                       cam.focal_mm, cam.projection, cam.width, cam.height,
+                       cam.multiplier))
+            if cam.id == active:
+                item.setForeground(0, QColor(150, 190, 240))
+            self.tree.addTopLevelItem(item)
+        add_cam = QTreeWidgetItem(["+  Camera (save this view)", "", ""])
+        add_cam.setData(0, ROLE_KIND, "add_camera")
+        add_cam.setFlags(Qt.ItemIsEnabled)
+        add_cam.setForeground(0, QColor(150, 190, 240))
+        self.tree.addTopLevelItem(add_cam)
 
     #: A molecule with hidden atoms — bright enough to catch the eye in a
     #: long list, since the whole problem is that hidden atoms are invisible.
@@ -747,11 +807,18 @@ class OutlinerPanel(QWidget):
                 item.checkState(self.EYE_COLUMN) == Qt.Checked)
         elif column == 0 and kind == "object":
             self.renamed.emit(self._obj_id(item), item.text(0))
+        elif column == 0 and kind == "camera":
+            # The row carries a glyph the user did not type, so it is
+            # stripped before the name goes back to the scene.
+            self.camera_renamed.emit(self._obj_id(item),
+                                     item.text(0).lstrip("🎥 "))
 
     def _on_item_clicked(self, item, _column):
         kind = self._kind(item)
         if kind == "add":
             self.add_requested.emit()
+        elif kind == "add_camera":
+            self.camera_add_requested.emit()
         elif kind == "object":
             # Qt changes the selection on PRESS and emits itemClicked on
             # RELEASE, so this ran last and collapsed a Ctrl/Shift selection
@@ -776,6 +843,9 @@ class OutlinerPanel(QWidget):
             self.objects_selected.emit(list(chosen))
 
     def _on_item_double_clicked(self, item, column):
+        if column == 0 and self._kind(item) == "camera":
+            self.camera_activated.emit(int(self._obj_id(item)))
+            return
         if column == 0 and self._kind(item) == "object":
             self.tree.editItem(item, 0)
 
@@ -792,6 +862,18 @@ class OutlinerPanel(QWidget):
             act_col.triggered.connect(lambda: self._set_label_color(obj, idx))
             menu.addAction(act_txt)
             menu.addAction(act_col)
+            menu.exec(self.tree.viewport().mapToGlobal(pos))
+            return
+        if kind == "camera":
+            cam_id = int(self._obj_id(item))
+            for text, slot in (
+                    ("Look through", lambda: self.camera_activated.emit(cam_id)),
+                    ("Rename", lambda: self.tree.editItem(item, 0)),
+                    ("Delete",
+                     lambda: self.camera_delete_requested.emit(cam_id))):
+                act = QAction(text, menu)
+                act.triggered.connect(slot)
+                menu.addAction(act)
             menu.exec(self.tree.viewport().mapToGlobal(pos))
             return
         if kind != "object":

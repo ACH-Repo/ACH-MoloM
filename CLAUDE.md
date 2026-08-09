@@ -56,6 +56,52 @@ the operator key table, CIF reading with symmetry, coordination polyhedra,
 meta atoms, the scene clock with a multi-track timeline, vibrational modes,
 per-element display control, and the symmetry modifier. 512 tests.
 
+Round 56 (2026-08-09, CAMERA OBJECTS — Blender's model, Christian's spec):
+"introduce camera objects like in blender... that way a savefile can retain
+previously used angles". `core/cameras.py` holds a `CameraObject`: a pose
+(pivot + distance + quaternion, the same triple the interactive rig uses, so
+activating one is an assignment), a lens, a film size and a roll.
+**Three decisions worth keeping.** (1) **Focal length is MILLIMETRES against a
+SENSOR WIDTH, not Angstrom** — Angstrom is the scene's unit and a focal length
+only means something relative to the film it projects onto; (50 mm, 36 mm) is
+a pair every photographer and every Blender user can already picture, and
+`fov_y_degrees` turns it into the vertical FOV the projection actually wants
+(one arctan, and the aspect divides the sensor so a 16:9 camera and a square
+one do NOT frame the same height). (2) **Roll is explicit**, because the
+interactive camera is a TURNTABLE and cannot represent a rolled pose (round 3
+is the whole no-roll fix) — a saved camera has to carry it rather than hope
+the orbit rig can hold it. (3) **Resolution is pixels PLUS a multiplier**:
+512x512 at 2x is a different statement from 1024x1024 — "this framing,
+finer" — and it survives deciding later that the figure wants 4x.
+**Cameras are a SEPARATE list from `Scene.objects`**, and that is the whole
+reason the round was cheap: a camera has no atoms, so every loop that draws,
+picks, exports or perceives bonds would otherwise have to learn to skip it.
+None of that code changed at all. They ride `snapshot`/`to_dict` like
+everything else — and `from_dict` rebuilds the snapshot dict BY HAND, so the
+first savefile lost them until that was carried too (a new entry in round 31's
+four-place checklist, and the same shape of bug).
+**The UI**: the outliner grows a section under a hairline divider with a
+`+ Camera` row; double-click looks through one; **Numpad 0 TOGGLES** (glance
+at the shot, then back to composing — entering only would make the key
+half-useful, and the free view is restored to where it was). A 🎥 properties
+page carries projection / focal length / sensor / pixels / multiplier / roll.
+Looking through a camera veils everything outside the film back and draws the
+frame with **eight drag handles** — Christian asked for "indicators that make
+the user realise he can use them", and an invisible hit target is the
+commonest way a drag-to-resize goes undiscovered. A corner is tested before an
+edge, since dragging the very corner should never resize one axis only.
+**The Blender export was the clean part.** MoloM's rig and Blender's camera
+already share a convention (look down local -Z, +Y up), so a saved camera's
+world matrix is the same construction `camera_setup` already used and roll is
+just part of the rotation. Every saved camera becomes a real Blender camera,
+the active one is made `scene.camera`, and the viewport camera is only added
+when there are none — two cameras describing one shot is clutter. `data.lens`
+and `sensor_width` are set DIRECTLY rather than through the field of view, so
+the number in Blender's N panel is the number in MoloM's. Verified by running
+it: an 85 mm camera at 640x360 with a 2x multiplier and 0.35 rad of roll came
+out of Blender 5.1 as a 1280x720 render, tilted, from the .blend alone.
+1219 tests.
+
 Round 55 (2026-08-09, four of Christian's, and the render keys):
 **(1) Re-baking a normal mode teleported the molecule home.** `_rest_geometry`
 was captured ONCE when the frequencies were read and reused for every bake, so
@@ -2141,7 +2187,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1191 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1219 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -2290,6 +2336,11 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   is the separated aiming mark. Roll is an explicit angle here and an explicit
   PARAMETER on `Camera.fly_look`, applied after the azimuth/elevation rebuild
   so it can never accumulate; pitch is still clamped short of vertical.
+- `core/cameras.py` — saved viewpoints (round 56). A `CameraObject` is a
+  pose plus a lens: focal length in MM against a sensor width, an explicit
+  roll (the turntable cannot hold one), and pixels plus a multiplier. Also
+  owns the film-back rectangle and its drag handles, so the viewport
+  overlay is arithmetic that can be tested without a window.
 - `core/animation.py` — the scene clock as a FILE (round 54). `frame_times`
   is the plan and is where the mistakes live (a repeated loop boundary hitches
   once per cycle and is invisible in a single frame); PNG sequences need no
@@ -2416,6 +2467,11 @@ independent cross-check inside a single fixture.
   vector then spin so the backbone points outward.
 
 ## Hard-won gotchas (don't re-learn these)
+- **`Scene.from_dict` rebuilds the snapshot dict BY HAND** (round 56), so
+  anything added to `snapshot()` and not added there is silently lost on
+  load — the cameras vanished from the first savefile that had them. When
+  adding scene-level state, grep for `next_id`: it appears in `snapshot`,
+  `to_dict`, `from_dict` and `restore`, and that is the checklist.
 - **A two-part chord needs both spellings** (round 55). `Shift+Space, L` only
   matches when Shift comes UP before the second key; hold it and Qt looks for
   `Shift+L`. Nothing warns you — the action simply never fires, and it reads

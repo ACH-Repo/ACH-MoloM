@@ -47,6 +47,7 @@ from .choice_popup import ChoicePopup
 from ..core import (bonding, edits, elements, flight, grid as grid_mod,
                     input_map, internal,
                     manipulate, measure, meshes, picking,
+                    cameras as cameras_mod,
                     polyhedra as poly_mod, rotations,
                     selection2d, style as style_mod)
 from ..core.camera import Camera, quat_from_mat3, quat_mul, quat_to_mat3
@@ -710,6 +711,12 @@ class MolViewport(QOpenGLWidget):
     # exception", which points nowhere near the real cause. Defaults on the
     # class mean the attributes exist from the first instant the object does.
     _fly = None
+    #: The CameraObject id we are looking through, or None for the free
+    #: view. On the class because `event()` can be reached during
+    #: construction (round 34).
+    looking_through = None
+    camera_roll = 0.0
+    _frame_drag = None
     _poly_key = None
     _poly_cache = None
     _poly_edge_cache = None
@@ -831,6 +838,7 @@ class MolViewport(QOpenGLWidget):
         self.render_scale = 2            # resolution multiplier on render
         self.adjust_h = True             # re-dress hydrogens on edits
         self.on_edit_begin = None        # app callback: () -> None (undo)
+        self.on_camera_changed = None    # a frame drag finished
         self.on_mode_changed = None      # app callback: (mode) -> None
         self.on_new_molecule = None      # app callback: () -> obj_id
         self.on_toggle_mode = None       # app callback: () -> None (Tab)
@@ -1878,6 +1886,24 @@ class MolViewport(QOpenGLWidget):
         view = self.camera.view_matrix()
         proj = self.camera.projection_matrix(w, h)
         return picking.ray_from_screen(qpos.x(), qpos.y(), w, h, view, proj)
+
+    def active_camera_object(self):
+        """The CameraObject we are looking through, or None."""
+        if self.looking_through is None or self.scene is None:
+            return None
+        return self.scene.camera(self.looking_through)
+
+    def camera_rect(self):
+        """The film back as a widget-space rectangle, or None.
+
+        Only while looking through a camera: outside one there is no framing
+        to compose against, and drawing a rectangle over the free view would
+        just be furniture.
+        """
+        cam = self.active_camera_object()
+        if cam is None:
+            return None
+        return cameras_mod.frame_rect(self.width(), self.height(), cam.aspect)
 
     def _camera_frame(self):
         """Eye position and view/projection matrices, CACHED on the camera.
@@ -3227,6 +3253,58 @@ class MolViewport(QOpenGLWidget):
         finally:
             p.end()
 
+    #: The film-back overlay. Blue enough to read as UI rather than as part
+    #: of the molecule, and the same colour as the outliner's camera rows.
+    CAMERA_FRAME = QColor(150, 190, 240)
+
+    def _paint_camera_frame(self, p):
+        """What the render will contain, plus handles to change its shape.
+
+        Everything OUTSIDE the frame is veiled rather than hidden: you still
+        want to see the atom just off the edge, because that is what tells
+        you which way to move. The handles are drawn as small filled squares
+        — Christian asked for "indicators that make the user realise he can
+        use them", and an invisible hit target is the commonest way a
+        drag-to-resize goes undiscovered.
+        """
+        rect = self.camera_rect()
+        cam = self.active_camera_object()
+        if rect is None or cam is None:
+            return
+        x, y, w, h = rect
+        veil = QColor(0, 0, 0, 110)
+        p.setPen(Qt.NoPen)
+        p.setBrush(veil)
+        p.drawRect(0, 0, self.width(), int(y))
+        p.drawRect(0, int(y + h), self.width(), self.height())
+        p.drawRect(0, int(y), int(x), int(h) + 1)
+        p.drawRect(int(x + w), int(y), self.width(), int(h) + 1)
+
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(self.CAMERA_FRAME, 1.4))
+        p.drawRect(int(x), int(y), int(w), int(h))
+
+        hot = self._frame_drag["handle"] if self._frame_drag else None
+        for name, u, v in cameras_mod.HANDLES:
+            hx, hy = x + u * w, y + v * h
+            live = (name == hot)
+            p.setBrush(QColor(255, 255, 255) if live else self.CAMERA_FRAME)
+            p.setPen(QPen(QColor(30, 30, 30), 1.0))
+            r = 5 if live else 4
+            p.drawRect(int(hx - r), int(hy - r), 2 * r, 2 * r)
+
+        p.setPen(QPen(self.CAMERA_FRAME, 1.0))
+        f = QFont()
+        f.setPointSize(9)
+        p.setFont(f)
+        rw, rh = cam.render_size()
+        label = "{}  |  {:.0f} mm  |  {} x {}".format(cam.name, cam.focal_mm,
+                                                      rw, rh)
+        if cam.multiplier != 1.0:
+            label += "  ({}x{} at {:g}x)".format(cam.width, cam.height,
+                                                 cam.multiplier)
+        p.drawText(int(x) + 6, int(y) - 6, label)
+
     def _paint_overlays(self, view, proj, empty):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
@@ -3236,6 +3314,8 @@ class MolViewport(QOpenGLWidget):
         self._paint_symmetry(p)
         if not empty:
             self._paint_labels(p)
+        if self.looking_through is not None:
+            self._paint_camera_frame(p)
         if self.show_compass:
             self._paint_compass(p)
         if self._region_drag is not None:
@@ -4346,6 +4426,11 @@ class MolViewport(QOpenGLWidget):
             if hit is not None:
                 self.align_view_axis(hit[0], hit[1])
                 return
+            # A frame handle sits OVER the molecule, and being grabbable
+            # there is the whole point of it — so it is tested before
+            # picking, exactly as the compass is.
+            if self._camera_handle_press(pos):
+                return
         self._drag_last = pos
         self._drag_button = ev.button()
         self._drag_moved = False
@@ -4451,6 +4536,9 @@ class MolViewport(QOpenGLWidget):
                 self._draw_from = self._atom_map[hit][1]
 
     def mouseMoveEvent(self, ev):
+        if self._frame_drag is not None:
+            self._camera_handle_move(ev.position())
+            return
         pos = ev.position()
         if self._fly_pending is not None:
             # Armed but not yet flying. Dragging is as clear a statement of
@@ -4830,6 +4918,12 @@ class MolViewport(QOpenGLWidget):
         self.refresh_geometry()
 
     def mouseReleaseEvent(self, ev):
+        if self._frame_drag is not None:
+            self._frame_drag = None
+            if self.on_camera_changed is not None:
+                self.on_camera_changed()
+            self.update()
+            return
         if self._fly_pending is not None and ev.button() == Qt.RightButton:
             # Came up before the hold elapsed and without travelling: an
             # ordinary right CLICK. It opens the geometry menu straight away —
@@ -5191,6 +5285,41 @@ class MolViewport(QOpenGLWidget):
         if hit is None:
             return None
         return index_map[hit] if index_map is not None else hit
+
+    def _camera_handle_press(self, pos):
+        """Start a frame drag if the press landed on a handle.
+
+        Checked BEFORE picking, because a handle sits over the molecule and
+        the whole point of it is to be grabbable there.
+        """
+        rect = self.camera_rect()
+        if rect is None:
+            return False
+        handle = cameras_mod.handle_at(rect, pos.x(), pos.y())
+        if handle is None:
+            return False
+        cam = self.active_camera_object()
+        self._frame_drag = {"handle": handle, "rect": rect,
+                            "start": (pos.x(), pos.y()),
+                            "w": cam.width, "h": cam.height}
+        self.update()
+        return True
+
+    def _camera_handle_move(self, pos):
+        d = self._frame_drag
+        if d is None:
+            return False
+        cam = self.active_camera_object()
+        if cam is None:
+            return False
+        w, h = cameras_mod.resize_pixels(
+            d["handle"], d["w"], d["h"], pos.x() - d["start"][0],
+            pos.y() - d["start"][1], d["rect"])
+        cam.width, cam.height = w, h
+        self.status_message.emit(
+            "{}: {} x {} ({:.3f}:1)".format(cam.name, w, h, cam.aspect))
+        self.update()
+        return True
 
     def _click_pick(self, ev):
         if self.scene is None:

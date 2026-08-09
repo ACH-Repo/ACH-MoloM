@@ -312,6 +312,49 @@ def cell_edges(cell, radius=0.04):
 
 
 # ------------------------------------------------------------------ camera
+def camera_object_setup(cam, name=""):
+    # type: (object, str) -> dict
+    """A saved CameraObject as a Blender camera.
+
+    This is the clean part of the camera work: MoloM's rig and Blender's
+    camera already share a convention (look down local -Z, +Y up), so the
+    world matrix is the view rotation transposed with the eye in the
+    translation column — the same construction `camera_setup` uses for the
+    live view, and roll is simply part of that rotation rather than a special
+    case. The lens carries over as a REAL focal length and sensor size,
+    because that is how it is stored (see `core/cameras.py`).
+    """
+    from . import cameras as cameras_mod
+    rot = quat_to_mat3(np.asarray(cam.rotation, dtype=float))
+    if abs(float(cam.roll)) > 1e-12:
+        # Roll is about the VIEW axis, so it multiplies on the view side —
+        # the same order `Camera.fly_look` applies it in, and the reason a
+        # rolled camera exports rolled instead of silently levelling.
+        c, s_ = np.cos(float(cam.roll)), np.sin(float(cam.roll))
+        rot = np.array([[c, -s_, 0.0], [s_, c, 0.0], [0.0, 0.0, 1.0]]) @ rot
+    eye = np.asarray(cam.center, dtype=float) + rot.T @ np.array(
+        [0.0, 0.0, float(cam.distance)])
+    m = np.eye(4)
+    m[:3, :3] = rot.T
+    m[:3, 3] = eye
+    width, height = cam.render_size()
+    half_h = np.tan(np.radians(cam.fov_y) / 2.0) * float(cam.distance)
+    return {
+        "name": str(name or cam.name),
+        "matrix": [[round(float(v), 8) for v in row] for row in m],
+        "type": "ORTHO" if cam.orthographic else "PERSP",
+        "angle_y": round(float(np.radians(cam.fov_y)), 8),
+        "lens": round(float(cam.focal_mm), 4),
+        "sensor": round(float(cam.sensor_mm), 4),
+        "ortho_scale": round(float(2.0 * half_h), 6),
+        "clip_start": round(max(float(cam.distance) * 0.005, 0.01), 6),
+        "clip_end": round(float(cam.distance) * 20.0 + 100.0, 3),
+        "resolution": [int(width), int(height)],
+        "eye": _xyz(eye),
+        "target": _xyz(cam.center),
+    }
+
+
 def camera_setup(camera, width, height):
     # type: (object, int, int) -> dict
     """The viewport camera as a Blender camera.
@@ -433,6 +476,20 @@ def collect(scene, style, options, camera=None, width=1920, height=1080,
     else:
         centre, radius = np.zeros(3), 1.0
     cam = camera_setup(camera, width, height) if camera is not None else None
+    # Every SAVED camera becomes a real Blender camera, and the active one is
+    # made `scene.camera` — so the angles a savefile has been carrying arrive
+    # in Blender as objects you can switch between, not as one baked view.
+    saved = []
+    active_name = ""
+    for stored in list(getattr(scene, "cameras", []) or []):
+        spec = camera_object_setup(stored)
+        saved.append(spec)
+        if stored.id == getattr(scene, "active_camera_id", None):
+            active_name = spec["name"]
+    if saved and active_name:
+        # The active saved camera wins over the viewport pose: looking through
+        # a camera and exporting must render THAT shot.
+        cam = next(c for c in saved if c["name"] == active_name)
     mats = []
     for name in sorted(materials):
         rgb, sym, alpha = materials[name]
@@ -456,6 +513,8 @@ def collect(scene, style, options, camera=None, width=1920, height=1080,
         "bonds": bonds,
         "polyhedra": solids,
         "materials": mats,
+        "saved_cameras": saved,
+        "active_camera": active_name,
         "camera": cam,
         # HALF POWER when a world HDRI is doing half the work. An environment
         # lights a molecule from every direction at once; adding a full lamp
@@ -497,6 +556,8 @@ OPTIONS = {options}
 MATERIALS = {materials}
 CAMERA = {camera}
 LIGHTS = {lights}
+SAVED_CAMERAS = {saved_cameras}
+ACTIVE_CAMERA = {active_camera}
 SCENE_CENTRE = {centre}
 SCENE_RADIUS = {radius}
 
@@ -706,6 +767,36 @@ def build_world():
     return world
 
 
+def build_saved_cameras(coll):
+    """One Blender camera per MoloM camera object.
+
+    `lens`/`sensor_width` rather than `angle_y`: the focal length is what was
+    actually stored, and setting it directly means the number in Blender's N
+    panel is the number in MoloM's — going through the field of view would
+    round-trip it into something almost but not quite the same.
+    """
+    made = {}
+    for spec in SAVED_CAMERAS:
+        data = bpy.data.cameras.new(spec["name"])
+        cam = bpy.data.objects.new(spec["name"], data)
+        coll.objects.link(cam)
+        cam.matrix_world = Matrix(spec["matrix"])
+        data.clip_start = spec["clip_start"]
+        data.clip_end = spec["clip_end"]
+        data.sensor_fit = "HORIZONTAL"
+        data.sensor_width = spec["sensor"]
+        if spec["type"] == "ORTHO":
+            data.type = "ORTHO"
+            data.ortho_scale = spec["ortho_scale"]
+        else:
+            data.lens = spec["lens"]
+        made[spec["name"]] = cam
+    active = made.get(ACTIVE_CAMERA)
+    if active is not None:
+        bpy.context.scene.camera = active
+    return made
+
+
 def build_camera(coll):
     if not CAMERA:
         return None
@@ -762,7 +853,9 @@ def set_engine(preferred):
 def build_render():
     scene = bpy.context.scene
     engine = set_engine(OPTIONS["engine"])
-    w, h = CAMERA["resolution"] if CAMERA else (1920, 1080)
+    active = next((c for c in SAVED_CAMERAS
+                   if c["name"] == ACTIVE_CAMERA), None)
+    w, h = (active or CAMERA or {}).get("resolution", (1920, 1080))
     scene.render.resolution_x = int(w)
     scene.render.resolution_y = int(h)
     scene.render.resolution_percentage = 100
@@ -833,14 +926,19 @@ def main():
         build_polyhedra(sub_collection(root, "polyhedra"), mats)
 
     rig = sub_collection(root, "rig")
-    build_camera(rig)
+    saved = build_saved_cameras(rig)
+    # The viewport camera is only added when there are no saved ones — two
+    # cameras describing the same shot is clutter, and `scene.camera` can
+    # only be one of them anyway.
+    if not saved:
+        build_camera(rig)
     n_lights = build_lights(rig)
     build_world()
     engine = build_render()
     print("MoloM: {0} atoms, {1} bond segments, {2} polyhedra, {3} materials, "
-          "{4} lights, engine {5}".format(len(ATOMS), len(BONDS),
-                                          len(POLYHEDRA), len(MATERIALS),
-                                          n_lights, engine))
+          "{4} lights, {5} camera(s), engine {6}".format(
+              len(ATOMS), len(BONDS), len(POLYHEDRA), len(MATERIALS),
+              n_lights, len(SAVED_CAMERAS), engine))
 
 
 def save_blend(path):
@@ -931,6 +1029,8 @@ def build_script(data, options, title="scene", version="", basename="",
         materials=_pretty(data["materials"]),
         camera=_pretty(data["camera"] or {}),
         lights=_pretty(data["lights"]),
+        saved_cameras=_pretty(data.get("saved_cameras") or []),
+        active_camera=_pretty(data.get("active_camera") or ""),
         centre=_pretty(data["centre"]),
         radius=repr(float(data["radius"])),
         atoms="\n".join("    {},".format(_row(a)) for a in data["atoms"]),

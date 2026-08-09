@@ -1361,3 +1361,151 @@ class PropertiesDock(QDockWidget):
         self.stack.setCurrentIndex(entry[1])
         for k, (btn, _i) in self.buttons.items():
             btn.setChecked(k == key)
+
+
+class CameraPage(QWidget):
+    """The active camera's lens and film.
+
+    Deliberately small. Christian: "the rest of the settings should not be so
+    important" — so this is projection, focal length, pixels, multiplier and
+    roll, and nothing else. Everything here is a property of the CAMERA
+    OBJECT, so it rides savepoints and undo with it.
+    """
+
+    changed = Signal()
+    activate_requested = Signal()
+
+    _loading = False
+    _camera = None
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        form = QFormLayout(self)
+        form.setContentsMargins(8, 8, 8, 8)
+
+        self.summary = QLabel("")
+        self.summary.setWordWrap(True)
+        form.addRow(self.summary)
+
+        self.look_btn = QPushButton("Look through this camera")
+        self.look_btn.clicked.connect(
+            lambda _c=False: self.activate_requested.emit())
+        form.addRow("", self.look_btn)
+
+        self.projection = QComboBox()
+        self.projection.addItem("Perspective", "perspective")
+        self.projection.addItem("Orthographic", "orthographic")
+        self.projection.currentIndexChanged.connect(self._emit)
+        form.addRow("Projection:", self.projection)
+
+        self.focal = QDoubleSpinBox()
+        self.focal.setRange(1.0, 5000.0)
+        self.focal.setDecimals(1)
+        self.focal.setSuffix(" mm")
+        self.focal.setToolTip(
+            "Focal length against the sensor width below - the same pair a "
+            "camera or Blender uses, so 50 mm means what it means "
+            "everywhere.\n\nNOT Angstrom: Angstrom is the scene's unit, and a "
+            "focal length only means something relative to the film it "
+            "projects onto.")
+        self.focal.valueChanged.connect(self._emit)
+        form.addRow("Focal length:", self.focal)
+
+        self.sensor = QDoubleSpinBox()
+        self.sensor.setRange(1.0, 200.0)
+        self.sensor.setDecimals(1)
+        self.sensor.setSuffix(" mm")
+        self.sensor.setToolTip("Sensor WIDTH. 36 mm is full frame, and is "
+                               "Blender's default.")
+        self.sensor.valueChanged.connect(self._emit)
+        form.addRow("Sensor width:", self.sensor)
+
+        size = QHBoxLayout()
+        self.width = QSpinBox()
+        self.width.setRange(16, 16384)
+        self.height = QSpinBox()
+        self.height.setRange(16, 16384)
+        for box in (self.width, self.height):
+            box.valueChanged.connect(self._emit)
+            box.setToolTip(
+                "The frame you compose in. Drag the handles on the camera "
+                "frame in the viewport to change the shape directly.")
+        size.addWidget(self.width)
+        size.addWidget(QLabel("x"))
+        size.addWidget(self.height)
+        form.addRow("Resolution:", size)
+
+        self.multiplier = QDoubleSpinBox()
+        self.multiplier.setRange(0.1, 16.0)
+        self.multiplier.setSingleStep(0.5)
+        self.multiplier.setToolTip(
+            "Renders at this multiple of the resolution above. 512x512 at 2x "
+            "is a different statement from 1024x1024: it says 'this framing, "
+            "finer', and it survives deciding later that the figure wants 4x.")
+        self.multiplier.valueChanged.connect(self._emit)
+        form.addRow("Render multiplier:", self.multiplier)
+
+        self.roll = QDoubleSpinBox()
+        self.roll.setRange(-180.0, 180.0)
+        self.roll.setDecimals(1)
+        self.roll.setSuffix(" deg")
+        self.roll.setToolTip(
+            "Tilt about the view axis. The interactive camera is a TURNTABLE "
+            "and cannot hold a rolled pose, so a saved camera carries it "
+            "explicitly.")
+        self.roll.valueChanged.connect(self._emit)
+        form.addRow("Roll:", self.roll)
+
+        form.addRow("", QLabel(""))
+        self.set_camera(None)
+
+    def _emit(self, *_a):
+        if self._loading or self._camera is None:
+            return
+        cam = self._camera
+        cam.projection = self.projection.currentData()
+        cam.focal_mm = self.focal.value()
+        cam.sensor_mm = self.sensor.value()
+        cam.width = self.width.value()
+        cam.height = self.height.value()
+        cam.multiplier = self.multiplier.value()
+        cam.roll = float(self.roll.value()) * 3.141592653589793 / 180.0
+        self._refresh_summary()
+        self.changed.emit()
+
+    def _refresh_summary(self):
+        cam = self._camera
+        if cam is None:
+            self.summary.setText(
+                "No camera. Place one with <b>F3 &rarr; Camera: place one "
+                "here</b>, or the <b>+ Camera</b> row at the bottom of the "
+                "outliner — it saves the view you are looking at now.")
+            return
+        w, h = cam.render_size()
+        self.summary.setText(
+            "<b>{}</b><br>{} x {} rendered, {:.1f}&deg; vertical field of "
+            "view".format(cam.name, w, h, cam.fov_y))
+
+    def set_camera(self, cam):
+        """Show this camera, or grey out when there is none."""
+        self._camera = cam
+        has = cam is not None
+        for w in (self.projection, self.focal, self.sensor, self.width,
+                  self.height, self.multiplier, self.roll, self.look_btn):
+            w.setEnabled(has)
+        if not has:
+            self._refresh_summary()
+            return
+        # Guarded, or writing the page fires every valueChanged back at the
+        # camera it is describing (round 30's TimelinePanel bug).
+        self._loading = True
+        idx = self.projection.findData(cam.projection)
+        self.projection.setCurrentIndex(max(idx, 0))
+        self.focal.setValue(float(cam.focal_mm))
+        self.sensor.setValue(float(cam.sensor_mm))
+        self.width.setValue(int(cam.width))
+        self.height.setValue(int(cam.height))
+        self.multiplier.setValue(float(cam.multiplier))
+        self.roll.setValue(float(cam.roll) * 180.0 / 3.141592653589793)
+        self._loading = False
+        self._refresh_summary()

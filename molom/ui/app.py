@@ -27,6 +27,7 @@ from ..core import (bonding, edits, input_map, internal, io, measure, project,
                     rotations)
 from ..core import cif as cif_mod
 from ..core import animation as anim_mod
+from ..core import cameras as cameras_mod
 from ..core import cif_write
 from ..core import packing as packing_mod
 from ..core import coplanar
@@ -51,7 +52,7 @@ from .dialogs import (AnimationExportDialog, BlenderExportDialog,
 from .crystal_ribbon import CrystalRibbon
 from .optimize_panel import OptimizeDock, OptimizeWorker, TASK_SELECTION
 from . import properties as properties_mod
-from .properties import (CrystalPage, ModifierPage,
+from .properties import (CameraPage, CrystalPage, ModifierPage,
                          PropertiesDock, VibrationPage)
 from .timeline_panel import TimelinePanel
 from .toolbar import ViewportToolbar
@@ -103,6 +104,9 @@ class MainWindow(QMainWindow):
     #: it exists before any export has happened — the round-34 rule.
     _cif_export_note = ""
     _cif_export_reports = ()
+
+    #: Where the free view was before we stepped into a camera.
+    _view_before_camera = None
 
     #: What F12 / Ctrl+F12 render when pressed again: {animation: {...}}.
     #: On the CLASS so the keys exist before any export has happened, and
@@ -179,6 +183,7 @@ class MainWindow(QMainWindow):
         # of the whole crystal, and baked it into the cell reference: on
         # MOF-5 one H -> F tilted the box by 1.2 degrees and grew the drawn
         # cell by 144 carbons. `begin_model_edit` snapshots undo itself.
+        self.viewport.on_camera_changed = self.camera_changed
         self.viewport.on_edit_begin = self.begin_model_edit
         self.viewport.on_mode_changed = self._on_mode_changed
         self.viewport.on_new_molecule = self.new_empty_molecule
@@ -249,6 +254,15 @@ class MainWindow(QMainWindow):
         self.outliner.delete_requested.connect(self._on_obj_delete)
         self.outliner.activated.connect(self._on_obj_activated)
         self.outliner.add_requested.connect(self.on_outliner_add)
+        self.outliner.camera_activated.connect(
+            lambda cid: self.on_activate_camera(cid))
+        self.outliner.camera_add_requested.connect(
+            self.on_place_camera)
+        self.outliner.camera_delete_requested.connect(
+            lambda cid: self.on_delete_camera(cid))
+        self.outliner.camera_renamed.connect(
+            lambda cid, name: (self.scene.rename_camera(cid, name),
+                               self._sync_all()))
         self.outliner.merge_requested.connect(self.on_merge_ids)
         self.outliner.crystal_view_changed.connect(self._on_crystal_row_view)
         self.outliner.crystal_box_toggled.connect(
@@ -300,6 +314,10 @@ class MainWindow(QMainWindow):
             lambda on: self._set_obj_flag("show_ghosts", on))
         for _key, _box in self.crystal_page.kind_checks.items():
             _box.toggled.connect(lambda _on: self._sync_symmetry_kinds())
+        self.camera_page = CameraPage()
+        self.camera_page.changed.connect(lambda: self.camera_changed())
+        self.camera_page.activate_requested.connect(
+            lambda: self.on_activate_camera(self.scene.active_camera_id))
         self.modifier_page = ModifierPage()
         self.modifier_page.changed.connect(self._on_modifiers_changed)
         self.modifier_page.add_requested.connect(self.on_add_modifier)
@@ -315,6 +333,8 @@ class MainWindow(QMainWindow):
               self.crystal_page),
              ("vibrations", "∿", "Vibrational normal modes (ORCA FREQ)",
               self.vibration_page),
+             ("camera", "🎥", "Camera — lens, frame and roll",
+              self.camera_page),
              ("forcefield", "⚛", "Force field",
               self.optimize_panel.widget())], self)
         self.addDockWidget(Qt.RightDockWidgetArea, self.properties)
@@ -732,6 +752,23 @@ class MainWindow(QMainWindow):
           category="File", shortcut="Ctrl+Shift+A", key="Ctrl+Shift+A",
           aliases=("movie", "video", "mp4", "gif", "render", "frames",
                    "trajectory", "playback", "sequence"))
+        r("camera_place", "Camera: place one here (save this view)",
+          lambda c: c.on_place_camera(), category="Camera",
+          aliases=("view", "viewpoint", "angle", "save view", "bookmark",
+                   "shot", "add camera"))
+        r("camera_activate", "Camera: look through the active one",
+          lambda c: c.on_activate_camera(), category="Camera",
+          enabled=lambda c: bool(c.scene.cameras),
+          shortcut="Numpad 0", key="Num+0",
+          aliases=("view", "through", "numpad", "restore view"))
+        r("camera_update", "Camera: update the active one to this view",
+          lambda c: c.on_update_camera(), category="Camera",
+          enabled=lambda c: c.scene.active_camera() is not None,
+          aliases=("re-place", "move camera", "re-aim"))
+        r("camera_delete", "Camera: delete the active one",
+          lambda c: c.on_delete_camera(), category="Camera",
+          enabled=lambda c: c.scene.active_camera() is not None,
+          aliases=("remove camera",))
         r("render_still", "Render: still image (F12)",
           lambda c: c.on_render_key(False), enabled=has_obj, category="File",
           shortcut="F12", key="F12",
@@ -2643,6 +2680,7 @@ class MainWindow(QMainWindow):
         # so his first click was the one that finally set the flag on this
         # one. Same for the symmetry tick.
         self._sync_crystal_page()
+        self.camera_page.set_camera(self.scene.active_camera())
         self._sync_crystal_ribbon()
 
     @staticmethod
@@ -4683,6 +4721,110 @@ class MainWindow(QMainWindow):
                 message + " — Ctrl+F12 again for the next", 12000)
         else:
             QMessageBox.warning(self, "Render", message)
+
+    # --------------------------------------------------------------- cameras
+    def on_place_camera(self):
+        """F3 / the outliner: save the current view as a camera object."""
+        vp = self.viewport
+        self.push_undo()
+        cam = self.scene.add_camera(camera=vp.camera, width=vp.width(),
+                                    height=vp.height())
+        self.viewport.looking_through = cam.id
+        self._sync_all()
+        self.statusBar().showMessage(
+            "{} placed here — {:.0f} mm, {}x{}. Numpad 0 looks through it "
+            "again.".format(cam.name, cam.focal_mm, cam.width, cam.height),
+            9000)
+
+    def on_activate_camera(self, cam_id=None):
+        """Numpad 0: look through a camera — and press it again to leave.
+
+        Toggling rather than only entering is Blender's behaviour and the
+        thing that makes the key usable: you glance through the shot, then go
+        back to the view you were composing from.
+        """
+        vp = self.viewport
+        if cam_id is None:
+            if vp.looking_through is not None:
+                self.leave_camera()
+                return
+            cam_id = self.scene.active_camera_id
+        cam = self.scene.camera(cam_id) if cam_id is not None else None
+        if cam is None:
+            self.statusBar().showMessage(
+                "No camera yet — F3 \"Camera: place one here\" saves this "
+                "view as one", 6000)
+            return
+        # Remember where we were, so leaving the camera puts the user back
+        # rather than stranding them inside a shot.
+        if vp.looking_through is None:
+            self._view_before_camera = {
+                "center": np.array(vp.camera.center, dtype=float),
+                "distance": float(vp.camera.distance),
+                "rotation": np.array(vp.camera.rotation, dtype=float),
+                "orthographic": bool(vp.camera.orthographic)}
+        self.scene.active_camera_id = cam.id
+        cam.apply_to(vp.camera)
+        vp.looking_through = cam.id
+        vp.camera_roll = float(cam.roll)
+        self._sync_all()
+        self.statusBar().showMessage(
+            "Looking through {} ({:.0f} mm, {}x{} at {:g}x) — Numpad 0 to "
+            "leave".format(cam.name, cam.focal_mm, cam.width, cam.height,
+                           cam.multiplier), 9000)
+
+    def leave_camera(self):
+        """Back to the free view, where it was before."""
+        vp = self.viewport
+        vp.looking_through = None
+        vp.camera_roll = 0.0
+        saved = self._view_before_camera
+        if saved:
+            vp.camera.center = saved["center"].copy()
+            vp.camera.distance = saved["distance"]
+            vp.camera.rotation = saved["rotation"].copy()
+            vp.camera.orthographic = saved["orthographic"]
+        self._view_before_camera = None
+        self._sync_all()
+        self.statusBar().showMessage("Free view", 4000)
+
+    def on_update_camera(self):
+        """Re-aim the active camera at the view you are looking from."""
+        cam = self.scene.active_camera()
+        if cam is None:
+            return
+        vp = self.viewport
+        self.push_undo()
+        keep = (cam.width, cam.height, cam.multiplier)
+        cam.capture(vp.camera)
+        cam.width, cam.height, cam.multiplier = keep
+        cam.roll = float(getattr(vp, "camera_roll", 0.0))
+        self._sync_all()
+        self.statusBar().showMessage(
+            "{} now looks from here".format(cam.name), 7000)
+
+    def on_delete_camera(self, cam_id=None):
+        cam = (self.scene.camera(cam_id) if cam_id is not None
+               else self.scene.active_camera())
+        if cam is None:
+            return
+        self.push_undo()
+        if self.viewport.looking_through == cam.id:
+            self.leave_camera()
+        name = cam.name
+        self.scene.remove_camera(cam.id)
+        self._sync_all()
+        self.statusBar().showMessage("Deleted {}".format(name), 6000)
+
+    def camera_changed(self, cam_id=None):
+        """A camera's settings were edited — re-apply if we are inside it."""
+        cam = (self.scene.camera(cam_id) if cam_id is not None
+               else self.scene.active_camera())
+        if cam is not None and self.viewport.looking_through == cam.id:
+            cam.apply_to(self.viewport.camera)
+            self.viewport.camera_roll = float(cam.roll)
+        self.viewport.refresh_geometry()
+        self.viewport.update()
 
     def on_graphics_info(self):
         """Which GPU is drawing the viewport, and at what GL version.
