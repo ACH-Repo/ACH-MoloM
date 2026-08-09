@@ -15,7 +15,7 @@ from typing import Callable, List, Optional, Tuple
 
 class Operator:
     def __init__(self, op_id, label, run, enabled=None, category="General",
-                 shortcut="", aliases=(), key=""):
+                 shortcut="", aliases=(), key="", extra_keys=()):
         # type: (str, str, Callable, Optional[Callable], str, str, tuple, str) -> None
         self.id = op_id
         self.label = label
@@ -34,6 +34,11 @@ class Operator:
         # "recalculate" bonds), and a palette that only knows one of them
         # looks empty to everyone who learned the other.
         self.aliases = tuple(aliases)
+        # Additional bindings for the SAME operator — a second key people
+        # already have in their fingers from another program (Blender deletes
+        # with X, MoloM has always used Del). They are bound alongside `key`
+        # and counted by `duplicate_keys` like any other claim.
+        self.extra_keys = tuple(k for k in extra_keys if k)
 
     def enabled(self, ctx):
         # type: (object) -> bool
@@ -54,12 +59,12 @@ class OperatorRegistry:
         self._by_id = {}
 
     def register(self, op_id, label, run, enabled=None, category="General",
-                 shortcut="", aliases=(), key=""):
-        # type: (str, str, Callable, Optional[Callable], str, str, tuple, str) -> Operator
+                 shortcut="", aliases=(), key="", extra_keys=()):
+        # type: (str, str, Callable, Optional[Callable], str, str, tuple, str, tuple) -> Operator
         if op_id in self._by_id:
             raise ValueError("duplicate operator id: {}".format(op_id))
         op = Operator(op_id, label, run, enabled, category, shortcut, aliases,
-                      key)
+                      key, extra_keys)
         self._ops.append(op)
         self._by_id[op_id] = op
         return op
@@ -88,8 +93,8 @@ class OperatorRegistry:
         """
         seen = {}
         for op in self._ops:
-            if op.key:
-                seen.setdefault(op.key, []).append(op.id)
+            for key in ((op.key,) if op.key else ()) + op.extra_keys:
+                seen.setdefault(key, []).append(op.id)
         return {k: v for k, v in seen.items() if len(v) > 1}
 
     def search(self, text, ctx):
@@ -109,3 +114,26 @@ class OperatorRegistry:
                 out.append((not en, not prefix, k, op, en))
         out.sort(key=lambda t: t[:3])
         return [(op, en) for _e, _p, _k, op, en in out]
+
+
+def chord_variants(key):
+    # type: (str) -> list
+    """Every spelling of a key that a user pressing it might actually produce.
+
+    A two-part chord like `Shift+Space, L` only matches if Shift is RELEASED
+    before the second key — hold it through, as anyone naturally does, and Qt
+    sees `Shift+Space, Shift+L` and fires nothing. That is why the lasso
+    "hotkey does not work" while the box-select one appeared to: it is not a
+    case problem in the string, it is whether the modifier is still down.
+
+    So a chord whose first part carries Shift is registered BOTH ways. UI-free
+    and returning plain strings, so `_install_shortcuts` stays a loop.
+    """
+    key = str(key or "").strip()
+    if not key or "," not in key:
+        return [key] if key else []
+    head, tail = key.split(",", 1)
+    head, tail = head.strip(), tail.strip()
+    if not tail or "Shift" not in head or "Shift" in tail:
+        return [key]
+    return [key, "{}, Shift+{}".format(head, tail)]

@@ -173,3 +173,25 @@ def summarise(n_images, fps, fmt):
     seconds = float(n_images) / max(float(fps), 1e-6)
     return "{} image(s) at {:g} fps — {:.1f} s of {}".format(
         n_images, fps, seconds, str(fmt).upper())
+
+
+def next_free(path, enabled=True, limit=9999):
+    # type: (str, bool, int) -> str
+    """`shot.png` -> `shot_001.png` when `shot.png` already exists.
+
+    Overwrite protection for the F12 keys, and the reason they can be
+    press-and-forget at all: a render key that silently replaces the last
+    render is a key you cannot press twice. Blender's own output settings work
+    the same way, and the suffix is separate from the frame numbering so a
+    sequence's `_0000` counters are never confused with a take number.
+
+    Off returns the path unchanged, so "I want to overwrite" stays possible.
+    """
+    if not enabled or not os.path.exists(path):
+        return path
+    root, ext = os.path.splitext(path)
+    for n in range(1, int(limit) + 1):
+        candidate = "{}_{:03d}{}".format(root, n, ext)
+        if not os.path.exists(candidate):
+            return candidate
+    return path

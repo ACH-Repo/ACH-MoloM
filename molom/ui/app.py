@@ -37,6 +37,7 @@ from ..core import timeline as timeline_mod
 from ..core import meta as meta_mod
 from ..core.camera import quat_from_mat3, quat_to_mat3
 from ..core import resolve as resolve_mod
+from ..core import ops as ops_mod
 from ..core.ops import OperatorRegistry
 from ..core.scene import Scene
 from ..core.structure import Structure
@@ -103,12 +104,18 @@ class MainWindow(QMainWindow):
     _cif_export_note = ""
     _cif_export_reports = ()
 
+    #: What F12 / Ctrl+F12 render when pressed again: {animation: {...}}.
+    #: On the CLASS so the keys exist before any export has happened, and
+    #: deliberately NOT persisted — a render key that fires at a path from
+    #: last week is worse than one that asks.
+
     def __init__(self):
         super().__init__()
         #: Objects already warned about editing a packed crystal — the hazard
         #: is real every time, but a message on every drag drowns out
         #: everything else the status bar has to say.
         self._packed_edit_warned = set()
+        self._render_target = {}
         self.setWindowTitle("MoloM")
         self.settings = QSettings("ACH", "MoloM")
         self.scene = Scene()
@@ -597,7 +604,7 @@ class MainWindow(QMainWindow):
           category="Edit", shortcut="Shift+A (object mode)", key="Shift+A")
         r("delete_selected", "Delete selected atoms",
           lambda c: c.on_delete_selected(), enabled=sel, category="Edit",
-          shortcut="Del", key="Del")
+          shortcut="Del or X", key="Del", extra_keys=("X",))
         r("hide_selected", "Hide the selected atoms",
           lambda c: c.on_hide_selected(), enabled=sel, category="Edit",
           shortcut="H", key="H",
@@ -725,6 +732,14 @@ class MainWindow(QMainWindow):
           category="File", shortcut="Ctrl+Shift+A", key="Ctrl+Shift+A",
           aliases=("movie", "video", "mp4", "gif", "render", "frames",
                    "trajectory", "playback", "sequence"))
+        r("render_still", "Render: still image (F12)",
+          lambda c: c.on_render_key(False), enabled=has_obj, category="File",
+          shortcut="F12", key="F12",
+          aliases=("render", "image", "png", "screenshot", "f12", "execute"))
+        r("render_animation", "Render: animation (Ctrl+F12)",
+          lambda c: c.on_render_key(True), enabled=has_obj, category="File",
+          shortcut="Ctrl+F12", key="Ctrl+F12",
+          aliases=("render", "movie", "animation", "f12", "execute"))
         r("graphics_info", "Report the graphics device (which GPU is drawing)",
           lambda c: c.on_graphics_info(), category="App",
           aliases=("gpu", "opengl", "renderer", "driver", "video card",
@@ -820,7 +835,16 @@ class MainWindow(QMainWindow):
         self._op_actions = {}
         for op in self.ops.keyed():
             act = QAction(op.label, self)
-            act.setShortcut(QKeySequence(op.key))
+            # A chord gets both spellings — see `ops.chord_variants`: holding
+            # Shift through `Shift+Space, L` makes Qt look for `Shift+L` as
+            # the second key, and nothing fires.
+            variants = list(ops_mod.chord_variants(op.key))
+            for extra in op.extra_keys:
+                variants += ops_mod.chord_variants(extra)
+            if len(variants) > 1:
+                act.setShortcuts([QKeySequence(v) for v in variants])
+            else:
+                act.setShortcut(QKeySequence(op.key))
             act.setShortcutContext(Qt.WindowShortcut)
             act.triggered.connect(
                 lambda _checked=False, op_id=op.id: self.run_op(op_id))
@@ -1967,9 +1991,11 @@ class MainWindow(QMainWindow):
                                  "Could not write {}".format(path))
             return
         self.settings.setValue("last_dir", os.path.dirname(path))
+        # F12 from here on renders straight to the next free name.
+        self._render_target[False] = {"path": path, "increment": True}
         self.statusBar().showMessage(
-            "Wrote {} ({}x{})".format(os.path.basename(path),
-                                      img.width(), img.height()), 6000)
+            "Wrote {} ({}x{}) — F12 renders the next one".format(
+                os.path.basename(path), img.width(), img.height()), 8000)
 
     # ------------------------------------------------------------ Blender
     #: Export options that are worth remembering between sessions. The camera
@@ -3767,6 +3793,33 @@ class MainWindow(QMainWindow):
             n_frames=int(self._mode_frames.get(
                 obj_id, vib_mod.DEFAULT_PERIOD_FRAMES)))
 
+    def _rest_for(self, obj):
+        # type: (object) -> object
+        """This molecule's EQUILIBRIUM geometry, where it is now.
+
+        A mode is baked as `rest + eigenvector * sin(phase)`, so the stored
+        rest was captured once when the frequencies were read and then used
+        for every re-bake — which meant selecting another mode, or nudging the
+        amplitude, teleported the molecule back to where it was imported.
+        Christian: "selecting a different normal mode should not reset the
+        transform location of the molecule."
+
+        Frame 0 of a baked mode IS the undisplaced geometry (sin 0 = 0), and a
+        grab moves EVERY frame, so after any transform frame 0 is the rest
+        geometry in its new place. Re-reading it is the whole fix, and it
+        needs no extra bookkeeping to go stale.
+        """
+        stored = self._rest_geometry.get(obj.id)
+        active = self._active_mode.get(obj.id)
+        if active is not None and obj.structure.n_frames > 1:
+            current = np.asarray(obj.structure.frames[0], dtype=float)
+            if stored is None or current.shape == np.shape(stored):
+                stored = current.copy()
+        if stored is None or np.shape(stored)[0] != obj.structure.n_atoms:
+            stored = obj.structure.coords.copy()
+        self._rest_geometry[obj.id] = stored
+        return stored
+
     def on_animate_mode(self, index, amplitude=None, n_frames=None,
                         push=True, resync=True):
         """Bake one mode into a looping track on the scene clock.
@@ -3785,10 +3838,7 @@ class MainWindow(QMainWindow):
         mode = next((m for m in modes if m.index == int(index)), None)
         if mode is None:
             return
-        rest = self._rest_geometry.get(obj.id)
-        if rest is None:
-            rest = obj.structure.coords.copy()
-            self._rest_geometry[obj.id] = rest
+        rest = self._rest_for(obj)
         amplitude = float(
             self._mode_amplitude.get(obj.id, properties_mod.DEFAULT_AMPLITUDE)
             if amplitude is None else amplitude)
@@ -3866,10 +3916,7 @@ class MainWindow(QMainWindow):
         if not ok:
             return
         mode = listed[labels.index(choice)]
-        rest = self._rest_geometry.get(obj.id)
-        if rest is None:
-            rest = obj.structure.coords.copy()
-            self._rest_geometry[obj.id] = rest
+        rest = self._rest_for(obj)
         self.push_undo()
         self._active_mode[obj.id] = mode.index
         obj.structure.frames = vib_mod.mode_frames(
@@ -4495,7 +4542,11 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Animation export failed", str(e))
             return
         if written:
-            self.statusBar().showMessage(message, 15000)
+            self._render_target[True] = {"path": path, "opts": opts,
+                                         "increment": opts.get("increment",
+                                                               True)}
+            self.statusBar().showMessage(
+                message + " — Ctrl+F12 renders the next one", 15000)
         else:
             QMessageBox.warning(self, "Animation export", message)
 
@@ -4569,6 +4620,69 @@ class MainWindow(QMainWindow):
                 os.path.basename(where["path"]), n, opts["fps"])
         return False, ("The {} frames rendered to\n{}\n\nbut the encode "
                        "failed:\n\n{}".format(n, directory, note))
+
+    def on_render_key(self, animation=False):
+        """F12 / Ctrl+F12 — Blender's render keys, with Blender's habit.
+
+        The FIRST press behaves like the ordinary export: the dialog opens and
+        a file is chosen. From then on the same key RENDERS IMMEDIATELY with
+        those settings, which is what F12 means to anyone who uses Blender —
+        the deliberate route (Ctrl+Shift+E / Ctrl+Shift+A) still opens the
+        dialog every time, so nothing is taken away.
+
+        Press-and-forget is only safe because the filename increments
+        (`animation.next_free`): a render key that silently replaces the last
+        render is a key you cannot press twice.
+        """
+        remembered = self._render_target.get(bool(animation))
+        if remembered is None:
+            if animation:
+                self.on_export_animation()
+            else:
+                self.on_export_image()
+            return
+        if animation:
+            self._render_animation_again(remembered)
+        else:
+            self._render_still_again(remembered)
+
+    def _render_still_again(self, remembered):
+        path = anim_mod.next_free(remembered["path"],
+                                  remembered.get("increment", True))
+        try:
+            image = self.viewport.render_image()
+        except Exception:
+            image = self.viewport.grabFramebuffer()
+        if not image.save(path):
+            self.statusBar().showMessage(
+                "Could not write {}".format(path), 8000)
+            return
+        # The remembered path stays the BASE one. Storing the incremented
+        # name instead compounds the suffix — three presses gave
+        # shot.png, shot_001.png, shot_001_001.png.
+        self.statusBar().showMessage(
+            "Rendered {} ({}x{}) — F12 again for the next".format(
+                os.path.basename(path), image.width(), image.height()), 8000)
+
+    def _render_animation_again(self, remembered):
+        times = anim_mod.frame_times(self.timeline,
+                                     loops=remembered["opts"]["loops"])
+        if not times:
+            self.statusBar().showMessage("Nothing to animate", 5000)
+            return
+        path = anim_mod.next_free(remembered["path"],
+                                  remembered.get("increment", True))
+        try:
+            ok, message = self.write_animation(path, times,
+                                               remembered["opts"])
+        except Exception as e:
+            QMessageBox.critical(self, "Render failed", str(e))
+            return
+        if ok:
+            self.statusBar().showMessage(
+                message + " — Ctrl+F12 again for the next", 12000)
+        else:
+            QMessageBox.warning(self, "Render", message)
 
     def on_graphics_info(self):
         """Which GPU is drawing the viewport, and at what GL version.

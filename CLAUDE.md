@@ -56,6 +56,37 @@ the operator key table, CIF reading with symmetry, coordination polyhedra,
 meta atoms, the scene clock with a multi-track timeline, vibrational modes,
 per-element display control, and the symmetry modifier. 512 tests.
 
+Round 55 (2026-08-09, four of Christian's, and the render keys):
+**(1) Re-baking a normal mode teleported the molecule home.** `_rest_geometry`
+was captured ONCE when the frequencies were read and reused for every bake, so
+selecting another mode — or nudging the amplitude, or the frames-per-period —
+regenerated `rest + eigenvector * sin(phase)` around coordinates from before
+the user had moved anything. `_rest_for` re-reads it instead: frame 0 of a
+baked mode IS the undisplaced geometry (sin 0 = 0) and a grab moves EVERY
+frame, so frame 0 is the rest geometry wherever the molecule now is. No extra
+bookkeeping, and nothing left to go stale.
+**(2) The lasso hotkey, and it was Christian's own guess.** Not a case problem
+in the string: `Shift+Space, L` matches only if Shift is RELEASED before the
+second key, and holding it through — as anyone does — makes Qt look for
+`Shift+L` and fire nothing. `ops.chord_variants` registers both spellings for
+any chord whose first part carries Shift, so box select was quietly as fragile
+and is fixed with it.
+**(3) X deletes**, alongside Del, which is what Blender does and what X was
+doing nothing for. `Operator.extra_keys` is the general mechanism, and
+`duplicate_keys` counts an extra binding as a claim like any other — two
+operators sharing a key makes Qt fire NEITHER (round 16).
+**(4) F12 / Ctrl+F12 are the EXECUTE keys**, Christian's own better idea. The
+first press behaves like the ordinary export and opens the dialog; from then
+on the same key renders immediately with those settings, which is what F12
+means to a Blender user. The deliberate routes (Ctrl+Shift+E, Ctrl+Shift+A)
+still ask every time, so nothing is taken away. Press-and-forget is only safe
+because the filename INCREMENTS (`animation.next_free`, a tick in the dialog,
+on by default): a render key that silently replaces the last render is a key
+you cannot press twice. The remembered path is always the BASE one — storing
+the incremented name instead compounds the suffix, and three presses gave
+`shot.png`, `shot_001.png`, `shot_001_001.png`.
+1191 tests.
+
 Round 54 (2026-08-09, the animation export, copies that follow, and a
 CORRECTION):
 **(0) I was wrong about MSAA, and the retraction is the useful part.** Round
@@ -2110,7 +2141,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1176 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1191 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -2385,6 +2416,14 @@ independent cross-check inside a single fixture.
   vector then spin so the backbone points outward.
 
 ## Hard-won gotchas (don't re-learn these)
+- **A two-part chord needs both spellings** (round 55). `Shift+Space, L` only
+  matches when Shift comes UP before the second key; hold it and Qt looks for
+  `Shift+L`. Nothing warns you — the action simply never fires, and it reads
+  as "that hotkey does not work". `ops.chord_variants` returns both, and any
+  new chord should go through it.
+- **A remembered output path must be the BASE name** (round 55). Storing the
+  incremented one back compounds the suffix: `shot.png`, `shot_001.png`,
+  `shot_001_001.png`. Increment at the point of writing, never in the state.
 - **`format().samples()` is not the sample count** (round 54). It describes
   the window; a QOpenGLWidget draws into an FBO Qt owns, so it reads 0 on a
   fully multisampled context. `glGetIntegerv(GL_SAMPLES)` from inside the

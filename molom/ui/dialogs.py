@@ -1330,6 +1330,16 @@ class AnimationExportDialog(QDialog):
             "draws around it.")
         form.addRow("", self.furniture)
 
+        self.increment = QCheckBox("Increment filenames (overwrite "
+                                   "protection)")
+        self.increment.setChecked(True)
+        self.increment.setToolTip(
+            "A second render writes name_001, name_002, ... instead of "
+            "replacing the first. This is what makes F12 safe to lean on: a "
+            "render key that silently overwrites is a key you cannot press "
+            "twice.")
+        form.addRow("", self.increment)
+
         self.transparent = QCheckBox("Transparent background")
         self.transparent.setChecked(True)
         self.transparent.toggled.connect(self._refresh)
@@ -1372,4 +1382,5 @@ class AnimationExportDialog(QDialog):
                 "loops": self.loops.value(),
                 "furniture": self.furniture.isChecked(),
                 "transparent": (self.transparent.isChecked()
-                                and fmt != self._anim.FORMAT_MP4)}
+                                and fmt != self._anim.FORMAT_MP4),
+                "increment": self.increment.isChecked()}
