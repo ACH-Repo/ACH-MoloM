@@ -43,60 +43,152 @@ def win():
     return MainWindow()
 
 
-# ------------------------------------------------------- the frame is a size
-def test_the_frame_can_be_an_arbitrary_size_and_stays_centred():
-    """The film back was always the largest rectangle of its aspect that fits,
-    so only its SHAPE could ever show — which is why a corner drag "did
-    nothing"."""
-    full = cameras.frame_rect(800, 600, 1.5)
-    half = cameras.frame_rect(800, 600, 1.5, zoom=0.5)
-    assert half[2] == pytest.approx(full[2] / 2.0)
-    assert half[3] == pytest.approx(full[3] / 2.0)
-    for rect in (full, half):
-        x, y, w, h = rect
-        assert x + w / 2.0 == pytest.approx(400.0)     # centred, both ways
-        assert y + h / 2.0 == pytest.approx(300.0)
+# ------------------------------------------------- the frame moves BORDERS
+def _cam(width=1920, height=1080, focal=50.0):
+    cam = cameras.CameraObject(1)
+    cam.width, cam.height, cam.focal_mm = width, height, focal
+    cam.fit_frame(800, 600)
+    return cam
 
 
-def test_a_corner_drag_along_the_diagonal_used_to_change_nothing_visible():
-    """The exact reason for the complaint: dragging a corner along the
-    rectangle's own diagonal gives scale_x == scale_y, so the ASPECT — the
-    only thing the drawn rectangle could express — is untouched."""
-    rect = (0.0, 0.0, 400.0, 200.0)
-    w, h = cameras.resize_pixels("se", 400, 200, 40.0, 20.0, rect)
-    assert w / h == pytest.approx(400.0 / 200.0)       # same shape as before
-
-    # With the frame zoom carried, the same drag is now visible.
-    _w, _h, zoom = cameras.resize_frame("se", 400, 200, 0.5, 40.0, 20.0, rect)
-    assert zoom > 0.5
+def _content_scale(cam, widget_w=800, widget_h=600):
+    """Pixels per world unit at the pivot plane — what "the scene rescaled"
+    means, measured rather than eyeballed."""
+    rect = cameras.frame_rect(widget_w, widget_h, *cam.half_angles(),
+                              zoom=cam.frame_zoom)
+    fov = cameras.viewport_fov_y(cam.fov_y, rect[3], widget_h)
+    return (widget_h / 2.0) / np.tan(np.radians(fov) / 2.0)
 
 
-def test_a_corner_carries_the_frame_zoom_and_an_edge_does_not():
-    rect = (0.0, 0.0, 400.0, 200.0)
-    _w, _h, zoom = cameras.resize_frame("se", 400, 200, 0.5, -60.0, -30.0,
-                                        rect)
-    assert zoom < 0.5                                  # dragged in: smaller
-    _w, _h, zoom = cameras.resize_frame("e", 400, 200, 0.5, 60.0, 0.0, rect)
-    assert zoom == pytest.approx(0.5)                  # an edge is aspect only
+def test_dragging_a_handle_does_not_rescale_the_scene():
+    """Christian: "when I pull the corners, the camera zooms out or is moved
+    back. It shouldn't. I want the current camera position to not change and
+    just adjust the borders of the camera view." """
+    cam = _cam()
+    before = _content_scale(cam)
+    rect = cameras.frame_rect(800, 600, *cam.half_angles(), zoom=cam.frame_zoom)
+    for handle, dx, dy in (("se", 40.0, 25.0), ("nw", 30.0, 30.0),
+                           ("e", -50.0, 0.0), ("n", 0.0, 20.0)):
+        sensor, w, h = cameras.resize_frame(handle, cam.focal_mm,
+                                            cam.sensor_mm, cam.width,
+                                            cam.height, dx, dy, rect)
+        cam.sensor_mm, cam.width, cam.height = sensor, w, h
+        assert _content_scale(cam) == pytest.approx(before, rel=1e-9)
 
 
-def test_the_frame_zoom_is_clamped_at_the_fit():
-    """A frame larger than the window puts its own drag handles off screen,
-    which is a state with no way out of it."""
-    rect = (0.0, 0.0, 400.0, 200.0)
-    _w, _h, zoom = cameras.resize_frame("se", 400, 200, 1.0, 5000.0, 5000.0,
-                                        rect)
-    assert zoom == pytest.approx(cameras.MAX_FRAME_ZOOM)
-    _w, _h, zoom = cameras.resize_frame("se", 400, 200, 1.0, -5000.0, -5000.0,
-                                        rect)
-    assert zoom == pytest.approx(cameras.MIN_FRAME_ZOOM)
+def test_dragging_a_handle_moves_that_border():
+    """It has to DO something: the shot gets wider or taller.
+
+    The other axis holds to a tenth of a percent rather than exactly, because
+    a resolution is whole pixels: `pixels_for_aspect` rounds, so the aspect —
+    and with it the vertical half-angle — is quantised. The scale of the
+    picture is not affected by that, which is why the test above can demand
+    1e-9 of it.
+    """
+    cam = _cam()
+    rect = cameras.frame_rect(800, 600, *cam.half_angles(), zoom=cam.frame_zoom)
+    tx0, ty0 = cam.half_angles()
+
+    sensor, w, h = cameras.resize_frame("e", cam.focal_mm, cam.sensor_mm,
+                                        cam.width, cam.height, 40.0, 0.0, rect)
+    tx, ty = cameras.half_angles(cam.focal_mm, sensor, w / h)
+    assert tx > tx0                              # wider
+    assert ty == pytest.approx(ty0, rel=2e-3)    # and no taller
+
+    sensor, w, h = cameras.resize_frame("s", cam.focal_mm, cam.sensor_mm,
+                                        cam.width, cam.height, 0.0, 30.0, rect)
+    tx, ty = cameras.half_angles(cam.focal_mm, sensor, w / h)
+    assert ty > ty0
+    assert tx == pytest.approx(tx0, rel=2e-3)
+
+
+def test_dragging_never_inflates_the_resolution():
+    """The 6000x5000 Blender render: `build_render` takes the ACTIVE camera's
+    resolution, and the handles were driving it directly, so a few drags
+    ratcheted a 1x camera into a huge render."""
+    cam = _cam(640, 360)
+    for _ in range(40):
+        rect = cameras.frame_rect(800, 600, *cam.half_angles(),
+                                  zoom=cam.frame_zoom)
+        sensor, w, h = cameras.resize_frame("se", cam.focal_mm, cam.sensor_mm,
+                                            cam.width, cam.height,
+                                            60.0, 40.0, rect)
+        cam.sensor_mm, cam.width, cam.height = sensor, w, h
+    assert max(cam.width, cam.height) == 640
+    assert cam.render_size() == (640, int(round(640 / cam.aspect)))
+
+
+# ---------------------------------------------------- the wheel is the zoom
+def test_the_wheel_grows_the_frame_and_leaves_the_camera_alone():
+    """"if I have made a frame ... way smaller than the viewport, scrolling
+    forward should cause the frame to grow in the viewport." """
+    cam = _cam()
+    cam.frame_zoom = 0.3
+    small = cameras.frame_rect(800, 600, *cam.half_angles(), zoom=cam.frame_zoom)
+    cam.frame_zoom = cameras.zoom_frame(cam.frame_zoom, 4)
+    bigger = cameras.frame_rect(800, 600, *cam.half_angles(), zoom=cam.frame_zoom)
+    assert bigger[2] > small[2] and bigger[3] > small[3]
+    # and scrolling back is exactly the inverse
+    assert cameras.zoom_frame(cameras.zoom_frame(0.3, 4), -4) ==         pytest.approx(0.3)
+
+
+def test_the_wheel_does_not_change_the_focal_length():
+    """"Right now it is effectively changing the focal length as far as I can
+    tell. It should not be doing that." """
+    cam = _cam()
+    before = (cam.focal_mm, cam.sensor_mm, cam.width, cam.height,
+              float(cam.distance), tuple(cam.center))
+    cam.frame_zoom = cameras.zoom_frame(cam.frame_zoom, 5)
+    assert (cam.focal_mm, cam.sensor_mm, cam.width, cam.height,
+            float(cam.distance), tuple(cam.center)) == before
 
 
 def test_the_frame_zoom_rides_the_savefile():
     cam = cameras.CameraObject(3)
     cam.frame_zoom = 0.4
-    assert cameras.CameraObject.from_dict(cam.to_dict()).frame_zoom == \
-        pytest.approx(0.4)
+    assert cameras.CameraObject.from_dict(cam.to_dict()).frame_zoom ==         pytest.approx(0.4)
+
+
+def test_the_frame_stays_centred_at_every_zoom():
+    cam = _cam()
+    for zoom in (0.1, 0.5, 1.0, 3.0):
+        x, y, w, h = cameras.frame_rect(800, 600, *cam.half_angles(),
+                                        zoom=zoom)
+        assert x + w / 2.0 == pytest.approx(400.0)
+        assert y + h / 2.0 == pytest.approx(300.0)
+
+
+# ------------------------------------------------------------- the gizmo
+def test_a_camera_draws_as_a_pyramid_with_a_drop_line():
+    """Christian: "cones with a rectangular base as wireframes which have a
+    dashed line attached to their tip that goes towards the xy plane." """
+    cam = cameras.CameraObject(1)
+    g = cameras.gizmo_geometry(cam, 2.0)
+    assert len(g["base"]) == 4 and len(g["edges"]) == 4
+    # the apex IS the camera, so grabbing it moves the camera
+    assert np.allclose(g["apex"], cam.eye())
+    # the base sits `size` in front of the apex, square to the view
+    assert np.linalg.norm(np.mean(g["base"], axis=0) - g["apex"]) ==         pytest.approx(2.0)
+    # and the drop line ends on the floor, straight down
+    assert g["drop"][1][2] == pytest.approx(0.0)
+    assert np.allclose(g["drop"][1][:2], g["apex"][:2])
+
+
+def test_the_base_is_the_films_shape():
+    """A 16:9 camera should say so while it sits in the scene."""
+    cam = cameras.CameraObject(1)
+    cam.width, cam.height = 1920, 1080
+    g = cameras.gizmo_geometry(cam, 3.0)
+    base = g["base"]
+    wide = np.linalg.norm(base[1] - base[0])
+    tall = np.linalg.norm(base[2] - base[1])
+    assert wide / tall == pytest.approx(16.0 / 9.0, rel=1e-6)
+
+
+def test_the_gizmo_scales_with_the_scene():
+    assert cameras.gizmo_size(100.0) > cameras.gizmo_size(5.0)
+    assert cameras.gizmo_size(1e9) <= cameras.GIZMO_MAX
+    assert cameras.gizmo_size(1e-9) >= cameras.GIZMO_MIN
 
 
 # ----------------------------------------------- the frame is a real framing
@@ -382,14 +474,169 @@ def test_a_render_through_a_camera_is_the_frame_at_its_own_resolution(win):
     win.camera_changed()
 
     crop = vp._render_crop(vp.width(), vp.height())
-    assert crop["box"][2:] == cam.render_size()
+    assert crop["target"] == cam.render_size()
     # The buffer keeps the WIDGET's aspect, which is what lets the projection
     # stay identical to the screen's and every overlay land where it does.
     bw, bh = crop["buffer"]
     assert bw / bh == pytest.approx(vp.width() / vp.height(), rel=0.02)
-    # and it is never upscaled
-    assert bw >= cam.render_size()[0] and bh >= cam.render_size()[1]
+    # and the kept box has the CAMERA's aspect
+    _bx, _by, box_w, box_h = crop["box"]
+    assert box_w / box_h == pytest.approx(cam.aspect, rel=0.02)
+
+
+def test_a_small_frame_cannot_demand_a_giant_render_buffer(win):
+    """The frame's size on screen is a VIEWING choice (the wheel), so it must
+    not decide how much memory a render takes — `resolution / frame fraction`
+    grows without bound as the frame is pulled in."""
+    win.on_place_camera()
+    vp = win.viewport
+    cam = win.scene.active_camera()
+    cam.width, cam.height = 1920, 1080
+    cam.frame_zoom = cameras.MIN_FRAME_ZOOM
+    win.camera_changed()
+    bw, bh = vp._render_crop(vp.width(), vp.height())["buffer"]
+    assert bw <= vp.width() * vp._MAX_RENDER_BUFFER
+    assert bh <= vp.height() * vp._MAX_RENDER_BUFFER
 
 
 def test_the_free_view_render_is_untouched(win):
     assert win.viewport._render_crop(800, 600) is None
+
+
+# ------------------------------------------------ the camera never moves
+def test_the_wheel_inside_a_camera_resizes_the_frame_only(win):
+    """Christian: "mousewheel should also not move the camera, only scroll in
+    the view.\" """
+    win.on_place_camera()
+    vp = win.viewport
+    cam = win.scene.active_camera()
+    pose = (np.array(cam.center), float(cam.distance), float(cam.focal_mm))
+    view = (np.array(vp.camera.center), float(vp.camera.distance))
+    zoom = cam.frame_zoom
+
+    vp.zoom_camera_frame(3)
+    assert cam.frame_zoom > zoom
+    assert np.allclose(cam.center, pose[0])
+    assert cam.distance == pytest.approx(pose[1])
+    assert cam.focal_mm == pytest.approx(pose[2])
+    assert np.allclose(vp.camera.center, view[0])
+    assert vp.camera.distance == pytest.approx(view[1])
+
+
+def test_a_frame_drag_never_moves_the_camera(win):
+    from PySide6.QtCore import QPointF
+    win.on_place_camera()
+    vp = win.viewport
+    cam = win.scene.active_camera()
+    pose = (np.array(cam.center), float(cam.distance),
+            np.array(cam.rotation), float(vp.camera.distance))
+    rect = vp.camera_rect()
+    vp._camera_handle_press(QPointF(rect[0] + rect[2], rect[1] + rect[3]))
+    assert vp._frame_drag is not None
+    vp._camera_handle_move(QPointF(rect[0] + rect[2] + 40,
+                                   rect[1] + rect[3] + 30))
+    assert np.allclose(cam.center, pose[0])
+    assert cam.distance == pytest.approx(pose[1])
+    assert np.allclose(cam.rotation, pose[2])
+    assert vp.camera.distance == pytest.approx(pose[3])
+
+
+def test_escape_leaves_the_camera_view(win):
+    win.on_place_camera()
+    vp = win.viewport
+    assert vp.looking_through is not None
+    assert vp.cancel_modes() is True
+    assert vp.looking_through is None
+
+
+def test_escape_cancels_a_modal_before_the_camera_view(win):
+    """Esc backs out of the innermost thing you are in — cancelling a grab
+    must not also throw you out of the shot."""
+    win.open_path(FREQ)
+    obj = win._active_obj()
+    win.on_place_camera()
+    vp = win.viewport
+    vp.set_selection([(obj.id, 0)])
+    vp.start_grab()
+    assert vp.cancel_modes() is True
+    assert vp.looking_through is not None       # still in the camera
+    assert vp.cancel_modes() is True
+    assert vp.looking_through is None
+
+
+# ---------------------------------------------------- the viewport gizmo
+def test_cameras_are_drawn_in_the_viewport_but_not_the_one_you_are_in(win):
+    win.on_place_camera()
+    vp = win.viewport
+    assert vp.camera_gizmos() == []             # standing at its apex
+    win.leave_camera()
+    assert [c.id for c, _g in vp.camera_gizmos()] == \
+        [c.id for c in win.scene.cameras]
+
+
+def test_a_camera_can_be_picked_and_grabbed(win):
+    from PySide6.QtCore import QPointF
+    win.on_place_camera()
+    win.leave_camera()
+    vp = win.viewport
+    # A camera placed here sits exactly AT your eye, so back off first or its
+    # apex is on the near plane and projects to nothing — which is also true
+    # in the app, and is why the gizmo appears as soon as you move.
+    vp.camera.distance *= 4.0
+    cam = win.scene.cameras[0]
+    xy, front = vp._project(cam.eye()[None, :])
+    assert bool(front[0])
+    hit = vp._camera_gizmo_at(QPointF(float(xy[0][0]), float(xy[0][1])))
+    assert hit is not None and hit.id == cam.id
+
+    vp.select_camera(cam.id)
+    before = np.array(cam.center)
+    assert vp.start_camera_grab() is True
+    vp._camera_drag_move(QPointF(100.0, 100.0))
+    vp._camera_drag_move(QPointF(180.0, 140.0))
+    assert not np.allclose(cam.center, before)
+    vp.finish_camera_drag(commit=True)
+    assert vp._camera_drag is None
+
+
+def test_cancelling_a_camera_grab_puts_it_back(win):
+    from PySide6.QtCore import QPointF
+    win.on_place_camera()
+    win.leave_camera()
+    vp = win.viewport
+    cam = win.scene.cameras[0]
+    vp.select_camera(cam.id)
+    before = (np.array(cam.center), np.array(cam.rotation))
+    vp.start_camera_grab(rotate=True)
+    vp._camera_drag_move(QPointF(100.0, 100.0))
+    vp._camera_drag_move(QPointF(200.0, 160.0))
+    assert not np.allclose(cam.rotation, before[1])
+    vp.finish_camera_drag(commit=False)
+    assert np.allclose(cam.center, before[0])
+    assert np.allclose(cam.rotation, before[1])
+
+
+def test_G_goes_to_the_camera_only_when_one_is_picked(win):
+    win.open_path(FREQ)
+    obj = win._active_obj()
+    win.on_place_camera()
+    win.leave_camera()
+    vp = win.viewport
+    vp.set_selection([(obj.id, 0)])
+    assert vp.start_camera_grab() is False      # nothing picked: molecules
+    vp.select_camera(win.scene.cameras[0].id)
+    assert vp.start_camera_grab() is True
+    vp.finish_camera_drag(commit=False)
+
+
+def test_numpad_zero_is_bound_with_num_lock_OFF_too():
+    """With NUM LOCK OFF the numpad's 0 sends Key_Insert, not Key_0 — so
+    `Num+0` alone binds a key half the keyboards never send."""
+    from molom.ui.app import MainWindow
+    from PySide6.QtWidgets import QApplication
+    QApplication.instance() or QApplication([])
+    win = MainWindow()
+    op = win.ops.get("camera_activate")
+    keys = ((op.key,) if op.key else ()) + op.extra_keys
+    assert "Num+0" in keys and "Num+Ins" in keys
+    assert not win.ops.duplicate_keys()

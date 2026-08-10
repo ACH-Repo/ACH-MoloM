@@ -56,6 +56,79 @@ the operator key table, CIF reading with symmetry, coordination polyhedra,
 meta atoms, the scene clock with a multi-track timeline, vibrational modes,
 per-element display control, and the symmetry modifier. 512 tests.
 
+Round 58 (2026-08-10, the camera view rebuilt on Christian's correction):
+round 57's frame model was wrong and he said exactly how. "When I pull the
+corners, the camera zooms out or is moved back. It shouldn't. I want the
+current camera position to not change and just adjust the borders of the
+camera view." Everything else he reported falls out of the same mistake.
+**The fault: the frame was FITTED and the projection was fitted to it.**
+`frame_rect` returned the largest rectangle of the camera's aspect that the
+window holds, and `sync_camera_lens` then widened the field of view so the
+camera's own landed on it — so the instant a handle changed the aspect, the
+rectangle changed size, the field of view changed with it, and **the entire
+scene rescaled**. Which reads exactly as the camera dollying backwards.
+**The fix is one decision: THE FRAME IS ANGULAR.** Half-width `Z*tan(fov_x/2)`
+and half-height `Z*tan(fov_y/2)`, with `Z = zoom * widget_h / 2`. Work out
+what the scene's on-screen scale then is and it comes to **`Z / distance` —
+no `tx`, no `ty`, no lens, no aspect**. So moving a border cannot rescale
+anything, and the only control that resizes the picture is `zoom`. That is
+not a design choice dressed up as maths; it is the only model in which "the
+borders move and nothing else does" is true, which is why it was worth
+deriving rather than guessing at a third time.
+**Consequences, all of them things he asked for.** A HANDLE moves a border:
+horizontally by resizing the FILM (`sensor_mm` — a film back's border is
+literally the size of the film), vertically through the aspect, since the
+sensor size is horizontal and the aspect is what divides it. **The
+resolution follows the aspect with the LONGER SIDE PINNED**, which is where
+the "6000 x 5000 image even though the multiplier is 1" came from: round 57
+had the handles driving the pixel count directly, `blender_export.
+build_render` takes the ACTIVE CAMERA's resolution for the Blender scene, and
+a few drags ratcheted it into the thousands. Dragging now reshapes a shot and
+can never inflate it — measured, 40 outward corner drags leave a 640-pixel
+camera at 640.
+**The WHEEL is the frame zoom** ("mousewheel should also not move the camera,
+only scroll in the view" / "scrolling forward should cause the frame to grow
+in the viewport. Right now it is effectively changing the focal length"). It
+was dollying `camera.distance` against a pinned field of view, which is
+indistinguishable from a lens change. Every scroll gesture goes there while
+inside a camera, not just the zoom one — there is nothing else a scroll could
+mean when the camera is not allowed to move, and leaving pan or orbit live on
+the wheel would be a way to move it by accident. A pan DRAG is refused with a
+hint rather than silently ignored; a zoom drag does the frame zoom.
+**CAMERA OBJECTS ARE DRAWN AND GRABBABLE** — "just like in blender they should
+be cones with a rectangular base as wireframes which have a dashed line
+attached to their tip that goes towards the xy plane". `cameras.
+gizmo_geometry` returns the pieces in world space and `_paint_cameras` draws
+them: the rectangular base IS the film, so its shape states the aspect ratio;
+a small triangle marks up, which is the only thing distinguishing a rolled
+camera from a level one at a glance; the dashed drop line is what makes the
+thing placeable, since without it a camera above the floor and one below it
+look identical. Clicking the apex selects it (the apex is where the camera IS,
+so grabbing it moves the camera), **G moves and R aims** through a small modal
+of its own — the molecule modals act on a selection of ATOMS through the
+scene's snapshots and a camera has none — with the same click-to-confirm,
+Esc-to-revert contract. `selected_camera_id` is a separate field from
+`selection` for round 56's reason: a camera has no atoms, so every loop over
+`(obj_id, atom)` would otherwise have to learn to skip it.
+**Numpad 0 was bound to a key half the keyboards never send.** `Num+0` is
+`KeypadModifier | Key_0`, and **with NUM LOCK OFF the numpad's 0 sends
+`Key_Insert`**. `extra_keys=("Num+Ins",)` registers both, the same mechanism
+round 55 used for both spellings of a Shift chord. **Esc leaves the camera
+view** too, and it does so LAST in `cancel_modes` — Esc backs out of the
+innermost thing you are in, so cancelling a grab must not also throw you out
+of the shot.
+**Two traps found while building it.** A frame is now free to grow past the
+window, and it takes its own drag handles with it — so a border drag is
+clamped at the window and says so (the wheel is how you make room). And
+`_render_crop` asks for a buffer of `resolution / frame fraction`, which grows
+without bound as the frame is pulled in — capped at 6x the widget, with the
+crop scaled the rest of the way, because the frame's size on screen is a
+VIEWING choice and must not decide how much memory a render takes. Verified in
+a real window: dragging a border moved it while the molecule stayed at
+**184.2 px, unchanged to a tenth of a pixel**, and a 640x360 camera rendered
+640x360 and exported 640x360 to Blender.
+1261 tests.
+
 Round 57 (2026-08-10, the camera view becomes a view, and four animation
 faults): Christian used round 56 in anger and every complaint pointed the same
 way — **the camera view was a decoration laid over an ordinary view rather
@@ -2270,7 +2343,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1246 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1261 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -2424,10 +2497,14 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   roll (the turntable cannot hold one), and pixels plus a multiplier. Also
   owns the film-back rectangle and its drag handles, so the viewport
   overlay is arithmetic that can be tested without a window. Round 57 added
-  `frame_zoom` (how big the film back is DRAWN — a viewing property, nothing
-  to do with the render), `viewport_fov_y` (which makes the rectangle a real
-  framing rather than a decoration) and `twist_rotation`, the ONE place that
-  knows which way roll goes.
+  `viewport_fov_y` (which makes the rectangle a real framing rather than a
+  decoration) and `twist_rotation`, the ONE place that knows which way roll
+  goes; round 58 made the frame ANGULAR — `half_angles`, `frame_rect(tx, ty,
+  zoom)`, `fit_frame_zoom`, `resize_frame` (a handle moves a BORDER) and
+  `zoom_frame` (the wheel), plus `gizmo_geometry` for the wireframe pyramid
+  drawn in the viewport. Read `frame_rect`'s docstring before changing any of
+  it: the whole model exists so that moving a border cannot rescale the
+  scene.
 - `core/animation.py` — the scene clock as a FILE (round 54). `frame_times`
   is the plan and is where the mistakes live (a repeated loop boundary hitches
   once per cycle and is invisible in a single frame); PNG sequences need no
@@ -2592,6 +2669,30 @@ independent cross-check inside a single fixture.
   aspect-preserving direction, which is the one a user naturally drags. If a
   control is reported as doing nothing, check what of its output survives to
   the screen before checking whether it runs.
+- **A FITTED rectangle plus a projection fitted to it means every reshape is a
+  rescale** (round 58, and it is the round-57 fix biting from the other side).
+  Round 57 answered "the handles do nothing" by making the fitted frame drive
+  the field of view — so changing the aspect changed the frame's size, which
+  changed the field of view, which rescaled the whole scene, which reads as
+  the camera dollying backwards. The cure is to make the frame ANGULAR
+  (half-width `Z*tan(fov_x/2)`): the scene's on-screen scale is then `Z /
+  distance`, with no lens or aspect term, so "the borders move and nothing
+  else does" is a property of the arithmetic instead of something arranged.
+  When a control must leave something invariant, derive the invariant and see
+  what parameterisation makes it fall out — do not fix the symptom.
+- **A control that decides a BUFFER SIZE is a control that can exhaust memory**
+  (round 58). `_render_crop` asked for `resolution / frame fraction`, so
+  pulling the frame small demanded a proportionally huge offscreen buffer; and
+  the frame handles drove the camera's resolution, which `blender_export.
+  build_render` copies into the Blender scene — a few drags turned a 1x camera
+  into a 6000x5000 render. Anything a user can drag needs a stated budget:
+  pin the long side, cap the buffer, and scale the rest of the way.
+- **`Num+0` is a key half the keyboards in the world never send** (round 58).
+  It means `KeypadModifier | Key_0`, and with NUM LOCK OFF the numpad's 0
+  sends `Key_Insert` instead — so the shortcut silently does nothing for
+  anyone who does not happen to have Num Lock on. Register `Num+Ins` beside
+  it (`extra_keys`), the same way round 55 registers both spellings of a
+  Shift chord.
 - **Re-applying a whole object to re-apply one field of it destroys the rest**
   (round 57). `camera_changed` called `apply_to`, which assigns centre,
   distance and rotation, so editing the RESOLUTION threw away any navigating
@@ -3541,7 +3642,7 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 1246 offline tests. `tests/conftest.py`
+1. `python -m pytest tests/ -q` — 1261 offline tests. `tests/conftest.py`
    sandboxes QSettings, so a GUI test can drive a real control without
    writing into your own MoloM configuration.
 2. `python -m molom --selftest` — headless core sanity.

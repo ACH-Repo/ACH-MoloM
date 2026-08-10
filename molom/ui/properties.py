@@ -1450,13 +1450,14 @@ class CameraPage(QWidget):
         self.frame_zoom.setRange(cameras.MIN_FRAME_ZOOM * 100.0,
                                  cameras.MAX_FRAME_ZOOM * 100.0)
         self.frame_zoom.setDecimals(0)
-        self.frame_zoom.setSingleStep(5.0)
+        self.frame_zoom.setSingleStep(10.0)
         self.frame_zoom.setSuffix(" %")
         self.frame_zoom.setToolTip(
             "How big the shot is DRAWN in the viewport - nothing to do with "
-            "the render. Pull it in to see the scene around what you are "
-            "framing.\n\nDragging a CORNER handle of the camera frame does "
-            "the same thing; an EDGE handle changes the aspect ratio.")
+            "the render, and it does not move the camera.\n\nThe MOUSE WHEEL "
+            "does this while you look through the camera. The frame's drag "
+            "handles are a different thing: they move the BORDERS of the "
+            "shot, changing what it contains rather than how big it looks.")
         self.frame_zoom.valueChanged.connect(self._emit)
         form.addRow("Frame size:", self.frame_zoom)
 

@@ -84,18 +84,52 @@ def main(paths):
             win.camera_changed()
             grab("91_camera_{}".format(tag))
         cam.focal_mm = 50.0
-        for zoom in (0.35, 1.0):
-            cam.frame_zoom = zoom
-            win.camera_changed()
-            grab("92_camera_frame_{:.0f}pc".format(zoom * 100))
+        win.camera_changed()
+        # The WHEEL zooms the frame; the camera must not move.
+        for tag, steps in (("out", -8), ("back", 8), ("in", 6)):
+            win.viewport.zoom_camera_frame(steps)
+            grab("92_camera_wheel_{}".format(tag))
+        # A handle drag moves a BORDER: the scene must not rescale. Scroll out
+        # first so there is room to drag INTO — the frame is clamped at the
+        # window, or its own handles would go off screen.
+        win.viewport.zoom_camera_frame(-10)
+        from PySide6.QtCore import QPointF
+
+        def molecule_extent():
+            """Screen width of the drawn molecule — the thing that must not
+            change when a border moves."""
+            obj = win.scene.visible_objects()[0]
+            xy, _f = win.viewport._project(obj.display_coords())
+            return float(xy[:, 0].max() - xy[:, 0].min())
+
+        before = molecule_extent()
+        rect = win.viewport.camera_rect()
+        win.viewport._camera_handle_press(
+            QPointF(rect[0] + rect[2], rect[1] + rect[3] / 2.0))
+        for step in (40, 90):
+            win.viewport._camera_handle_move(
+                QPointF(rect[0] + rect[2] + step, rect[1] + rect[3] / 2.0))
+            grab("93_camera_border_{}".format(step))
+        win.viewport._frame_drag = None
+        after = molecule_extent()
+        print("  after dragging: {} x {}, multiplier {:g}; molecule {:.1f} -> "
+              "{:.1f} px {}".format(cam.width, cam.height, cam.multiplier,
+                                    before, after,
+                                    "OK" if abs(after - before) < 0.5
+                                    else "RESCALED"))
+        win.viewport.zoom_camera_frame(10)
         cam.roll = 0.4                     # the frame drawn over a tilted view
         win.camera_changed()
-        grab("93_camera_rolled")
+        grab("94_camera_rolled")
         cam.roll = 0.0
         win.camera_changed()
         win.viewport._orbit_input(45.0, 10.0)   # and out again, by orbiting
         app.processEvents()
-        grab("94_camera_orbited_out")
+        grab("95_camera_orbited_out")           # the gizmo should be visible
+        win.viewport.camera.distance *= 2.5
+        win.viewport.select_camera(cam.id)
+        app.processEvents()
+        grab("96_camera_gizmo_selected")
 
     def vibration_steps():
         """A baked normal mode with a selection on it: the bonds must survive
@@ -117,7 +151,7 @@ def main(paths):
             win.timeline.advance_images(3)
             win._apply_timeline()
             app.processEvents()
-            grab("95_vibration_{}".format(k))
+            grab("97_vibration_{}".format(k))
         print("  bonds through the cycle:",
               len(win.scene.get(obj.id).structure.bonds))
 

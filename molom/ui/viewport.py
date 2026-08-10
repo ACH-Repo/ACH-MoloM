@@ -717,6 +717,13 @@ class MolViewport(QOpenGLWidget):
     looking_through = None
     camera_roll = 0.0
     on_camera_exit = None
+    #: The camera object picked in the viewport — what G and R act on. A
+    #: separate field from `selection` because a camera has no atoms and
+    #: every loop over `(obj_id, atom)` would have to learn to skip it, which
+    #: is the same reason cameras are a separate list on the Scene (round 56).
+    selected_camera_id = None
+    _camera_drag = None
+    on_camera_look = None
     _frame_drag = None
     _poly_key = None
     _poly_cache = None
@@ -989,6 +996,9 @@ class MolViewport(QOpenGLWidget):
         # An armed-but-not-yet-flying right press is never worth reporting,
         # but it must not survive whatever comes next and take off later.
         self._cancel_fly_arm()
+        if self._camera_drag is not None:
+            self.finish_camera_drag(commit=False)
+            return True
         if self.measure_active:
             self.set_measure_tool(False)
             return True
@@ -1013,12 +1023,22 @@ class MolViewport(QOpenGLWidget):
         if self._select_tool is not None:
             self.set_select_tool(None)
             return True
+        # LAST, because Esc's job is to back out of the innermost thing you
+        # are in, and a camera view is the outermost of these — cancelling a
+        # grab should not also throw you out of the shot.
+        if self.looking_through is not None:
+            # Esc is a CANCEL, so it puts the view back where it was before
+            # you looked through the camera — the same as Numpad 0, and unlike
+            # orbiting out, which is a deliberate move.
+            self.exit_camera_view("Left the camera view", restore=True)
+            return True
         return False
 
     def modal_active(self):
         return (self._grab is not None or self._rotate is not None
                 or self._align_wait is not None
-                or self._internal is not None)
+                or self._internal is not None
+                or self._camera_drag is not None)
 
     # ---------------------------------------------------- origin handle
     def set_origin_active(self, on):
@@ -1913,7 +1933,8 @@ class MolViewport(QOpenGLWidget):
         cam = self.active_camera_object()
         if cam is None:
             return None
-        return cameras_mod.frame_rect(self.width(), self.height(), cam.aspect,
+        tx, ty = cam.half_angles()
+        return cameras_mod.frame_rect(self.width(), self.height(), tx, ty,
                                       zoom=cam.frame_zoom)
 
     def sync_camera_lens(self):
@@ -1951,7 +1972,7 @@ class MolViewport(QOpenGLWidget):
             self._cam_key = None     # the FOV is not part of the cache key
         cam.apply_lens_to(self.camera)
 
-    def exit_camera_view(self, reason=None):
+    def exit_camera_view(self, reason=None, restore=False):
         """Leave the camera view, KEEPING the pose you are looking from.
 
         Blender's rule, and Christian's: "rotating the view should immediately
@@ -1969,7 +1990,7 @@ class MolViewport(QOpenGLWidget):
         if self.looking_through is None:
             return False
         if self.on_camera_exit is not None:
-            self.on_camera_exit()
+            self.on_camera_exit(restore)
         else:                                # standalone viewport (tests)
             self.looking_through = None
             self.camera_roll = 0.0
@@ -3405,8 +3426,8 @@ class MolViewport(QOpenGLWidget):
         p.setPen(QPen(QColor(self.CAMERA_FRAME.red(), self.CAMERA_FRAME.green(),
                              self.CAMERA_FRAME.blue(), 150), 1.0))
         p.drawText(int(x) + 6, int(y + h) + 14,
-                   "orbit or Numpad 0 to leave  |  corners resize the frame, "
-                   "edges the aspect")
+                   "orbit / Esc / Numpad 0 to leave  |  drag the handles to "
+                   "move the shot's borders, scroll to resize the frame")
 
     def _paint_overlays(self, view, proj, empty):
         p = QPainter(self)
@@ -3414,6 +3435,7 @@ class MolViewport(QOpenGLWidget):
         p.setRenderHint(QPainter.TextAntialiasing)
         if self.show_cell:
             self._paint_cells(p)
+        self._paint_cameras(p)
         self._paint_symmetry(p)
         if not empty:
             self._paint_labels(p)
@@ -3709,6 +3731,86 @@ class MolViewport(QOpenGLWidget):
                 (x0, y0), (x1, y1) = seg
                 p.setPen(QPen(_AXIS_COLORS[axis], 2.0))
                 p.drawLine(int(x0), int(y0), int(x1), int(y1))
+
+    #: The colour of a camera gizmo, and of a selected one.
+    CAMERA_GIZMO = QColor(170, 180, 200)
+    CAMERA_GIZMO_ACTIVE = QColor(255, 170, 60)
+
+    def camera_gizmos(self):
+        """`[(cam, geometry), ...]` for every camera drawn in the viewport.
+
+        Not the one being LOOKED THROUGH: you are standing at its apex, so its
+        wireframe would be a scatter of lines across the whole screen with the
+        film back already drawn as the frame.
+        """
+        if self.scene is None:
+            return []
+        size = cameras_mod.gizmo_size(self._scene_scale())
+        return [(cam, cameras_mod.gizmo_geometry(cam, size))
+                for cam in self.scene.cameras
+                if cam.visible and cam.id != self.looking_through]
+
+    def _paint_cameras(self, p):
+        """Camera objects, drawn the way Blender draws them.
+
+        Christian: "there are no camera objects being displayed in the
+        viewport that can be grabbed and moved like in blender. Just like in
+        blender they should be cones with a rectangular base as wireframes
+        which have a dashed line attached to their tip that goes towards the
+        xy plane."
+
+        The rectangular base IS the film, so its shape is the aspect ratio and
+        a 16:9 camera says so while it sits in the scene; the little triangle
+        on top is which way is up, which is the only thing that distinguishes
+        a rolled camera from a level one at a glance. The dashed drop line is
+        what makes the thing placeable — without it a camera above the floor
+        and one below it look identical.
+        """
+        gizmos = self.camera_gizmos()
+        if not gizmos:
+            return
+        for cam, g in gizmos:
+            live = (cam.id == self.selected_camera_id)
+            colour = self.CAMERA_GIZMO_ACTIVE if live else self.CAMERA_GIZMO
+            body = QPen(QColor(colour.red(), colour.green(), colour.blue(),
+                               235 if live else 170), 2.0 if live else 1.3)
+            base = g["base"]
+            for a, b in (list(zip(base, base[1:] + base[:1]))
+                         + list(g["edges"])):
+                seg = self._segment_screen(a, b)
+                if seg is None:
+                    continue
+                (x0, y0), (x1, y1) = seg
+                p.setPen(body)
+                p.drawLine(int(x0), int(y0), int(x1), int(y1))
+            up = g["up"]
+            for a, b in zip(up, up[1:]):
+                seg = self._segment_screen(a, b)
+                if seg is None:
+                    continue
+                (x0, y0), (x1, y1) = seg
+                p.setPen(body)
+                p.drawLine(int(x0), int(y0), int(x1), int(y1))
+            seg = self._segment_screen(*g["drop"])
+            if seg is not None:
+                (x0, y0), (x1, y1) = seg
+                drop = QPen(QColor(colour.red(), colour.green(),
+                                   colour.blue(), 120), 1.0, Qt.DashLine)
+                p.setPen(drop)
+                p.drawLine(int(x0), int(y0), int(x1), int(y1))
+            xy, front = self._project(g["apex"][None, :])
+            if not bool(front[0]):
+                continue
+            ax, ay = float(xy[0][0]), float(xy[0][1])
+            p.setPen(QPen(QColor(30, 30, 30), 1.0))
+            p.setBrush(colour)
+            p.drawEllipse(int(ax - 4), int(ay - 4), 8, 8)
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(colour, 1.0))
+            f = QFont()
+            f.setPointSize(8)
+            p.setFont(f)
+            p.drawText(int(ax) + 8, int(ay) - 6, cam.name)
 
     def _paint_symmetry(self, p):
         """Symmetry elements and 'ghost' images of the asymmetric unit.
@@ -4506,6 +4608,9 @@ class MolViewport(QOpenGLWidget):
 
     def mousePressEvent(self, ev):
         pos = ev.position()
+        if self._camera_drag is not None:
+            self.finish_camera_drag(commit=ev.button() == Qt.LeftButton)
+            return
         if self._internal is not None:
             # Same contract as G and R: left confirms, right cancels.
             self._finish_internal(commit=ev.button() == Qt.LeftButton)
@@ -4534,6 +4639,15 @@ class MolViewport(QOpenGLWidget):
             # picking, exactly as the compass is.
             if self._camera_handle_press(pos):
                 return
+            # A camera gizmo likewise: it is a small target drawn on top of
+            # the scene, and it has to win over an atom behind it or it could
+            # not be picked in a crowded scene.
+            hit = self._camera_gizmo_at(pos)
+            if hit is not None:
+                self.select_camera(hit.id)
+                return
+            if self.selected_camera_id is not None:
+                self.select_camera(None)     # clicking away deselects it
         self._drag_last = pos
         self._drag_button = ev.button()
         self._drag_moved = False
@@ -4598,6 +4712,15 @@ class MolViewport(QOpenGLWidget):
         return None
 
     def mouseDoubleClickEvent(self, ev):
+        # Double-clicking a camera gizmo looks through it, which is what a
+        # double-click means everywhere else in MoloM (the outliner row does
+        # the same) and what it means in Blender's outliner.
+        if ev.button() == Qt.LeftButton and self._camera_drag is None:
+            hit = self._camera_gizmo_at(ev.position())
+            if hit is not None and self.on_camera_look is not None:
+                self.select_camera(hit.id)
+                self.on_camera_look(hit.id)
+                return
         # RIGHT double-click LATCHES flight: you fly with both hands free
         # until a single right click or Esc lands you, instead of holding the
         # button down. The first click of the pair already started an
@@ -4639,6 +4762,9 @@ class MolViewport(QOpenGLWidget):
                 self._draw_from = self._atom_map[hit][1]
 
     def mouseMoveEvent(self, ev):
+        if self._camera_drag is not None:
+            self._camera_drag_move(ev.position())
+            return
         if self._frame_drag is not None:
             self._camera_handle_move(ev.position())
             return
@@ -4742,6 +4868,18 @@ class MolViewport(QOpenGLWidget):
         w, h = max(self.width(), 1), max(self.height(), 1)
         if self._nav_drag == "orbit":
             self._orbit_input(dx, dy, cursor_pos=pos)
+        elif self.looking_through is not None:
+            # "unless the camera is selected and grabbed, it should not move".
+            # A zoom drag resizes the frame like the wheel; a pan drag would
+            # have to move the camera sideways, so it is refused and says so —
+            # the frame is drawn centred, and off-centring it is a different
+            # feature from the one that was asked for.
+            if self._nav_drag == "zoom":
+                self.zoom_camera_frame(-dy / _DRAG_ZOOM_PX)
+            elif self._nav_drag == "pan":
+                self.status_message.emit(
+                    "The camera is locked while you look through it — select "
+                    "it and press G to move it")
         elif self._nav_drag == "pan":
             self.camera.pan(dx, dy, w, h)
         elif self._nav_drag == "zoom":
@@ -5139,6 +5277,18 @@ class MolViewport(QOpenGLWidget):
             self._internal["state"].add_delta(np.sign(dy) * span)
             self._apply_internal()
             return
+        if self.looking_through is not None and not self.modal_active():
+            # Inside a camera the wheel resizes the FRAME. Every scroll
+            # gesture, not just the zoom one: a camera you are looking through
+            # must not move, so there is nothing else for a scroll to mean,
+            # and leaving pan or orbit live here would be a way to move it by
+            # accident. Orbiting still exits, but through a DRAG (see
+            # `_orbit_input`) — a stray trackpad swipe should not throw you
+            # out of a shot you are composing.
+            steps = (ad.y() / _WHEEL_NOTCH) if ev.pixelDelta().isNull() \
+                else dy / 40.0
+            self.zoom_camera_frame(steps)
+            return
         if action == input_map.ZOOM:
             # A detent is a fixed 120 units, so a mouse zooms in even steps;
             # a trackpad's pixel deltas keep the continuous feel.
@@ -5263,15 +5413,31 @@ class MolViewport(QOpenGLWidget):
             self.update()
         if crop is not None:
             image = image.copy(*crop["box"])
+            if (image.width(), image.height()) != crop["target"]:
+                from PySide6.QtCore import Qt as _Qt
+                image = image.scaled(crop["target"][0], crop["target"][1],
+                                     _Qt.IgnoreAspectRatio,
+                                     _Qt.SmoothTransformation)
         return image
+
+    #: An offscreen buffer this many times the widget is already generous;
+    #: past it the crop is scaled instead. Without a cap, a frame pulled small
+    #: asks for a buffer of `resolution / frame fraction`, which is how a
+    #: perfectly ordinary camera can demand a several-thousand-pixel render.
+    _MAX_RENDER_BUFFER = 6
 
     def _render_crop(self, w, h):
         """How to turn a viewport-shaped render into THIS CAMERA's frame.
 
-        Returns `{"buffer": (w, h), "box": (x, y, w, h)}` — the offscreen size
-        to draw at and the rectangle to keep — or None when there is no camera
-        to honour. See `render_image` for why it is a crop and not a second
-        projection.
+        Returns `{"buffer": (w, h), "box": (x, y, w, h), "target": (w, h)}` —
+        the offscreen size to draw at, the rectangle to keep and the size to
+        deliver — or None when there is no camera to honour. See `render_image`
+        for why it is a crop and not a second projection.
+
+        The buffer is enlarged so the crop lands at the camera's resolution
+        without upscaling, but only up to `_MAX_RENDER_BUFFER`: the frame's
+        size on screen is a VIEWING choice now (the wheel), and it must not be
+        able to decide how much memory a render takes.
         """
         cam = self.active_camera_object()
         rect = self.camera_rect()
@@ -5281,14 +5447,18 @@ class MolViewport(QOpenGLWidget):
         fx = max(rect[2] / float(widget_w), 1e-6)
         fy = max(rect[3] / float(widget_h), 1e-6)
         target_w, target_h = cam.render_size()
-        buf_w = max(int(round(target_w / fx)), target_w)
-        buf_h = max(int(round(target_h / fy)), target_h)
+        cap = float(self._MAX_RENDER_BUFFER)
+        buf_w = int(round(min(max(target_w / fx, target_w), widget_w * cap)))
+        buf_h = int(round(min(max(target_h / fy, target_h), widget_h * cap)))
+        box_w = max(int(round(buf_w * fx)), 1)
+        box_h = max(int(round(buf_h * fy)), 1)
         x = int(round(rect[0] * buf_w / float(widget_w)))
         y = int(round(rect[1] * buf_h / float(widget_h)))
         # Clamped so a rounding pixel cannot ask for area outside the buffer.
-        x = max(min(x, buf_w - target_w), 0)
-        y = max(min(y, buf_h - target_h), 0)
-        return {"buffer": (buf_w, buf_h), "box": (x, y, target_w, target_h)}
+        x = max(min(x, buf_w - box_w), 0)
+        y = max(min(y, buf_h - box_h), 0)
+        return {"buffer": (buf_w, buf_h), "box": (x, y, box_w, box_h),
+                "target": (target_w, target_h)}
 
     def enterEvent(self, ev):
         """Focus follows the cursor (Blender). Without this, a keypress after
@@ -5434,6 +5604,128 @@ class MolViewport(QOpenGLWidget):
             return None
         return index_map[hit] if index_map is not None else hit
 
+    def _camera_gizmo_at(self, pos, radius=11.0):
+        """Which camera's apex the cursor is on, or None.
+
+        The apex is the grab point, as it is in Blender: it is where the
+        camera IS, so moving it moves the camera rather than the shape drawn
+        round it. Nearest-first, so overlapping cameras pick the closest.
+        """
+        best, best_d = None, radius * radius
+        for cam, g in self.camera_gizmos():
+            xy, front = self._project(g["apex"][None, :])
+            if not bool(front[0]):
+                continue
+            d = (float(xy[0][0]) - pos.x()) ** 2 + \
+                (float(xy[0][1]) - pos.y()) ** 2
+            if d <= best_d:
+                best, best_d = cam, d
+        return best
+
+    def select_camera(self, cam_id):
+        """Pick a camera in the viewport. G and R then move it."""
+        self.selected_camera_id = cam_id
+        if cam_id is not None and self.scene is not None:
+            self.scene.active_camera_id = cam_id
+            cam = self.scene.camera(cam_id)
+            if cam is not None:
+                self.status_message.emit(
+                    "{} — G moves it, R aims it, Numpad 0 looks through "
+                    "it".format(cam.name))
+        self.update()
+
+    def selected_camera(self):
+        if self.scene is None or self.selected_camera_id is None:
+            return None
+        return self.scene.camera(self.selected_camera_id)
+
+    def start_camera_grab(self, rotate=False):
+        """G / R on a selected camera object.
+
+        Deliberately its own small modal rather than the G/R the molecules
+        use: those act on a selection of ATOMS through the scene's undo
+        snapshots, and a camera has none. The contract is the same — move the
+        mouse, left-click or Enter to confirm, right-click or Esc to revert —
+        because a modal that behaves differently from the other modals is
+        worse than no modal.
+        """
+        cam = self.selected_camera()
+        if cam is None:
+            return False
+        if self.on_edit_begin is not None:
+            self.on_edit_begin()             # one undo entry for the gesture
+        self._camera_drag = {
+            "id": cam.id, "rotate": bool(rotate),
+            "center": np.array(cam.center, dtype=float),
+            "rotation": np.array(cam.rotation, dtype=float),
+            "start": None,
+        }
+        self.grabKeyboard()
+        self.status_message.emit(
+            "{} {} — click to confirm, Esc to cancel".format(
+                cam.name, "aim" if rotate else "move"))
+        self.update()
+        return True
+
+    def _camera_drag_move(self, pos):
+        d = self._camera_drag
+        cam = self.scene.camera(d["id"]) if self.scene else None
+        if cam is None:
+            return False
+        if d["start"] is None:
+            d["start"] = (pos.x(), pos.y())
+            return True
+        dx = pos.x() - d["start"][0]
+        dy = pos.y() - d["start"][1]
+        if d["rotate"]:
+            # The turntable, so a camera object cannot acquire a roll it
+            # would then have to store twice (`roll` is its own field).
+            rate = self.camera.rotate_speed * 2.0 * np.pi / Camera.PX_PER_REV
+            r = quat_to_mat3(d["rotation"])
+            yaw = rotations.axis_angle_mat3([0.0, 0.0, 1.0], -dx * rate)
+            pitch_axis = r.T @ np.array([1.0, 0.0, 0.0])
+            pitch = rotations.axis_angle_mat3(pitch_axis, -dy * rate)
+            cam.rotation = quat_from_mat3(pitch @ yaw @ r)
+        else:
+            # Screen-parallel, in the plane through the camera — the same
+            # feel as panning, because that is the gesture being imitated.
+            r = quat_to_mat3(self.camera.rotation)
+            half = np.tan(np.radians(self.camera.FOV_Y) / 2.0) \
+                * float(self.camera.distance)
+            per_px = 2.0 * half / max(self.height(), 1)
+            right = r.T @ np.array([1.0, 0.0, 0.0])
+            up = r.T @ np.array([0.0, 1.0, 0.0])
+            cam.center = d["center"] + right * (dx * per_px) \
+                - up * (dy * per_px)
+        self._sync_looked_through(cam)
+        self.update()
+        return True
+
+    def finish_camera_drag(self, commit=True):
+        d = self._camera_drag
+        self._camera_drag = None
+        self.releaseKeyboard()
+        if d is None:
+            return
+        cam = self.scene.camera(d["id"]) if self.scene else None
+        if cam is not None and not commit:
+            cam.center = d["center"]
+            cam.rotation = d["rotation"]
+            self._sync_looked_through(cam)
+        if not commit and self.on_model_edit_cancel is not None:
+            self.on_model_edit_cancel()
+        elif commit:
+            self.edit_committed.emit()
+        self.status_message.emit("" if commit else "Cancelled")
+        self.update()
+
+    def _sync_looked_through(self, cam):
+        """If this is the camera we are inside, follow it — otherwise moving
+        the one you are looking through would do nothing you could see."""
+        if cam is not None and cam.id == self.looking_through:
+            cam.apply_to(self.camera)
+            self.sync_camera_lens()
+
     def _camera_handle_press(self, pos):
         """Start a frame drag if the press landed on a handle.
 
@@ -5450,29 +5742,60 @@ class MolViewport(QOpenGLWidget):
         self._frame_drag = {"handle": handle, "rect": rect,
                             "start": (pos.x(), pos.y()),
                             "w": cam.width, "h": cam.height,
-                            "zoom": cam.frame_zoom}
+                            "sensor": cam.sensor_mm}
         self.update()
         return True
 
     def _camera_handle_move(self, pos):
+        """Move a BORDER of the shot. Nothing on screen rescales — see
+        `cameras.frame_rect` for why that is a property of the frame being
+        angular rather than something arranged here."""
         d = self._frame_drag
         if d is None:
             return False
         cam = self.active_camera_object()
         if cam is None:
             return False
-        w, h, zoom = cameras_mod.resize_frame(
-            d["handle"], d["w"], d["h"], d["zoom"], pos.x() - d["start"][0],
-            pos.y() - d["start"][1], d["rect"])
-        cam.width, cam.height, cam.frame_zoom = w, h, zoom
-        # The FOV follows the frame, or shrinking it would CROP the shot
-        # instead of showing more of the scene around it.
+        sensor, w, h = cameras_mod.resize_frame(
+            d["handle"], cam.focal_mm, d["sensor"], d["w"], d["h"],
+            pos.x() - d["start"][0], pos.y() - d["start"][1], d["rect"])
+        # A border may not be dragged off the screen: the handles go with it
+        # and there is then nothing left to grab. Growing the shot past the
+        # window is still possible — scroll out first, which is what the wheel
+        # is for, and is the same order of operations Blender wants.
+        tx, ty = cameras_mod.half_angles(cam.focal_mm, sensor,
+                                         float(w) / max(float(h), 1e-6))
+        rect = cameras_mod.frame_rect(self.width(), self.height(), tx, ty,
+                                      zoom=cam.frame_zoom)
+        margin = cameras_mod.FRAME_FIT_MARGIN
+        if rect[2] > self.width() * margin or rect[3] > self.height() * margin:
+            self.status_message.emit(
+                "{}: that is as wide as the frame goes here — scroll out for "
+                "more room".format(cam.name))
+            return True
+        cam.sensor_mm, cam.width, cam.height = sensor, w, h
         self.sync_camera_lens()
         self.status_message.emit(
-            "{}: {} x {} ({:.3f}:1){}".format(
-                cam.name, w, h, cam.aspect,
-                "" if d["handle"] not in cameras_mod.CORNERS
-                else "  frame {:.0f}%".format(zoom * 100.0)))
+            "{}: {} x {} ({:.3f}:1) on a {:.1f} mm film".format(
+                cam.name, w, h, cam.aspect, sensor))
+        self.update()
+        return True
+
+    def zoom_camera_frame(self, steps):
+        """The wheel inside a camera view: resize the FRAME, never the camera.
+
+        Christian, twice: "mousewheel should also not move the camera, only
+        scroll in the view", and "if I have made a frame ... way smaller than
+        the viewport, scrolling forward should cause the frame to grow in the
+        viewport. Right now it is effectively changing the focal length."
+        """
+        cam = self.active_camera_object()
+        if cam is None:
+            return False
+        cam.frame_zoom = cameras_mod.zoom_frame(cam.frame_zoom, steps)
+        self.sync_camera_lens()
+        self.status_message.emit(
+            "{}: frame {:.0f}%".format(cam.name, cam.frame_zoom * 100.0))
         self.update()
         return True
 
@@ -5673,10 +5996,14 @@ class MolViewport(QOpenGLWidget):
         # O / Shift+O route through the app's QAction shortcuts
         # (O = origin handle in edit mode, Shift+O = projection toggle).
         if key == Qt.Key_G:
-            self.start_grab()
+            # A picked camera object takes G and R, exactly as a picked
+            # molecule does — that IS the "grabbed and moved like in blender".
+            if not self.start_camera_grab(rotate=False):
+                self.start_grab()
             return
         if key == Qt.Key_R:
-            self.start_rotate()
+            if not self.start_camera_grab(rotate=True):
+                self.start_rotate()
             return
         if key == Qt.Key_Escape:
             if not self.cancel_modes():

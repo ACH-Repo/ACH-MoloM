@@ -916,53 +916,70 @@ before, and holding still works even on a selected atom.
 A camera is a saved viewpoint that lives in the scene, appears at the bottom
 of the outliner and rides savepoints and undo like anything else. **F3 →
 "Camera: place one here"** (or the `+ Camera` outliner row) saves the view you
-are looking at; **Numpad 0** looks through the active one and, pressed again,
-goes back to the view you came from.
+are looking at.
+
+### In the viewport
+Each camera is drawn as Blender draws one: a **wireframe pyramid** whose
+rectangular base is the film (so its shape is the aspect ratio), a small
+triangle on top for which way is up, a dot at the apex, and a **dashed line
+straight down to the XY plane** — without that line a camera above the floor
+and one below it look identical.
+
+| Gesture | What happens |
+|---|---|
+| **Click the apex dot** | selects the camera and makes it active |
+| **G** | move it (screen-parallel, like a pan). Click to confirm, Esc to revert |
+| **R** | aim it (turntable, so it cannot pick up a roll it would then store twice) |
+| **Double-click it** | look through it |
+
+The camera you are looking THROUGH is not drawn — you are standing at its
+apex, and its film back is already on screen as the frame.
 
 ### Looking through one
 
 | Gesture | What happens |
 |---|---|
-| **Orbit** (MMB / Alt+LMB drag, or plain scroll on a trackpad) | **Leaves the camera**, keeping the pose you rotated to — Blender's rule |
-| **Pan / zoom** (Shift+drag, Ctrl+drag, Shift/Ctrl+scroll, wheel on a mouse) | Stays inside. Navigate freely; the saved camera does not move |
-| **Compass click / view along an axis** | Leaves the camera — it is a view rotation |
-| **Right-drag flight** | Leaves the camera |
-| **Tumbling a molecule** (one atom selected, cursor on it) | Stays inside — that moves the MODEL, not the camera |
-| **Numpad 0** | Leaves and restores the view from before you entered |
+| **Orbit** (MMB / Alt+LMB drag) | **Leaves the camera**, keeping the pose you rotated to — Blender's rule |
+| **Esc**, **Numpad 0** | Leaves and restores the view from before you entered |
+| **Mouse wheel** | Resizes the FRAME (see below). Never moves the camera |
+| **Ctrl+drag** | The same frame zoom |
+| **Shift+drag** (pan) | Refused, with a hint — the camera is locked while you look through it |
+| **Compass click / axis view / flight** | Leaves the camera — all view rotations |
+| **Tumbling a molecule** | Stays inside — that moves the MODEL, not the camera |
 
-The exception list is not written in terms of modifier keys: it is the
-RESOLVED ACTION (`_nav_drag_kind`, `input_map.wheel_action`) that decides, so
-it behaves the same on a trackpad and on a mouse.
+Numpad 0 is bound to **both** `Num+0` and `Num+Ins`, because with **Num Lock
+off** the numpad's 0 sends `Key_Insert` — binding only the first is a shortcut
+half the keyboards in the world never send.
 
-**The camera object itself never moves while you look through it.** Editing
-its lens, resolution or frame re-applies only the projection, never the pose —
-so navigating inside a shot and then touching a control does not throw the
-navigation away. "Camera: update the active one to this view" is the explicit
-way to move it.
+**The camera object never moves while you look through it.** Not by scrolling,
+not by dragging its frame, not by editing its lens or resolution. Select it and
+press **G** to move it, or use "Camera: update the active one to this view".
 
 ### The film back
 
 The rectangle is what will be **rendered**, and it means it: the viewport's
-field of view is widened so the camera's own lands exactly on the frame, which
-is what makes the focal length visible on screen rather than only in the
-label. Everything outside is veiled.
+field of view is set so the camera's own lands exactly on the frame.
 
-| Handle | Changes |
-|---|---|
-| **Corner** | the frame's SIZE on screen (and the resolution on both axes) |
-| **Edge** | the aspect ratio — that axis's pixels only |
+**The frame is angular, not fitted.** Its half-width is `Z·tan(fov_x/2)` and
+its half-height `Z·tan(fov_y/2)`, with `Z` set by the frame zoom alone. The
+consequence is the whole point: the on-screen scale of the scene works out to
+`Z / distance`, with no lens or aspect term in it, so
 
-Corner drags used to appear to do nothing, and they nearly did: the frame was
-always redrawn as the largest rectangle of its aspect that fits, so only the
-SHAPE could ever show — and dragging a corner along the rectangle's own
-diagonal is precisely the direction that leaves the shape alone. The frame
-size is a separate property now (**Frame size** on the 🎥 page, 12–100%);
-pulling it in shows more of the scene around the shot rather than cropping it.
+* **dragging a handle moves a BORDER of the shot** — what it contains changes
+  and nothing rescales. A horizontal drag resizes the FILM (the sensor width),
+  a vertical one changes the aspect; the resolution follows the aspect with
+  the **longer side pinned**, so dragging can reshape a shot but never inflate
+  its pixel count;
+* **the wheel is the only thing that resizes the picture** — frame and
+  contents together, which is Blender's camera-view zoom.
 
-**F12 through a camera** renders exactly the framed rectangle, at the camera's
-resolution × multiplier. It is done as a crop of an ordinary viewport render
-enlarged so the crop never upscales — one projection, one set of overlay
-painters, no second code path to drift.
+A border is clamped at the window so its own handles cannot be dragged off
+screen; scroll out first if you want a wider shot than there is room for.
+
+**F12 through a camera** renders exactly the framed rectangle at the camera's
+resolution × multiplier — a crop of an ordinary viewport render, enlarged so
+the crop does not upscale (capped, so a small frame cannot demand a huge
+buffer). One projection, one set of overlay painters.
 
 ### Roll
 The interactive camera is a turntable and cannot hold a rolled pose, so a

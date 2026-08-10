@@ -46,14 +46,16 @@ PERSPECTIVE = "perspective"
 ORTHOGRAPHIC = "orthographic"
 PROJECTIONS = (PERSPECTIVE, ORTHOGRAPHIC)
 
-#: How large the film back is DRAWN, as a fraction of the largest rectangle of
-#: its aspect that fits the viewport. Purely a viewing property — it changes
-#: nothing about the render, only how much of the scene around the shot you
-#: can see while composing it, which is Blender's camera-view zoom.
-#: Capped at the fit: a frame larger than the window puts its own drag handles
-#: off screen, which is a state with no way out of it.
-MIN_FRAME_ZOOM = 0.12
-MAX_FRAME_ZOOM = 1.0
+#: How large the film back is DRAWN, as pixels-per-unit-of-tan-half-angle
+#: over half the widget height. Purely a viewing property: it changes nothing
+#: about the render, only how big the shot appears while you compose it, and
+#: it is what the WHEEL drives inside a camera view — Blender's camera-view
+#: zoom. See `frame_rect` for why the frame is angular rather than fitted.
+MIN_FRAME_ZOOM = 0.05
+MAX_FRAME_ZOOM = 20.0
+
+#: Room left round the frame at the default fit, for the drag handles.
+FRAME_FIT_MARGIN = 0.92
 
 
 def fov_y_degrees(focal_mm, sensor_mm=DEFAULT_SENSOR_MM, aspect=None):
@@ -160,6 +162,18 @@ class CameraObject(object):
         tilted, rather than showing a level view of a shot that is not."""
         return twist_rotation(self.rotation, self.roll)
 
+    def half_angles(self):
+        """`(tan(fov_x/2), tan(fov_y/2))` — where this shot's borders fall."""
+        return half_angles(self.focal_mm, self.sensor_mm, self.aspect)
+
+    def fit_frame(self, widget_w, widget_h, margin=FRAME_FIT_MARGIN):
+        """Size the drawn frame to this viewport. Called when a camera is
+        made and by "fit the frame" — never per draw, which is what made the
+        frame's size depend on its own shape."""
+        tx, ty = self.half_angles()
+        self.frame_zoom = fit_frame_zoom(widget_w, widget_h, tx, ty, margin)
+        return self.frame_zoom
+
     # -------------------------------------------------------- interchange
     def apply_to(self, camera):
         """Put the interactive camera into this pose AND this lens."""
@@ -265,26 +279,61 @@ def clamp_frame_zoom(value):
     return float(min(max(z, MIN_FRAME_ZOOM), MAX_FRAME_ZOOM))
 
 
-def frame_rect(widget_w, widget_h, aspect, margin=0.92, zoom=1.0):
+def half_angles(focal_mm, sensor_mm, aspect):
+    """`(tan(fov_x/2), tan(fov_y/2))` for a lens on a film.
+
+    The sensor size is HORIZONTAL, so the horizontal half-angle is a property
+    of the lens and the film alone and the aspect only divides the vertical
+    one. Everything about the frame is expressed in these two numbers, because
+    they are what decides where its borders fall.
+    """
+    focal = max(float(focal_mm), 1e-6)
+    sensor = max(float(sensor_mm), 1e-6)
+    tx = 0.5 * sensor / focal
+    ty = tx / max(float(aspect), 1e-6)
+    return float(tx), float(ty)
+
+
+def frame_rect(widget_w, widget_h, tx, ty, zoom=1.0):
     """The camera's FILM back as a rectangle inside the viewport.
 
-    Looking through a camera whose aspect differs from the window has to show
-    what will actually be rendered, or the framing you compose is not the
-    framing you get. Returns (x, y, w, h) in widget pixels, centred, the
-    largest rectangle of that aspect that fits with a little room round it for
-    the drag handles — scaled by `zoom`, which is what lets the frame be an
-    arbitrary size rather than always filling the window.
+    **The frame is ANGULAR, not fitted.** Its half-width is `Z * tx` and its
+    half-height `Z * ty`, where `Z = zoom * widget_h / 2` is a scale in pixels
+    per unit of tan-half-angle. That one decision is what round 57's first cut
+    got wrong, and everything Christian reported follows from it.
+
+    It was fitted before — always the largest rectangle of the camera's aspect
+    that the window holds — and the projection was then widened so the
+    camera's field of view landed on it. So the moment a handle changed the
+    aspect, the fitted rectangle changed size, the field of view changed with
+    it, and the whole scene rescaled: "when I pull the corners, the camera
+    zooms out or is moved back. It shouldn't."
+
+    Angular, it cannot: the on-screen scale of the scene works out to `Z /
+    distance`, with no `tx` or `ty` in it at all. Moving a border therefore
+    changes WHAT IS CAPTURED and nothing else, which is exactly "just adjust
+    the borders of the camera view", and the only thing that resizes the
+    picture is `zoom` — the wheel. Returns (x, y, w, h), centred.
+    """
+    widget_h = max(float(widget_h), 1.0)
+    z = clamp_frame_zoom(zoom) * widget_h / 2.0
+    w = 2.0 * z * max(float(tx), 1e-6)
+    h = 2.0 * z * max(float(ty), 1e-6)
+    return ((max(float(widget_w), 1.0) - w) / 2.0, (widget_h - h) / 2.0, w, h)
+
+
+def fit_frame_zoom(widget_w, widget_h, tx, ty, margin=FRAME_FIT_MARGIN):
+    """The zoom at which the frame just fits the widget.
+
+    Used when a camera is CREATED, so a new one is framed sensibly, and by
+    "fit the frame" — not on every draw, which is what made the frame's size
+    depend on its own shape.
     """
     widget_w = max(float(widget_w), 1.0)
     widget_h = max(float(widget_h), 1.0)
-    aspect = max(float(aspect), 1e-6)
-    scale = clamp_frame_zoom(zoom) * float(margin)
-    w = widget_w * scale
-    h = w / aspect
-    if h > widget_h * scale:
-        h = widget_h * scale
-        w = h * aspect
-    return ((widget_w - w) / 2.0, (widget_h - h) / 2.0, w, h)
+    by_h = float(margin) / max(float(ty), 1e-6)
+    by_w = float(margin) * (widget_w / widget_h) / max(float(tx), 1e-6)
+    return clamp_frame_zoom(min(by_h, by_w))
 
 
 def viewport_fov_y(cam_fov_y, rect_h, widget_h):
@@ -328,6 +377,16 @@ def handle_at(rect, x, y, radius=9.0):
 
 CORNERS = ("nw", "ne", "sw", "se")
 
+#: A camera's film cannot be arbitrarily large or vanishingly small.
+MIN_SENSOR_MM, MAX_SENSOR_MM = 1.0, 200.0
+MIN_ASPECT, MAX_ASPECT = 0.05, 20.0
+#: The most pixels a DRAG may put on the long side. Dragging changes the
+#: SHAPE of the shot; the resolution boxes on the properties page change how
+#: many pixels it has. Keeping the two apart is not tidiness — coupling them
+#: is how a few corner drags turned a 1x camera into a 6000x5000 Blender
+#: render (`build_render` takes the active camera's resolution).
+MAX_DRAG_PIXELS = 8192
+
 
 def handle_scales(handle, dx, dy, rect):
     """(scale_x, scale_y) the frame grows by when `handle` is dragged.
@@ -346,41 +405,125 @@ def handle_scales(handle, dx, dy, rect):
     return scale_x, scale_y
 
 
+def pixels_for_aspect(width, height, aspect):
+    """Resolution of that aspect keeping the LONGER side's pixel count.
+
+    A drag reshapes the shot; it must never change how many pixels the render
+    has. Anchoring the long side means repeated dragging cannot ratchet the
+    resolution anywhere — which it did, all the way to 6000x5000.
+    """
+    aspect = float(min(max(float(aspect), MIN_ASPECT), MAX_ASPECT))
+    longest = max(int(width), int(height), 16)
+    if aspect >= 1.0:
+        w, h = longest, longest / aspect
+    else:
+        w, h = longest * aspect, longest
+    return (min(max(int(round(w)), 16), MAX_DRAG_PIXELS),
+            min(max(int(round(h)), 16), MAX_DRAG_PIXELS))
+
+
 def resize_pixels(handle, width, height, dx, dy, rect):
     """New (width, height) in PIXELS after dragging a handle by (dx, dy).
 
     The drag changes the ASPECT RATIO, which is what the handles are for —
-    the pixel count follows so the longer side keeps its size. A corner moves
-    both, an edge only its own axis, and both are clamped well above zero
-    because a camera 0 pixels wide is not a state worth being able to reach.
+    the pixel count follows so the longer side keeps its size.
     """
     scale_x, scale_y = handle_scales(handle, dx, dy, rect)
-    w = int(round(max(float(width) * scale_x, 16)))
-    h = int(round(max(float(height) * scale_y, 16)))
-    return min(w, 16384), min(h, 16384)
+    aspect = (float(width) / max(float(height), 1e-6)) * scale_x / scale_y
+    return pixels_for_aspect(width, height, aspect)
 
 
-def resize_frame(handle, width, height, zoom, dx, dy, rect):
-    """New (width, height, frame_zoom) after dragging a handle.
+def resize_frame(handle, focal_mm, sensor_mm, width, height, dx, dy, rect):
+    """New `(sensor_mm, width, height)` after dragging a frame handle.
 
-    Round 57, Christian: "the corner drag buttons essentially do nothing".
-    They were doing exactly what they were written to do — changing the pixel
-    count — and none of it was VISIBLE, because `frame_rect` normalised the
-    result back to the largest rectangle that fits. Only the aspect could ever
-    show, and a corner dragged along the rectangle's own diagonal is precisely
-    the direction that leaves the aspect alone: `scale_x == scale_y`, same
-    shape, same drawn size, nothing on screen moves.
+    A handle moves a BORDER of the shot: what falls inside changes, and
+    nothing on screen rescales. Because the frame is angular (see
+    `frame_rect`), that means the drag changes the camera's half-angles —
+    horizontally by resizing the FILM, which is what the border of a film back
+    physically is, and vertically through the aspect, since the sensor size is
+    horizontal and the aspect is what divides it.
 
-    So a corner now also carries the FRAME ZOOM, by the geometric mean of the
-    two scale factors — drag out and the frame grows, drag in and it shrinks,
-    while the resolution still follows both axes independently so any width
-    and height remain reachable ("more arbitrary"). An EDGE keeps its one job:
-    that axis's pixels, i.e. the aspect, with the zoom untouched.
+    The resolution follows the aspect with the longer side pinned, so dragging
+    reshapes the shot and never inflates it. Round 57 had the handles driving
+    the pixel count directly AND a frame zoom, which is what produced both
+    "the camera zooms out" and a 6000x5000 Blender render from a camera whose
+    multiplier said 1.
     """
     scale_x, scale_y = handle_scales(handle, dx, dy, rect)
-    w, h = resize_pixels(handle, width, height, dx, dy, rect)
-    if handle in CORNERS:
-        zoom = clamp_frame_zoom(float(zoom) * float(np.sqrt(scale_x * scale_y)))
-    else:
-        zoom = clamp_frame_zoom(zoom)
-    return w, h, zoom
+    tx, ty = half_angles(focal_mm, sensor_mm,
+                         float(width) / max(float(height), 1e-6))
+    tx, ty = tx * scale_x, ty * scale_y
+    sensor = float(min(max(2.0 * float(focal_mm) * tx, MIN_SENSOR_MM),
+                       MAX_SENSOR_MM))
+    w, h = pixels_for_aspect(width, height, tx / max(ty, 1e-9))
+    return sensor, w, h
+
+
+def zoom_frame(zoom, steps, rate=1.15):
+    """The frame zoom after `steps` wheel detents — positive scrolls IN.
+
+    The wheel inside a camera view resizes the FRAME, not the camera. Christian
+    was explicit twice: "mousewheel should also not move the camera, only
+    scroll in the view", and "if I have made a frame ... way smaller than the
+    viewport, scrolling forward should cause the frame to grow in the
+    viewport."
+    """
+    return clamp_frame_zoom(float(zoom) * (float(rate) ** float(steps)))
+
+
+# --------------------------------------------------- the viewport gizmo
+#: How big a camera is DRAWN in the viewport, as a fraction of the scene
+#: radius. Blender draws its cameras at a fixed size in Blender units; MoloM's
+#: scenes run from a 3 A molecule to a 200 A framework, so a fixed size would
+#: be either invisible or the whole screen.
+GIZMO_SCENE_FRACTION = 0.22
+GIZMO_MIN, GIZMO_MAX = 0.4, 40.0
+
+
+def gizmo_size(scene_radius):
+    """The world length of a camera gizmo's axis in this scene."""
+    r = float(scene_radius) if np.isfinite(scene_radius) else 1.0
+    return float(min(max(abs(r) * GIZMO_SCENE_FRACTION, GIZMO_MIN), GIZMO_MAX))
+
+
+def gizmo_geometry(cam, size):
+    """A camera drawn the way Blender draws one.
+
+    Returns a dict of WORLD-space pieces:
+
+    * `apex`        — the eye, which is the point you grab;
+    * `base`        — the four corners of the film back, in order, so the
+                      caller closes the loop;
+    * `edges`       — apex-to-corner, the four sides of the pyramid;
+    * `up`          — the little triangle marking which way is up, which is
+                      the only thing that tells a rolled camera from a level
+                      one at a glance;
+    * `drop`        — apex to the XY plane, drawn DASHED. Blender's, and it is
+                      what turns a floating wireframe into something you can
+                      place: without it a camera above the floor and a camera
+                      below it look identical.
+
+    A rectangular base and not a circular one: the base IS the film, so its
+    shape is the aspect ratio, and a camera whose shot is 16:9 should say so
+    while it sits in the scene.
+    """
+    rot = camera_mod.quat_to_mat3(cam.rolled_rotation())
+    right, up, back = rot[0], rot[1], rot[2]      # rows: the view basis
+    forward = -back
+    apex = np.asarray(cam.eye(), dtype=float)
+    tx, ty = half_angles(cam.focal_mm, cam.sensor_mm, cam.aspect)
+    depth = float(size)
+    centre = apex + forward * depth
+    hx, hy = right * (tx * depth), up * (ty * depth)
+    base = [centre - hx - hy, centre + hx - hy, centre + hx + hy,
+            centre - hx + hy]
+    peak = centre + up * (ty * depth * 1.9)
+    return {
+        "apex": apex,
+        "base": base,
+        "edges": [(apex, corner) for corner in base],
+        "up": [base[3], peak, base[2]],
+        # Straight down to z = 0. `apex` itself when the camera is already on
+        # the floor, which draws as nothing rather than as a stray dot.
+        "drop": (apex, np.array([apex[0], apex[1], 0.0])),
+    }

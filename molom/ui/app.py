@@ -188,7 +188,9 @@ class MainWindow(QMainWindow):
         # rotated to (round 57) — restoring the pre-camera view here would
         # undo the very gesture that caused the exit.
         self.viewport.on_camera_exit = \
-            lambda: self.leave_camera(restore=False, message="")
+            lambda restore=False: self.leave_camera(restore=restore,
+                                                    message="")
+        self.viewport.on_camera_look = self.on_activate_camera
         self.viewport.on_edit_begin = self.begin_model_edit
         self.viewport.on_mode_changed = self._on_mode_changed
         self.viewport.on_new_molecule = self.new_empty_molecule
@@ -765,6 +767,12 @@ class MainWindow(QMainWindow):
           lambda c: c.on_activate_camera(), category="Camera",
           enabled=lambda c: bool(c.scene.cameras),
           shortcut="Numpad 0", key="Num+0",
+          # With NUM LOCK OFF the numpad's 0 sends Key_Insert, not Key_0 —
+          # so `Num+0` alone binds a key that half the keyboards in the world
+          # never send, and the shortcut simply does nothing (Christian:
+          # "Numpad 0 is also not bound"). Both spellings, the same way round
+          # 55 registers both spellings of a Shift chord.
+          extra_keys=("Num+Ins",),
           aliases=("view", "through", "numpad", "restore view", "exit camera",
                    "leave camera"))
         r("camera_update", "Camera: update the active one to this view",
@@ -4775,6 +4783,10 @@ class MainWindow(QMainWindow):
         self.push_undo()
         cam = self.scene.add_camera(camera=vp.camera, width=vp.width(),
                                     height=vp.height())
+        # Size the DRAWN frame once, here. The frame is angular, so its size
+        # is a stored property rather than something recomputed per draw —
+        # which is exactly what stops a handle drag rescaling the scene.
+        cam.fit_frame(vp.width(), vp.height())
         self._view_before_camera = self._current_view()
         self.viewport.looking_through = cam.id
         vp.sync_camera_lens()
@@ -4880,6 +4892,8 @@ class MainWindow(QMainWindow):
         self.push_undo()
         if self.viewport.looking_through == cam.id:
             self.leave_camera()
+        if self.viewport.selected_camera_id == cam.id:
+            self.viewport.selected_camera_id = None
         name = cam.name
         self.scene.remove_camera(cam.id)
         self._sync_all()

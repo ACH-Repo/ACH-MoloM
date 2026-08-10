@@ -150,8 +150,14 @@ def test_from_dict_carries_everything_snapshot_produces():
 
 # --------------------------------------------------------------- the frame
 def test_the_frame_keeps_the_cameras_aspect_inside_the_window():
-    rect = cameras.frame_rect(800, 600, 16.0 / 9.0)
-    x, y, w, h = rect
+    """Round 57 made the frame ANGULAR, so it is sized from the half-angles
+    and a fitted zoom rather than from the aspect alone — see
+    `cameras.frame_rect`."""
+    cam = cameras.CameraObject(1)
+    cam.width, cam.height = 1920, 1080
+    tx, ty = cam.half_angles()
+    zoom = cameras.fit_frame_zoom(800, 600, tx, ty)
+    x, y, w, h = cameras.frame_rect(800, 600, tx, ty, zoom=zoom)
     assert w / h == pytest.approx(16.0 / 9.0)
     assert w <= 800 and h <= 600
     assert x == pytest.approx((800 - w) / 2.0)         # centred
@@ -159,7 +165,11 @@ def test_the_frame_keeps_the_cameras_aspect_inside_the_window():
 
 
 def test_a_tall_camera_fits_by_height():
-    _x, _y, w, h = cameras.frame_rect(800, 600, 0.5)
+    cam = cameras.CameraObject(1)
+    cam.width, cam.height = 500, 1000                 # aspect 0.5
+    tx, ty = cam.half_angles()
+    zoom = cameras.fit_frame_zoom(800, 600, tx, ty)
+    _x, _y, w, h = cameras.frame_rect(800, 600, tx, ty, zoom=zoom)
     assert h <= 600 and w / h == pytest.approx(0.5)
 
 
@@ -179,16 +189,20 @@ def test_a_corner_wins_over_an_edge():
 
 
 def test_dragging_an_edge_changes_only_its_own_axis():
+    """The ASPECT moves; the pixel count does not, because the longer side is
+    pinned (round 57 — dragging must not be able to inflate the render)."""
     rect = (0.0, 0.0, 200.0, 100.0)
     w, h = cameras.resize_pixels("e", 400, 200, 20.0, 999.0, rect)
-    assert w > 400
-    assert h == 200                       # the vertical drag is ignored
+    assert w / h > 400 / 200              # wider shot
+    assert max(w, h) == 400               # same pixel budget
 
 
 def test_dragging_a_corner_changes_both():
     rect = (0.0, 0.0, 200.0, 100.0)
-    w, h = cameras.resize_pixels("se", 400, 200, 20.0, 10.0, rect)
-    assert w > 400 and h > 200
+    wide = cameras.resize_pixels("se", 400, 200, 40.0, 0.0, rect)
+    tall = cameras.resize_pixels("se", 400, 200, 0.0, 40.0, rect)
+    assert wide[0] / wide[1] > 2.0        # dragged out sideways: wider
+    assert tall[0] / tall[1] < 2.0        # dragged down: taller
 
 
 def test_the_frame_can_never_be_dragged_to_nothing():
