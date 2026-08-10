@@ -716,6 +716,7 @@ class MolViewport(QOpenGLWidget):
     #: construction (round 34).
     looking_through = None
     camera_roll = 0.0
+    on_camera_exit = None
     _frame_drag = None
     _poly_key = None
     _poly_cache = None
@@ -839,6 +840,9 @@ class MolViewport(QOpenGLWidget):
         self.adjust_h = True             # re-dress hydrogens on edits
         self.on_edit_begin = None        # app callback: () -> None (undo)
         self.on_camera_changed = None    # a frame drag finished
+        #: Called when a view rotation drops us out of a camera view, so the
+        #: window can forget the remembered free view and refresh its panels.
+        self.on_camera_exit = None
         self.on_mode_changed = None      # app callback: (mode) -> None
         self.on_new_molecule = None      # app callback: () -> obj_id
         self.on_toggle_mode = None       # app callback: () -> None (Tab)
@@ -934,6 +938,9 @@ class MolViewport(QOpenGLWidget):
 
     def align_view_axis(self, axis, sign):
         # type: (int, int) -> None
+        # An axis view is a view ROTATION, so it leaves a camera exactly as
+        # orbiting does — otherwise the compass would silently re-aim the shot.
+        self.exit_camera_view()
         self.camera.align_view(axis, sign)
         name = ("-" if sign < 0 else "+") + "XYZ"[axis]
         self.status_message.emit(
@@ -1176,6 +1183,9 @@ class MolViewport(QOpenGLWidget):
             if latched:                   # promote a held flight to latched
                 self._fly["latched"] = True
             return
+        # Flying is a view rotation with the throttle open, so it leaves a
+        # camera view for the same reason orbiting does.
+        self.exit_camera_view("Left the camera view — flying")
         model = flight.FlightModel(scale=self._scene_scale())
         model.accel = float(self.fly_accel)
         model.damping = float(self.fly_damping)
@@ -1903,7 +1913,70 @@ class MolViewport(QOpenGLWidget):
         cam = self.active_camera_object()
         if cam is None:
             return None
-        return cameras_mod.frame_rect(self.width(), self.height(), cam.aspect)
+        return cameras_mod.frame_rect(self.width(), self.height(), cam.aspect,
+                                      zoom=cam.frame_zoom)
+
+    def sync_camera_lens(self):
+        """Make the viewport's projection be the ACTIVE CAMERA's projection.
+
+        `Camera.FOV_Y` is a class attribute, so assigning it here shadows it on
+        this one instance and every matrix in the program — view, projection,
+        picking rays, `fit()`, `pan()`, the offscreen render — follows from the
+        single value. That is the reason to do it this way rather than to
+        thread a field of view through `projection_matrix`: there is no second
+        code path to keep in step.
+
+        The field of view is widened so the camera's own lands exactly on the
+        film-back rectangle (see `cameras.viewport_fov_y`), which is what makes
+        the frame a framing rather than a decoration — and what makes the frame
+        zoom mean "see more around the shot" instead of "crop it".
+
+        Cheap and IDEMPOTENT — it is called at the top of every frame, which
+        is what makes a resize, a lens edit and a frame drag all correct with
+        no invalidation bookkeeping anywhere. The `_camera_frame` cache is
+        only dropped when the value really moves; dropping it every frame
+        would undo round 35c's whole overlay fix.
+        """
+        cam = self.active_camera_object()
+        if cam is None:
+            # Back to the class default. `del` would raise where it was never
+            # shadowed, and `pop` on the instance dict says exactly that.
+            if self.camera.__dict__.pop("FOV_Y", None) is not None:
+                self._cam_key = None
+            return
+        rect = self.camera_rect()
+        fov = cameras_mod.viewport_fov_y(cam.fov_y, rect[3], self.height())
+        if self.camera.__dict__.get("FOV_Y") != fov:
+            self.camera.FOV_Y = fov
+            self._cam_key = None     # the FOV is not part of the cache key
+        cam.apply_lens_to(self.camera)
+
+    def exit_camera_view(self, reason=None):
+        """Leave the camera view, KEEPING the pose you are looking from.
+
+        Blender's rule, and Christian's: "rotating the view should immediately
+        exit it like in blender, unless it is done with shift+drag or
+        ctrl+drag." Shift and Ctrl are pan and zoom on both input presets
+        (`_nav_drag_kind`, `input_map.wheel_action`), so gating on the RESOLVED
+        ACTION rather than on the modifier keys gets the exception for free and
+        gets it identically on a trackpad and a mouse.
+
+        It does NOT restore the view from before the camera — you left by
+        moving, so the pose you have is the one you want; Numpad 0 is still
+        there to go back. Tumbling a MOLECULE about an anchor does not exit
+        either: that is a model edit, and the camera has not moved.
+        """
+        if self.looking_through is None:
+            return False
+        if self.on_camera_exit is not None:
+            self.on_camera_exit()
+        else:                                # standalone viewport (tests)
+            self.looking_through = None
+            self.camera_roll = 0.0
+            self.sync_camera_lens()
+        if reason:
+            self.status_message.emit(reason)
+        return True
 
     def _camera_frame(self):
         """Eye position and view/projection matrices, CACHED on the camera.
@@ -2647,6 +2720,13 @@ class MolViewport(QOpenGLWidget):
         lands between an edit and the next paint would otherwise hit nothing
         (round 6 bug — the arrays used to be filled only inside paintGL).
         This is CPU-only, so it is safe to call from event handlers.
+
+        Positions come from `display_coords()` — where the atom is DRAWN —
+        rather than from the stored frame, or a click during playback would
+        land on the nearest source frame while the sphere is somewhere between
+        two of them (round 57, the same mismatch as the selection outline).
+        The invalidation is already right: `refresh_geometry` runs on every
+        clock tick and sets `_pick_dirty`.
         """
         if not self._pick_dirty:
             return
@@ -2660,7 +2740,7 @@ class MolViewport(QOpenGLWidget):
             rr = np.array([st.atom_radius(v) for v in vdw])
             if st.fixed_atom_radius is None:
                 rr = rr * self.atom_scale
-            xyz = s.coords
+            xyz = obj.display_coords()
             for i in range(s.n_atoms):
                 if i in obj.atom_hidden:
                     continue          # hidden atoms are not pickable either
@@ -2862,6 +2942,9 @@ class MolViewport(QOpenGLWidget):
 
     # ------------------------------------------------------------------ paint
     def paintGL(self):
+        # Cheap, idempotent, and the reason a window resize or a lens edit
+        # cannot leave the projection describing the previous frame.
+        self.sync_camera_lens()
         if self._needs_rebuild:
             self._rebuild()
             self._needs_rebuild = False
@@ -3150,6 +3233,15 @@ class MolViewport(QOpenGLWidget):
         Including the bonds is what makes a selected fragment read as one
         outlined object (Christian's Blender reference) instead of a string of
         separate orange rings.
+
+        The coordinates come from `display_coords()`, not from the stored
+        frame. Round 57, Christian: "the orange selection highlight when an
+        animation is played is out of sync with the position of the meshes."
+        It was — the spheres are drawn from `evaluated()`, which interpolates
+        BETWEEN frames, while this read `s.coords`, which is the nearest
+        stored one. So the outline sat up to half a source frame away from the
+        atom it was outlining, and on a vibration that is a visible lag that
+        reverses at each turning point.
         """
         width = self.outline_width()
         spheres, cylinders = [], []
@@ -3159,6 +3251,7 @@ class MolViewport(QOpenGLWidget):
                 continue
             st = self._object_style(obj)
             s = obj.structure
+            xyz = obj.display_coords()
             chosen = set(rows)
             for i in rows:
                 if i in obj.atom_hidden:
@@ -3173,7 +3266,7 @@ class MolViewport(QOpenGLWidget):
                 base = 0.10 if st.wireframe else max(base, 0.12)
                 m = np.zeros((4, 4))
                 m[0, 0] = m[1, 1] = m[2, 2] = base + width
-                m[:3, 3] = s.coords[i]
+                m[:3, 3] = xyz[i]
                 m[3, 3] = 1.0
                 spheres.append(m)
             if st.show_bonds and not st.wireframe:
@@ -3182,7 +3275,7 @@ class MolViewport(QOpenGLWidget):
                         continue
                     if i in obj.atom_hidden or j in obj.atom_hidden:
                         continue
-                    cylinders.append((s.coords[i], s.coords[j],
+                    cylinders.append((xyz[i], xyz[j],
                                       st.bond_radius + width))
         return spheres, cylinders
 
@@ -3303,7 +3396,17 @@ class MolViewport(QOpenGLWidget):
         if cam.multiplier != 1.0:
             label += "  ({}x{} at {:g}x)".format(cam.width, cam.height,
                                                  cam.multiplier)
+        if abs(cam.frame_zoom - 1.0) > 1e-3:
+            label += "  |  frame {:.0f}%".format(cam.frame_zoom * 100.0)
         p.drawText(int(x) + 6, int(y) - 6, label)
+        # Christian asked outright, "is it even possible to exit the current
+        # camera view?" — which is the answer to whether the way out is
+        # discoverable. It is written on the frame now.
+        p.setPen(QPen(QColor(self.CAMERA_FRAME.red(), self.CAMERA_FRAME.green(),
+                             self.CAMERA_FRAME.blue(), 150), 1.0))
+        p.drawText(int(x) + 6, int(y + h) + 14,
+                   "orbit or Numpad 0 to leave  |  corners resize the frame, "
+                   "edges the aspect")
 
     def _paint_overlays(self, view, proj, empty):
         p = QPainter(self)
@@ -5085,6 +5188,20 @@ class MolViewport(QOpenGLWidget):
                     else subdiv_bonus)
         w = max(int(self.width() * scale), 1)
         h = max(int(self.height() * scale), 1)
+        # Looking through a camera, the render IS the film back: its size, its
+        # aspect, its multiplier. Done as a CROP of an ordinary viewport render
+        # rather than as a second projection — the frame already shows exactly
+        # what a viewport render would contain, so cropping to it needs no new
+        # matrices, and every overlay painter keeps working, because they all
+        # project through the widget's own size (`_paint_export_overlays`).
+        #
+        # The offscreen buffer is enlarged so the crop lands at the camera's
+        # resolution WITHOUT upscaling, and enlarging it by the same fraction
+        # on both axes leaves the widget's aspect exactly intact, which is what
+        # keeps the projection identical to the screen's.
+        crop = self._render_crop(w, h)
+        if crop is not None:
+            w, h = crop["buffer"]
         self.makeCurrent()
         fmt = QOpenGLFramebufferObjectFormat()
         fmt.setAttachment(QOpenGLFramebufferObject.CombinedDepthStencil)
@@ -5144,7 +5261,34 @@ class MolViewport(QOpenGLWidget):
             GL.glViewport(0, 0, max(self.width(), 1), max(self.height(), 1))
             self.doneCurrent()
             self.update()
+        if crop is not None:
+            image = image.copy(*crop["box"])
         return image
+
+    def _render_crop(self, w, h):
+        """How to turn a viewport-shaped render into THIS CAMERA's frame.
+
+        Returns `{"buffer": (w, h), "box": (x, y, w, h)}` — the offscreen size
+        to draw at and the rectangle to keep — or None when there is no camera
+        to honour. See `render_image` for why it is a crop and not a second
+        projection.
+        """
+        cam = self.active_camera_object()
+        rect = self.camera_rect()
+        if cam is None or rect is None:
+            return None
+        widget_w, widget_h = max(self.width(), 1), max(self.height(), 1)
+        fx = max(rect[2] / float(widget_w), 1e-6)
+        fy = max(rect[3] / float(widget_h), 1e-6)
+        target_w, target_h = cam.render_size()
+        buf_w = max(int(round(target_w / fx)), target_w)
+        buf_h = max(int(round(target_h / fy)), target_h)
+        x = int(round(rect[0] * buf_w / float(widget_w)))
+        y = int(round(rect[1] * buf_h / float(widget_h)))
+        # Clamped so a rounding pixel cannot ask for area outside the buffer.
+        x = max(min(x, buf_w - target_w), 0)
+        y = max(min(y, buf_h - target_h), 0)
+        return {"buffer": (buf_w, buf_h), "box": (x, y, target_w, target_h)}
 
     def enterEvent(self, ev):
         """Focus follows the cursor (Blender). Without this, a keypress after
@@ -5229,6 +5373,10 @@ class MolViewport(QOpenGLWidget):
         anchor = (self._selection_pivot()
                   if self._gesture_mode == "tumble" else None)
         if anchor is None:
+            # Orbiting the VIEW leaves the camera; tumbling a MOLECULE does
+            # not, because that moves the model and not the camera.
+            self.exit_camera_view(
+                "Left the camera view — Numpad 0 goes back in")
             self.camera.rotate(dx_px, dy_px)
             return
         self._last_model_rot_t = now
@@ -5301,7 +5449,8 @@ class MolViewport(QOpenGLWidget):
         cam = self.active_camera_object()
         self._frame_drag = {"handle": handle, "rect": rect,
                             "start": (pos.x(), pos.y()),
-                            "w": cam.width, "h": cam.height}
+                            "w": cam.width, "h": cam.height,
+                            "zoom": cam.frame_zoom}
         self.update()
         return True
 
@@ -5312,12 +5461,18 @@ class MolViewport(QOpenGLWidget):
         cam = self.active_camera_object()
         if cam is None:
             return False
-        w, h = cameras_mod.resize_pixels(
-            d["handle"], d["w"], d["h"], pos.x() - d["start"][0],
+        w, h, zoom = cameras_mod.resize_frame(
+            d["handle"], d["w"], d["h"], d["zoom"], pos.x() - d["start"][0],
             pos.y() - d["start"][1], d["rect"])
-        cam.width, cam.height = w, h
+        cam.width, cam.height, cam.frame_zoom = w, h, zoom
+        # The FOV follows the frame, or shrinking it would CROP the shot
+        # instead of showing more of the scene around it.
+        self.sync_camera_lens()
         self.status_message.emit(
-            "{}: {} x {} ({:.3f}:1)".format(cam.name, w, h, cam.aspect))
+            "{}: {} x {} ({:.3f}:1){}".format(
+                cam.name, w, h, cam.aspect,
+                "" if d["handle"] not in cameras_mod.CORNERS
+                else "  frame {:.0f}%".format(zoom * 100.0)))
         self.update()
         return True
 

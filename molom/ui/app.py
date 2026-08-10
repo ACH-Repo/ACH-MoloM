@@ -184,6 +184,11 @@ class MainWindow(QMainWindow):
         # MOF-5 one H -> F tilted the box by 1.2 degrees and grew the drawn
         # cell by 144 carbons. `begin_model_edit` snapshots undo itself.
         self.viewport.on_camera_changed = self.camera_changed
+        # A view rotation drops out of a camera view KEEPING the pose it
+        # rotated to (round 57) — restoring the pre-camera view here would
+        # undo the very gesture that caused the exit.
+        self.viewport.on_camera_exit = \
+            lambda: self.leave_camera(restore=False, message="")
         self.viewport.on_edit_begin = self.begin_model_edit
         self.viewport.on_mode_changed = self._on_mode_changed
         self.viewport.on_new_molecule = self.new_empty_molecule
@@ -760,7 +765,8 @@ class MainWindow(QMainWindow):
           lambda c: c.on_activate_camera(), category="Camera",
           enabled=lambda c: bool(c.scene.cameras),
           shortcut="Numpad 0", key="Num+0",
-          aliases=("view", "through", "numpad", "restore view"))
+          aliases=("view", "through", "numpad", "restore view", "exit camera",
+                   "leave camera"))
         r("camera_update", "Camera: update the active one to this view",
           lambda c: c.on_update_camera(), category="Camera",
           enabled=lambda c: c.scene.active_camera() is not None,
@@ -3147,6 +3153,8 @@ class MainWindow(QMainWindow):
             nearest = int(round(position))
             if nearest != obj.structure.current_frame:
                 obj.structure.set_frame(nearest)
+                if bonding.bonds_are_fixed(obj.structure):
+                    continue     # a vibration is one molecule at every phase
                 # Bond perception is the expensive part of a tick, and it is
                 # unobservable on a molecule nobody can see — so an animated
                 # molecule you have hidden is deferred rather than computed
@@ -3846,15 +3854,25 @@ class MainWindow(QMainWindow):
         grab moves EVERY frame, so after any transform frame 0 is the rest
         geometry in its new place. Re-reading it is the whole fix, and it
         needs no extra bookkeeping to go stale.
+
+        Round 57: it was re-read only while a mode was ALREADY animating, so
+        the FIRST animate still used the capture taken when the frequencies
+        were read and teleported the molecule back to where it was imported —
+        Christian: "curiously, only the first animate click resets the
+        location". There is nothing special about the first one. Frame 0 is
+        the rest geometry whether a mode is baked (undisplaced phase) or not
+        (the molecule itself), so it is read unconditionally; the capture
+        survives only as the fallback for a mode whose atom count does not
+        match the molecule, which cannot be animated anyway.
         """
+        s = obj.structure
         stored = self._rest_geometry.get(obj.id)
-        active = self._active_mode.get(obj.id)
-        if active is not None and obj.structure.n_frames > 1:
-            current = np.asarray(obj.structure.frames[0], dtype=float)
-            if stored is None or current.shape == np.shape(stored):
-                stored = current.copy()
-        if stored is None or np.shape(stored)[0] != obj.structure.n_atoms:
-            stored = obj.structure.coords.copy()
+        current = np.asarray(s.frames[0] if s.n_frames else s.coords,
+                             dtype=float)
+        if current.shape == (s.n_atoms, 3):
+            stored = current.copy()
+        if stored is None or np.shape(stored)[0] != s.n_atoms:
+            stored = s.coords.copy()
         self._rest_geometry[obj.id] = stored
         return stored
 
@@ -3891,6 +3909,7 @@ class MainWindow(QMainWindow):
         obj.structure.frames = vib_mod.mode_frames(
             rest, mode, amplitude=amplitude, n_frames=n_frames)
         obj.structure.set_frame(0)
+        self._freeze_mode_bonds(obj)
         self._sync_traj_bar()
         track = self.timeline.get(obj.id)
         if track is not None:
@@ -3900,6 +3919,24 @@ class MainWindow(QMainWindow):
             self._sync_vibration_page()
         self.statusBar().showMessage(
             "{}: animating {}".format(obj.name, mode.label().strip()), 9000)
+
+    def _freeze_mode_bonds(self, obj):
+        """Pin this molecule's connectivity to its EQUILIBRIUM geometry.
+
+        Called the moment a mode is baked, with the playhead put back on frame
+        0 — which is the undisplaced geometry — so the bonds drawn for the
+        whole animation are the bonds of the molecule at rest. See
+        `bonding.bonds_are_fixed` for why a vibrating frame must not be asked
+        the question at all.
+
+        Re-perceiving here rather than merely setting the flag is what makes
+        it self-healing: a mode animated earlier at a large amplitude may
+        already have eaten a bond, and this is the point at which the
+        molecule is definitely standing still.
+        """
+        obj.structure.metadata[bonding.FIXED_BONDS] = True
+        self._stale_bonds.discard(obj.id)
+        bonding.perceive_structure_bonds(obj.structure)
 
     def _on_mode_settings(self, amplitude, n_frames):
         """Amplitude or frames-per-period moved. Both belong to the FREQ
@@ -3964,6 +4001,7 @@ class MainWindow(QMainWindow):
             n_frames=int(self._mode_frames.get(
                 obj.id, vib_mod.DEFAULT_PERIOD_FRAMES)))
         obj.structure.set_frame(0)
+        self._freeze_mode_bonds(obj)
         self._sync_traj_bar()
         track = self.timeline.get(obj.id)
         if track is not None:
@@ -4555,8 +4593,16 @@ class MainWindow(QMainWindow):
         vp = self.viewport
         times = anim_mod.frame_times(clock)
         have_video = anim_mod.video_available()
+        # Inside a camera, the shot's own resolution is the default — the
+        # frames come out of `render_image` cropped to the film back, so a
+        # default taken from the WINDOW would have a different aspect and the
+        # export's final scale (IgnoreAspectRatio) would stretch every frame.
+        active_cam = self.scene.active_camera() \
+            if vp.looking_through is not None else None
+        default_size = (active_cam.render_size() if active_cam is not None
+                        else (vp.width(), vp.height()))
         dlg = AnimationExportDialog(self, len(times), clock.fps,
-                                    (vp.width(), vp.height()), have_video)
+                                    default_size, have_video)
         if not dlg.exec():
             return
         opts = dlg.options()
@@ -4729,7 +4775,9 @@ class MainWindow(QMainWindow):
         self.push_undo()
         cam = self.scene.add_camera(camera=vp.camera, width=vp.width(),
                                     height=vp.height())
+        self._view_before_camera = self._current_view()
         self.viewport.looking_through = cam.id
+        vp.sync_camera_lens()
         self._sync_all()
         self.statusBar().showMessage(
             "{} placed here — {:.0f} mm, {}x{}. Numpad 0 looks through it "
@@ -4758,35 +4806,53 @@ class MainWindow(QMainWindow):
         # Remember where we were, so leaving the camera puts the user back
         # rather than stranding them inside a shot.
         if vp.looking_through is None:
-            self._view_before_camera = {
-                "center": np.array(vp.camera.center, dtype=float),
-                "distance": float(vp.camera.distance),
-                "rotation": np.array(vp.camera.rotation, dtype=float),
-                "orthographic": bool(vp.camera.orthographic)}
+            self._view_before_camera = self._current_view()
         self.scene.active_camera_id = cam.id
         cam.apply_to(vp.camera)
         vp.looking_through = cam.id
         vp.camera_roll = float(cam.roll)
+        vp.sync_camera_lens()
         self._sync_all()
         self.statusBar().showMessage(
-            "Looking through {} ({:.0f} mm, {}x{} at {:g}x) — Numpad 0 to "
-            "leave".format(cam.name, cam.focal_mm, cam.width, cam.height,
-                           cam.multiplier), 9000)
+            "Looking through {} ({:.0f} mm, {}x{} at {:g}x) — orbit or "
+            "Numpad 0 to leave".format(cam.name, cam.focal_mm, cam.width,
+                                       cam.height, cam.multiplier), 9000)
 
-    def leave_camera(self):
-        """Back to the free view, where it was before."""
+    def _current_view(self):
+        """The interactive camera's pose as a plain dict."""
+        cam = self.viewport.camera
+        return {"center": np.array(cam.center, dtype=float),
+                "distance": float(cam.distance),
+                "rotation": np.array(cam.rotation, dtype=float),
+                "orthographic": bool(cam.orthographic)}
+
+    def leave_camera(self, restore=True, message="Free view"):
+        """Back to the free view.
+
+        `restore=True` is the Numpad 0 toggle: it puts the view back where it
+        was before you looked through the camera, which is what makes the key
+        a glance rather than a one-way trip.
+
+        `restore=False` is the ORBIT exit (round 57). You left by moving, so
+        the pose you are holding is the one you want — restoring would undo
+        the gesture that caused the exit, which is precisely backwards. The
+        remembered view is dropped with it, since a subsequent Numpad 0 will
+        capture the pose you have now on the way back in.
+        """
         vp = self.viewport
         vp.looking_through = None
         vp.camera_roll = 0.0
         saved = self._view_before_camera
-        if saved:
+        if restore and saved:
             vp.camera.center = saved["center"].copy()
             vp.camera.distance = saved["distance"]
             vp.camera.rotation = saved["rotation"].copy()
             vp.camera.orthographic = saved["orthographic"]
         self._view_before_camera = None
+        vp.sync_camera_lens()
         self._sync_all()
-        self.statusBar().showMessage("Free view", 4000)
+        if message:
+            self.statusBar().showMessage(message, 4000)
 
     def on_update_camera(self):
         """Re-aim the active camera at the view you are looking from."""
@@ -4795,10 +4861,13 @@ class MainWindow(QMainWindow):
             return
         vp = self.viewport
         self.push_undo()
-        keep = (cam.width, cam.height, cam.multiplier)
-        cam.capture(vp.camera)
-        cam.width, cam.height, cam.multiplier = keep
-        cam.roll = float(getattr(vp, "camera_roll", 0.0))
+        keep = (cam.width, cam.height, cam.multiplier, cam.frame_zoom)
+        # The roll is handed in so `capture` can take it back OFF the pose it
+        # stores — the view rotation already carries it, and storing it in
+        # both places would tilt the camera twice on the next activation.
+        cam.capture(vp.camera, roll=float(getattr(vp, "camera_roll", 0.0)))
+        cam.width, cam.height, cam.multiplier, cam.frame_zoom = keep
+        vp.sync_camera_lens()
         self._sync_all()
         self.statusBar().showMessage(
             "{} now looks from here".format(cam.name), 7000)
@@ -4817,14 +4886,31 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Deleted {}".format(name), 6000)
 
     def camera_changed(self, cam_id=None):
-        """A camera's settings were edited — re-apply if we are inside it."""
+        """A camera's settings were edited — re-apply if we are inside it.
+
+        The LENS only, never the pose. Round 57, Christian: "clicking on one
+        of the scaling knobs of the camera view also resets a previous dolly."
+        It did — every edit ran `apply_to`, which assigns centre, distance and
+        rotation, so touching the resolution threw away any navigating done
+        since Numpad 0. Changing the film size is not a statement about where
+        the camera stands.
+
+        A rolled pose is the one exception, because roll lives in the
+        rotation: it is re-applied against the pose you are actually holding
+        rather than against the camera's stored one, so a dolly survives that
+        too.
+        """
         cam = (self.scene.camera(cam_id) if cam_id is not None
                else self.scene.active_camera())
-        if cam is not None and self.viewport.looking_through == cam.id:
-            cam.apply_to(self.viewport.camera)
-            self.viewport.camera_roll = float(cam.roll)
-        self.viewport.refresh_geometry()
-        self.viewport.update()
+        vp = self.viewport
+        if cam is not None and vp.looking_through == cam.id:
+            if float(cam.roll) != float(vp.camera_roll):
+                vp.camera.rotation = cameras_mod.twist_rotation(
+                    vp.camera.rotation, float(cam.roll) - float(vp.camera_roll))
+                vp.camera_roll = float(cam.roll)
+            vp.sync_camera_lens()
+        vp.refresh_geometry()
+        vp.update()
 
     def on_graphics_info(self):
         """Which GPU is drawing the viewport, and at what GL version.

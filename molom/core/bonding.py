@@ -401,6 +401,35 @@ def perceive_structure_bonds(structure, tolerance=TOLERANCE,
     structure.bonds = [(i, j, old.get((i, j), 1)) for i, j, _ in fresh]
 
 
+#: Metadata flag: this structure's frames are one MOLECULE seen at different
+#: phases, so its connectivity must not be re-derived per frame. Set when a
+#: normal mode is baked (`ui/app.on_animate_mode`).
+FIXED_BONDS = "fixed_bonds"
+
+
+def bonds_are_fixed(structure):
+    # type: (object) -> bool
+    """Should the player leave this structure's bonds alone as it steps?
+
+    An MD trajectory really does make and break bonds, so re-perceiving per
+    frame is right for it. A baked NORMAL MODE is the opposite case: it is one
+    molecule at successive phases of an oscillation about equilibrium, and
+    nothing bonds or unbonds along the way — so re-perceiving it can only ever
+    lose bonds, never find real ones.
+
+    And it does. Round 57, Christian: "when an animation shortens a bond far
+    enough it is no longer drawn." Measured on his own H3PO4 FREQ job: at the
+    DEFAULT 0.2 A amplitude the 1346 cm-1 mode squeezes P=O to 1.127 A against
+    an `IMPOSSIBLE_FACTOR` floor of 1.13, and the bond is refused; at 0.4 A
+    the O-H stretches reach 0.56 A and go too. The filters are right — no
+    static structure with a 0.56 A O-H is real — but they are answering a
+    question nobody asked here, because the phase of a vibration is not a
+    structure to be judged. So the honest fix is to stop asking.
+    """
+    meta = getattr(structure, "metadata", None) or {}
+    return bool(meta.get(FIXED_BONDS))
+
+
 # --------------------------------------------------------------- bond orders
 # Typical maximum valence (sum of bond orders) for elements whose bond orders
 # we are willing to raise. Anything absent — every metal, most metalloids — is

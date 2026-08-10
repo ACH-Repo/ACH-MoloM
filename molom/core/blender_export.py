@@ -324,14 +324,15 @@ def camera_object_setup(cam, name=""):
     case. The lens carries over as a REAL focal length and sensor size,
     because that is how it is stored (see `core/cameras.py`).
     """
-    from . import cameras as cameras_mod
-    rot = quat_to_mat3(np.asarray(cam.rotation, dtype=float))
-    if abs(float(cam.roll)) > 1e-12:
-        # Roll is about the VIEW axis, so it multiplies on the view side —
-        # the same order `Camera.fly_look` applies it in, and the reason a
-        # rolled camera exports rolled instead of silently levelling.
-        c, s_ = np.cos(float(cam.roll)), np.sin(float(cam.roll))
-        rot = np.array([[c, -s_, 0.0], [s_, c, 0.0], [0.0, 0.0, 1.0]]) @ rot
+    # Roll comes from `CameraObject.rolled_rotation` rather than being
+    # rebuilt here. It was rebuilt here, with the twist matrix TRANSPOSED —
+    # so the export rolled the opposite way from `Camera.fly_look`, which is
+    # the convention round 56 said it was following. Nothing caught it while
+    # the viewport ignored roll entirely (there was no preview to disagree
+    # with); the moment looking through a rolled camera actually tilts the
+    # view, a render tilting the other way is unmissable. One function now
+    # owns the convention, so they cannot part again.
+    rot = quat_to_mat3(cam.rolled_rotation())
     eye = np.asarray(cam.center, dtype=float) + rot.T @ np.array(
         [0.0, 0.0, float(cam.distance)])
     m = np.eye(4)

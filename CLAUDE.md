@@ -56,6 +56,89 @@ the operator key table, CIF reading with symmetry, coordination polyhedra,
 meta atoms, the scene clock with a multi-track timeline, vibrational modes,
 per-element display control, and the symmetry modifier. 512 tests.
 
+Round 57 (2026-08-10, the camera view becomes a view, and four animation
+faults): Christian used round 56 in anger and every complaint pointed the same
+way — **the camera view was a decoration laid over an ordinary view rather
+than being one.**
+**(1) The film back did not frame anything.** The scene was drawn at the
+viewport's fixed 40 degree FOV over the whole window and the rectangle merely
+painted on top, so the focal length changed the LABEL and nothing else and what
+you composed inside the frame was not what would be rendered.
+`cameras.viewport_fov_y` widens the widget's FOV so the camera's own lands
+exactly on the rectangle, and it is applied by shadowing `Camera.FOV_Y` on the
+one instance — which means every matrix in the program (view, projection,
+picking rays, `fit`, `pan`, the offscreen render) follows from a single value
+with no second code path to keep in step. `sync_camera_lens` is idempotent and
+runs at the top of `paintGL`, so a resize or a lens edit cannot leave the
+projection describing the previous frame; it only drops the `_camera_frame`
+cache when the value really moves (dropping it per frame would undo round 35c).
+**(2) "The corner drag buttons essentially do nothing" — and they nearly
+didn't.** `frame_rect` always returned the largest rectangle of the aspect that
+fits, so only the SHAPE could ever show, and **a corner dragged along the
+rectangle's own diagonal is exactly the aspect-preserving direction**
+(`scale_x == scale_y`): same shape, same drawn size, nothing moves. A corner
+now also carries a `frame_zoom` (12-100%, purely a viewing property) by the
+geometric mean of the two scale factors, so it visibly grows and shrinks while
+the resolution still follows both axes independently; an edge keeps its one
+job. Because the FOV follows the frame, pulling it in shows MORE of the scene
+around the shot rather than cropping it.
+**(3) A knob click "resets a previous dolly"** because every edit ran
+`apply_to`, which assigns centre, distance AND rotation. Split into `apply_to`
+(pose + lens) and `apply_lens_to`; `camera_changed` calls only the second, so
+changing the film size is no longer a statement about where the camera stands.
+**(4) "Is it even possible to exit the current camera view?"** Now: **orbit
+leaves it, keeping the pose you rotated to** (Blender's rule — restoring the
+pre-camera view would undo the very gesture that caused the exit), and so do
+axis views and taking off into flight. Pan and zoom stay inside. The exception
+is gated on the RESOLVED ACTION rather than on Shift/Ctrl, so it is identical
+on a trackpad and a mouse; tumbling a MOLECULE does not exit, because that
+moves the model. And the way out is written on the frame.
+**(5) F12 through a camera renders the frame**, at the camera's resolution x
+multiplier — as a CROP of an ordinary viewport render enlarged so the crop
+never upscales. Enlarging by the same fraction on both axes leaves the widget's
+aspect exactly intact, which is what keeps the projection identical to the
+screen's and every overlay painter working unchanged (they all project through
+`self.width()`). The animation dialog's default size comes from the active
+camera for the same reason: a window-shaped default would be stretched by the
+export's `IgnoreAspectRatio` scale.
+**(6) ROLL was stored and never applied to the view**, and the Blender export
+built its own twist matrix TRANSPOSED — so it rolled the OPPOSITE way from
+`Camera.fly_look`, which round 56 said it was following. Nothing caught it
+while the viewport ignored roll entirely: there was no preview to disagree
+with. `cameras.twist_rotation` is now the single place that knows the
+convention, `capture` takes the roll back OFF the pose it stores (or the next
+activation tilts twice), and verified by rendering: a 0.45 rad camera comes out
+of Blender 5.1 tilted the same way MoloM draws it (topmost-H bearing 121.4 deg
+against 118.7 — the residual is blob-detection noise, where the old code
+differed by 2 x 0.45 rad).
+**The animation half, all four measured on Christian's own H3PO4 FREQ job.**
+**(a) Only the FIRST animate click reset the location**, which is exactly what
+he observed. Round 55's `_rest_for` re-read frame 0 only `if active is not
+None` — i.e. only while a mode was already animating — so the first bake still
+used the capture taken when the frequencies were read. There is nothing special
+about the first one: frame 0 is the rest geometry whether a mode is baked
+(sin 0 = 0) or not (the molecule itself), so it is read unconditionally.
+**(b) "When an animation shortens a bond far enough it is no longer drawn."**
+Correct, and the chemistry filters are not wrong — they were being asked the
+wrong question. The player re-perceives connectivity on every integer frame
+change, and at the DEFAULT 0.2 A amplitude the 1346 cm-1 mode squeezes P=O to
+**1.127 A against an `IMPOSSIBLE_FACTOR` floor of 1.13**; at 0.4 A the O-H
+stretches reach **0.56 A**. A normal mode is one molecule at successive phases
+of an oscillation about equilibrium and nothing bonds or unbonds along the way,
+so `bonding.FIXED_BONDS` in the structure's metadata (round 43's pattern —
+rides undo and savepoints with no `Scene.snapshot` checklist) stops the
+question being asked. `_freeze_mode_bonds` also re-perceives ONCE at frame 0,
+which makes it self-healing for a molecule whose bonds an earlier big-amplitude
+mode had already eaten.
+**(c) The orange outline lagged the meshes.** It did: `_rebuild` draws from
+`evaluated()`, which INTERPOLATES between frames, while `_selection_hull` read
+`s.coords`, the nearest stored one — up to half a source frame apart, which on
+a vibration reads as a lag that reverses at each turning point (Christian
+guessed a 90 degree phase; the mechanism is the half-frame). `_ensure_pick_data`
+had the same fault, so a click during playback landed on the stored frame while
+the sphere was somewhere between two. Both take `display_coords()` now.
+1246 tests.
+
 Round 56 (2026-08-09, CAMERA OBJECTS — Blender's model, Christian's spec):
 "introduce camera objects like in blender... that way a savefile can retain
 previously used angles". `core/cameras.py` holds a `CameraObject`: a pose
@@ -2187,7 +2270,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1219 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1246 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -2340,7 +2423,11 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   pose plus a lens: focal length in MM against a sensor width, an explicit
   roll (the turntable cannot hold one), and pixels plus a multiplier. Also
   owns the film-back rectangle and its drag handles, so the viewport
-  overlay is arithmetic that can be tested without a window.
+  overlay is arithmetic that can be tested without a window. Round 57 added
+  `frame_zoom` (how big the film back is DRAWN — a viewing property, nothing
+  to do with the render), `viewport_fov_y` (which makes the rectangle a real
+  framing rather than a decoration) and `twist_rotation`, the ONE place that
+  knows which way roll goes.
 - `core/animation.py` — the scene clock as a FILE (round 54). `frame_times`
   is the plan and is where the mistakes live (a repeated loop boundary hitches
   once per cycle and is invisible in a single frame); PNG sequences need no
@@ -2467,6 +2554,57 @@ independent cross-check inside a single fixture.
   vector then spin so the backbone points outward.
 
 ## Hard-won gotchas (don't re-learn these)
+- **A DISPLAY value and a STORED value are two different coordinates**
+  (round 57). `MolObject.display_coords()` interpolates between frames while
+  `structure.coords` is the nearest stored one, so anything that draws or
+  hit-tests alongside `_rebuild` must use the first. The selection hull and the
+  pick arrays used the second, which is invisible when paused and reads as the
+  outline LAGGING the atoms during playback — up to half a source frame, and it
+  reverses at each turning point, which is why it looks like a phase error
+  rather than an off-by-one. Grep for `s.coords` in `ui/viewport.py` whenever
+  adding a pass that has to sit on top of the molecule.
+- **Re-perceiving bonds per frame is right for a TRAJECTORY and wrong for a
+  VIBRATION** (round 57). A normal mode is one molecule at successive phases of
+  an oscillation, so the chemistry filters can only ever LOSE bonds on it: at
+  the default 0.2 A amplitude an ordinary P=O goes under `IMPOSSIBLE_FACTOR`
+  and the stick vanishes mid-animation. `bonding.FIXED_BONDS` in the
+  structure's metadata says "these frames share one connectivity"; set it
+  wherever frames are generated from a displacement rather than read from a
+  file.
+- **A capture taken "once, at load" goes stale the moment anything moves it**
+  (round 57, and round 55 fixed half of this already). `_rest_geometry` was
+  re-read only while a mode was ALREADY animating, so the FIRST bake still
+  teleported the molecule home — which is why the symptom was the strange
+  "only the first click does it". If the live data can answer the question
+  (frame 0 IS the rest geometry), read it every time and keep the capture only
+  as a fallback; a conditional refresh is a cache with one branch nobody tests.
+- **A "camera view" that does not change the PROJECTION is a decoration**
+  (round 57). MoloM drew the film back over a viewport still running its own
+  fixed 40 degree FOV, so the focal length changed the label and nothing else
+  and the frame was not a framing. Shadowing `Camera.FOV_Y` on the instance is
+  the whole fix, and it is the right shape precisely because every matrix in
+  the program derives from that one value — view, projection, picking rays,
+  `fit`, `pan`, the offscreen render. Resist adding a `fov=` parameter to
+  `projection_matrix`: that is a second code path.
+- **Normalising a rectangle to "the largest that fits" throws away everything
+  but its ASPECT** (round 57), so handles that change its SIZE appear dead —
+  and a corner dragged along the rectangle's own diagonal is exactly the
+  aspect-preserving direction, which is the one a user naturally drags. If a
+  control is reported as doing nothing, check what of its output survives to
+  the screen before checking whether it runs.
+- **Re-applying a whole object to re-apply one field of it destroys the rest**
+  (round 57). `camera_changed` called `apply_to`, which assigns centre,
+  distance and rotation, so editing the RESOLUTION threw away any navigating
+  done since Numpad 0 — "clicking a scaling knob resets a previous dolly".
+  Split the assignment along the axis the user thinks in (pose vs lens) rather
+  than passing flags.
+- **A convention with two implementations has one bug waiting** (round 57).
+  Roll was built in `blender_export` with the twist matrix TRANSPOSED, i.e.
+  the opposite way from `Camera.fly_look`, and nothing caught it for a whole
+  round because the viewport ignored roll entirely — there was no preview to
+  disagree with. Any quantity that appears both on screen and in an export
+  needs ONE function (`cameras.twist_rotation`), and the test is a comparison
+  between the two, not an assertion about either.
 - **`Scene.from_dict` rebuilds the snapshot dict BY HAND** (round 56), so
   anything added to `snapshot()` and not added there is silently lost on
   load — the cameras vanished from the first savefile that had them. When
@@ -3403,18 +3541,20 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 963 offline tests. `tests/conftest.py`
+1. `python -m pytest tests/ -q` — 1246 offline tests. `tests/conftest.py`
    sandboxes QSettings, so a GUI test can drive a real control without
    writing into your own MoloM configuration.
 2. `python -m molom --selftest` — headless core sanity.
 3. GUI smoke: `python tools/smoke_gui.py` — a REAL window (never
    offscreen), which is the only thing that can catch a paintGL
-   exception. Historically: a scripted QTimer run that opens examples, switches styles,
-   selects atoms, drives the trajectory bar, and grabs framebuffers lives in
-   the session scratchpad pattern (`smoke_gui.py`) — recreate as needed; the
-   `grabFramebuffer()` PNGs are how rendering was verified without manual
-   clicking (ethanol B&S, selection halos, stick, VdW, wireframe, ethene
-   double bond, trajectory frame 3).
+   exception. It wraps every `_draw*`/`_paint*` method so a raise is RECORDED
+   rather than swallowed, grabs a framebuffer per step and exits non-zero.
+   Steps cover the crystal overlays (polyhedra, symmetry, ghosts, refused
+   bonds, the boundary ticks), the **camera view** (lens, frame zoom, roll,
+   orbiting out — round 57) and a **baked vibration with a selection on it**
+   (the bond count is printed, because a vibration that loses bonds is the
+   round-57 failure). The PNGs land in `tools/_smoke/` and are meant to be
+   looked at, not just asserted.
 
 ## Meta atoms (SHIPPED round 19 — `core/meta.py`)
 Goal: pre-optimise metal-organic complexes without force-field parameters for
@@ -3502,12 +3642,43 @@ choice.
    mesh" tick is a few lines and would matter on a big packing. Not urgent —
    measure a real ZIF export first, since 500 small meshes may be perfectly
    fine.
+   **Christian asked about this on 2026-08-10** and his instinct is right —
+   "Blender users would hate not having fine control after export because the
+   export doesn't preserve distinct elements." **Nothing is merged today and
+   nothing should be.** Every atom and every half-bond is its own Blender
+   OBJECT sharing one mesh datablock as a linked duplicate, with the material
+   on the object slot (`new_object`), so each atom is selectable, movable and
+   recolourable and one material change repaints every atom of that element at
+   once. Merging would trade exactly that away — and it is also what future
+   KEYFRAME animation needs, since a per-atom trajectory is per-object
+   keyframes. If the merge tick is ever built it must stay a tick, default off,
+   and be scoped to the POLYHEDRA (which are decoration, not chemistry) rather
+   than to the atoms.
 
 6. **The `.blend` export cannot render on the spot.** It saves and stops,
    which is the right default, but "and render it now" is one more
    `subprocess` call (`blender -b out.blend -o //render_ -f 1`) and would
    close the loop for someone making a figure. Wanted only if Christian asks:
    he specifically said the point is that F12 works.
+
+7. **KEYFRAME ANIMATION in the Blender export — scoped 2026-08-10, not
+   built.** Christian's constraint is settled and it costs nothing: the export
+   already gives every atom its own object, so the animation is per-object
+   keyframes on `location`, which is the shape Blender users expect and leaves
+   materials, selection and per-atom edits exactly as they are after export.
+   The plan: walk `animation.frame_times` (the existing export plan, so the
+   .blend and a PNG sequence describe the same motion), and for each time
+   write `ob.location` + `keyframe_insert("location", frame=k)` per atom, with
+   the BONDS keyframed on `matrix_world` because a bond is a scaled and
+   rotated cylinder rather than a translated sphere. Two decisions to make
+   first: (a) whether to bake every frame or only the source frames and let
+   Blender interpolate — source frames plus LINEAR interpolation is smaller
+   and matches MoloM's own player, but Blender's default Bezier easing would
+   NOT match, so the interpolation mode has to be set explicitly; and (b) what
+   to do when connectivity changes between frames, which for a baked vibration
+   it now never does (round 57's `FIXED_BONDS`) but for an MD trajectory it
+   does — the honest options are to keyframe bond VISIBILITY or to refuse and
+   say so. Scene frame range and fps come from the clock.
 
 ## Roadmap
 Round-1 skeleton and round-2 Blender batch: DELIVERED (see "What this is").

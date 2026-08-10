@@ -13,6 +13,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QDoubleValidator
 
 from . import dragcheck
+from ..core import cameras
 from ..core import vibrations
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDockWidget,
                                QLineEdit, QSlider,
@@ -1445,6 +1446,20 @@ class CameraPage(QWidget):
         self.multiplier.valueChanged.connect(self._emit)
         form.addRow("Render multiplier:", self.multiplier)
 
+        self.frame_zoom = QDoubleSpinBox()
+        self.frame_zoom.setRange(cameras.MIN_FRAME_ZOOM * 100.0,
+                                 cameras.MAX_FRAME_ZOOM * 100.0)
+        self.frame_zoom.setDecimals(0)
+        self.frame_zoom.setSingleStep(5.0)
+        self.frame_zoom.setSuffix(" %")
+        self.frame_zoom.setToolTip(
+            "How big the shot is DRAWN in the viewport - nothing to do with "
+            "the render. Pull it in to see the scene around what you are "
+            "framing.\n\nDragging a CORNER handle of the camera frame does "
+            "the same thing; an EDGE handle changes the aspect ratio.")
+        self.frame_zoom.valueChanged.connect(self._emit)
+        form.addRow("Frame size:", self.frame_zoom)
+
         self.roll = QDoubleSpinBox()
         self.roll.setRange(-180.0, 180.0)
         self.roll.setDecimals(1)
@@ -1469,6 +1484,8 @@ class CameraPage(QWidget):
         cam.width = self.width.value()
         cam.height = self.height.value()
         cam.multiplier = self.multiplier.value()
+        cam.frame_zoom = cameras.clamp_frame_zoom(
+            self.frame_zoom.value() / 100.0)
         cam.roll = float(self.roll.value()) * 3.141592653589793 / 180.0
         self._refresh_summary()
         self.changed.emit()
@@ -1491,7 +1508,8 @@ class CameraPage(QWidget):
         self._camera = cam
         has = cam is not None
         for w in (self.projection, self.focal, self.sensor, self.width,
-                  self.height, self.multiplier, self.roll, self.look_btn):
+                  self.height, self.multiplier, self.frame_zoom, self.roll,
+                  self.look_btn):
             w.setEnabled(has)
         if not has:
             self._refresh_summary()
@@ -1506,6 +1524,7 @@ class CameraPage(QWidget):
         self.width.setValue(int(cam.width))
         self.height.setValue(int(cam.height))
         self.multiplier.setValue(float(cam.multiplier))
+        self.frame_zoom.setValue(round(float(cam.frame_zoom) * 100.0))
         self.roll.setValue(float(cam.roll) * 180.0 / 3.141592653589793)
         self._loading = False
         self._refresh_summary()

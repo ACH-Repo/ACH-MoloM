@@ -529,6 +529,22 @@ arrives on the scene clock like any other track: it interpolates, it appears
 in the multi-track pane, and it plays alongside other trajectories. The track
 is set to loop, because a vibration is one.
 
+**Baking does not move the molecule.** The undisplaced geometry is read from
+frame 0 of whatever is there, which is the rest geometry wherever you have
+since dragged the molecule to — not from a capture taken when the file was
+read.
+
+**A baked mode's bonds are FIXED** (`bonding.FIXED_BONDS`). The player
+re-perceives connectivity when a trajectory steps to a new frame, which is
+right for an MD run — bonds really do break there — and wrong for a
+vibration, which is one molecule at successive phases of an oscillation.
+Asking the chemistry filters about a squeezed phase can only lose bonds:
+measured on the vendored H3PO4 job, at the DEFAULT 0.2 Å amplitude the
+1346 cm⁻¹ mode takes P=O to 1.127 Å against an `IMPOSSIBLE_FACTOR` floor of
+1.13 Å and the bond vanishes; at 0.4 Å the O–H stretches reach 0.56 Å. So the
+bonds are perceived once, at rest, and left alone. **Ctrl+P** still
+re-perceives on request.
+
 ## Trajectory playback (the scene clock)
 There is **one playhead for the whole scene**, not one per molecule, so every
 trajectory loaded plays at the same time. The bar under the viewport is that
@@ -894,6 +910,67 @@ menu first; that is no longer needed, because a single press cannot start
 flight any more. The cost is that a right double-click *on a selected atom*
 flashes the menu instead of latching flight — anywhere else it latches as
 before, and holding still works even on a selected atom.
+
+## Camera objects (rounds 56 and 57)
+
+A camera is a saved viewpoint that lives in the scene, appears at the bottom
+of the outliner and rides savepoints and undo like anything else. **F3 →
+"Camera: place one here"** (or the `+ Camera` outliner row) saves the view you
+are looking at; **Numpad 0** looks through the active one and, pressed again,
+goes back to the view you came from.
+
+### Looking through one
+
+| Gesture | What happens |
+|---|---|
+| **Orbit** (MMB / Alt+LMB drag, or plain scroll on a trackpad) | **Leaves the camera**, keeping the pose you rotated to — Blender's rule |
+| **Pan / zoom** (Shift+drag, Ctrl+drag, Shift/Ctrl+scroll, wheel on a mouse) | Stays inside. Navigate freely; the saved camera does not move |
+| **Compass click / view along an axis** | Leaves the camera — it is a view rotation |
+| **Right-drag flight** | Leaves the camera |
+| **Tumbling a molecule** (one atom selected, cursor on it) | Stays inside — that moves the MODEL, not the camera |
+| **Numpad 0** | Leaves and restores the view from before you entered |
+
+The exception list is not written in terms of modifier keys: it is the
+RESOLVED ACTION (`_nav_drag_kind`, `input_map.wheel_action`) that decides, so
+it behaves the same on a trackpad and on a mouse.
+
+**The camera object itself never moves while you look through it.** Editing
+its lens, resolution or frame re-applies only the projection, never the pose —
+so navigating inside a shot and then touching a control does not throw the
+navigation away. "Camera: update the active one to this view" is the explicit
+way to move it.
+
+### The film back
+
+The rectangle is what will be **rendered**, and it means it: the viewport's
+field of view is widened so the camera's own lands exactly on the frame, which
+is what makes the focal length visible on screen rather than only in the
+label. Everything outside is veiled.
+
+| Handle | Changes |
+|---|---|
+| **Corner** | the frame's SIZE on screen (and the resolution on both axes) |
+| **Edge** | the aspect ratio — that axis's pixels only |
+
+Corner drags used to appear to do nothing, and they nearly did: the frame was
+always redrawn as the largest rectangle of its aspect that fits, so only the
+SHAPE could ever show — and dragging a corner along the rectangle's own
+diagonal is precisely the direction that leaves the shape alone. The frame
+size is a separate property now (**Frame size** on the 🎥 page, 12–100%);
+pulling it in shows more of the scene around the shot rather than cropping it.
+
+**F12 through a camera** renders exactly the framed rectangle, at the camera's
+resolution × multiplier. It is done as a crop of an ordinary viewport render
+enlarged so the crop never upscales — one projection, one set of overlay
+painters, no second code path to drift.
+
+### Roll
+The interactive camera is a turntable and cannot hold a rolled pose, so a
+saved camera carries roll explicitly and it is applied on top of the pose when
+you look through one. It uses `Camera.fly_look`'s convention, and
+`cameras.twist_rotation` is the single place that knows it — the Blender
+export built its own with the matrix transposed and therefore rolled the
+opposite way, which nothing noticed while the viewport ignored roll entirely.
 
 ## Blender export (Ctrl+Shift+B, round 37)
 Writes a **Python script**, not a `.blend` — writing .blend needs Blender

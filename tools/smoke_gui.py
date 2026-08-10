@@ -68,9 +68,64 @@ def main(paths):
         win.viewport.grabFramebuffer().save(path)
         print("  frame:", path)
 
+    def camera_steps():
+        """The camera view has its own paint path (`_paint_camera_frame`) and
+        its own projection (`sync_camera_lens`), and both were rewritten in
+        round 57 — so both belong here. Nothing else opens a camera view."""
+        print("camera view")
+        win.on_place_camera()
+        app.processEvents()
+        grab("90_camera_looking_through")
+        cam = win.scene.active_camera()
+        if cam is None:
+            return
+        for focal, tag in ((18.0, "wide"), (200.0, "long")):
+            cam.focal_mm = focal
+            win.camera_changed()
+            grab("91_camera_{}".format(tag))
+        cam.focal_mm = 50.0
+        for zoom in (0.35, 1.0):
+            cam.frame_zoom = zoom
+            win.camera_changed()
+            grab("92_camera_frame_{:.0f}pc".format(zoom * 100))
+        cam.roll = 0.4                     # the frame drawn over a tilted view
+        win.camera_changed()
+        grab("93_camera_rolled")
+        cam.roll = 0.0
+        win.camera_changed()
+        win.viewport._orbit_input(45.0, 10.0)   # and out again, by orbiting
+        app.processEvents()
+        grab("94_camera_orbited_out")
+
+    def vibration_steps():
+        """A baked normal mode with a selection on it: the bonds must survive
+        the squeeze and the orange hull must track the interpolated atoms."""
+        freq = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "tests", "data",
+            "orca_freq_h3po4.out")
+        if not os.path.exists(freq):
+            return
+        print("vibration")
+        win.open_path(freq)
+        obj = win._active_obj()
+        modes = [m for m in win._modes.get(obj.id, []) if not m.is_trivial]
+        if not modes:
+            return
+        win.on_animate_mode(modes[-1].index, amplitude=0.8)
+        win.viewport.set_selection([(obj.id, i) for i in range(3)])
+        for k in range(4):
+            win.timeline.advance_images(3)
+            win._apply_timeline()
+            app.processEvents()
+            grab("95_vibration_{}".format(k))
+        print("  bonds through the cycle:",
+              len(win.scene.get(obj.id).structure.bonds))
+
     def run():
         try:
             grab("00_startup")
+            camera_steps()
+            vibration_steps()
             for index, path in enumerate(paths):
                 if not os.path.exists(path):
                     print("  skipped (missing):", path)

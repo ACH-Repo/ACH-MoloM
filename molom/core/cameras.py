@@ -46,6 +46,15 @@ PERSPECTIVE = "perspective"
 ORTHOGRAPHIC = "orthographic"
 PROJECTIONS = (PERSPECTIVE, ORTHOGRAPHIC)
 
+#: How large the film back is DRAWN, as a fraction of the largest rectangle of
+#: its aspect that fits the viewport. Purely a viewing property — it changes
+#: nothing about the render, only how much of the scene around the shot you
+#: can see while composing it, which is Blender's camera-view zoom.
+#: Capped at the fit: a frame larger than the window puts its own drag handles
+#: off screen, which is a state with no way out of it.
+MIN_FRAME_ZOOM = 0.12
+MAX_FRAME_ZOOM = 1.0
+
 
 def fov_y_degrees(focal_mm, sensor_mm=DEFAULT_SENSOR_MM, aspect=None):
     """Vertical field of view for a lens on a sensor.
@@ -60,6 +69,24 @@ def fov_y_degrees(focal_mm, sensor_mm=DEFAULT_SENSOR_MM, aspect=None):
     if aspect and float(aspect) > 0:
         sensor = sensor / float(aspect)
     return float(np.degrees(2.0 * np.arctan(0.5 * sensor / focal)))
+
+
+def twist_rotation(rotation, roll):
+    """`rotation` twisted about the VIEW axis by `roll` radians.
+
+    The stored pose of a camera is a turntable one and therefore level; roll
+    sits on top of it. Built exactly as `Camera.fly_look` builds its own —
+    `right, up -> right c + up s, up c - right s`, which is the pre-multiplied
+    view-space delta `Camera.orbit` already uses — so the two conventions
+    cannot drift apart. Pass `-roll` to take a roll back off.
+    """
+    q = np.asarray(rotation, dtype=float)
+    if not roll:
+        return q.copy()
+    c, s = np.cos(float(roll)), np.sin(float(roll))
+    twist = np.array([[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]])
+    return camera_mod.quat_normalize(
+        camera_mod.quat_mul(camera_mod.quat_from_mat3(twist), q))
 
 
 def focal_from_fov(fov_deg, sensor_mm=DEFAULT_SENSOR_MM, aspect=None):
@@ -98,6 +125,8 @@ class CameraObject(object):
         self.width = DEFAULT_WIDTH
         self.height = DEFAULT_HEIGHT
         self.multiplier = 1.0
+        #: Viewport-only: how big the film back is drawn. See MIN_FRAME_ZOOM.
+        self.frame_zoom = 1.0
 
     # ----------------------------------------------------------- geometry
     @property
@@ -125,12 +154,30 @@ class CameraObject(object):
         return np.asarray(self.center, dtype=float) + rot.T @ np.array(
             [0.0, 0.0, float(self.distance)])
 
+    def rolled_rotation(self):
+        """The view rotation INCLUDING this camera's roll — what the viewport
+        has to be given so that looking through a rolled camera is actually
+        tilted, rather than showing a level view of a shot that is not."""
+        return twist_rotation(self.rotation, self.roll)
+
     # -------------------------------------------------------- interchange
     def apply_to(self, camera):
-        """Put the interactive camera into this pose."""
+        """Put the interactive camera into this pose AND this lens."""
         camera.center = np.asarray(self.center, dtype=float).copy()
         camera.distance = float(self.distance)
-        camera.rotation = np.asarray(self.rotation, dtype=float).copy()
+        camera.rotation = self.rolled_rotation()
+        self.apply_lens_to(camera)
+        return camera
+
+    def apply_lens_to(self, camera):
+        """Only the things that change how the scene is PROJECTED.
+
+        Separate from the pose because editing a camera while looking through
+        it must not teleport the view: round 57, Christian — "clicking on one
+        of the scaling knobs of the camera view also resets a previous dolly."
+        It did, because every edit re-applied the whole thing, pose included,
+        and a dolly is exactly a change to the pose.
+        """
         camera.orthographic = self.orthographic
         camera.auto_ortho = False
         # The turntable cannot hold a rolled pose, so a rolled camera must
@@ -139,14 +186,20 @@ class CameraObject(object):
         camera.auto_level = False
         return camera
 
-    def capture(self, camera, width=None, height=None):
+    def capture(self, camera, width=None, height=None, roll=0.0):
         """Take this camera's pose FROM the interactive one — "place a camera
         here". The lens is derived from the viewport's field of view so the
         saved camera frames what the user is looking at, not something wider.
+
+        `roll` is whatever twist the view being captured already carries: it
+        is TAKEN BACK OFF the stored rotation and kept as `self.roll`, because
+        the two are added together again by `rolled_rotation` and a pose
+        captured from a rolled view would otherwise come back rolled twice.
         """
         self.center = np.asarray(camera.center, dtype=float).copy()
         self.distance = float(camera.distance)
-        self.rotation = np.asarray(camera.rotation, dtype=float).copy()
+        self.roll = float(roll)
+        self.rotation = twist_rotation(camera.rotation, -float(roll))
         self.projection = (ORTHOGRAPHIC if camera.orthographic
                            else PERSPECTIVE)
         if width and height:
@@ -168,6 +221,7 @@ class CameraObject(object):
             "sensor_mm": float(self.sensor_mm),
             "width": int(self.width), "height": int(self.height),
             "multiplier": float(self.multiplier),
+            "frame_zoom": float(self.frame_zoom),
         }
 
     @classmethod
@@ -188,6 +242,7 @@ class CameraObject(object):
         cam.width = int(d.get("width", DEFAULT_WIDTH))
         cam.height = int(d.get("height", DEFAULT_HEIGHT))
         cam.multiplier = float(d.get("multiplier", 1.0))
+        cam.frame_zoom = clamp_frame_zoom(d.get("frame_zoom", 1.0))
         return cam
 
     def copy(self):
@@ -199,24 +254,58 @@ class CameraObject(object):
 
 
 # ------------------------------------------------------------ the frame
-def frame_rect(widget_w, widget_h, aspect, margin=0.92):
+def clamp_frame_zoom(value):
+    """A frame zoom that is inside the range and is a number."""
+    try:
+        z = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if not np.isfinite(z):
+        return 1.0
+    return float(min(max(z, MIN_FRAME_ZOOM), MAX_FRAME_ZOOM))
+
+
+def frame_rect(widget_w, widget_h, aspect, margin=0.92, zoom=1.0):
     """The camera's FILM back as a rectangle inside the viewport.
 
     Looking through a camera whose aspect differs from the window has to show
     what will actually be rendered, or the framing you compose is not the
     framing you get. Returns (x, y, w, h) in widget pixels, centred, the
     largest rectangle of that aspect that fits with a little room round it for
-    the drag handles.
+    the drag handles — scaled by `zoom`, which is what lets the frame be an
+    arbitrary size rather than always filling the window.
     """
     widget_w = max(float(widget_w), 1.0)
     widget_h = max(float(widget_h), 1.0)
     aspect = max(float(aspect), 1e-6)
-    w = widget_w * float(margin)
+    scale = clamp_frame_zoom(zoom) * float(margin)
+    w = widget_w * scale
     h = w / aspect
-    if h > widget_h * float(margin):
-        h = widget_h * float(margin)
+    if h > widget_h * scale:
+        h = widget_h * scale
         w = h * aspect
     return ((widget_w - w) / 2.0, (widget_h - h) / 2.0, w, h)
+
+
+def viewport_fov_y(cam_fov_y, rect_h, widget_h):
+    """The field of view the WHOLE WIDGET must use so that `cam_fov_y` lands
+    exactly on a centred rectangle of height `rect_h`.
+
+    Without this the film back is a decoration rather than a framing: the
+    scene was drawn at the viewport's own fixed 40 degrees over the whole
+    window and the rectangle merely laid on top, so the focal length changed
+    the label and nothing else, and what you composed inside the frame was not
+    what would be rendered. A centred rectangle in a symmetric frustum scales
+    the half-height linearly, so one `tan` each way is exact.
+
+    Clamped short of 180: a frame pulled very small would otherwise ask for a
+    field of view that has no projection matrix.
+    """
+    rect_h = max(float(rect_h), 1e-6)
+    widget_h = max(float(widget_h), 1e-6)
+    half = np.tan(np.radians(max(min(float(cam_fov_y), 179.0), 0.1)) / 2.0)
+    half *= widget_h / rect_h
+    return float(min(np.degrees(2.0 * np.arctan(half)), 179.0))
 
 
 #: The eight handles of the frame, as (name, u, v) in 0..1 rectangle space.
@@ -237,6 +326,26 @@ def handle_at(rect, x, y, radius=9.0):
     return None
 
 
+CORNERS = ("nw", "ne", "sw", "se")
+
+
+def handle_scales(handle, dx, dy, rect):
+    """(scale_x, scale_y) the frame grows by when `handle` is dragged.
+
+    Both edges move, so a drag of dx widens the frame by 2*dx about the centre
+    — the rectangle stays centred, which is how it is drawn and the whole
+    reason the arithmetic is this short.
+    """
+    _rx, _ry, rw, rh = rect
+    fx = {"e": 1.0, "w": -1.0, "ne": 1.0, "se": 1.0, "nw": -1.0,
+          "sw": -1.0}.get(handle, 0.0)
+    fy = {"s": 1.0, "n": -1.0, "se": 1.0, "sw": 1.0, "ne": -1.0,
+          "nw": -1.0}.get(handle, 0.0)
+    scale_x = max(1.0 + (2.0 * fx * float(dx)) / max(rw, 1.0), 0.05)
+    scale_y = max(1.0 + (2.0 * fy * float(dy)) / max(rh, 1.0), 0.05)
+    return scale_x, scale_y
+
+
 def resize_pixels(handle, width, height, dx, dy, rect):
     """New (width, height) in PIXELS after dragging a handle by (dx, dy).
 
@@ -245,15 +354,33 @@ def resize_pixels(handle, width, height, dx, dy, rect):
     both, an edge only its own axis, and both are clamped well above zero
     because a camera 0 pixels wide is not a state worth being able to reach.
     """
-    _rx, _ry, rw, rh = rect
-    fx = {"e": 1.0, "w": -1.0, "ne": 1.0, "se": 1.0, "nw": -1.0,
-          "sw": -1.0}.get(handle, 0.0)
-    fy = {"s": 1.0, "n": -1.0, "se": 1.0, "sw": 1.0, "ne": -1.0,
-          "nw": -1.0}.get(handle, 0.0)
-    # Both edges move, so a drag of dx widens the frame by 2*dx about the
-    # centre — the rectangle stays centred, as it is drawn.
-    scale_x = 1.0 + (2.0 * fx * float(dx)) / max(rw, 1.0)
-    scale_y = 1.0 + (2.0 * fy * float(dy)) / max(rh, 1.0)
-    w = int(round(max(float(width) * max(scale_x, 0.05), 16)))
-    h = int(round(max(float(height) * max(scale_y, 0.05), 16)))
+    scale_x, scale_y = handle_scales(handle, dx, dy, rect)
+    w = int(round(max(float(width) * scale_x, 16)))
+    h = int(round(max(float(height) * scale_y, 16)))
     return min(w, 16384), min(h, 16384)
+
+
+def resize_frame(handle, width, height, zoom, dx, dy, rect):
+    """New (width, height, frame_zoom) after dragging a handle.
+
+    Round 57, Christian: "the corner drag buttons essentially do nothing".
+    They were doing exactly what they were written to do — changing the pixel
+    count — and none of it was VISIBLE, because `frame_rect` normalised the
+    result back to the largest rectangle that fits. Only the aspect could ever
+    show, and a corner dragged along the rectangle's own diagonal is precisely
+    the direction that leaves the aspect alone: `scale_x == scale_y`, same
+    shape, same drawn size, nothing on screen moves.
+
+    So a corner now also carries the FRAME ZOOM, by the geometric mean of the
+    two scale factors — drag out and the frame grows, drag in and it shrinks,
+    while the resolution still follows both axes independently so any width
+    and height remain reachable ("more arbitrary"). An EDGE keeps its one job:
+    that axis's pixels, i.e. the aspect, with the zoom untouched.
+    """
+    scale_x, scale_y = handle_scales(handle, dx, dy, rect)
+    w, h = resize_pixels(handle, width, height, dx, dy, rect)
+    if handle in CORNERS:
+        zoom = clamp_frame_zoom(float(zoom) * float(np.sqrt(scale_x * scale_y)))
+    else:
+        zoom = clamp_frame_zoom(zoom)
+    return w, h, zoom
