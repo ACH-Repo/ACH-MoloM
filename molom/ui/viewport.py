@@ -724,6 +724,9 @@ class MolViewport(QOpenGLWidget):
     selected_camera_id = None
     _camera_drag = None
     on_camera_look = None
+    #: Which camera the current Shift+drag is re-framing, so the whole
+    #: gesture is ONE undo entry rather than one per mouse-move event.
+    _truck_gesture = None
     _frame_drag = None
     _poly_key = None
     _poly_cache = None
@@ -4869,17 +4872,22 @@ class MolViewport(QOpenGLWidget):
         if self._nav_drag == "orbit":
             self._orbit_input(dx, dy, cursor_pos=pos)
         elif self.looking_through is not None:
-            # "unless the camera is selected and grabbed, it should not move".
-            # A zoom drag resizes the frame like the wheel; a pan drag would
-            # have to move the camera sideways, so it is refused and says so —
-            # the frame is drawn centred, and off-centring it is a different
-            # feature from the one that was asked for.
+            # A zoom drag resizes the frame, like the wheel. SHIFT+DRAG trucks
+            # the CAMERA sideways — Christian: "all I need now is to bring back
+            # shift+drag so that I can do final adjustments to the camera
+            # view." It moves the camera OBJECT rather than the free view,
+            # which is the difference between an adjustment that survives
+            # leaving the shot and one that quietly does not: round 57 panned
+            # the interactive camera, so the framing you nudged was gone the
+            # next time you pressed Numpad 0.
+            #
+            # It does not contradict "unless the camera is selected and
+            # grabbed, it should not move": a held modifier plus a drag IS the
+            # deliberate gesture, and it is the only one on the camera.
             if self._nav_drag == "zoom":
                 self.zoom_camera_frame(-dy / _DRAG_ZOOM_PX)
             elif self._nav_drag == "pan":
-                self.status_message.emit(
-                    "The camera is locked while you look through it — select "
-                    "it and press G to move it")
+                self.truck_camera(dx, dy)
         elif self._nav_drag == "pan":
             self.camera.pan(dx, dy, w, h)
         elif self._nav_drag == "zoom":
@@ -5159,6 +5167,10 @@ class MolViewport(QOpenGLWidget):
         self.refresh_geometry()
 
     def mouseReleaseEvent(self, ev):
+        if self._truck_gesture is not None:
+            # Ends the undo gesture, so the next Shift+drag is a new step.
+            self._truck_gesture = None
+            self.edit_committed.emit()
         if self._frame_drag is not None:
             self._frame_drag = None
             if self.on_camera_changed is not None:
@@ -5778,6 +5790,44 @@ class MolViewport(QOpenGLWidget):
         self.status_message.emit(
             "{}: {} x {} ({:.3f}:1) on a {:.1f} mm film".format(
                 cam.name, w, h, cam.aspect, sensor))
+        self.update()
+        return True
+
+    def truck_camera(self, dx_px, dy_px):
+        """Shift+drag inside a camera view: slide the CAMERA in its own screen
+        plane, for the last few pixels of framing.
+
+        The film-back rectangle is drawn centred and stays centred, so the way
+        to re-frame is to move the camera rather than to slide the frame over
+        the scene — and moving the camera object is also what makes the
+        adjustment persist into the savefile, the render and the Blender
+        export instead of living in the free view until you next leave.
+
+        One undo entry per gesture: `_truck_gesture` is cleared on release, so
+        a whole drag is a single step rather than one per mouse-move event.
+        """
+        cam = self.active_camera_object()
+        if cam is None:
+            return False
+        if self._truck_gesture != cam.id:
+            self._truck_gesture = cam.id
+            if self.on_edit_begin is not None:
+                self.on_edit_begin()
+        rot = quat_to_mat3(cam.rolled_rotation())
+        # World units per SCREEN pixel, from the widget's field of view — so
+        # the shot slides by exactly as many pixels as the hand moved, at any
+        # frame zoom. That is also what makes the gesture self-regulating for
+        # "final adjustments": scroll in and the same drag becomes a finer
+        # nudge, because more pixels now cover the same part of the shot.
+        half = np.tan(np.radians(self.camera.FOV_Y) / 2.0) * float(cam.distance)
+        per_px = 2.0 * half / max(self.height(), 1)
+        right = rot.T @ np.array([1.0, 0.0, 0.0])
+        up = rot.T @ np.array([0.0, 1.0, 0.0])
+        cam.center = np.asarray(cam.center, dtype=float) \
+            - right * (dx_px * per_px) + up * (dy_px * per_px)
+        cam.apply_to(self.camera)
+        self.sync_camera_lens()
+        self.status_message.emit("{}: re-framing".format(cam.name))
         self.update()
         return True
 

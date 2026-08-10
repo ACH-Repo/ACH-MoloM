@@ -943,7 +943,7 @@ apex, and its film back is already on screen as the frame.
 | **Esc**, **Numpad 0** | Leaves and restores the view from before you entered |
 | **Mouse wheel** | Resizes the FRAME (see below). Never moves the camera |
 | **Ctrl+drag** | The same frame zoom |
-| **Shift+drag** (pan) | Refused, with a hint — the camera is locked while you look through it |
+| **Shift+drag** | Trucks the CAMERA sideways — the last few pixels of framing. 1:1 on screen at any frame zoom, so scroll in for a finer nudge |
 | **Compass click / axis view / flight** | Leaves the camera — all view rotations |
 | **Tumbling a molecule** | Stays inside — that moves the MODEL, not the camera |
 
@@ -951,9 +951,16 @@ Numpad 0 is bound to **both** `Num+0` and `Num+Ins`, because with **Num Lock
 off** the numpad's 0 sends `Key_Insert` — binding only the first is a shortcut
 half the keyboards in the world never send.
 
-**The camera object never moves while you look through it.** Not by scrolling,
-not by dragging its frame, not by editing its lens or resolution. Select it and
-press **G** to move it, or use "Camera: update the active one to this view".
+**The camera object never moves by accident.** Not by scrolling, not by
+dragging its frame, not by editing its lens or resolution. The two gestures
+that DO move it are deliberate and say so: **Shift+drag** re-frames the shot
+from inside, and **G** on a selected camera gizmo moves it from outside.
+("Camera: update the active one to this view" re-aims it wholesale.)
+
+A Shift+drag moves the camera OBJECT, not the free view — which is the
+difference between an adjustment that survives leaving the shot and one that
+quietly does not, and it is what carries the nudge into the savefile, the
+render and the Blender export. The whole drag is one undo step.
 
 ### The film back
 

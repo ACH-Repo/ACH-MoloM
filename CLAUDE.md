@@ -49,6 +49,15 @@ fields, click-to-type with safe arithmetic eval, location + Euler-XYZ),
 **align-largest-planar-part to XY/XZ/YZ** (RANSAC plane clustering,
 core/align.py).
 
+## VERSION 0.3.0 (2026-08-10) — the line under this session
+(Rounds 34-58 sit above 0.2.0; everything from the PC/mouse preset through
+camera objects and the camera view is in this release.) Headline items since
+0.2.0: CIF import that keeps the crystallography honest (space groups from a
+symbol, the labelled periodic bond graph, disorder and occupancy policies, a
+real CIF writer), coordination polyhedra, the Blender export as a .blend with
+polyhedra and saved cameras, installable add-ons, the animation export, and
+camera objects with a viewport frame you compose in. 1265 tests.
+
 ## VERSION 0.2.0 (2026-08-03) — the line under the previous session
 (Round 34 sits above it, unreleased.)
 Everything below shipped between 0.1.0 and 0.2.0: the PC/mouse input preset,
@@ -127,7 +136,22 @@ VIEWING choice and must not decide how much memory a render takes. Verified in
 a real window: dragging a border moved it while the molecule stayed at
 **184.2 px, unchanged to a tenth of a pixel**, and a 640x360 camera rendered
 640x360 and exported 640x360 to Blender.
-1261 tests.
+**And SHIFT+DRAG came back, as a real camera move.** "All I need now is to
+bring back shift+drag so that I can do final adjustments to the camera view.
+That was in before and it was good." It was refused outright when the camera
+was locked, which was one step too far — but restoring what round 57 did would
+not have been right either: that panned the INTERACTIVE camera, so the framing
+you nudged was gone the next time you pressed Numpad 0, and no render carried
+it. `truck_camera` slides the camera OBJECT in its own screen plane, so the
+adjustment survives leaving the shot and reaches the savefile, the render and
+the Blender export. It does not contradict "unless the camera is selected and
+grabbed, it should not move": a held modifier plus a drag IS the deliberate
+gesture. Measured against the WIDGET's field of view rather than the camera's,
+so the shot slides by exactly as many pixels as the hand moved at any frame
+zoom — which makes the gesture self-regulating for fine work, since scrolling
+in puts more pixels across the same part of the shot. One undo step per drag
+(`_truck_gesture`, cleared on release).
+1265 tests. **RELEASED AS 0.3.0.**
 
 Round 57 (2026-08-10, the camera view becomes a view, and four animation
 faults): Christian used round 56 in anger and every complaint pointed the same
@@ -2343,7 +2367,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1261 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1265 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -3642,7 +3666,7 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 1261 offline tests. `tests/conftest.py`
+1. `python -m pytest tests/ -q` — 1265 offline tests. `tests/conftest.py`
    sandboxes QSettings, so a GUI test can drive a real control without
    writing into your own MoloM configuration.
 2. `python -m molom --selftest` — headless core sanity.

@@ -117,7 +117,24 @@ def main(paths):
                                     before, after,
                                     "OK" if abs(after - before) < 0.5
                                     else "RESCALED"))
-        win.viewport.zoom_camera_frame(10)
+        cam.fit_frame(win.viewport.width(), win.viewport.height())
+        win.camera_changed()
+        # Shift+drag re-frames the shot by moving the CAMERA, so the nudge
+        # survives leaving it — and it is 1:1 on screen at any frame zoom.
+        obj = win.scene.visible_objects()[0]
+
+        def centre_px():
+            xy, _f = win.viewport._project(obj.display_coords())
+            return float(xy[:, 0].mean())
+
+        was = centre_px()
+        win.viewport.truck_camera(60.0, 0.0)
+        app.processEvents()
+        grab("93b_camera_shift_drag")
+        print("  shift+drag 60 px: molecule {:.1f} -> {:.1f} px on screen"
+              .format(was, centre_px()))
+        win.viewport.truck_camera(-60.0, 0.0)
+        win.viewport._truck_gesture = None
         cam.roll = 0.4                     # the frame drawn over a tilted view
         win.camera_changed()
         grab("94_camera_rolled")

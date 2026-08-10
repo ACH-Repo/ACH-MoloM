@@ -640,3 +640,87 @@ def test_numpad_zero_is_bound_with_num_lock_OFF_too():
     keys = ((op.key,) if op.key else ()) + op.extra_keys
     assert "Num+0" in keys and "Num+Ins" in keys
     assert not win.ops.duplicate_keys()
+
+
+# ------------------------------------------- shift+drag re-frames the shot
+def test_shift_drag_moves_the_camera_itself(win):
+    """Christian: "all I need now is to bring back shift+drag so that I can do
+    final adjustments to the camera view." It moves the camera OBJECT, not the
+    free view — round 57 panned the interactive camera, so the framing you
+    nudged was gone the next time you pressed Numpad 0."""
+    win.on_place_camera()
+    vp = win.viewport
+    cam = win.scene.active_camera()
+    before = np.array(cam.center)
+    aim = np.array(cam.rotation)
+    dist = float(cam.distance)
+
+    assert vp.truck_camera(30.0, -12.0) is True
+    assert not np.allclose(cam.center, before)
+    # a truck slides the camera; it does not turn it or dolly it
+    assert np.allclose(cam.rotation, aim)
+    assert cam.distance == pytest.approx(dist)
+    # sideways, in the camera's own screen plane — never along the view axis
+    moved = np.asarray(cam.center) - before
+    forward = quat_to_mat3(cam.rolled_rotation()).T @ np.array([0.0, 0.0, -1.0])
+    assert float(np.dot(moved, forward)) == pytest.approx(0.0, abs=1e-9)
+    # and the view follows, or you would be adjusting something you cannot see
+    assert np.allclose(vp.camera.center, cam.center)
+
+
+def test_a_re_framing_survives_leaving_and_coming_back(win):
+    win.on_place_camera()
+    vp = win.viewport
+    cam = win.scene.active_camera()
+    vp.truck_camera(40.0, 20.0)
+    framed = np.array(cam.center)
+    win.leave_camera()
+    win.on_activate_camera(cam.id)
+    assert np.allclose(cam.center, framed)
+    assert np.allclose(vp.camera.center, framed)
+
+
+def test_a_whole_shift_drag_is_one_undo_step(win):
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    win.on_place_camera()
+    vp = win.viewport
+    cam = win.scene.active_camera()
+    depth = len(win.undo._stack) if hasattr(win.undo, "_stack") else None
+    for _ in range(8):
+        vp.truck_camera(5.0, 0.0)
+    assert vp._truck_gesture == cam.id
+    vp.mouseReleaseEvent(QMouseEvent(
+        QEvent.MouseButtonRelease, QPointF(1.0, 1.0), Qt.MiddleButton,
+        Qt.NoButton, Qt.ShiftModifier))
+    assert vp._truck_gesture is None
+    if depth is not None:
+        assert len(win.undo._stack) == depth + 1
+
+
+def test_the_nudge_is_one_to_one_on_screen_at_any_zoom(win):
+    """A drag slides the shot by as many pixels as the hand moved, whatever
+    the frame zoom — which is what makes it self-regulating for "final
+    adjustments": scroll in and the same drag becomes a finer nudge, because
+    more pixels then cover the same part of the shot."""
+    win.on_place_camera()
+    vp = win.viewport
+    cam = win.scene.active_camera()
+
+    def screen_shift(drag_px):
+        start = np.array(cam.center)
+        probe = np.array(cam.center)          # a point fixed in the world
+        before, _f = vp._project(probe[None, :])
+        vp.truck_camera(drag_px, 0.0)
+        after, _f = vp._project(probe[None, :])
+        cam.center = start.copy()
+        cam.apply_to(vp.camera)
+        vp.sync_camera_lens()
+        return float(after[0][0] - before[0][0])
+
+    wide = screen_shift(50.0)
+    cam.frame_zoom = cameras.zoom_frame(cam.frame_zoom, -6)
+    vp.sync_camera_lens()
+    tight = screen_shift(50.0)
+    assert abs(wide) == pytest.approx(50.0, abs=0.5)
+    assert abs(tight) == pytest.approx(50.0, abs=0.5)
