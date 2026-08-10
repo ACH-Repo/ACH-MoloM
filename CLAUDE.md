@@ -119,6 +119,32 @@ so they only appear once `docs/screenshots/` is pushed to `main`. `twine check
 --strict` passes both artefacts; the built wheel was installed and its
 `--selftest` run. 1281 tests. **NOT UPLOADED — that is Christian's to run.**
 
+Round 59 follow-up, same day: Christian replaced the five generated screenshots
+with his own — deliberately NOT a clean-slate default scene per shot, because
+"I wanted to show off molom's performance and ability to visualise multiple
+structures at once." So the vibrations shot carries TWO independent ORCA FREQ
+jobs animating on separate timeline tracks alongside several other imported
+molecules and crystals, and the camera shot frames three different crystal
+structures — a coordination compound, a polyhedral framework and a simple
+ionic lattice — composed together in one shot. `docs/screenshots/README.md`
+says outright that these are hand-picked, not tool output, so a future
+`tools/screenshots.py` run does not silently overwrite them with a blander
+default-scene set.
+
+**Reported in passing, NOT reproduced or root-caused — logged for later,
+explicitly not urgent (Christian: "niche case... acceptable bug we can get to
+later"):** occupancy pie spheres appear not to propagate correctly from an
+asymmetric-unit view to the full-cell view. Round 42's `site_occupancy` map is
+keyed by DRAWN atom index and round 42/52's own lesson is that such a map has
+to be rebuilt (or explicitly carried) every time the atom list is regenerated
+— asym-unit -> full-cell is exactly that kind of rebuild, and round 51's
+`_sync_all` bug (a page not refreshed on the very same transition) is the
+shape of bug most likely to recur here. First step for whoever picks this up:
+reproduce on a real shared-site file (`cod_1547149_solid_solution.cif` is
+already vendored and is the file round 42 was written against) by switching
+Asymmetric unit only -> Full unit cell with occupancy pie spheres ticked, and
+check whether `site_occupancy`/`site_of` survives `packing.pack`'s rebuild.
+
 ## VERSION 0.2.0 (2026-08-03) — the line under the previous session
 (Round 34 sits above it, unreleased.)
 Everything below shipped between 0.1.0 and 0.2.0: the PC/mouse input preset,

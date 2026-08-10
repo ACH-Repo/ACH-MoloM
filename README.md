@@ -5,9 +5,9 @@ Avogadro's chemistry with Blender's ergonomics, plus the crystallography that
 usually means opening VESTA or Mercury instead.
 
 Instanced-OpenGL ball-and-stick over a UI-free, offline-testable core.
-1265 tests, no display required to run them.
+1282 tests, no display required to run them.
 
-![MoloM viewport](https://raw.githubusercontent.com/ACH-Repo/ACH-MoloM/main/docs/screenshots/01-viewport.png)
+![Two imported structures side by side in MoloM's outliner](https://raw.githubusercontent.com/ACH-Repo/ACH-MoloM/main/docs/screenshots/01-viewport.png)
 
 ```bash
 pip install molom
@@ -38,7 +38,7 @@ Kekulé-alternating instead of stalling one double bond short.
 
 ### Crystallography that survives the import
 
-![Coordination polyhedra and the crystal page](https://raw.githubusercontent.com/ACH-Repo/ACH-MoloM/main/docs/screenshots/02-crystal-polyhedra.png)
+![A CIF drawn as its asymmetric unit — the handful of independent sites a space group expands](https://raw.githubusercontent.com/ACH-Repo/ACH-MoloM/main/docs/screenshots/02-asymmetric-unit.png)
 
 A CIF is not a coordinate file, so MoloM's own reader keeps the cell, the space
 group, the symmetry operators, the asymmetric unit, the occupancies and the
@@ -66,12 +66,15 @@ for free.
   re-derived from the coordinates, and says so. ASE and pymatgen both read the
   output exactly as they read the original.
 
-![Ferrocene packed whole](https://raw.githubusercontent.com/ACH-Repo/ACH-MoloM/main/docs/screenshots/03-packing.png)
+![The same file's full unit cell, with the crystal properties page open](https://raw.githubusercontent.com/ACH-Repo/ACH-MoloM/main/docs/screenshots/03-crystal-packing.png)
 
 Molecules are wrapped by *fragment* and completed across the cell faces, so
 nothing is cut in half at a boundary — and a framework, which percolates
 through the boundary and has no "whole" to complete, is detected and left
-alone rather than marched across the cell forever.
+alone rather than marched across the cell forever. The properties page
+alongside it reads off the cell parameters, volume, calculated density and the
+space group actually used — re-derived from the file's own Hall symbol here,
+since the file names its group without listing the operators.
 
 ### Editing that keeps the chemistry upright
 
@@ -97,7 +100,7 @@ force field has parameters for.
 
 ### Cameras, renders and Blender
 
-![Looking through a camera](https://raw.githubusercontent.com/ACH-Repo/ACH-MoloM/main/docs/screenshots/04-camera-view.png)
+![A saved camera framing three different crystal structures at once](https://raw.githubusercontent.com/ACH-Repo/ACH-MoloM/main/docs/screenshots/04-camera-view.png)
 
 Camera objects are saved viewpoints that ride the savefile: a pose, a focal
 length in millimetres against a sensor width, an explicit roll, and a
@@ -105,7 +108,9 @@ resolution plus a multiplier. Looking through one really frames the shot — the
 projection follows the film back, so what is inside the rectangle is what gets
 rendered. Drag a border to reshape the film, `Shift`+drag to re-frame, the
 wheel to zoom the frame; the camera itself never moves unless you say so.
-`F12` renders exactly that.
+`F12` renders exactly that — here composing three separate crystal structures,
+a coordination compound, a polyhedral framework and a simple ionic lattice,
+into one shot.
 
 Export goes to a **`.blend`**, built by invoking Blender headlessly so the file
 opens complete — no auto-run script, no trust prompt, just F12. Every atom and
@@ -116,7 +121,7 @@ coordination polyhedra come with it.
 
 ### Animation
 
-![A baked ORCA normal mode](https://raw.githubusercontent.com/ACH-Repo/ACH-MoloM/main/docs/screenshots/05-vibrations.png)
+![Two ORCA frequency jobs animating on separate timeline tracks, alongside several other imported structures](https://raw.githubusercontent.com/ACH-Repo/ACH-MoloM/main/docs/screenshots/05-vibrations.png)
 
 One scene clock, one playhead, a track per object with its own offset, speed
 and end mode — so several trajectories play together, staggered or at different
@@ -126,7 +131,9 @@ stops a turning molecule visibly contracting halfway through.
 
 ORCA normal modes are baked onto that same clock as ordinary frames, so a
 vibration plays, scrubs and exports with no vibration-specific code anywhere in
-the UI. Export is a PNG sequence with no extra dependency, or video through
+the UI — the two frequency jobs animating together above are just two more
+tracks, sharing the scene with everything else that has been imported into it.
+Export is a PNG sequence with no extra dependency, or video through
 `imageio-ffmpeg` — always encoded *from* the written sequence, so a failed
 encode still leaves every frame on disk.
 
@@ -191,6 +198,8 @@ ASE, pymatgen and each file's own formula × Z. Ligand templating works on
 synthetic cases but not yet reliably in real use. Editing a packed crystal is
 flagged rather than fully solved: the drawn boundary copies are independent
 atoms, so an edit is reported and you are pointed at "Asymmetric unit only".
+Occupancy pie spheres on a shared crystallographic site do not always survive
+switching from the asymmetric unit to the full cell — reported, not yet fixed.
 
 ## Credits
 
