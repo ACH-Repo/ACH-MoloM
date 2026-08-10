@@ -1,27 +1,44 @@
 [build-system]
-requires = ["setuptools>=61"]
+# >=77 for the SPDX `license`/`license-files` fields used below. The older
+# `License :: OSI Approved ::` classifier is deprecated and PyPI now warns on
+# it, so this is the form a fresh upload should use.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "molom"
-version = "0.2.0"
-description = "Standalone Avogadro-like molecule viewer/builder: ball-and-stick GL viewport with universal structure import"
+version = "0.3.0"
+description = "Molecule viewer, builder and crystal visualiser with Blender-style ergonomics: OpenGL ball-and-stick, CIF crystallography, coordination polyhedra, saved cameras and a Blender export"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 authors = [
     { name = "Christian Nelle" },
 ]
 keywords = [
-    "chemistry", "molecule", "viewer", "3d", "opengl", "ball-and-stick",
-    "xyz", "avogadro", "quantum chemistry",
+    "chemistry", "crystallography", "molecule", "viewer", "editor", "3d",
+    "opengl", "ball-and-stick", "cif", "space-group", "symmetry",
+    "coordination-polyhedra", "xyz", "smiles", "avogadro", "vesta", "blender",
+    "orca", "quantum-chemistry", "vibrational-modes", "mof",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
+    "Environment :: Win32 (MS Windows)",
+    "Environment :: X11 Applications :: Qt",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
+    "Intended Audience :: Education",
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Visualization",
 ]
 # Core runtime. rdkit/openbabel are OPTIONAL (SMILES + non-xyz formats degrade
 # gracefully without them, mirroring ORCA Workbench's tiering).
@@ -43,8 +60,18 @@ dependencies = [
 [project.optional-dependencies]
 chem = ["rdkit", "openbabel-wheel"]
 
+[project.urls]
+Homepage = "https://github.com/ACH-Repo/ACH-MoloM"
+Source = "https://github.com/ACH-Repo/ACH-MoloM"
+Issues = "https://github.com/ACH-Repo/ACH-MoloM/issues"
+Changelog = "https://github.com/ACH-Repo/ACH-MoloM/blob/main/CLAUDE.md"
+
 [project.scripts]
 molom = "molom.__main__:main"
 
 [tool.setuptools]
-packages = ["molom", "molom.core", "molom.ui"]
+# Hand-written, so a new subpackage is silently left out of the wheel —
+# `molom.addons` was, and add-ons are imported BY NAME at run time, so the
+# omission would have shipped as a broken feature rather than an ImportError.
+# `tests/test_round59_release.py` compares this list against what is on disk.
+packages = ["molom", "molom.core", "molom.ui", "molom.addons"]

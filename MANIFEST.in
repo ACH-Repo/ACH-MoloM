@@ -1,0 +1,29 @@
+# What goes into the SDIST beyond the package itself. The wheel is decided by
+# `[tool.setuptools] packages`; this file only affects `molom-x.y.z.tar.gz`.
+#
+# Tests and their fixtures are included deliberately: the whole architecture
+# rests on `molom/core/` being testable offline (see CLAUDE.md), so an sdist
+# that cannot be tested has thrown away the one guarantee the project makes.
+include LICENSE
+include THIRD_PARTY_NOTICES.md
+include README.md
+include CLAUDE.md
+include beta_testers.md
+recursive-include tests *.py
+recursive-include tests/data *
+recursive-include examples *.xyz
+recursive-include docs *.md
+recursive-include tools *.py
+include tools/avogadro_data/elementdata.h
+
+# The screenshots stay OUT of the sdist: 2.9 MB of PNG that nothing in the
+# package reads, and the README references them by absolute URL because PyPI
+# does not render relative image paths anyway. They belong in the repo, not in
+# every download.
+prune docs/screenshots
+
+# Never ship build or cache droppings.
+global-exclude *.py[cod]
+global-exclude __pycache__
+prune tools/_smoke
+prune .pytest_cache

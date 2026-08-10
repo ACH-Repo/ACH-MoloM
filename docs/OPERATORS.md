@@ -57,7 +57,7 @@ Measured//computed **file** imports (xyz, sdf, pdb, …) are never silently
 transformed.
 | **Export geometry...** — every molecule ticked visible in the outliner goes into the file (merged into one record); a single visible trajectory still writes all its frames | **Ctrl+E** | scene not empty |
 | **Export image...** — PNG/JPG snapshot of the viewport exactly as drawn (grid, labels and all) at its current resolution | **Ctrl+Shift+E** | scene not empty |
-| **Export to Blender...** — a build SCRIPT (`.py`) with materials, camera, lights and world, after a pre-configuration dialog. See below | **Ctrl+Shift+B** | scene not empty |
+| **Export to Blender...** — a **`.blend`** (or the build script alone) with materials, coordination polyhedra, saved cameras, lights and world, after a pre-configuration dialog. See below | **Ctrl+Shift+B** | scene not empty |
 | **New empty molecule** — an empty object to draw into (Tab on an empty scene does this too) | — | — |
 | Clear scene | — | scene not empty |
 
@@ -943,7 +943,7 @@ apex, and its film back is already on screen as the frame.
 | **Esc**, **Numpad 0** | Leaves and restores the view from before you entered |
 | **Mouse wheel** | Resizes the FRAME (see below). Never moves the camera |
 | **Ctrl+drag** | The same frame zoom |
-| **Shift+drag** | Trucks the CAMERA sideways — the last few pixels of framing. 1:1 on screen at any frame zoom, so scroll in for a finer nudge |
+| **Shift+drag** (left button, or Shift+MMB) | Trucks the CAMERA sideways — the last few pixels of framing. 1:1 on screen at any frame zoom, so scroll in for a finer nudge |
 | **Compass click / axis view / flight** | Leaves the camera — all view rotations |
 | **Tumbling a molecule** | Stays inside — that moves the MODEL, not the camera |
 
@@ -961,6 +961,14 @@ A Shift+drag moves the camera OBJECT, not the free view — which is the
 difference between an adjustment that survives leaving the shot and one that
 quietly does not, and it is what carries the nudge into the savefile, the
 render and the Blender export. The whole drag is one undo step.
+
+**On the LEFT button as well as the middle one** (round 59). Round 58 built
+`truck_camera` and hung it off the pan drag, which is Shift+MIDDLE — so the
+plain gesture still started an additive box select, and the feature was
+unreachable for anyone whose wheel-click is a stiff scroll-wheel press (the
+reason round 16 already had to alias orbit onto Alt+LMB). Inside a camera view
+Shift + left-drag now trucks; outside one it is still additive box select, and
+an explicitly armed box or lasso tool still wins over it.
 
 ### The film back
 
@@ -997,12 +1005,19 @@ export built its own with the matrix transposed and therefore rolled the
 opposite way, which nothing noticed while the viewport ignored roll entirely.
 
 ## Blender export (Ctrl+Shift+B, round 37)
-Writes a **Python script**, not a `.blend` — writing .blend needs Blender
-itself, and hunting for an installation to shell out to is exactly the sort of
-fragile thing this project avoids. A script is also better: diffable, editable
-before it runs, re-runnable after the scene changes, and it shows how the
-scene was built. Open it in Blender's Scripting workspace and press Run, or
-`blender --python file.py`. **One Angstrom = one Blender unit.**
+Writes a **`.blend`** (round 50). Christian: "I don't like having to load it in
+every time... all I have to do is press F12." Blender is INVOKED to build it —
+the same generated script, run headlessly as `blender -b --factory-startup
+--python build.py -- --save out.blend` — so the scene is complete before the
+file is saved and the `.blend` opens ready to render: no auto-run, no "Allow
+Execution", no trust dialog. The script rides along as a text datablock and
+stays on disk beside the `.blend`, and it is still an output format on its own,
+because it is diffable, editable before it runs and needs no Blender at all.
+The Blender path is a setting with discovery (stored hint, then PATH, then the
+usual install locations newest-first); a `blender-launcher.exe` is resolved to
+the real `blender.exe` beside it, since the launcher is a GUI shim that cannot
+be scripted. A failed build leaves the script and says so.
+**One Angstrom = one Blender unit.**
 
 A dialog comes up first, because a render is a dozen decisions and every one
 is quicker to make here than to hunt for in Blender afterwards. Defaults are

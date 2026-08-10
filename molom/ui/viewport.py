@@ -4852,6 +4852,28 @@ class MolViewport(QOpenGLWidget):
         # (A double-click-drag builder on empty space was tried and removed:
         # it collided with box select, and clicking one atom then dragging
         # from it does the same job.)
+        # SHIFT+LEFT-DRAG inside a camera view RE-FRAMES the shot. Round 58
+        # built the mechanism (`truck_camera`) but hung it off `_nav_drag ==
+        # "pan"`, i.e. Shift+MIDDLE-drag — and "shift+drag" means the plain
+        # gesture, on the button every mouse and every trackpad has. On the
+        # desktop PC's wheel mouse the middle button is a stiff scroll-wheel
+        # click, which is exactly why round 16 already had to alias orbit onto
+        # Alt+LMB; a framing nudge measured in single pixels is the last
+        # gesture that should need it. So the left button carries it too.
+        #
+        # Scoped to a camera view, so ordinary additive box select is
+        # untouched everywhere else — and an EXPLICITLY ARMED box/lasso tool
+        # still wins here, on round 52's rule that an armed tool owns every
+        # click. Setting `_nav_drag` is what routes it: the branch below
+        # already turns a pan into a truck while looking through a camera, and
+        # `mouseReleaseEvent` already clears the flag and suppresses the
+        # release pick, which a re-framing drag must not perform.
+        if self._drag_button == Qt.LeftButton and self._drag_moved \
+                and self.looking_through is not None \
+                and bool(ev.modifiers() & Qt.ShiftModifier) \
+                and self._select_tool is None \
+                and self._region_drag is None and self._nav_drag is None:
+            self._nav_drag = "pan"
         # Plain LEFT-DRAG is box select (Blender's default). This replaced the
         # double-click-drag-only trigger, which never fired reliably on a
         # trackpad; double-click-drag still works, and an armed lasso tool

@@ -58,6 +58,67 @@ real CIF writer), coordination polyhedra, the Blender export as a .blend with
 polyhedra and saved cameras, installable add-ons, the animation export, and
 camera objects with a viewport frame you compose in. 1265 tests.
 
+Round 59 (2026-08-10, THE PYPI RELEASE — and Shift+drag reaching the code that
+already existed): Christian asked for the release to be prepared, "just one
+thing I would like to add though: Shift+drag to adjust the view when in camera
+mode" — which round 58 reports as shipped. **It was built and it was
+unreachable.** `truck_camera` exists, is correct and has four tests, and every
+one of those tests CALLS IT DIRECTLY; the routing hung it off `_nav_drag ==
+"pan"`, and `_nav_drag_kind` only returns that for Shift+**MIDDLE**-drag. So the
+plain gesture — Shift + left-drag — still started an additive box select, on the
+machine whose stiff scroll-wheel click is the reason round 16 had to alias orbit
+onto Alt+LMB in the first place. **A mechanism with tests and no gesture test is
+a feature nobody can reach**, and that is the lesson worth keeping: the tests
+proved the arithmetic and said nothing about whether any hand could get to it.
+Fixed by resolving a Shift+left-drag inside a camera view to `_nav_drag =
+"pan"`, which reuses the existing truck branch AND the existing release
+handling (one undo step, no pick on release). Scoped to a camera view, so
+additive box select is untouched everywhere else; an explicitly armed box/lasso
+tool still wins, on round 52's rule.
+**Three real bugs fell out of packaging**, all of which would have shipped.
+(1) **`molom.addons` was not in `[tool.setuptools] packages`** — a hand-written
+list, so round 46's add-ons were simply absent from the wheel, and since
+add-ons are imported BY NAME at run time that ships as a broken feature rather
+than an ImportError. (2) **`pyproject` said 0.2.0 while `molom.__version__`
+said 0.3.0**; both are now pinned against each other by a test, because a
+release is exactly the moment two sources of one number disagree. (3) **An
+orphan dock shell floated over the menu bar.** Round 15 moved `OptimizeDock`'s
+WIDGET into the properties dock as a page and left the dock behind, parented to
+the window but never added to a dock area — and `QWidget.show()` shows every
+child not explicitly hidden, so an empty titled husk sat at (0, 0) on top of
+"File" and "Edit". Invisible for 44 rounds because nobody photographs a fresh
+window; the first screenshot made it unmissable.
+**`tools/screenshots.py` generates the PyPI images**, and the interesting part
+is that a screenshot tool has its own silent failure mode. **`win.grab()` drops
+every QPainter overlay the GL widget draws** — measured, not assumed: the same
+frame grabbed both ways gives the film back, eight handles, the veil and the
+hint line through `grabFramebuffer()` and NONE of them through `win.grab()`.
+Since the overlays are most of what MoloM draws (camera frame, cell box,
+compass, labels, symmetry elements, measurements), a window grab photographs
+the program with its features apparently switched off, and the picture looks
+perfectly fine. So `compose()` takes both and pastes the framebuffer over the
+viewport — then pastes the viewport's CHILD widgets back **out of the original
+window grab**, because they are real widgets over the GL surface (the floating
+tool column, the crystal ribbon) and a flat framebuffer paste erased them,
+while re-grabbing each one throws away the translucency they are styled with
+and came back white. **The DPR trap on top of that**: both grabs carry a
+devicePixelRatio (1.5 here) and a QPainter on such an image works in LOGICAL
+coordinates, so device-pixel offsets get multiplied a second time and everything
+lands 1.5x too low — visible as a ghost ribbon 27 px above the real one.
+`setDevicePixelRatio(1.0)` makes one pixel of arithmetic mean one pixel of
+image. Two more rules the tool holds: **a fresh window per shot** (imports ADD
+in MoloM and never replace, so the first draft's camera shot contained cubane, a
+ferrocene packing and a solid solution at once, 247 atoms of unrelated
+structures), and **drive the CONTROLS, not the metadata** — setting
+`metadata["polyhedra"]` draws the solids and leaves the tick box unticked, i.e.
+round 51's bug staged for the camera.
+**README rewritten as the PyPI page** (it still described the round-1
+"skeleton": import, render, "editing stubs"). Images are absolute
+`raw.githubusercontent.com` URLs because PyPI does not render relative paths —
+so they only appear once `docs/screenshots/` is pushed to `main`. `twine check
+--strict` passes both artefacts; the built wheel was installed and its
+`--selftest` run. 1281 tests. **NOT UPLOADED — that is Christian's to run.**
+
 ## VERSION 0.2.0 (2026-08-03) — the line under the previous session
 (Round 34 sits above it, unreleased.)
 Everything below shipped between 0.1.0 and 0.2.0: the PC/mouse input preset,

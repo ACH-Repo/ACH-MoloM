@@ -289,6 +289,14 @@ class MainWindow(QMainWindow):
 
         self.optimize_panel = OptimizeDock(self)
         self.optimize_panel.start_requested.connect(self.on_optimize)
+        # Round 15 moved this dock's WIDGET into the properties dock as a page
+        # and left the dock itself behind, parented to the window but never
+        # added to a dock area. `QWidget.show()` shows every child that has not
+        # been explicitly hidden, so the empty shell — title bar, close button,
+        # nothing in it — floated at (0, 0) ON TOP OF THE MENU BAR, which is
+        # why "File" and "Edit" read as overlapping garbage in a screenshot of
+        # a fresh window. Only the page is wanted; hide the husk.
+        self.optimize_panel.setVisible(False)
         self._opt_worker = None
 
         # Blender's properties editor: one dock, a vertical tab strip, and a
