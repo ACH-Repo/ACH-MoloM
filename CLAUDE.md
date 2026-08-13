@@ -4763,6 +4763,37 @@ batches. Known next items, rough order:
    round-trip with coords_locked on reload.
 6. Perf, if ever needed: impostor (billboard) spheres, partial buffer
    updates during grab instead of full rebuilds.
+6b. **THE RESIDUAL THIRD-PERSON JITTER — diagnosed 2026-08-13, deliberately
+   NOT fixed in 0.4.0.** Christian, after round 72: "it works as intended now
+   except for the jitter in 3rd person mode specifically, but that is a
+   cosmetic issue we can shelve for now". The mechanism is frame PACING, not
+   the camera model: **`_FLY_TICK_MS = 16` is 62.5 Hz against a 60 Hz
+   display**, so the two beat at ~2.5 Hz and every ~0.4 s a presented frame
+   contains two integration steps or none. `dt` is wall-clock, so the physics
+   is correct and the SIMULATION is smooth; what is uneven is the sampling of
+   it, and the eye judges what is presented. Windows makes it worse - the
+   default system timer granularity is ~15.6 ms, so a 16 ms QTimer does not
+   fire at 16 ms.
+   **Why third person specifically, which is the part that identifies it.** In
+   the cockpit the camera is rigidly ON the cockpit atom, so ship and camera
+   share any sampling error EXACTLY and nothing looks wrong relative to
+   anything else. In the chase view the camera position is a lagging filter of
+   the ship's, so uneven sampling appears as relative motion between the two -
+   which is exactly what a sporadic wobble of the ship against the frame looks
+   like. That also means it cannot be tuned away in `follow`/`spring_lag`:
+   round 72 measured the per-tick screen step at 0.016 deg mean, and the
+   problem is WHEN those steps are shown, not how big they are.
+   **The fix is to integrate on the PAINT**: each presented frame advances by
+   the time since the last presented frame, so displayed motion is a function
+   of displayed time. Contained, because `_fly_tick(dt=)` stays the entry point
+   and the ~50 tests that drive it directly are unaffected - the timer becomes
+   a frame REQUESTER (`update()` only) and `paintGL` calls the tick with its
+   own dt. Two things to be careful of: an exception inside `paintGL` is
+   swallowed by Qt (see the gotchas), so the tick needs a guard there or a
+   physics bug becomes an invisible one; and `_end_fly` must not run from
+   inside a paint. The cheap partial, if the restructure is not wanted, is
+   `_FLY_TICK_MS = 8` - it halves the beat amplitude and touches nothing, at
+   the cost of doubling the per-tick rebuild that round 71 worked to reduce.
 7. **MOPAC as an add-on** (scoped 2026-08-10, NOT built — Christian: "the
    dependency is apparently tiny. Could probably run it in molom itself. But
    idk how well we can integrate that as an addon that doesn't mess with
