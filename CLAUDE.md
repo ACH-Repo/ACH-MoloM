@@ -198,6 +198,62 @@ other side, and the two export fixes are verified in `tools/smoke_gui.py`
 instead, which now measures the crop and counts ink with and without the cell
 box. 1310 tests.
 
+Round 73 (2026-08-14, MOPAC as an add-on - roadmap item 7, and the extension
+point is the whole design):
+Christian's constraint from the scoping was the design brief: "idk how well we
+can integrate that as an addon that doesn't mess with anything else in the
+software." **So `core/forcefield.py` gained a REGISTRY - a dict and a signature
+- and nothing else.** `register_method(key, label, callable)`, where the
+callable takes `optimize`'s own arguments minus the method. Core knows the
+contract and never the implementation: it does not import the add-on, does not
+know what a semiempirical method is, and holds no subprocess or binary
+discovery of its own. Every line that knows what MOPAC is lives in
+`molom/addons/mopac_optimize.py`, and disabling the add-on leaves core exactly
+the module it was. Pinned by a test that reads forcefield's IMPORTS via the AST
+rather than grepping its source for the word - the first cut did the latter and
+failed on the comment explaining the extension point, which is round 71's "a
+test that pinned the wrong thing" repeating within the hour.
+**The other half of "doesn't mess with anything else" is that it must not be a
+SECOND optimise panel.** A semiempirical method is the same gesture as a force
+field - pick a method, press Start, get a geometry - so it goes in the one
+Method list next to MMFF94 and UFF. `OptimizeDock.refresh_methods` rebuilds the
+combo on register/unregister (add-ons are enabled while the window is open) and
+PRESERVES the current selection, or enabling an unrelated add-on would silently
+drop the user back to MMFF94.
+**AN ADD-ON METHOD DOES NOT FALL BACK, deliberately.** Dropping MMFF94 -> UFF
+is a change of force field; dropping a Hamiltonian to a force field is a change
+of PHYSICS, and handing back an MMFF94 geometry labelled as the thing the user
+asked for is round 38's silent substitution. It reports instead.
+**Verified by RUNNING it (round 37's rule), and cross-checked against
+CHEMISTRY rather than against numbers I chose.** MOPAC v23.2.5 at
+`C:\Program Files\MOPAC\bin\mopac.exe` - note the `bin` level, which the first
+draft of the discovery list missed, so a perfectly ordinary default install
+found nothing. Water comes back at 0.956 A / 105.3 degrees with a heat of
+formation of **-57.800 kcal/mol**, which is the experimental value PM7 is
+fitted to - an independent statement that the whole path did what it claims.
+PtCl4(2-) gives four equal Pt-Cl at **2.321 A** against an experimental ~2.31,
+while MMFF94 has no parameters for platinum and quietly hands back a UFF guess:
+that gap is the entire reason the tier exists. And **frozen atoms move
+0.000000 A**, because MOPAC carries a per-COORDINATE optimisation flag in its
+geometry block - so round 62's bug (the tier every metal complex lands on was
+the one ignoring `fixed`) cannot recur here; the constraint IS the format.
+**The output is read through OPENBABEL's `mopout` reader**, driven by MoloM's
+own `_obabel_worker` subprocess, rather than by a parser written here - twenty
+years of C++ against the format's variants, the existing timeout guard for
+free, and no parser fixture invented from memory. `tests/data/
+mopac_pm7_water.out` is verbatim from a real run.
+**Two tests had to be rewritten within minutes of being written**, both for the
+same reason: they encoded "there is no MOPAC on this machine", which stopped
+being true half an hour later and would never have been true on the laptop. A
+test about the missing-binary path has to FORCE the absence
+(`monkeypatch.setattr(m, "find_mopac", ...)`), and the live jobs are behind a
+`skipif` so the suite is honest on a machine without it. 1545 tests.
+**Also this round: `docs/OPEN_ITEMS.md`** - every scoped-but-unbuilt item swept
+out of this file into one inventory, because they had accumulated across 73
+rounds of prose where nobody could see them at once. And
+**`docs/ISOSURFACES.md`**, answering Christian's design questions about where a
+physics-based visualisation would live before any of it is built.
+
 Round 72 (2026-08-13, the shuttle fixed for real - and the pattern is that
 every chase fix was written into ONE branch):
 Christian: "the last round was supposed to fix the issues, but they persist
@@ -3035,7 +3091,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1510 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1545 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -4794,7 +4850,12 @@ batches. Known next items, rough order:
    inside a paint. The cheap partial, if the restructure is not wanted, is
    `_FLY_TICK_MS = 8` - it halves the beat amplitude and touches nothing, at
    the cost of doubling the per-tick rebuild that round 71 worked to reduce.
-7. **MOPAC as an add-on** (scoped 2026-08-10, NOT built — Christian: "the
+7. ~~**MOPAC as an add-on**~~ **DELIVERED round 73** - built as the second
+   shape the scoping proposed (the add-on owns everything), plus the piece
+   it left open: a registry in `core/forcefield.py` so the methods appear in
+   the ONE Optimize panel instead of a parallel one nobody finds. See
+   `molom/addons/mopac_optimize.py`. Original scoping kept below.
+   (scoped 2026-08-10 — Christian: "the
    dependency is apparently tiny. Could probably run it in molom itself. But
    idk how well we can integrate that as an addon that doesn't mess with
    anything else in the software"). Semiempirical geometry optimisation and

@@ -62,9 +62,7 @@ class OptimizeDock(QDockWidget):
         form.addRow("Task:", self.task_combo)
 
         self.method_combo = QComboBox()
-        for key, label in forcefield.METHODS:
-            self.method_combo.addItem(label, key)
-        self.method_combo.setCurrentIndex(0)
+        self.refresh_methods()
         form.addRow("Method:", self.method_combo)
 
         self.steps_spin = QSpinBox()
@@ -95,6 +93,25 @@ class OptimizeDock(QDockWidget):
         self.setWidget(w)
         self.setFeatures(QDockWidget.DockWidgetClosable
                          | QDockWidget.DockWidgetMovable)
+
+    def refresh_methods(self):
+        """Rebuild the Method list from `forcefield.all_methods()`.
+
+        Called at construction and again whenever an ADD-ON registers or
+        removes a method, because add-ons are enabled and disabled while the
+        window is open (round 46) and a combo filled once at startup would
+        either miss a new method or keep offering one that has just gone.
+        The current selection is preserved where it survives, so enabling an
+        unrelated add-on cannot silently reset the user back to MMFF94.
+        """
+        keep = self.method_combo.currentData()
+        self.method_combo.blockSignals(True)
+        self.method_combo.clear()
+        for key, label in forcefield.all_methods():
+            self.method_combo.addItem(label, key)
+        index = self.method_combo.findData(keep)
+        self.method_combo.setCurrentIndex(max(index, 0))
+        self.method_combo.blockSignals(False)
 
     def _emit_start(self):
         self.start_requested.emit(self.task_combo.currentData(),

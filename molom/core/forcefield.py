@@ -26,6 +26,57 @@ METHODS = [
 ]
 DEFAULT_METHOD = "mmff94"     # same default as OWB / Avogadro
 
+#: Optimisers contributed by ADD-ONS, {key: (label, callable)}.
+#:
+#: This is the whole extension point, and it exists so that a method living
+#: entirely outside `core/` can still appear in the one Optimize panel rather
+#: than growing a second, parallel one that nobody finds. Core knows the
+#: CONTRACT and never the implementation: it does not import the add-on, does
+#: not know what a semiempirical method is, and holds no subprocess or
+#: binary-discovery code. Christian's constraint for MOPAC was "an addon that
+#: doesn't mess with anything else in the software", and a dict plus a
+#: signature is the smallest thing that satisfies it.
+#:
+#: The callable takes `(symbols, coords, bonds, steps, fixed)` — `optimize`'s
+#: own arguments minus the method — and returns `(coords, info)` with the same
+#: `info` keys the built-in tiers produce, or raises `ForceFieldError`.
+_EXTERNAL = {}
+
+
+def register_method(key, label, func):
+    # type: (str, str, object) -> None
+    """Add an optimiser to the Method list. Idempotent, so enabling an add-on
+    twice cannot double the entry."""
+    if not key or not callable(func):
+        raise ValueError("register_method needs a key and a callable")
+    _EXTERNAL[str(key)] = (str(label), func)
+
+
+def unregister_method(key):
+    # type: (str) -> None
+    """Remove one. Silent when it was never there, so an add-on's
+    `unregister` never has to guard against a half-finished `register`."""
+    _EXTERNAL.pop(str(key), None)
+
+
+def all_methods():
+    # type: () -> list
+    """`METHODS` plus whatever add-ons have registered, for the UI.
+
+    Built fresh on every call rather than cached: an add-on can be enabled or
+    disabled while the window is open, and a cached list is how the panel ends
+    up offering a method that has just been unregistered.
+    """
+    return list(METHODS) + [(k, lab) for k, (lab, _f) in _EXTERNAL.items()]
+
+
+def external_method(key):
+    # type: (str) -> object
+    """The callable for `key`, or None. Lets a caller ask "is this one of
+    ours?" without reaching into the registry."""
+    entry = _EXTERNAL.get(str(key))
+    return entry[1] if entry else None
+
 
 class ForceFieldError(Exception):
     """No backend could handle the molecule at all."""
@@ -243,6 +294,15 @@ def optimize(symbols, coords, bonds, method=DEFAULT_METHOD, steps=500,
         return np.asarray(coords, dtype=float).reshape(-1, 3), {
             "engine": "none", "method": method, "energy": 0.0,
             "converged": True, "notes": ["nothing to optimise"]}
+    # AN ADD-ON METHOD DOES NOT FALL BACK, and that is deliberate. Dropping
+    # from MMFF94 to UFF is a change of force field; dropping from a
+    # semiempirical Hamiltonian to a force field is a change of PHYSICS, and
+    # quietly returning an MMFF94 geometry labelled as the thing the user asked
+    # for is exactly the kind of silent substitution round 38 argued against.
+    # So it reports instead — the panel shows the message.
+    external = external_method(method)
+    if external is not None:
+        return external(symbols, coords, bonds, steps=steps, fixed=fixed)
     notes = []
     chain = [method]
     if method != "uff":

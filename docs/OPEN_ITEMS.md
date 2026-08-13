@@ -1,0 +1,226 @@
+# Open items
+
+Everything in CLAUDE.md that is scoped, measured or promised and **not done**,
+swept out of the round log on 2026-08-13 (after 0.4.0 and the MOPAC add-on).
+Struck-through items in CLAUDE.md are omitted; this is only what is left.
+
+Nothing here is urgent. It is an inventory, not a plan.
+
+---
+
+## A. Real bugs, measured and standing
+
+**A1. The meta-atom table is not reindexed on delete.** `meta.remap`/`prune`
+exist and are **not called from `edits.delete_atoms`**, so deleting atoms
+around a meta centre leaves the table pointing at the wrong index — a meta spec
+silently attached to some other atom. This is the round-42 "a per-atom map must
+survive a renumbering" rule with the fix already written and never wired up.
+*Smallest real bug on this list, and the one most likely to bite.*
+
+**A2. Third-person shuttle jitter** (roadmap 6b, diagnosed 2026-08-13).
+`_FLY_TICK_MS = 16` is 62.5 Hz against a 60 Hz display; the beat means a
+presented frame occasionally carries two integration steps or none. Cosmetic,
+third-person-only because the chase camera is a lagging filter of the ship
+while the cockpit camera is rigidly on it. Fix is to integrate on the paint.
+
+**A3. Editing a PACKED crystal desynchronises the boundary copies.** Flagged
+with a message in round 50, never fixed. Edits should operate on the cell
+CONTENT and re-pack. Related: `edits.adjust_bond_lengths` is cell-unaware and
+can push an atom across a face.
+
+**A4. Occupancy pie spheres may not survive asym-unit -> full-cell.** Reported
+in passing, never reproduced. Christian: "niche case... acceptable bug we can
+get to later". First step is written down: reproduce on
+`cod_1547149_solid_solution.cif`, check whether `site_occupancy`/`site_of`
+survives `packing.pack`'s rebuild.
+
+**A5. `4-ABA-oxime.cif` floats 36 unbonded hydrogens.** The disordered methyl's
+surplus H are drawn with no bonds, because dropping the BOND does not drop the
+ATOM. Resolving undeclared disorder geometrically would fix it, but on that
+carbon only two of four H pairs overlap, so a naive sweep leaves a 2-hydrogen
+methyl. **Needs a decision, not a patch.**
+
+**A6. The desktop-only selection flicker was fixed by inference, not by
+reproduction.** Overlays got their own buffers (round 35), which is right
+either way, but the flicker was never reproduced here — so "most likely cause"
+is still the honest description.
+
+---
+
+## B. Crystallography (roadmap 1b)
+
+**B1. Packing as an ARRAY MODIFIER** instead of the current destructive
+rebuild. The last piece of the "everything generative is a modifier" story;
+symmetry already went this way in round 29.
+
+**B2. The periodic bond graph is rebuilt per call, not cached.** `bondgraph`
+should be keyed on (cell, ops, filtered sites, bond rules). Correct today, just
+re-derived more often than it needs to be.
+
+**B3. Occupancy reaches an export only on the LOSSLESS path.** A re-derived
+cell writes 1.0 and says so. A shared site whose other species were merged away
+at import (round 45e's ordering flaw) cannot be recovered at all — the solid
+solution exports Nb 0.5 twice rather than Nb/Ti/Ni/Co.
+
+**B4. The disorder policy is applied at IMPORT**, so switching it re-reads the
+file rather than re-resolving in place.
+
+**B5. A CIF round-trip sweep.** Every CIF on the machine through
+read -> write -> read and diff. Stronger than the two vendored fixtures.
+
+**B6. A large disordered test set is still wanted.** Two MIL-53 files are the
+only real fixtures.
+
+**B7. `fit_view` frames the ATOMS**, so a cell box larger than its contents
+overflows the view.
+
+**B8. Read the CIF's own `_geom_bond_` loop as a tier.** Its third column IS
+the n_pqr code, i.e. a ready-made labelled graph. Cannot be trusted verbatim
+(it lists Na...Na 3.43 A as a bond) but "worth a tier one day".
+
+**B9. The per-object outliner row pattern was designed to be reused for
+PROTEINS.** Christian's call, 2026-08-02.
+
+### Sandbox / VESTA agreement (open questions, not bugs)
+**B10.** Bonds from a FULL-occupancy O to partial ones survive the
+alternatives rule — 1.475 A is exactly a peroxide bond, so no distance rule can
+reject it.
+**B11.** The shell growth is symmetric while VESTA's looks asymmetric (it adds
+O to metals but not metals to O).
+**B12.** On `4118335`, `Cu_trz_cub`, `2240539` our molecule completion is more
+generous than VESTA's, because VESTA wraps atoms individually and we wrap by
+molecule.
+
+---
+
+## C. Export and rendering
+
+**C1. KEYFRAME ANIMATION in the Blender export** (roadmap 7) — fully scoped,
+not built. Every atom is already its own object, so it is per-object keyframes
+on `location`, bonds on `matrix_world`. Two decisions first: bake every frame
+vs. source frames with explicitly-set LINEAR interpolation (Blender's default
+Bezier would not match MoloM's player); and what to do when connectivity
+changes mid-trajectory.
+
+**C2. Merge polyhedra per object in the Blender export.** A tick, default off,
+scoped to the polyhedra only — never the atoms, which must stay individually
+selectable. Measure a real ZIF export first; 500 small meshes may be fine.
+
+**C3. Offscreen supersampling** — render the GL scene into an FBO at 4-8x and
+downsample. No new dependency, no new look.
+
+**C4. POV-Ray** — evaluated and explicitly NOT recommended. Listed only so it
+does not get re-proposed.
+
+---
+
+## D. Timeline (roadmap 1c)
+
+**D1. Transform keyframes.** The recommendation is already written: keyframe
+the per-object TRANSFORM only (a sorted list of (time, value) per channel), and
+treat atom positions as the coordinate channel via the existing frame
+machinery, rather than building a second animation system. Estimated at about
+the size of the modifier stack.
+
+---
+
+## E. Polish, small items
+
+**E1. Outliner:** duplicate object, per-object fit/zoom, drag-reorder,
+multi-molecule arrangement helpers (align/snap — the maths is in OWB's
+`transform.py`, ready to port).
+
+**E2. Viewport:** depth-cue fog; numbered-frame outliner rows for trajectories.
+
+**E3. Input feel-check on real hardware** (roadmap 1): scroll SIGNS on both
+devices, the zoom step per detent (0.88^n), and whether mouse users want
+zoom-to-cursor rather than zoom-to-centre.
+
+**E4. Performance, if ever needed:** impostor (billboard) spheres; partial
+buffer updates during a grab instead of full rebuilds. Also worth re-measuring
+a real frame with a packed MOF on screen — round 50 fixed the biggest cost in
+the paint path, but it need not have been the only one.
+
+---
+
+## F. OWB integration (roadmap 5)
+
+**F1.** Point ORCA Workbench's `viewer_3d_path`/`editor_3d_path` at `molom`.
+**F2.** A `--select i,j,k` CLI so geomspec atom indices can be read.
+**F3.** xyz round-trip with `coords_locked` on reload.
+
+*This is the item that motivated the whole project and is the least advanced.*
+
+---
+
+## G. New direction: physics-based visualisation
+
+Raised 2026-08-13: "There is stuff in avogadro and vesta etc. that is more
+physics based like iso-surfaces that we do not do at all."
+
+Correct — MoloM draws **structure** and nothing derived from a wavefunction or
+a field. The candidates, roughly in order of value per unit of work:
+
+- **Molecular orbitals / electron density** from a cube file. ORCA already
+  writes them (`orca_plot`), and MOPAC can too, so the data path exists.
+- **Electrostatic potential mapped onto a density surface** — the picture
+  everyone actually wants, and it is the same machinery plus a colour lookup.
+- **Spin density**, same machinery again.
+- **Vibrational displacement vectors as arrows** — trivial next to the above,
+  since the eigenvectors are already parsed (`core/vibrations.py`).
+- **Simulated PXRD from a loaded CIF** — structure factors are a closed-form
+  sum over the asymmetric unit and the symmetry is already in metadata. This
+  one needs no new file format at all.
+- **Voids / solvent-accessible surface** for the framework work — same
+  isosurface machinery over a distance field rather than a wavefunction.
+
+The shared piece is **one isosurface pipeline**: a scalar field on a grid ->
+marching cubes -> a mesh with optional per-vertex colour. Everything above is
+that one pipeline with a different field and a different colour source.
+
+See `docs/ISOSURFACES.md` for where such an object would live.
+
+---
+
+## H. Long term: MoloM as an interactive teaching tool
+
+Raised 2026-08-13, explicitly **not a priority and not part of the base
+install**: "I think molom could be more than just a visualiser... interactive,
+visual educational purposes. Like: Show how diffracted x-rays at a unit cell
+schematically lead to certain reflections and how those end up on a PXRD
+pattern. Perhaps even as a small game engine in which you need to progress
+through a platforming section by solving chemical problems in a visual way. I
+am thinking of games like The Talos Principle as a template."
+
+Two quite different things, and they should be kept apart because one is
+cheap and one is a project of its own.
+
+**H1. Interactive demonstrations of things MoloM already knows.** These are
+small, because the physics is already in the repo:
+- *Diffraction -> reflections -> PXRD.* The cell, the operators and the site
+  occupancies are in metadata; the structure factor is a closed-form sum. The
+  demonstration is the same arithmetic drawn instead of tabulated — Ewald
+  sphere, reciprocal lattice, the reflections lighting up as the crystal
+  turns, the pattern building underneath.
+- *Symmetry operations acting on an asymmetric unit.* Already drawn as glyphs
+  and ghosts (round 25/26); making them step, one operation at a time, is a
+  presentation of what is there.
+- *Normal modes.* Already animate. Naming them and asking the user to pick
+  the C=O stretch is a quiz over existing machinery.
+These fit MoloM as it is. They want a presentation MODE, not an engine.
+
+**H2. The game.** A platformer with chemical puzzles is a different program
+that happens to share a renderer, and the honest scoping note is that MoloM's
+viewport is an orbit/fly camera over instanced meshes with no collision, no
+character controller, no level format and no scripting. That is not an
+argument against it — the shuttle flight model (`core/flight.py`) is already
+a real 6DoF physics model with acceleration, drag and a chase camera, which is
+further along than it sounds. But it belongs as a **separate application built
+on molom as a library**, not as an add-on inside the viewer, and the first
+step would be making `molom` importable as a rendering library with a scene
+you can drive — which is roughly what `core/` already is.
+
+The cheap first move, if this is ever picked up, is H1's PXRD demonstration:
+it is useful to a working crystallographer on its own merits, it needs no new
+dependency, and it would tell you whether the "explain a thing visually" mode
+is worth building out before anything is bet on it.
