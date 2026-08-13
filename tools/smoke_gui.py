@@ -148,6 +148,77 @@ def main(paths):
         app.processEvents()
         grab("96_camera_gizmo_selected")
 
+    def export_steps():
+        """`render_image` needs a LIVE GL context — it builds an FBO — so a
+        headless pytest run cannot touch it (it segfaults on
+        `QOpenGLFramebufferObject`). These two are round 60's fixes and this is
+        the only place they can be checked against real pixels.
+        """
+        print("image export")
+        data = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "tests", "data")
+        cif = os.path.join(data, "cod_2101932_ferrocene.cif")
+        if not os.path.exists(cif):
+            return
+        win.open_path(cif)
+        win.viewport.show_cell = True
+        win.viewport.fit_view()
+        app.processEvents()
+
+        def ink(image):
+            """Non-transparent samples — a cheap "how much was drawn"."""
+            return sum(1 for y in range(0, image.height(), 4)
+                       for x in range(0, image.width(), 4)
+                       if (image.pixel(x, y) >> 24) & 0xFF)
+
+        full = win.viewport.render_image(crop_to_content=False)
+        tight = win.viewport.render_image(crop_to_content=True)
+        full.save(os.path.join(OUT, "98_export_full.png"))
+        tight.save(os.path.join(OUT, "98_export_cropped.png"))
+        shrank = (tight.width() < full.width()
+                  or tight.height() < full.height())
+        print("  crop to content: {}x{} -> {}x{} {}".format(
+            full.width(), full.height(), tight.width(), tight.height(),
+            "OK" if shrank else "DID NOT SHRINK"))
+        if not shrank:
+            FAILURES.append("crop_to_content did not shrink the image")
+
+        # The unit cell must reach the exported image (it used to be gated on
+        # `furniture=`, which the still export never passes).
+        with_box = ink(full)
+        win.viewport.show_cell = False
+        without = win.viewport.render_image(crop_to_content=False)
+        win.viewport.show_cell = True
+        print("  cell box in export: ink {} with, {} without {}".format(
+            with_box, ink(without),
+            "OK" if with_box > ink(without) else "MISSING"))
+        if with_box <= ink(without):
+            FAILURES.append("the unit cell box is missing from render_image")
+
+    def measure_steps():
+        """Persistent measurements: several at once, one of them highlighted as
+        the Delete target. `_paint_measure` is a paint path, so a raise here is
+        exactly what this tool exists to catch."""
+        print("measurements")
+        obj = win._active_obj()
+        if obj is None or obj.structure.n_atoms < 5:
+            return
+        vp = win.viewport
+        vp.set_measure_tool(True)
+        vp._measure_picks = [(obj.id, 0), (obj.id, 1)]
+        first = vp.commit_measurement()
+        vp._measure_picks = [(obj.id, 1), (obj.id, 2), (obj.id, 3)]
+        vp.commit_measurement()
+        vp._measure_picks = [(obj.id, 3), (obj.id, 4)]      # live, dashed
+        vp._hover_measurement = first                        # highlighted
+        grab("99_measurements")
+        print("  kept {}, clickable rects {}".format(
+            len(vp.measurements), len(vp._measure_hits)))
+        if len(vp._measure_hits) != len(vp.measurements):
+            FAILURES.append("a kept measurement has no clickable label rect")
+        vp.clear_measurements()
+        vp.set_measure_tool(False)
+
     def vibration_steps():
         """A baked normal mode with a selection on it: the bonds must survive
         the squeeze and the orange hull must track the interpolated atoms."""
@@ -176,6 +247,8 @@ def main(paths):
         try:
             grab("00_startup")
             camera_steps()
+            export_steps()
+            measure_steps()
             vibration_steps()
             for index, path in enumerate(paths):
                 if not os.path.exists(path):

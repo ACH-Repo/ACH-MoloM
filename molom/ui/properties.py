@@ -13,6 +13,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QDoubleValidator
 
 from . import dragcheck
+from .widgets import make_text_selectable
 from ..core import cameras
 from ..core import vibrations
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDockWidget,
@@ -454,6 +455,10 @@ class CrystalPage(QWidget):
     refused_toggled = Signal(bool)
     symmetry_toggled = Signal(bool)
     ghosts_toggled = Signal(bool)
+    cell_apply_requested = Signal()
+    cell_suggest_requested = Signal()
+    cell_remove_requested = Signal()
+    frac_apply_requested = Signal()
 
     #: Has the ACTIVE molecule's cell been edited into P1?
     _frozen = False
@@ -502,6 +507,131 @@ class CrystalPage(QWidget):
         self.detail.setOpenExternalLinks(True)
         self.detail.hide()
         lay.addWidget(self.detail)
+
+        # ------------------------------------------------ define / edit it
+        # Everything else on this page CONSUMES a cell that came from a file.
+        # Without this a molecule with no cell could never be given one, and an
+        # imported cell could never be corrected.
+        self._cell_arrow = QToolButton()
+        self._cell_arrow.setArrowType(Qt.RightArrow)
+        self._cell_arrow.setAutoRaise(True)
+        self._cell_arrow.setText("Define / edit the cell")
+        self._cell_arrow.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._cell_arrow.setToolTip(
+            "Set a, b, c and the angles - or put a box around a molecule that "
+            "has none")
+        self._cell_arrow.clicked.connect(lambda _c=False: self._toggle_editor())
+        lay.addWidget(self._cell_arrow)
+
+        self.cell_editor = QWidget()
+        edit_lay = QFormLayout(self.cell_editor)
+        edit_lay.setContentsMargins(6, 2, 2, 2)
+        self.cell_edits = {}
+        for key, label, lo, hi, step in (
+                ("a", "a (A):", 0.01, 10000.0, 0.1),
+                ("b", "b (A):", 0.01, 10000.0, 0.1),
+                ("c", "c (A):", 0.01, 10000.0, 0.1),
+                ("alpha", "alpha (deg):", 1.0, 179.0, 1.0),
+                ("beta", "beta (deg):", 1.0, 179.0, 1.0),
+                ("gamma", "gamma (deg):", 1.0, 179.0, 1.0)):
+            box = QDoubleSpinBox()
+            box.setDecimals(4 if key in ("a", "b", "c") else 3)
+            box.setRange(lo, hi)
+            box.setSingleStep(step)
+            box.setValue(90.0 if key not in ("a", "b", "c") else 10.0)
+            self.cell_edits[key] = box
+            edit_lay.addRow(label, box)
+
+        self.cell_keep_frac = QCheckBox("Keep fractional coordinates")
+        self.cell_keep_frac.setChecked(True)
+        self.cell_keep_frac.setToolTip(
+            "ON: the atoms keep their fractional positions and move with the "
+            "box, so the structure stretches with it. That is what a cell edit "
+            "means crystallographically - fractional coordinates ARE the "
+            "structure and a, b, c are the frame they sit in.\n\n"
+            "OFF: the atoms stay exactly where they are and only the drawn box "
+            "changes, which is what you want when putting a box around a "
+            "molecule that never had one.")
+        edit_lay.addRow("", self.cell_keep_frac)
+
+        self.cell_group = QLineEdit()
+        self.cell_group.setPlaceholderText("P 1")
+        self.cell_group.setToolTip(
+            "Space-group symbol, e.g. P 21/c. Left empty it stays P1, which is "
+            "true of every arrangement of atoms and is the only honest default "
+            "for a cell you have just drawn.")
+        edit_lay.addRow("Space group:", self.cell_group)
+
+        row = QHBoxLayout()
+        self.cell_apply = QPushButton("Apply")
+        self.cell_apply.clicked.connect(
+            lambda _c=False: self.cell_apply_requested.emit())
+        self.cell_suggest = QPushButton("Fit to molecule")
+        self.cell_suggest.setToolTip(
+            "Fill the fields with the molecule's bounding box plus a margin, "
+            "so there is something sensible to adjust rather than 1x1x1")
+        self.cell_suggest.clicked.connect(
+            lambda _c=False: self.cell_suggest_requested.emit())
+        self.cell_remove = QPushButton("Remove cell")
+        self.cell_remove.setToolTip(
+            "Drop the cell and its symmetry, leaving the atoms where they are")
+        self.cell_remove.clicked.connect(
+            lambda _c=False: self.cell_remove_requested.emit())
+        for widget in (self.cell_apply, self.cell_suggest, self.cell_remove):
+            row.addWidget(widget)
+        edit_lay.addRow("", self._wrap(row))
+        self.cell_note = QLabel("")
+        self.cell_note.setWordWrap(True)
+        self.cell_note.setStyleSheet("color: #c8a45a;")
+        edit_lay.addRow("", self.cell_note)
+        self.cell_editor.hide()
+        lay.addWidget(self.cell_editor)
+
+        # ------------------------------------- fractional coordinate entry
+        # "a quarter along a" is a statement about the STRUCTURE; 3.47 A is a
+        # statement about this particular cell. Typing a site is how a
+        # structure gets built by hand, and it needs the cell to be a fraction
+        # OF - so it lives here rather than in the N panel.
+        self._frac_arrow = QToolButton()
+        self._frac_arrow.setArrowType(Qt.RightArrow)
+        self._frac_arrow.setAutoRaise(True)
+        self._frac_arrow.setText("Atom position (fractional)")
+        self._frac_arrow.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._frac_arrow.setToolTip(
+            "Read and type the selected atom's position in cell fractions")
+        self._frac_arrow.clicked.connect(lambda _c=False: self._toggle_frac())
+        lay.addWidget(self._frac_arrow)
+
+        self.frac_editor = QWidget()
+        frac_lay = QFormLayout(self.frac_editor)
+        frac_lay.setContentsMargins(6, 2, 2, 2)
+        self.frac_edits = {}
+        for key in ("x", "y", "z"):
+            box = QDoubleSpinBox()
+            box.setDecimals(5)
+            box.setRange(-99.0, 99.0)
+            box.setSingleStep(0.05)
+            self.frac_edits[key] = box
+            frac_lay.addRow("{} /a{}".format(key, ""), box)
+        self.frac_wrap = QCheckBox("Wrap into the cell")
+        self.frac_wrap.setToolTip(
+            "Bring the result into [0, 1). What you want when typing a site "
+            "into a cell, and NOT what you want when nudging an atom that "
+            "legitimately sits outside one - a boundary copy, or a molecule "
+            "that has been unwrapped.")
+        frac_lay.addRow("", self.frac_wrap)
+        frac_row = QHBoxLayout()
+        self.frac_apply = QPushButton("Move atom")
+        self.frac_apply.clicked.connect(
+            lambda _c=False: self.frac_apply_requested.emit())
+        frac_row.addWidget(self.frac_apply)
+        frac_lay.addRow("", self._wrap(frac_row))
+        self.frac_note = QLabel("")
+        self.frac_note.setWordWrap(True)
+        self.frac_note.setStyleSheet("color: #c8a45a;")
+        frac_lay.addRow("", self.frac_note)
+        self.frac_editor.hide()
+        lay.addWidget(self.frac_editor)
 
         self.box_check = QCheckBox("Show unit cell box")
         self.box_check.setChecked(True)
@@ -742,6 +872,81 @@ class CrystalPage(QWidget):
         self.view_changed.emit(mode, self.na.value(), self.nb.value(),
                                self.nc.value())
 
+    @staticmethod
+    def _wrap(layout):
+        """A QWidget around a layout, so it can go in a form row."""
+        holder = QWidget()
+        layout.setContentsMargins(0, 0, 0, 0)
+        holder.setLayout(layout)
+        return holder
+
+    def _toggle_editor(self, force=None):
+        """Show or hide the cell editor.
+
+        `isHidden`, never `isVisible`: this page lives on a QStackedWidget
+        inside a dock that is usually closed, so `isVisible` is False for a
+        perfectly live widget and the arrow would only ever expand (round 34).
+        """
+        show = self.cell_editor.isHidden() if force is None else bool(force)
+        self.cell_editor.setVisible(show)
+        self._cell_arrow.setArrowType(Qt.DownArrow if show else Qt.RightArrow)
+
+    def cell_fields(self):
+        """The six numbers and the space-group text, as typed."""
+        return ({key: float(box.value())
+                 for key, box in self.cell_edits.items()},
+                self.cell_group.text().strip(),
+                bool(self.cell_keep_frac.isChecked()))
+
+    def set_cell_fields(self, cell, spacegroup=""):
+        """Write the editor from a cell, without firing anything."""
+        if cell is None:
+            return
+        self._loading = True
+        try:
+            for key, box in self.cell_edits.items():
+                box.setValue(float(getattr(cell, key)))
+            if spacegroup:
+                self.cell_group.setText(str(spacegroup))
+        finally:
+            self._loading = False
+
+    def _toggle_frac(self, force=None):
+        show = self.frac_editor.isHidden() if force is None else bool(force)
+        self.frac_editor.setVisible(show)
+        self._frac_arrow.setArrowType(Qt.DownArrow if show else Qt.RightArrow)
+
+    def frac_fields(self):
+        """The three typed fractions, and whether to wrap them."""
+        return ([float(self.frac_edits[k].value()) for k in ("x", "y", "z")],
+                bool(self.frac_wrap.isChecked()))
+
+    def set_frac_fields(self, frac, label=""):
+        """Show one atom's fractional position, or grey the block out.
+
+        `frac=None` means there is nothing to edit - no cell, or not exactly
+        one atom picked - and the block says which rather than offering three
+        live-looking fields that would apply to nothing.
+        """
+        enabled = frac is not None
+        self.frac_editor.setEnabled(enabled)
+        if not enabled:
+            self.frac_note.setText(
+                "Select exactly ONE atom on a molecule that has a cell.")
+            return
+        self._loading = True
+        try:
+            for key, value in zip(("x", "y", "z"), frac):
+                self.frac_edits[key].setValue(float(value))
+        finally:
+            self._loading = False
+        self.frac_note.setText(label or "")
+
+    def set_cell_note(self, text, error=False):
+        self.cell_note.setText(text or "")
+        self.cell_note.setStyleSheet(
+            "color: #ff9d7a;" if error else "color: #c8a45a;")
+
     def _toggle_detail(self, force=None):
         """Expand/collapse the file-details block.
 
@@ -970,6 +1175,32 @@ class CrystalPage(QWidget):
         self._loading = False
 
 
+class _ModeRow(QFrame):
+    """One mode, as a single clickable row.
+
+    A QFrame rather than a QPushButton so the stylesheet, the layout and the
+    child labels all behave exactly as they did when this was a card - only the
+    click is new. `WA_StyledBackground` is required or a plain QWidget subclass
+    ignores its own stylesheet background (the round-35 crystal-ribbon trap).
+    """
+
+    clicked = Signal(int)
+
+    def __init__(self, index, parent=None):
+        super().__init__(parent)
+        self._index = int(index)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mouseReleaseEvent(self, ev):
+        # On RELEASE, and only if it came up inside the row - the same contract
+        # every other button in the app has, so a press-and-drag-away cancels.
+        if ev.button() == Qt.LeftButton and self.rect().contains(
+                ev.position().toPoint()):
+            self.clicked.emit(self._index)
+        super().mouseReleaseEvent(ev)
+
+
 class VibrationPage(QWidget):
     """Normal modes of a FREQ job: one card per mode, over the settings that
     turn a mode into frames.
@@ -1060,11 +1291,25 @@ class VibrationPage(QWidget):
         self.sort_combo = QComboBox()
         self.sort_combo.addItem("Frequency", vibrations.SORT_FREQUENCY)
         self.sort_combo.addItem("IR intensity", vibrations.SORT_INTENSITY)
-        self.sort_combo.setMaximumWidth(130)
+        self.sort_combo.addItem("Viewport selection", vibrations.SORT_SELECTION)
+        self.sort_combo.setMaximumWidth(160)
         self.sort_combo.setToolTip(
             "Frequency lists the spectrum in order; IR intensity puts the "
-            "bands you would actually see at the top")
+            "bands you would actually see at the top; Viewport selection puts "
+            "the modes that move the SELECTED atoms most at the top.")
         form.addRow("Sort by:", self.sort_combo)
+
+        self.mass_check = QCheckBox("Mass-weight the selection ranking")
+        self.mass_check.setChecked(True)
+        self.mass_check.setToolTip(
+            "An eigenvector is a CARTESIAN displacement, so a C-H stretch is "
+            "nearly all hydrogen motion by amplitude — unweighted, every mode "
+            "involving a hydrogen scores highly and picking a heavy atom "
+            "returns almost nothing. Weighting by mass measures the share of "
+            "the kinetic energy instead, which is what 'this mode belongs to "
+            "that part of the molecule' actually means.")
+        self.mass_check.toggled.connect(lambda _on: self._rebuild())
+        form.addRow("", self.mass_check)
 
         self.low_edit = QLineEdit()
         self.high_edit = QLineEdit()
@@ -1111,7 +1356,12 @@ class VibrationPage(QWidget):
         self.amp_slider.valueChanged.connect(self._on_amp_slider)
         self.amp_spin.valueChanged.connect(self._on_amp_typed)
         self.frames_spin.valueChanged.connect(self._emit_settings)
-        self.sort_combo.currentIndexChanged.connect(lambda _i: self._rebuild())
+        self.sort_combo.currentIndexChanged.connect(
+            lambda _i: self._sort_changed())
+        #: The viewport selection, pushed in by the window (see set_selection).
+        self._selection = []
+        self._symbols = []
+        self.mass_check.setVisible(False)   # only meaningful for that ordering
         for edit in (self.low_edit, self.high_edit):
             edit.textChanged.connect(lambda _t: self._rebuild())
         dragcheck.install(self)
@@ -1191,6 +1441,28 @@ class VibrationPage(QWidget):
         except ValueError:
             return None
 
+    def _sort_changed(self):
+        """The mass-weighting tick only means anything for the selection
+        ranking, so it appears with it rather than sitting there inert."""
+        self.mass_check.setVisible(
+            self.sort_combo.currentData() == vibrations.SORT_SELECTION)
+        self._rebuild()
+
+    def set_selection(self, indices, symbols=None):
+        """Which atoms are picked in the viewport, for the selection ranking.
+
+        Stored rather than pulled: this page has no reference to the viewport,
+        and giving it one to answer a sorting question would be the wrong way
+        round. The window pushes it on every selection change and the list
+        re-sorts itself only when that ordering is actually in use.
+        """
+        self._selection = sorted({int(i) for i in (indices or ())})
+        self._symbols = list(symbols or [])
+        self.mass_check.setVisible(
+            self.sort_combo.currentData() == vibrations.SORT_SELECTION)
+        if self.sort_combo.currentData() == vibrations.SORT_SELECTION:
+            self._rebuild()
+
     def visible_modes(self):
         # type: () -> list
         """The modes the list is currently showing, in list order."""
@@ -1198,7 +1470,11 @@ class VibrationPage(QWidget):
             self._modes, self._number(self.low_edit),
             self._number(self.high_edit),
             include_trivial=self.trivial_check.isChecked())
-        return vibrations.sort_modes(shown, self.sort_combo.currentData())
+        return vibrations.sort_modes(
+            shown, self.sort_combo.currentData(),
+            selection=getattr(self, "_selection", None),
+            symbols=getattr(self, "_symbols", None),
+            mass_weighted=self.mass_check.isChecked())
 
     def _rebuild(self):
         while self.column.count():
@@ -1224,15 +1500,23 @@ class VibrationPage(QWidget):
         one belong to the whole FREQ object and are now at the top of the
         page, so a card is a single scannable line.
         """
-        card = QFrame()
-        card.setFrameShape(QFrame.StyledPanel)
+        # THE WHOLE ROW is the button. There used to be a frame holding a
+        # second framed widget holding an "A" button, which is three nested
+        # boxes to say one thing - and once the selection share was added the
+        # button was pushed off the right edge of a narrow dock. A row that
+        # does one thing should be one clickable row.
+        card = _ModeRow(mode.index)
+        card.clicked.connect(self.mode_selected.emit)
         lit = 34 if self._active == mode.index else 10
         card.setStyleSheet(
-            "QFrame {{ background: rgba(255,255,255,{}); border: 1px solid"
-            " rgba(0,0,0,60); border-radius: 4px; }}".format(lit))
+            "_ModeRow {{ background: rgba(255,255,255,{}); border: 1px solid"
+            " rgba(0,0,0,60); border-radius: 4px; }}"
+            "_ModeRow:hover {{ background: rgba(255,255,255,26); }}"
+            .format(lit))
+        card.setToolTip("Animate this mode (adds it to the player track)")
         head = QHBoxLayout(card)
-        head.setContentsMargins(6, 2, 4, 2)
-        head.setSpacing(4)
+        head.setContentsMargins(8, 4, 8, 4)
+        head.setSpacing(6)
 
         title = QLabel("{:.2f} cm-1".format(mode.wavenumber))
         if mode.is_imaginary:
@@ -1250,16 +1534,29 @@ class VibrationPage(QWidget):
         intensity.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         intensity.setMinimumWidth(38)
 
-        play = QToolButton()
-        play.setText("A")            # a LETTER, per the outliner convention
-        play.setAutoRaise(True)
-        play.setToolTip("Animate this mode (adds it to the player track)")
-        play.clicked.connect(
-            lambda _c=False, i=mode.index: self.mode_selected.emit(i))
+        # Same rule for the selection share — when that is the ordering, the
+        # number it sorted on has to be visible on the row.
+        share = None
+        selection = getattr(self, "_selection", None)
+        if selection and self.sort_combo.currentData() == \
+                vibrations.SORT_SELECTION:
+            weight = vibrations.selection_weight(
+                mode, selection, getattr(self, "_symbols", None),
+                self.mass_check.isChecked())
+            share = QLabel("{:.0f}%".format(weight * 100.0))
+            share.setStyleSheet(
+                "color: rgba(255,200,120,{});".format(
+                    220 if weight >= 0.2 else 130))
+            share.setToolTip(
+                "Share of this mode's motion carried by the {} selected "
+                "atom(s)".format(len(selection)))
+            share.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            share.setMinimumWidth(38)
 
         head.addWidget(title, 1)
+        if share is not None:
+            head.addWidget(share)
         head.addWidget(intensity)
-        head.addWidget(play)
         return card
 
 
@@ -1305,6 +1602,11 @@ class PropertiesDock(QDockWidget):
         lay.addLayout(strip)
         lay.addWidget(self.stack, 1)
         self.setWidget(root)
+        # Anything this dock COMPUTES and displays is worth copying — a
+        # frequency, a density, a space group, a formula. Applied to the whole
+        # dock rather than label by label so a page added later cannot quietly
+        # be the unselectable one.
+        make_text_selectable(root)
         if pages:
             self.show_page(pages[0][0])
 
@@ -1334,6 +1636,7 @@ class PropertiesDock(QDockWidget):
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.stack.addWidget(scroll)
+        make_text_selectable(widget)      # add-on pages too
 
     def remove_page(self, key):
         """Take a page away again. Best effort — see `AddOnManager.disable`."""

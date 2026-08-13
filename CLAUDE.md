@@ -119,6 +119,587 @@ so they only appear once `docs/screenshots/` is pushed to `main`. `twine check
 --strict` passes both artefacts; the built wheel was installed and its
 `--selftest` run. 1281 tests. **NOT UPLOADED — that is Christian's to run.**
 
+Round 60 (2026-08-11, Christian's post-release batch — three gestures, two
+exports, one bug that hid in plain sight):
+**(1) Ctrl+drag and Shift+drag inside a camera did the SAME THING**, and the
+reason is a single line: round 58 sent EVERY scroll to `zoom_camera_frame` on
+the argument that a camera being looked through must not move, so both
+modifiers fell through to the frame zoom. The argument holds for the plain
+gesture and not for a held modifier — which is round 59's own reasoning for
+putting re-framing on Shift+drag. So **Ctrl+scroll now DOLLIES** (`dolly_camera`
+walks `cam.distance`, and round 58's `scale = Z / distance` is what makes that
+visibly different from a lens change: the frame keeps its size while everything
+inside it grows) and **Shift+scroll TRUCKS**. Keyed on the MODIFIERS, not on
+`input_map`'s resolved action, deliberately: a mouse resolves a plain wheel to
+ZOOM and a trackpad resolves it to ORBIT, so keying off the action would make
+the unmodified gesture mean two different things on the two dev machines, which
+is the round-16 mistake. **A scroll has no release**, so the one-undo-step-per-
+gesture flag needed a timeout — `_begin_camera_gesture` reuses `_GESTURE_GAP_S`
+(0.6 s), the same constant `_orbit_input` uses, or the first Ctrl+scroll of a
+session would have swallowed every later one into its undo step.
+**(2) `render_image`'s `furniture=False` was excluding SCENE CONTENT**, not
+furniture. Christian reported the visible half — "screenshots of cifs are
+missing the unit cell boundaries, not legible without them" — but the same gate
+was also dropping coordination polyhedra, occupancy pie spheres, symmetry
+elements and, worst, the WIREFRAME buffer, so exporting a wireframe-styled
+molecule produced an empty picture. Every one of those is already behind its own
+user-facing toggle, so they are now unconditional and `furniture` means only the
+atom LABELS (round 13's argument against labels in a published still stands; it
+never applied to the cell box). The genuine furniture — compass, grid, origin
+dot, selection halos — was never in `render_image` at all, which is why the
+conflation survived.
+**(3) "Crop to content"** (`core/crop.py` + a Settings tick): the viewport is
+whatever shape the window happens to be and the molecule sits wherever the
+camera left it, so an export routinely carries a third of its pixels as dead
+background. The geometry is in `core/` and takes a numpy mask, so every rule is
+testable with no GL: an ALPHA mask for a transparent export and a COLOUR mask
+against the background for an opaque one, a margin, a floor, and an `aspect`
+that only ever GROWS the box (shrinking to a ratio would crop away the content
+just asked for). Applied AFTER the camera crop, because a film back is a
+deliberate framing and must win. Measured: 1260x1292 -> 882x746 on ferrocene.
+**The QImage->numpy bridge is the part that bites**: `bytesPerLine` can exceed
+`4 * width`, and assuming a tight buffer shears the image, so the stride is read
+and the pixels sliced back out.
+**(4) A SUPERCELL DREW NO BONDS**, and it is a pure omission with a
+long-lived cover story. `build_view`'s packing branch replicated `symbols` and
+`coords` per lattice offset and never touched the bonds, so
+`report["packed_bonds"]` still described ONE cell while the atom list had grown
+by `na*nb*nc` — every cell past the first came out as loose spheres. Nothing
+failed and nothing warned; it just looked like a cloud. Fixed by replicating the
+bonds with the index stride, and — the part that needed thought — remapping them
+through the coincident-atom merge. `_first_of_coincident` returned only a keep
+mask, so it could say an atom was dropped but not WHICH atom it was the same as;
+`_coincident_map` now also returns `canonical`, because a dropped atom is not
+lost, it is the same physical atom as the one it landed on, and the bonds that
+reference it are exactly the ones crossing an internal face of the block, i.e.
+the ones holding the supercell together. Verified as an invariant rather than a
+number: bonds/atoms is 1.4286 for 1x1x1, 2x1x1, 2x2x1 and 2x2x2 alike.
+**(5) MEASUREMENTS PERSIST** — "persistent in the viewport, but deletable by
+selecting + Delete or hovering over them + Delete". Several live at once,
+committed on the click that would have started a new one (previously that click
+silently discarded the finished measurement), drawn SOLID where a live one is
+dashed, and the hovered or selected one drawn white, which is what makes
+"hover + Delete" discoverable rather than secret. Two decisions worth keeping:
+they live on the VIEWPORT and not in the scene, so they stay out of
+`Scene.snapshot`'s four-place checklist (round 31) and out of savefiles — a
+measurement is an annotation on the current view; and `selected_measurement` is
+a separate field from `selection` for round 56's reason, because a measurement
+owns no atoms and every loop over `(obj_id, atom)` would otherwise have to learn
+to skip it. **The Delete key needed the operator's PREDICATE widened**:
+`run_op` refuses a disabled operator, so `enabled=sel` meant the key never
+reached the measurement when no atoms were selected — `has_measurement_target()`
+is public for exactly that. Stale-pruning was extracted out of `_paint_measure`
+into `prune_measurements()`: pruning inside a paint path is a hidden mutation
+that only fires once a frame is drawn, and it is untestable offscreen.
+**`render_image` cannot be tested by pytest at all** — it builds an FBO, and
+`QOpenGLFramebufferObject` with no live context is an ACCESS VIOLATION that
+takes the whole run down, not an exception. That is the round-48 lesson from the
+other side, and the two export fixes are verified in `tools/smoke_gui.py`
+instead, which now measures the crop and counts ink with and without the cell
+box. 1310 tests.
+
+Round 72 (2026-08-13, the shuttle fixed for real - and the pattern is that
+every chase fix was written into ONE branch):
+Christian: "the last round was supposed to fix the issues, but they persist
+unchanged." He was right on all three, and the reason is worth stating once
+because it caused this three rounds running: **rounds 69, 70 and 71 each fixed
+a real bug in the THIRD-PERSON branch and left the identical bug standing in
+first person**, while the round notes recorded the fix as done. Round 70's own
+test is the confession - it asserted the string `"self._cockpit_pos(obj) if
+chase else obj.origin"` appears in the source, i.e. it pinned the line that was
+wrong and passed for as long as the code kept being wrong.
+**(1) FIRST PERSON HAD ROUND 69'S AND ROUND 70'S BUGS, both of them.** The
+camera was re-anchored inside `_fly_object`, so it followed the ship when it
+TRANSLATED and not when it merely turned (round 69's scoping bug, fixed then
+for the chase camera only); and `_fly_turn` still rotated the molecule about
+`obj.origin`, on a comment claiming "first person is already the centroid AND
+the eye" - which round 71 had itself disproved by measuring 8.10 A between the
+two on this very file. Measured: three seconds of pure steering, no thrust,
+took the eye from 0.35 A off the picked atom to **9.41 A**. So round 71 fixed
+where the cockpit STARTS and left it leaving the instant you fly it. Now
+`_follow_cockpit` runs every tick for both modes (snapping in the cockpit,
+easing in the chase - there is nothing to lag behind when the eye IS the ship)
+and both modes pivot on the cockpit. A pure turn moves the cockpit atom
+0.0000 A in either mode.
+**(2) "ALL YOU SEE IS THE INSIDE OF AN ATOM" HAD FIVE SEPARATE CAUSES**, and
+the loudest one no offline test could ever have shown. `cam.distance = 0.35`
+flat, against an ordinary carbon drawn at **0.409** - and the camera looks AT
+that atom - so the eye was inside the sphere; `flight.cockpit_distance` clears
+the atom's own DRAWN radius (read the same way `_build_object_block` computes
+it, or the clearance is measured against a number nobody renders), and the cull
+is widened to cover where the eye now stands. Then four things kept putting
+geometry back in front of the lens. **The cull hid an atom's SPHERE and kept
+its BONDS**, so the eye sat inside the cylinders, which looks identical.
+**Round 71's draw cache froze a camera-dependent mask** - `_shuttle_hidden`
+measures every atom against the EYE, which moves every tick, so a block built
+once and reused drew a bystander molecule straight through the lens; the cache
+is off while a cull is live (third person culls nothing, so the case round 71
+measured on keeps it). **THE SELECTION OUTLINE IS AN ENLARGED SPHERE WITH ITS
+FRONT FACES CULLED** - and in the cockpit the selected atom IS the atom the
+camera sits on, always, because that is how the cockpit is named. So first
+person rendered as **a completely flat orange screen**, 54% of the frame being
+one atom's outline. And **a meta atom's HALO** is a stack of shells larger
+again, blended additively - which is not hypothetical, since the ship in the
+report is a meta complex.
+**Every offline test passed throughout, and `tools/smoke_gui.py`'s rule is why
+this was found: a REAL window, and then LOOK at the picture.** The frame had no
+exception in it, drew in the right place, and was orange from edge to edge; an
+ink count alone would have called it healthy, because there was plenty of ink.
+Both overlay passes have had their own buffers since round 35 and neither had
+ever been told about the cull, which is the cost of that split.
+**(3) THE JUDDER WAS NEVER THE SPRING, and the arithmetic says why in one
+line.** The hard clamp fires on **0 of 240 ticks** - before the fix as well as
+after. A cap of 3 molecule RADII at a viewing distance of 1.9 radii is **58
+degrees off the view axis, against a 20 degree half-frame**: the backstop for
+"keep the ship on screen" only engaged long after the ship had left. So round
+71 stiffened a spring that was never being reached, and the measurement that
+"the clamp never fires" was true and reassuring and meant nothing. The limit is
+an ANGLE now (`slip_limit`, 9 degrees of the frame, scaled by the viewing
+distance) because the gap is only ever SEEN as an angle.
+**That exposed the real mechanism, which is not a wall at all.** An exponential
+follow settles at `gap = speed / rate`, so a FIXED rate means the gap is
+proportional to the speed - and past a point the camera is being left behind
+faster than it can close, no matter how good the easing. That is precisely
+Christian's "as if the molecule has vastly more inertia than the camera", and
+it is a steady-state failure where `spring_lag` only ever treated a transient.
+`follow_rate` raises the rate exactly as far as it must to hold the gap inside
+the frame at this speed - `lag` unchanged when slow, so the trailing feel that
+is the whole point of the mode survives, stiffening by itself when fast.
+**And the speed itself was scaled by the wrong thing.** `_scene_scale` measures
+the whole SCENE, which is right for flying the camera (a navigation gesture)
+and wrong for flying a molecule (a placement gesture judged against the
+molecule). A 3.7 A ship in a 60 A scene got a **105 A/s** top speed - 1.75 A of
+travel per FRAME - which no chase camera can hold. Shuttle mode measures the
+SHIP now, so the speed and the chase geometry finally share one scale; Shift
+still boosts 3x for crossing the room. Measured on that scene: the ship
+wandered to **30.5 degrees** below the axis (off the bottom of a 20 degree
+half-frame) in per-tick steps of up to **4.6 degrees**, and now stays in frame
+with steps under 0.3. 1510 tests.
+
+Round 71 (2026-08-12, `docking.molom` - and Christian diagnosed two of these
+himself):
+**(1) THE COCKPIT ANCHORS BOTH MODES NOW, and his hypothesis was exactly
+right**: "could it be that the problem I had was that I free drew a mol far
+away from its object origin". Measured on his file: the acetones have
+`|origin - centroid| = 0.00` and work fine; **meta-ship's stored origin is
+8.10 A from its real centroid**, with its nearest atom 3.07 A away and its
+furthest 12.52. First person put the camera at `obj.origin`, so the cockpit
+view was from a point in empty space nowhere near the hydrogen he had picked -
+hence "the piloted mol is still miles away from what FPS mode showed you", and
+hence why only the meta-ship showed it. `obj.origin` is documented as the
+centroid and simply is not one once anything has moved it. Both modes take the
+selected atom now: the eye lands 0.350 A from the picked hydrogen (i.e. exactly
+`cam.distance`) instead of 10.2 A away.
+**(2) THE JITTER WAS A WALL, and he named the mechanism before I found it**:
+"as if the camera is colliding with a boundary... typically managed by spring
+arm logic in game engines... as if the molecule has vastly more inertia than
+the camera". It was colliding with a boundary - round 66's `clamp_slip` let the
+pivot ease freely until the gap hit a hard cap and then SNAPPED it back to
+exactly that cap, every frame, for as long as the burn lasted. Ease, wall,
+snap: a judder that is not a frame-rate problem and that no amount of tuning
+`lag` can remove, which is why my synthetic test (short, never reaching the cap)
+showed zero reversals and I wrongly concluded it was frame rate. `spring_lag`
+makes the follow rate rise smoothly from `lag` at 45% of the cap to `lag * 12`
+at the cap, so the gap ASYMPTOTES instead of striking something. `clamp_slip`
+stays as a backstop for a pathological dt only.
+**(3) THE PER-TICK REBUILD IS CACHED.** `_fly_object` calls `refresh_geometry`
+every tick, and `_rebuild` recomputed every visible object's matrices, colours
+and cylinder transforms - 3.64 ms on a 91-atom scene, 22% of a 60 Hz frame, and
+it scales with the SCENE rather than with the thing that moved. The per-object
+work is extracted into `_build_object_block` and cached per object WHILE
+FLYING; the flown molecule is deliberately never cached, so what is reused is
+every OTHER object, which cannot change during a flight because the viewport
+holds the keyboard. The cache is dropped in `_end_fly`, so nothing outside that
+window can read a stale block. 3.64 -> 2.36 ms here, and the saving grows with
+the share of the scene that is not the ship.
+**A note on the extraction**: the loop body contains object-level `continue`
+statements, so it is wrapped in `for _once in (0,):` rather than `if True:` -
+"skip the rest of this block" is exactly what "skip to the next object" meant,
+since one call now handles one object.
+**And a test that pinned the wrong thing**: round 62's meta-colour test
+asserted `meta_mod.all_meta` appeared *in the source of `_rebuild`*, so it
+broke the moment that code moved even though the behaviour was identical. It
+now checks the colour that actually reaches the buffer.
+
+Round 70 (2026-08-12, a regression I caused, and the symmetry modifier made
+legible):
+**(1) I MADE THE CHASE WORSE IN ROUND 69, and the fix is the model, not the
+tuning.** Christian: "turning only without acceleration now moves the entire
+mol. and it is moving fast." Round 69 made the follow run every tick (right)
+but `_fly_turn` still rotated the molecule about its CENTROID (wrong) - so with
+a cockpit atom off-centre, a pure turn swung that atom along an arc, the camera
+faithfully chased the arc, and the whole molecule swept across the frame. An
+aircraft turns about its COCKPIT, and so does this now: the pivot is the
+cockpit position in third person, `obj.origin` in first (where the centroid IS
+the eye, so the two agree). Measured: 3 s of pure steering moved the cockpit
+0.0000 A. `obj.origin` is rotated about the same pivot, because the centroid is
+a point ON the molecule and leaving it behind desynchronises the cell box and
+every later transform from the atoms they describe.
+**(2) A SYMMETRY MODIFIER DELETED EVERY BOND.** `evaluate` returned `[]` for
+bonds with a comment arguing that the copies' connectivity is a perception job
+- true, and the consequence was that adding the modifier dropped the bonds of
+the ASYMMETRIC UNIT as well, so the molecule fell apart into loose spheres.
+The connectivity is perceived, once, on the output. `evaluate` runs per REBUILD
+and not per frame, so it is affordable at the sizes this modifier is for.
+**(3) THE INVENTED CELL WAS INVISIBLE, and that explains three complaints at
+once.** A plain molecule gets a box invented for it (round 33), and that box
+lived privately on the MODIFIER. So the viewport could not draw a cell box for
+it, the ❖ page could not report a, b, c, and `on_add_modifier`'s boundary
+branch - which reads `cell_of(obj)`, i.e. METADATA - saw no cell and refused.
+That is "I have no idea what the cell/box limits are", "no idea where the
+center of inversion actually lies", and "the boundary bonds modifier doesn't
+add at all", all from one omission. The invented cell is written to metadata
+now, so it is a real cell: the box draws, the page reports it, the symmetry
+overlay can place its elements, and boundary adds. An IMPORTED cell is never
+overwritten.
+
+Round 69 (2026-08-12, the chase drift, shuttle speed, fractional entry):
+**(1) THE CHASE CAMERA DRIFTED AWAY WHEN NOTHING WAS PRESSED**, and it is a
+one-line scoping bug with a subtle cause. The follow lived inside
+`if np.any(delta):` - i.e. it only ran when the ship TRANSLATED. But steering
+rotates the molecule about its own origin, which swings the COCKPIT ATOM along
+an arc, so a pure turn moved the target and never moved the camera; every turn
+left the pivot further behind. `_chase_follow` is its own method called EVERY
+tick now. It also fixes a second case nobody had hit yet: a pivot that starts
+out of position could never converge, because convergence needed thrust.
+Measured: three seconds of pure steering used to walk the camera off, and now
+holds the gap at 1.66 A.
+**(2) SHUTTLE IS SLOWER THAN FLIGHT, and that is a real distinction rather
+than a number.** Christian: "shuttle mode must be at most half as fast."
+Flying the CAMERA is a navigation gesture - you want to cross the scene and
+arrive. Flying a MOLECULE is a PLACEMENT gesture: the thing you are moving is
+the subject, it has to stay in frame, and at camera speeds it is out of the
+viewport before the key comes up. `flight.shuttle_scaled` scales the
+acceleration AND the top speed by `DEFAULT_SHUTTLE_FACTOR` (0.45), both rather
+than the cap alone, because scaling only the top speed leaves the thing
+lurching to it just as hard - which is precisely the part that makes a molecule
+hard to place. Exposed as **Settings > Flight > Shuttle speed** and live-applied
+to a shuttle in progress ONLY, since it is the difference between the two modes
+and pushing it into a camera flight would slow down the thing it does not
+describe. Rebuilt from the unscaled setting each time, so repeated edits cannot
+compound.
+**(3) FRACTIONAL COORDINATE ENTRY.** "a quarter along a" is a statement about
+the STRUCTURE; 3.47 A is a statement about this particular cell. The ❖ page
+grows a block showing the selected atom's fractional position, editable.
+`set_fractional` writes EVERY frame, and `wrap` is **off by default** and a
+tick: bringing a value into [0, 1) is what you want when typing a site into a
+cell and emphatically not what you want when nudging an atom that legitimately
+sits outside one - a boundary copy, or a molecule that has been unwrapped
+(round 19). The block is live only for EXACTLY ONE picked atom on a molecule
+that has a cell, and says which of those is missing rather than offering three
+live-looking fields that would apply to nothing.
+
+Round 68 (2026-08-12, a unit cell can finally be DEFINED - `core/celledit.py`):
+Christian asked whether roadmap 1b was "the building of crystal structures" and
+then answered his own question better than the roadmap did: "what we definitely
+need is a way to define the unit cell parameters, right?" **1b is not that** -
+it is packing-as-a-modifier and bond-graph caching, both internal - and the
+thing he named was simply MISSING. Every routine in `core/cif.py` CONSUMES a
+cell that came out of a file; the ❖ page rendered a, b, c and the angles as
+read-only text; the only cell operators (`toggle_cell`, `crystal_cell`,
+`crystal_packing`, `crystal_edit_asym`, `cell_info`) all assume one already
+exists. So a molecule with no cell could never be given a box, and an imported
+cell could never be corrected.
+**THE DECISION THAT MATTERS is what happens to the ATOMS**, and there is no
+single right answer, so it is a parameter and a tick rather than a default
+buried in the code. Keeping FRACTIONAL coordinates means the atoms move with
+the frame and the structure stretches with it - which is what a cell edit means
+crystallographically, because fractional coordinates ARE the structure and
+a, b, c are the frame they sit in. Keeping CARTESIAN means only the drawn box
+changes. `apply_cell(keep_fractional=None)` decides sensibly: fractional if
+there WAS a cell to have them in, Cartesian if there was not, because in that
+case there are no fractional coordinates to preserve - only a box being drawn
+around what is already there.
+**THE VALIDATION IS THE INTERESTING PART.** Positive lengths are obvious; the
+angles are what catches people out, because they are NOT independently
+choosable. Three angles only close into a parallelepiped when
+`1 - cos^2a - cos^2b - cos^2g + 2 cos a cos b cos g > 0`, i.e. the squared
+volume factor, i.e. the metric tensor being positive definite. **30/30/120
+passes every per-angle range check and describes no solid at all** - the faces
+cannot meet. Catching it means `Cell.matrix()` never sees a degenerate frame,
+and the refusal says which way the user is wrong, ON THE PAGE rather than in a
+status-bar message that is gone four seconds later.
+Also: a space-group symbol typed here is resolved through `spacegroups.
+operators_for`, the SAME Hall database a file's own symbol goes through (round
+40), so a cell defined by hand expands exactly as an imported one would; an
+unrecognised symbol changes nothing rather than silently falling back to P1. A
+new cell with no symbol IS P1, stated explicitly - P1 is true of every
+arrangement of atoms (round 52). "Fit to molecule" fills the fields from the
+bounding box plus a margin, because an editor that opens on 1x1x1 and demands
+six numbers before anything can be seen is one nobody uses. Removing a cell
+takes the operators, the stored asymmetric unit and the derived columns with it:
+keeping a space group for a cell that no longer exists is how a later rebuild
+invents a structure from nothing.
+
+Round 67 (2026-08-12, the chase camera made consistent, and F3 repeating):
+**(1) THE SHIP DRIFTED LEFT UNDER ROLL**, and it was one line: the chase pivot
+was offset along the CAMERA's up vector, so rolling swung the offset sideways
+and carried the molecule out of frame with it. `chase_pivot` now defaults to
+**world Z** (`flight.WORLD_UP`), which cannot roll. On top of that the chase
+camera no longer rolls AT ALL - `fly_look` is passed `roll=0.0` in third person,
+and since it rebuilds the rotation from an azimuth/elevation pair that IS a
+level camera with no residue to unwind.
+**(2) THE ROLL MOVED TO THE SHIP**, where it belongs and where you can see it.
+Applied as a DELTA about the ship's forward axis, because `model.roll` is an
+ABSOLUTE angle and replaying it every tick would spin the molecule up without
+limit (`roll_applied` tracks what has been used). First person is untouched:
+inside the cockpit the camera and the ship are necessarily one rotation.
+**(3) THE COCKPIT IS AN ATOM.** "Select single atom (cockpit)" - one selected
+atom names the nose of the ship, which is what a chase camera needs to sit
+behind; a centroid is wrong for anything long or hollow. Exactly one selection
+counts, anything else is ambiguous and falls back to the origin.
+**(4) CLOSER**: `CHASE_DISTANCE` 4.0 -> 1.9 radii and the height 0.9 -> 0.45.
+Measured on ferrocene, 47.7 A -> 22.7 A.
+**(5) THE STEERING INSTRUMENT IS SHARED.** The shuttle drew a bare circle and
+none of the aim ring, drift reticle, roll tick or speed - so the one mode where
+you are steering a whole molecule had the LEAST on screen. `_paint_aim` is now
+the single implementation and both modes call it.
+**(6) F3 REMEMBERS.** Blender pre-highlights the last search result so a single
+Enter repeats it. `OperatorSearchDialog` takes `last=` and pre-selects it - but
+only on an EMPTY search, because once you have typed, the best match is what
+should be selected rather than a memory of something unrelated. An id that no
+longer exists (an add-on unloaded) is harmless.
+
+Round 66 (2026-08-12, roadmap item 10 - piloting from outside the ship):
+**THIRD-PERSON SHUTTLE.** Christian: "3rd person mode for piloting mols. trying
+to do it FPS only leads to problems." The problem is structural and worth
+stating: inside the thing you are steering you cannot see its orientation, and
+a molecule has no windscreen to give you a horizon, so the cockpit view is
+missing the two cues that make flying legible.
+The implementation is small because the camera was already the right shape: it
+is an ORBIT rig, so the eye already sits `distance` behind `center`, and a
+chase view is mostly a question of where to put the PIVOT. `start_shuttle`
+takes `third_person=`; the pivot goes slightly ABOVE the ship
+(`flight.chase_pivot`), which lifts the eye and drops the molecule below centre
+frame - the chase-cam look rather than a bug - and `distance` scales with the
+molecule's radius, because these scenes run from a 3 A molecule to a 200 A
+framework and a fixed number would be either inside the ship or in the next
+postcode. Turning needed NO change at all: the camera swings its heading, the
+ship rotates in place, and the pivot eases to the new position, which gives a
+bank for free.
+**THE LAG IS THE FEATURE.** A rigid chase camera makes the whole world swing
+around the molecule and is as disorienting as sitting inside it, which would
+have reproduced the very problem being fixed. `flight.follow` is exponential
+smoothing (`1 - exp(-lag*dt)`), framerate-INDEPENDENT for the same reason the
+drag is: a fixed fraction per frame trails further at 30 fps than at 120, so
+the feel would depend on the machine. A test runs it at both and asserts the
+same answer. Measured on cubane: the pivot-to-ship gap opens 3.29 -> 4.36 A
+under thrust and settles back to 3.30 when it coasts to rest.
+**`clamp_slip` is the part the scoping missed.** Lag is a feel; losing the ship
+off the edge of the screen during a long burn is a bug, so the gap is capped at
+3 radii and the pivot is dragged along past that. Also: nothing is clipped in
+third person. The cockpit hides atoms too close to the camera so they do not
+fill the screen, and here that rule would hide the ship itself, so `clip` is 0
+and `_shuttle_hidden` returns early on it.
+
+Round 65 (2026-08-12, roadmap item 8 - and the answer is "it is mostly Qt"):
+**LAUNCH-TIME GUARDS.** Christian: "the startup is getting slow." It was, and
+nothing in 1378 tests would ever have said so. `tools/startup_profile.py`
+splits it into the three problems one number cannot tell apart - IMPORT time,
+CONSTRUCTION, FIRST PAINT - and `tests/test_round65_startup.py` guards it
+STRUCTURALLY. **No wall-clock assertions anywhere**: a millisecond threshold
+across a laptop and a desktop with very different CPUs either passes everywhere
+or fails as noise, so the tests pin what is portable (core imports nothing
+heavy, opening a window imports no network stack, expensive widgets are lazy)
+and the numbers live in the tool for a human to read.
+**3269 ms -> 2877 ms**, from two fixes. `core.resolve` was imported at module
+scope in both `app.py` and `dialogs.py`, dragging urllib + http.client +
+email.parser (~130 ms) into every launch for a PubChem lookup most sessions
+never make; it is imported at its two use sites now. And the PERIODIC TABLE
+(118 painted cells) was built eagerly despite being hidden at startup - it only
+appears in plain edit mode - so it is a `@property` that builds on first touch.
+**The measurement that matters most is the one that says where NOT to look**:
+`MainWindow()` is ~940 ms cold and **~43 ms warm**, so almost all of it is Qt's
+one-off font and style caching, which whichever widget is constructed first
+pays. That is why the periodic table appeared to cost 638 ms and actually costs
+33. What remains is `OpenGL.GL` (~500 ms) and creating the GL context, and
+neither can be avoided before a first frame - so the guards are about not
+ADDING to the bill rather than about shrinking it further.
+**Also: COPY SMILES on a meta atom.** "he tries to use Xx as an element label"
+- exactly right, and the same shape as round 62's optimiser bug: `Xx` is atomic
+number 0, RDKit refuses it, and the whole SMILES failed with "unknown element
+'Xx'". Both call sites now go through `_smiles_symbols`, which is
+`meta.resolved_symbols` - a SMILES is a statement about chemistry and a
+placeholder is not an element. His `meta-test` now copies as
+`O=C1[O][Fe][O]C1=O`.
+
+Round 64 (2026-08-12, the export's geometry, and rows that are buttons):
+**(1) ATOMS WERE BAKED, NOT SUBDIVIDED.** "In blender atoms do not show a
+modifier and look a little blocky?" Both halves true: the export baked an
+icosphere at subdivision 3 and turned on smooth shading, which fixes the INSIDE
+of a sphere and not its SILHOUETTE - so the outline stayed faceted and there
+was no modifier to raise. `add_subsurf` puts a real Subdivision Surface
+modifier on every atom (1 viewport / 2 render, tickable). Per OBJECT because
+the mesh is a linked duplicate shared by every atom, which is the normal
+Blender arrangement.
+**(2) THE META HALO CAN GO TO BLENDER**, as an emissive material, **off by
+default** on Christian's own instruction. It gets its OWN material
+(`META_MATERIAL_PREFIX`) or every atom of that element would light up with it,
+and the name carries the fact so no parallel bookkeeping has to be threaded
+through the collector - the strength is a single option, so the prefix is all
+the spec builder needs. Verified by RUNNING Blender 4.4 headless and inspecting
+the saved .blend: `SUBSURF (1, 2)` on the atoms, emission 2.0 on
+`MoloM meta Fe`, 0.0 on `MoloM O`.
+**(3) The export was still colouring meta atoms `Xx` grey**, which round 62 had
+just changed in the viewport - found while doing the above, and exactly the
+round-37 rule (an export that quietly disagrees with the screen is worse than
+none).
+**(4) A MODE ROW IS THE BUTTON.** The selection share pushed the "A" button off
+the right edge of a narrow dock, and the card was a frame holding a framed
+widget holding a button - three nested boxes to say one thing. One clickable
+`_ModeRow`, one frame, no button. `WA_StyledBackground` is required or a
+QFrame subclass ignores its own stylesheet background (the round-35 ribbon
+trap), and the click fires on RELEASE inside the row so a drag-away cancels.
+**(5) The association script broke on his machine** with "The string is missing
+the terminator". PowerShell 5.1 reads a BOM-less file as cp1252, so a UTF-8
+em-dash arrives as three bytes and the string never closes. That is round 37's
+ASCII rule in a new language, and there is now a test asserting no byte above
+127 in the `.ps1`. **He has also asked for no em-dashes in code comments at
+all** - a plain hyphen, everywhere.
+
+Round 63 (2026-08-12, roadmap 1g, the halo, and the Explorer icon):
+**(1) MODES RANKED BY A VIEWPORT SELECTION** — roadmap 1g, scoped 2026-08-03
+and built as scoped. `selection_weight` is a PARTICIPATION RATIO: the selected
+atoms' share of the mode's motion, divided by the whole. A raw displacement sum
+was the obvious wrong answer — it ranks every high-amplitude mode above a mode
+that is genuinely localised on the selection, which is the opposite of the
+question. **Mass-weighting is on by default and is not cosmetic**: an
+eigenvector is a CARTESIAN displacement, so a C-H stretch is nearly all
+hydrogen motion by amplitude, and unweighted, picking a heavy atom returns
+almost nothing — phosphorus's best share on the vendored H3PO4 job is 0.176
+unweighted against 0.431 weighted. Weighting measures the share of the kinetic
+ENERGY, which is what "this mode belongs to that part of the molecule" means.
+Verified as CHEMISTRY, not as arithmetic: the three H rank the O-H stretches
+(3822-3831 cm-1, 94%) first and the P ranks the P=O stretch (1346 cm-1) first.
+The share is drawn on the card next to the IR intensity, on round 31's rule
+that sorting by an invisible number is a list you must trust blindly; the page
+is PUSHED the selection by the window rather than reaching for the viewport,
+and it is scoped to the ACTIVE object because another molecule's indices would
+mean different atoms here.
+**(2) THE HALO HAD VISIBLE RINGS**, and it was three shells doing it — three
+big alpha steps are three edges. Sixteen thin shells with a smooth
+`(1-t)**2` falloff read as one bloom. The knob that matters is that alpha is
+divided by the shell count (`3.0 / n`): they blend ADDITIVELY, so without it
+raising the count blows the halo out instead of smoothing it, and the two
+parameters cannot be tuned apart. A quartic was tried first and was too tight —
+it put everything at the centre and the outer glow vanished.
+**(3) A `.molom` FILE ICON.** The window icon (round 62) and the icon Explorer
+draws on a FILE are unrelated things: the second is a Windows file association,
+which lives in the registry. `molom/resources/molom.ico` is a real multi-size
+ICO (PNG-compressed entries, valid since Vista) and
+`tools/associate_molom_files.ps1` registers it — **opt-in, HKCU only so it needs
+no administrator rights, and reversible with `-Remove`**. Deliberately NOT done
+at startup: a program that quietly claims a file extension the first time it
+runs is one people learn to distrust.
+
+Round 62 (2026-08-12, the meta-atom optimisation, and a logo at last):
+**(1) META-ATOM OPTIMISATION COLLAPSED THE COORDINATION SPHERE**, and it took
+THREE compounding faults to do it. Christian: "the bonds do not keep the length
+they are set with. They become incredibly short." Measured on his own
+`testing.molom` (`meta-test`, a bent Fe centre with oxalate, distance set to
+2.0 A): the saved file has both donors at **0.655 A**.
+(a) The force field was handed the DUMMY symbol `Xx`. Both RDKit tiers refuse
+an unknown element outright — the notes read `mmff94: unknown element 'Xx'`
+and `uff: unknown element 'Xx'` — so every meta complex fell straight through
+to OpenBabel UFF. (b) **`_openbabel_optimize` ignored `fixed` entirely**: the
+parameter did not exist on it. That is the tier a metal complex ALWAYS lands
+on, so the one case that most needs frozen atoms was the one case that never
+got them, and `frozen_atoms` had been correct and useless all along. (c) With
+nothing frozen and a zero-radius dummy, UFF pulled the donors onto the centre.
+Fixed at all three levels: the optimiser is handed `meta.resolved_symbols` (the
+element the centre STANDS FOR, `Fe` here) so it reaches a real tier, OpenBabel
+honours `fixed` through `OBFFConstraints` (1-based, unlike everything else
+here), and the locked spheres are `idealize`d BEFORE being frozen — freezing a
+collapsed sphere just preserves the damage, and the whole promise of a locked
+meta atom is that the distance you set is the distance you get. Verified on his
+file: 0.655 -> 2.000, engine now **rdkit uff** instead of openbabel, frozen
+atoms move 0.0000.
+**(2) The "oxygen with a halo" was the same bug wearing a disguise.** Not a
+stale meta index (the saved table is `{0: Xx}` and correct) and not a leftover
+ligating mark — the meta atom had collapsed to 0.655 A from that oxygen, so its
+glow simply ENVELOPED it. Restoring the distance puts the halo back on the
+centre alone. Worth remembering as a diagnostic habit: an overlay that appears
+on the wrong atom may just be an overlay on the right atom in the wrong place.
+**(3) A meta atom now wears its RESOLVED element's colour** — Christian: "the
+halo will distinguish them as meta-atoms well enough". The `Xx` grey said
+nothing about what the centre becomes.
+**(4) MONODENTATE LIGANDS MAY COORDINATE SEVERAL TIMES AT ONCE.** With exactly
+one ligating atom marked, each selected placeholder gets its own copy, so four
+of cubane's hydrogens become four imidazoles in one operation (32 -> 64 atoms,
+measured). The geminal rule is untouched for anything polydentate, where slots
+on two different centres would mean a BRIDGING ligand — a genuinely different
+operation. Every transform is computed against the ORIGINAL coordinates before
+anything is appended, so a failure on the third of five leaves the molecule
+untouched rather than half-built.
+**(5) Bonds are pickable in OBJECT mode.** `_bond_at` is scoped to the EDITED
+molecule (it exists for hover-and-press-a-number), so double-clicking a stick
+in object mode found nothing at all; `_bond_object_at` searches every visible
+molecule and takes the NEAREST hit, or a bond behind would win over one in
+front.
+**(6) A LOGO.** `molom/resources/` carries Christian's SVG plus PNGs rendered
+from it at seven sizes, set on the QApplication (so dialogs and the taskbar
+inherit it) AND on `MainWindow` (so a window built by a test, the smoke tool or
+an embedder is not the odd one out). PNGs rather than the SVG alone because
+Qt's svg imageformat plugin is a deployment detail we do not control, and the
+failure mode is silently falling back to the generic Python icon. `package-data`
+had to be declared or the wheel would carry the module and none of the images —
+a bug that cannot be reproduced in the source tree it was written in.
+**(7) The animation export is in the File menu**, which is where someone who
+does not use shortcuts will look for the most option-heavy thing in the program.
+
+Round 61 (2026-08-11, the second post-release batch — and roadmap item 9 done):
+**(1) GIF FRAME RATES ARE NOT ARBITRARY.** Christian rendered a 60 fps GIF and
+got "the old jitter problem". The format stores each frame's delay as an INTEGER
+number of CENTISECONDS, so the only exactly representable rates are 100/n —
+60 fps wants 1.667 cs and the encoder has to round, unevenly, which is seen as a
+stutter no amount of re-rendering fixes. `gif_delay`/`gif_fps`/`gif_note` snap it
+BEFORE encoding (60 -> 50, 30 -> 33.33, 24 -> 25) and the dialog says so while
+you are choosing, not after. `-r` is set as well as `-framerate`, or the output
+rate drifts back to something unrepresentable. **His follow-up question — "is it
+the same for images?" — has a clean answer: no.** MP4 carries a rational
+timebase so 60 is exact, and a PNG sequence has no embedded timing at all; this
+is a GIF-only limitation and only GIF is snapped.
+**(2) THE RENDER SETTINGS WERE A ONE-WAY DOOR.** Round 55 made F12 press-and-
+forget, which is right, but once `_render_target` was set the dialog never
+appeared again and there was no operator to bring it back. `on_render_settings`
++ two F3 entries ("Render settings: animation / still — ask again") clear the
+memory AND reopen the dialog immediately, because "ask me next time" is never
+what someone wants when they have gone looking for the settings. The dialog also
+reopens showing the LAST choices rather than the defaults — re-picking the other
+six knobs to change one is pure friction.
+**(3) A TRACKPAD COULD NOT LEAVE A CAMERA VIEW BY ROTATING.** Round 60 gave
+every scroll inside a camera a job (plain resizes the frame, Ctrl dollies, Shift
+trucks) — and on a trackpad a two-finger scroll IS the orbit gesture and there
+is no middle button, so there was no scroll left that could exit. **Alt+scroll
+orbits and therefore leaves**, which is the same escape hatch Alt+LMB already
+provides for mice whose wheel-click is unusable (round 16), so it is the
+consistent answer rather than a new idea. The on-frame hint names it, since an
+invisible escape hatch is the same as no escape hatch.
+**(4) ROADMAP ITEM 9: ffmpeg WITHOUT SHIPPING IT.** `imageio-ffmpeg` moved out
+of `[project] dependencies` into an OPTIONAL `video` extra — a ~25 MB static
+binary should not ride along on every install to serve the minority who export
+video, when the primary animation format is a PNG sequence that needs no ffmpeg
+at all. `ffmpeg_candidates` gives it the `find_blender` treatment (round 50): a
+Settings hint first, then PATH, then the usual install locations, and the
+bundled wheel LAST rather than first — a system ffmpeg is usually newer and has
+the codecs the user installed it for. `ffmpeg_source` returns WHERE it came from
+so the dialog can say "Video via ffmpeg on PATH" before the render; where there
+is none, a "Locate ffmpeg..." button appears (and only then), and what it finds
+is remembered. `NO_FFMPEG_HELP` names the thing that DOES work, because a
+message that only lists what is broken reads as a dead end.
+**(5) TEXT YOU CAN COPY.** "I just tried to mark the resolved SMILES from name
+so I could copy it, but the highlighting is not possible." Qt labels are not
+selectable by default, so everything MoloM computes and then displays was
+readable and impossible to paste. `widgets.make_text_selectable` walks a
+CONTAINER rather than taking a list of labels — the failure mode of the
+hand-written version is the label somebody adds later — and skips labels with a
+BUDDY, which carry a mnemonic and must keep click-to-focus. Applied to the
+resolve dialog, the whole properties dock (including add-on pages, via
+`add_page`) and the graphics-device report, which is the first thing anyone is
+asked to paste into a bug report. The crystal page was already selectable; it
+had been using `TextBrowserInteraction` since round 41 for its DOI links.
+1331 tests.
+
 Round 59 follow-up, same day: Christian replaced the five generated screenshots
 with his own — deliberately NOT a clean-slate default scene per shot, because
 "I wanted to show off molom's performance and ability to visualise multiple
@@ -2454,7 +3035,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1265 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1510 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -3867,11 +4448,14 @@ choice.
    and be scoped to the POLYHEDRA (which are decoration, not chemistry) rather
    than to the atoms.
 
-6. **The `.blend` export cannot render on the spot.** It saves and stops,
-   which is the right default, but "and render it now" is one more
-   `subprocess` call (`blender -b out.blend -o //render_ -f 1`) and would
-   close the loop for someone making a figure. Wanted only if Christian asks:
-   he specifically said the point is that F12 works.
+~~6. **The `.blend` export cannot render on the spot.**~~ **NOT WANTED —
+   closed 2026-08-12.** Christian: "We do not need blender render on the spot
+   btw. Opening blender and pressing F12 from a blend file is convenient
+   enough. The whole point is that you can set your scene more easily and
+   immediately start working on shaders and lighting for the final touches."
+   So the export's job is to hand over a scene that is ready to WORK ON, not to
+   produce a finished picture — which is also why nothing is merged (see item 5)
+   and why the .blend opens complete with no script to run.
 
 7. **KEYFRAME ANIMATION in the Blender export — scoped 2026-08-10, not
    built.** Christian's constraint is settled and it costs nothing: the export
@@ -4042,8 +4626,19 @@ batches. Known next items, rough order:
      animal — it is a trajectory by another name, and should reuse the frame
      machinery rather than a second system. Recommendation: do transform
      keyframes only, and treat trajectories as the coordinate channel.
-1g. **RANK MODES BY A VIEWPORT SELECTION** (Christian's long-term idea,
-   2026-08-03, NOT built): "allow the user to make a selection in the
+1g. ~~**RANK MODES BY A VIEWPORT SELECTION**~~ **DELIVERED round 63**
+   (`vibrations.selection_weight` / `rank_by_selection` / `SORT_SELECTION`, a
+   third entry in the ∿ page's Sort by). It is a PARTICIPATION RATIO exactly as
+   scoped, and mass-weighting shipped ON by default with a tick to turn it off:
+   measured on the vendored H3PO4 job, phosphorus's best share goes from 0.176
+   unweighted to 0.431 weighted, which is the difference between "hydrogens win
+   everything" and a usable ranking. The chemistry checks out as a test rather
+   than an assertion of faith — selecting the three H ranks the O-H stretches
+   (3822-3831 cm-1, 94%) first, selecting the P ranks the P=O stretch
+   (1346 cm-1) first. The share is drawn ON the mode card, because sorting by a
+   number you cannot see is a list you have to trust blindly. Original scoping
+   kept below.
+   (Christian's long-term idea, 2026-08-03, NOT built): "allow the user to make a selection in the
    viewport of certain atoms whose vibrations they are interested in and
    calculate their offset during different modes, use that as a ranking
    parameter". A button — "Filter modes by selection" — next to the existing
@@ -4092,7 +4687,17 @@ batches. Known next items, rough order:
    snapshot — `scene.restore` rebuilds every MolObject, and the outliner's
    row widgets hold direct object references that would then be dangling.
 
-1e. **LIGAND TEMPLATE ATTACHMENT — SHIPPED BUT NOT WORKING PROPERLY.**
+1e. ~~**LIGAND TEMPLATE ATTACHMENT — SHIPPED BUT NOT WORKING PROPERLY.**~~
+   **LARGELY CLOSED 2026-08-12.** Christian retested and the geometry half is
+   fine: "templating seems to work when I put monodentate imidazol on the
+   hydrogens of the cubane. putting oxalate on methane to form
+   1,3-Dioxolan-2,4-dione also works. Even putting it on a meta atom work."
+   What was actually broken was the META-ATOM OPTIMISATION downstream of it
+   (round 62), not the fit. Also added in round 62: a monodentate ligand may
+   now be coordinated onto SEVERAL placeholders at once, one copy each — his
+   suggestion, and the geminal rule still holds for anything polydentate,
+   where two centres would mean a bridging ligand.
+   Original report kept below.
    Christian tried it 2026-08-03: "templating still not working. will need
    more work sometime else." The pieces exist (`core/templates.py`, the two
    F3 operators, violet donor markers, 16 passing geometry tests) and the
@@ -4158,3 +4763,145 @@ batches. Known next items, rough order:
    round-trip with coords_locked on reload.
 6. Perf, if ever needed: impostor (billboard) spheres, partial buffer
    updates during grab instead of full rebuilds.
+7. **MOPAC as an add-on** (scoped 2026-08-10, NOT built — Christian: "the
+   dependency is apparently tiny. Could probably run it in molom itself. But
+   idk how well we can integrate that as an addon that doesn't mess with
+   anything else in the software"). Semiempirical geometry optimisation and
+   single-point energies sitting next to the existing MMFF94/UFF tier in
+   `core/forcefield.py`, for the case a force field has no parameters for at
+   all (an exotic metal centre, a transition state) and DFT is overkill for a
+   quick check. MOPAC ships as a small, self-contained binary with no Python
+   bindings of its own — the interface is a written input file and a parsed
+   output file, the same shape `core/io.py`'s OpenBabel subprocess and
+   ORCA Workbench's `orca_parser.py` already use, so nothing here is a new
+   pattern.
+   **The real question is exactly the one Christian asked, and it is an
+   ADD-ON question, not a MOPAC question**: round 46 built add-ons on the
+   principle of full access and no sandbox ("if someone wants to brick their
+   install with something they made themselves, that's on them" — see
+   `molom/addons/`), which is right for a page that reads and writes the
+   live window. A geometry OPTIMISER is a different shape of risk: it wants to
+   hand off `(symbols, coords, bonds, fixed)`, run a real subprocess, and hand
+   back new coordinates — i.e. call the SAME SURFACE `forcefield.optimize`
+   already exposes, not reach into the viewport or the scene graph itself.
+   Two things worth deciding before writing code: (1) whether MOPAC should
+   register as another **tier inside `core/forcefield.py`** (same function,
+   same `fixed`-atom contract, same degrade-gracefully-if-the-binary-is-
+   missing pattern rdkit/openbabel already follow) with the add-on only
+   supplying the binary discovery and the Optimize panel a method choice — or
+   whether it is cleaner kept OUTSIDE core entirely, as a bundled add-on that
+   calls a small `run_mopac(symbols, coords, bonds, fixed) -> coords` helper
+   of its own, so a MOPAC failure can never touch the tiers `core/` already
+   guarantees offline-testable. The second shape is probably the safer answer
+   to "doesn't mess with anything else" — it keeps MOPAC's subprocess and
+   binary-discovery code entirely inside `molom/addons/`, same as the debug
+   and sandbox pages round 46 already cordoned off, and `core/forcefield.py`
+   never has to know it exists. (2) binary discovery: MOPAC has no wheel, so
+   this needs the same settings-plus-PATH-plus-known-locations resolution
+   `blender_export.find_blender` already does (round 50), not a hard
+   dependency — round 40's rule (spglib is hard because degrading silently
+   loses a quarter of a structure) does not apply here, since "MOPAC not
+   found" is a visible, harmless degrade back to the existing force-field
+   tiers.
+10. ~~**THIRD-PERSON PILOT MODE**~~ **DELIVERED round 66.** `F3 > Shuttle mode:
+   pilot from behind (third person)`, sharing every line of the flight model
+   with the cockpit - the only differences are where the camera sits and that
+   its pivot LAGS. Both design questions from the scoping were answered as
+   scoped: the follow is exponential smoothing (`flight.follow`, framerate
+   independent, pinned by a test that runs it at 30 and 120 fps and gets the
+   same answer), and there is no collision at all. `clamp_slip` was the one
+   addition the scoping missed - lag is a feel, but losing the ship off the
+   edge of the screen during a long burn is a bug, so the gap is capped at 3
+   radii. Nothing is clipped in third person either: the cockpit hides atoms
+   near the camera, and here that would hide the ship. Original scoping below.
+   (Christian, 2026-08-12: "3rd person mode for
+   piloting mols. trying to do it FPS only leads to problems.") Not built.
+   Shuttle mode (round 34, rebuilt on `core/flight.py` in round 35) snaps the
+   camera INTO the molecule's origin and flies it first-person — which is the
+   problem: you are inside the thing you are steering, so you cannot see its
+   orientation, and a molecule is not a cockpit with a windscreen. A chase
+   camera fixes exactly that: keep the same `FlightModel` driving the MOLECULE
+   and put the camera behind and above it, following with a lag.
+   The pieces exist. `flight.FlightModel` already produces a world-space
+   velocity and `AimReticle` a turn rate, so the molecule's motion needs no new
+   maths; what is new is the CAMERA's own follow. Two decisions worth making
+   before writing it: (a) the follow should lag with a spring or a simple
+   exponential smoothing rather than being rigidly attached — a rigid chase
+   camera makes the world swing around the molecule and is as disorienting as
+   the first-person view, whereas a lagging one is what reads as "following";
+   and (b) the camera must not collide with the rest of the scene, which for a
+   molecule viewer probably means ignoring collision entirely rather than
+   implementing it. Note `Camera` is a TURNTABLE with no roll (round 3), so a
+   banking chase view has the round-35 problem again: roll has to be an
+   explicit parameter applied last, exactly as `fly_look` does it, or it
+   accumulates.
+8. ~~**PERIODIC LAUNCH-TIME TESTS**~~ **DELIVERED round 65.**
+   `tools/startup_profile.py` prints the breakdown (and `--imports` the slowest
+   modules); `tests/test_round65_startup.py` guards it. The tests assert
+   STRUCTURE and never wall-clock, because a millisecond threshold on two
+   machines with very different CPUs either passes everywhere or fails as
+   noise: core must not pull in rdkit/openbabel/pymatgen, opening a window must
+   not import the network stack, and expensive widgets must not be built before
+   something asks for them. **Measured 3269 ms -> 2877 ms.** The two wins were
+   the RESOLVER (urllib/http/email, ~130 ms, for a lookup most launches never
+   make) and the PERIODIC TABLE, now built on first use. The useful finding is
+   the one that stops the next person chasing ghosts: `MainWindow()` is ~940 ms
+   cold and **~43 ms warm**, so nearly all of it is Qt's one-off font and style
+   caching rather than MoloM's widgets - the periodic table's apparent 638 ms
+   was mostly that cold cost, which whichever widget is built first pays. What
+   is left is `OpenGL.GL` (~500 ms) and the GL context, both unavoidable before
+   a first frame. Original scoping kept below.
+   (Christian, 2026-08-11: "Add periodic launch
+   time tests. The startup is getting slow.") Not built. The observation is
+   almost certainly right and nothing in the suite would notice: 1310 tests
+   build `MainWindow()` over and over and none of them times it, so startup can
+   regress by half a second per round and only ever be felt, never reported.
+   What to measure, in the order it is worth measuring: **import time** (`python
+   -X importtime -c "import molom.ui.app"` — rdkit and openbabel are the usual
+   suspects and both are supposed to be lazy, so if either is imported at module
+   scope that is the whole answer), then **`MainWindow()` construction**, then
+   **first paint**. Those are three different problems and a single "startup"
+   number cannot tell them apart.
+   Two design notes so this does not become a flaky test. (a) A wall-clock
+   assertion in pytest is a machine-speed assertion, and this project runs on
+   two machines with very different CPUs — so the useful form is a RATIO or a
+   recorded baseline, not `assert t < 2.0`. The honest cheap version is a
+   `tools/` script that prints a breakdown and a test that asserts only the
+   things that are machine-independent: that `molom.core.*` imports pull in
+   neither rdkit nor openbabel nor pymatgen, and that constructing a window
+   opens no file dialogs and reads no CIF. (b) The add-on scan (round 46) walks
+   `~/.molom/addons/` and parses metadata with `ast` at startup — cheap by
+   design, but it is disk I/O in the launch path and worth being in the
+   breakdown. Suspects to check first, all added since 0.2.0: the spglib import,
+   the add-on scan, `QSurfaceFormat` setup, and the periodic-table widget
+   (round 17 builds 118 painted cells).
+9. ~~**ffmpeg WITHOUT SHIPPING IT**~~ **DELIVERED round 61** — the extra is
+   `molom[video]`, discovery is hint -> PATH -> known locations -> the bundled
+   wheel, the dialog names which one it found before the render and grows a
+   "Locate ffmpeg..." button only when there is none, and GIF rates are snapped
+   to what the format can store. The one thing deliberately NOT done is having
+   MoloM `pip install` anything on the user's behalf: a program writing to its
+   own environment is a bigger promise than it looks, and it stayed Christian's
+   call. Original scoping kept below.
+   (Christian, 2026-08-11: "Maybe we can make
+   calling ffmpeg very intuitive to a user without shipping MoloM with it's own
+   ffmpeg dependency?"). Round 54's animation export already resolves ffmpeg the
+   right way — `animation.ffmpeg_executable()` tries a system `ffmpeg` on PATH
+   FIRST, then `imageio_ffmpeg`'s static binary, then reports honestly — and PNG
+   sequences need no ffmpeg at all. **The thing that is actually wrong is the
+   dependency list**: `imageio-ffmpeg` sits in `[project] dependencies`, so
+   every `pip install molom` drags a ~25 MB static binary in whether or not the
+   user ever exports a video. It belongs in `[project.optional-dependencies]`
+   next to rdkit and openbabel, which is exactly the tier this project already
+   uses for "works without it, better with it".
+   What "intuitive" then has to mean, since the failure moves from install time
+   to use time: the export dialog should say which ffmpeg it found (or that it
+   found none) BEFORE the render starts, not after — round 54's rule that a
+   failed encode still leaves the frames is the safety net, not the UX. Give it
+   the `blender_export.find_blender` treatment (round 50): a stored path hint in
+   Settings, then PATH, then the usual install locations, with a "Browse..." and
+   a one-line "PNG sequence works without ffmpeg" note so the dialog never reads
+   as a dead end. Worth deciding at the same time whether the video tier should
+   offer to `pip install imageio-ffmpeg` on the spot — convenient, and also a
+   program writing to its own environment, which is a bigger promise than it
+   looks.

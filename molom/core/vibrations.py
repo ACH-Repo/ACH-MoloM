@@ -311,23 +311,97 @@ def describe(modes, include_trivial=False):
 # --------------------------------------------------------- picking a mode
 SORT_FREQUENCY = "frequency"
 SORT_INTENSITY = "intensity"
-SORT_KEYS = (SORT_FREQUENCY, SORT_INTENSITY)
+SORT_SELECTION = "selection"
+SORT_KEYS = (SORT_FREQUENCY, SORT_INTENSITY, SORT_SELECTION)
+
+#: Atomic masses, for the mass-weighted participation ratio. Only the elements
+#: that turn up in ordinary FREQ jobs are worth listing; anything else falls
+#: back to a middling value, which is harmless because the ratio NORMALISES —
+#: a wrong mass shifts one atom's share slightly, it cannot break the measure.
+_MASSES = {"H": 1.008, "D": 2.014, "C": 12.011, "N": 14.007, "O": 15.999,
+           "F": 18.998, "P": 30.974, "S": 32.06, "Cl": 35.45, "Br": 79.904,
+           "I": 126.90, "B": 10.81, "Si": 28.085, "Se": 78.97}
+_DEFAULT_MASS = 30.0
 
 
-def sort_modes(modes, key=SORT_FREQUENCY):
-    # type: (List[Mode], str) -> List[Mode]
+def selection_weight(mode, indices, symbols=None, mass_weighted=True):
+    # type: (Mode, Sequence[int], Optional[Sequence[str]], bool) -> float
+    """How much of `mode`'s motion the SELECTED atoms carry, from 0 to 1.
+
+    Christian's idea (2026-08-03): "allow the user to make a selection in the
+    viewport of certain atoms whose vibrations they are interested in and
+    calculate their offset during different modes, use that as a ranking
+    parameter".
+
+    It is a PARTICIPATION RATIO, not a raw displacement sum, and that is the
+    whole design. A raw sum ranks every high-amplitude mode above a mode that
+    is genuinely localised on the selection, which is the opposite of the
+    question being asked — "which modes are about THESE atoms" is a question
+    about the FRACTION of the motion they carry, so the sum over the selection
+    is divided by the sum over everything.
+
+    `mass_weighted` is on by default, and it matters: an eigenvector is the
+    Cartesian displacement, so a C-H stretch is nearly all hydrogen motion by
+    amplitude. Unweighted, every mode involving a hydrogen scores highly and
+    selecting a heavy atom returns almost nothing. Weighting by mass measures
+    the share of the kinetic ENERGY instead, which is what "this mode belongs
+    to that part of the molecule" actually means.
+    """
+    vector = np.asarray(mode.displacements, dtype=float).reshape(-1, 3)
+    n = len(vector)
+    rows = sorted({int(i) for i in (indices or ()) if 0 <= int(i) < n})
+    if not rows or n == 0:
+        return 0.0
+    share = np.sum(vector * vector, axis=1)          # |d_i|^2 per atom
+    if mass_weighted:
+        masses = np.full(n, _DEFAULT_MASS)
+        for i, sym in enumerate(list(symbols or [])[:n]):
+            masses[i] = _MASSES.get(str(sym).strip().capitalize(),
+                                    _DEFAULT_MASS)
+        share = share * masses
+    total = float(share.sum())
+    if total <= 0.0:
+        return 0.0
+    return float(share[rows].sum() / total)
+
+
+def rank_by_selection(modes, indices, symbols=None, mass_weighted=True):
+    # type: (List[Mode], Sequence[int], Optional[Sequence[str]], bool) -> List[tuple]
+    """`[(mode, weight), ...]`, most-involved FIRST.
+
+    Descending for the same reason intensity is: the question "which modes move
+    these atoms" is answered from the top of the list, not the bottom.
+    """
+    scored = [(m, selection_weight(m, indices, symbols, mass_weighted))
+              for m in modes]
+    scored.sort(key=lambda pair: (-pair[1], pair[0].wavenumber))
+    return scored
+
+
+def sort_modes(modes, key=SORT_FREQUENCY, selection=None, symbols=None,
+               mass_weighted=True):
+    # type: (List[Mode], str, Optional[Sequence[int]], Optional[Sequence[str]], bool) -> List[Mode]
     """Order modes for the list.
 
     By frequency it is the spectrum, ascending — the order ORCA prints and
     the order you read a spectrum in. By intensity it is strongest FIRST,
     because the question that ordering answers is "which bands would I
-    actually see", and that is a descending question.
+    actually see", and that is a descending question. By SELECTION it is the
+    modes that move the picked atoms most, first (`selection_weight`).
 
     Modes with no intensity (the translations and rotations, which ORCA
     leaves out of the IR table, and every mode of a job that produced no IR
     block at all) sort to the end rather than being dropped: the list must
     still show everything it was given.
+
+    Sorting by selection with NOTHING selected falls back to frequency rather
+    than returning an arbitrary order — there is no question to answer yet.
     """
+    if key == SORT_SELECTION:
+        if not selection:
+            return sort_modes(modes, SORT_FREQUENCY)
+        return [m for m, _w in rank_by_selection(modes, selection, symbols,
+                                                 mass_weighted)]
     if key == SORT_INTENSITY:
         return sorted(modes,
                       key=lambda m: (m.intensity is None,

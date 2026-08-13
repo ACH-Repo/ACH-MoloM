@@ -25,6 +25,8 @@ from ..core import build as build_mod
 from ..core import modifiers as modifiers_mod
 from ..core import (bonding, edits, input_map, internal, io, measure, project,
                     rotations)
+from ..core import celledit
+from ..core import flight as flight_mod
 from ..core import cif as cif_mod
 from ..core import animation as anim_mod
 from ..core import cameras as cameras_mod
@@ -37,12 +39,12 @@ from ..core import vibrations as vib_mod
 from ..core import timeline as timeline_mod
 from ..core import meta as meta_mod
 from ..core.camera import quat_from_mat3, quat_to_mat3
-from ..core import resolve as resolve_mod
 from ..core import ops as ops_mod
 from ..core.ops import OperatorRegistry
 from ..core.scene import Scene
 from ..core.structure import Structure
 from ..core import style as style_mod
+from .. import resources
 from ..core.undo import UndoStack
 from .choice_popup import ChoicePopup
 from .dialogs import (AnimationExportDialog, BlenderExportDialog,
@@ -121,6 +123,12 @@ class MainWindow(QMainWindow):
         self._packed_edit_warned = set()
         self._render_target = {}
         self.setWindowTitle("MoloM")
+        # Also on the window, not only on the QApplication in `__main__`: a
+        # window built any other way (a test, the smoke tool, an embedder)
+        # would otherwise still show the generic Python icon.
+        _icon = resources.app_icon()
+        if _icon is not None:
+            self.setWindowIcon(_icon)
         self.settings = QSettings("ACH", "MoloM")
         self.scene = Scene()
         self.active_id = None            # type: Optional[int]
@@ -206,6 +214,19 @@ class MainWindow(QMainWindow):
             self.settings.value("label_scale", 1.0))
         self.viewport.adjust_h = self.settings.value(
             "adjust_hydrogens", "true") in (True, "true")
+        self.viewport.render_scale = int(
+            self.settings.value("render_scale", 2))
+        self.viewport.render_subdiv_bonus = int(
+            self.settings.value("render_subdiv", 2))
+        self.viewport.render_crop = self.settings.value(
+            "render_crop", "false") in (True, "true")
+        #: An explicit ffmpeg path, for when there is no system one and the
+        #: optional `imageio-ffmpeg` is not installed. Same shape as the
+        #: Blender path hint (round 50): a stored hint, then PATH, then the
+        #: usual install locations — never a hard dependency.
+        self.ffmpeg_hint = self.settings.value("ffmpeg_path", "") or ""
+        #: The last operator run from F3, pre-selected next time it opens.
+        self._last_operator = None
         #: What to do with partially occupied CIF sites — see
         #: `core.cif.resolve_disorder`. An import-time decision, so changing it
         #: applies to the next file opened (and to a crystal-view rebuild).
@@ -315,6 +336,10 @@ class MainWindow(QMainWindow):
         self.crystal_page.copies_toggled.connect(
             lambda on: self._on_packing_option(self.active_id, "copies", on))
         self.crystal_page.box_toggled.connect(self._set_cell_box)
+        self.crystal_page.cell_apply_requested.connect(self.on_apply_cell)
+        self.crystal_page.cell_suggest_requested.connect(self.on_suggest_cell)
+        self.crystal_page.cell_remove_requested.connect(self.on_remove_cell)
+        self.crystal_page.frac_apply_requested.connect(self.on_apply_fractional)
         # Through the page's GUARDED signals, never the raw `toggled`: these
         # ticks are now written from the active object by `set_cell`, and an
         # unguarded connection reads that refresh back as the user asking for
@@ -403,12 +428,16 @@ class MainWindow(QMainWindow):
 
         # Avogadro's element picker, floating just right of the tool column.
         # Edit mode only, and only with the draw tool OFF — see _sync_ptable.
-        self.ptable = PeriodicTablePanel(self.viewport)
-        self.ptable.element_picked.connect(self.viewport.apply_element)
-        self.ptable.meta_atom_requested.connect(self.on_meta_atom)
-        self.ptable.set_current(self.viewport.draw_element)
-        self.ptable.hide()
-        self.viewport.on_element_changed = self.ptable.set_current
+        # BUILT ON FIRST USE. 118 painted cells cost ~640 ms to construct,
+        # which was about a fifth of the whole launch - and the panel is hidden
+        # at startup, because it only appears in plain edit mode. Paying for a
+        # widget nobody has asked to see is the easiest kind of slow startup to
+        # fix, and the laziness is invisible: `_ptable` builds it the first
+        # time anything reaches for it.
+        self._ptable = None
+        self.viewport.on_element_changed = \
+            lambda symbol: (self._ptable.set_current(symbol)
+                            if self._ptable is not None else None)
 
         # Both data-dependent tabs start greyed; nothing is loaded yet.
         self._sync_crystal_page()
@@ -570,11 +599,34 @@ class MainWindow(QMainWindow):
                              or (c.viewport.last_transform is not None
                                  and bool(c.viewport.selection))),
           category="Edit", shortcut="Shift+R", key="Shift+R")
-        r("shuttle", "Shuttle mode: pilot the selected molecule",
-          lambda c: c.on_shuttle(), enabled=has_active, category="View")
+        r("shuttle", "Shuttle mode: pilot the selected molecule (cockpit)",
+          lambda c: c.on_shuttle(), enabled=has_active, category="View",
+          aliases=("fly", "pilot", "first person", "cockpit", "fps"))
+        r("shuttle_chase",
+          "Shuttle mode: pilot from behind (third person)",
+          lambda c: c.on_shuttle(third_person=True), enabled=has_active,
+          category="View",
+          aliases=("fly", "pilot", "third person", "chase", "chase camera",
+                   "follow", "behind"))
         r("toggle_hbonds", "Show suspected hydrogen bonds",
           lambda c: c.viewport.toggle_hbonds(), category="View",
           aliases=("h-bond", "hydrogen bonding", "contacts"))
+        # Measurements persist in the viewport, so they need the three controls
+        # any persistent annotation needs: hide them without losing them, get
+        # them back, and bin the lot.
+        r("measure_show", "Measurements: show or hide them all",
+          lambda c: c.viewport.set_show_measurements(
+              not c.viewport.show_measurements),
+          enabled=lambda c: bool(c.viewport.measurements),
+          category="View",
+          aliases=("hide measurements", "show measurements", "distances",
+                   "angles", "dihedral"))
+        r("measure_clear", "Measurements: delete every one",
+          lambda c: c.viewport.clear_measurements(),
+          enabled=lambda c: bool(c.viewport.measurements
+                                 or c.viewport._measure_picks),
+          category="View",
+          aliases=("clear measurements", "remove measurements"))
         r("optimize_panel", "Force field: optimize geometry (panel)",
           lambda c: c.on_toggle_optimize(), category="Edit", shortcut="Ctrl+R",
           key="Ctrl+R")
@@ -637,8 +689,11 @@ class MainWindow(QMainWindow):
                    "2 (two mols) = dock at 3 A, 3+ = plane key", key="A")
         r("add_atom", "Add atom...", lambda c: c.on_add_atom(),
           category="Edit", shortcut="Shift+A (object mode)", key="Shift+A")
-        r("delete_selected", "Delete selected atoms",
-          lambda c: c.on_delete_selected(), enabled=sel, category="Edit",
+        r("delete_selected", "Delete selected atoms (or a measurement)",
+          lambda c: c.on_delete_selected(),
+          enabled=lambda c: bool(c.viewport.selection
+                                 or c.viewport.has_measurement_target()),
+          category="Edit",
           shortcut="Del or X", key="Del", extra_keys=("X",))
         r("hide_selected", "Hide the selected atoms",
           lambda c: c.on_hide_selected(), enabled=sel, category="Edit",
@@ -799,6 +854,25 @@ class MainWindow(QMainWindow):
           lambda c: c.on_render_key(True), enabled=has_obj, category="File",
           shortcut="Ctrl+F12", key="Ctrl+F12",
           aliases=("render", "movie", "animation", "f12", "execute"))
+        # Once F12 has a remembered target it renders straight away, which is
+        # the point of it — but that made the settings a ONE-WAY DOOR:
+        # "there is currently no way to bring back the animation rendering
+        # properties tab once it has been set." These two put the question
+        # back, and the dialog now reopens showing what you last chose rather
+        # than the defaults.
+        r("render_settings_animation",
+          "Render settings: animation (ask again / change them)",
+          lambda c: c.on_render_settings(True),
+          enabled=lambda c: c.timeline.duration > 0.0, category="File",
+          aliases=("animation settings", "movie settings", "render properties",
+                   "change settings", "reconfigure", "ask again", "gif", "mp4",
+                   "fps", "framerate", "resolution", "export options"))
+        r("render_settings_still",
+          "Render settings: still image (ask again / change them)",
+          lambda c: c.on_render_settings(False), enabled=has_obj,
+          category="File",
+          aliases=("image settings", "render properties", "change settings",
+                   "ask again", "png", "export options"))
         r("graphics_info", "Report the graphics device (which GPU is drawing)",
           lambda c: c.on_graphics_info(), category="App",
           aliases=("gpu", "opengl", "renderer", "driver", "video card",
@@ -926,6 +1000,10 @@ class MainWindow(QMainWindow):
         self._add_op(m_file, "new_molecule", "New &empty molecule")
         self._add_op(m_file, "save_as", "&Export geometry...")
         self._add_op(m_file, "export_image", "Export &image...")
+        # The animation export is the most option-heavy thing in the program,
+        # and it was reachable only by Ctrl+Shift+A or F3 — so anyone who does
+        # not use shortcuts could not find it at all.
+        self._add_op(m_file, "export_animation", "Export a&nimation...")
         self._add_op(m_file, "export_blender", "Export to &Blender...")
         self._add_op(m_file, "clear_scene", "&Clear scene")
         m_file.addSeparator()
@@ -1086,6 +1164,12 @@ class MainWindow(QMainWindow):
             if c is not None:
                 picks.append((self.scene.pick_label(tuple(p)), c))
         self._measure_label.setText(measure.describe_picks(picks))
+        # The ∿ page can rank modes by how much they move the SELECTED atoms,
+        # so it has to hear about every selection change.
+        self._push_mode_selection()
+        # ...and the ❖ page's fractional block edits the ONE picked atom, so it
+        # has to know which (and to grey itself out when that is ambiguous).
+        self._sync_fractional()
         # Picking in the viewport makes that molecule ACTIVE — otherwise Tab
         # would edit whatever the outliner happened to be pointing at.
         if selection:
@@ -1485,10 +1569,23 @@ class MainWindow(QMainWindow):
             return modifiers_mod.SymmetryModifier(
                 cell=meta.get("cell"), symops=list(meta.get("symops")))
         cell, origin = self._default_cell_for(obj)
+        # THE INVENTED CELL IS WRITTEN TO METADATA, not kept privately on the
+        # modifier. Christian: "I have no idea what the cell/box limits are and
+        # where the center of inversion actually lies" - and he could not,
+        # because a cell known only to the modifier is a cell the viewport
+        # cannot draw a box for, the ❖ page cannot report, and
+        # `on_add_modifier`'s boundary branch reads as absent (which is why
+        # "the boundary bonds modifier doesn't add at all"). Making it a real
+        # cell makes all three work with no special cases.
+        if not meta.get("cell"):
+            obj.structure.metadata["cell"] = cell
+            obj.structure.metadata.setdefault("symops", ["x,y,z"])
+            obj.structure.metadata.setdefault("spacegroup", "P 1")
+            self.viewport.show_cell = True
         return modifiers_mod.SymmetryModifier(
-            cell=meta.get("cell") or cell,
-            symops=list(meta.get("symops") or ["x,y,z"]),
-            origin=None if meta.get("cell") else origin)
+            cell=obj.structure.metadata.get("cell") or cell,
+            symops=list(obj.structure.metadata.get("symops") or ["x,y,z"]),
+            origin=origin)
 
     @staticmethod
     def _default_cell_for(obj):
@@ -1922,13 +2019,33 @@ class MainWindow(QMainWindow):
         frozen_meta = meta_mod.frozen_atoms(s)
         if frozen_meta:
             fixed = sorted(set(fixed) | set(frozen_meta))
+        # RESTORE the spec geometry before freezing it. Christian: "the bonds
+        # do not keep the length they are set with. They become incredibly
+        # short." A previous run could leave the sphere collapsed (see below),
+        # and freezing a collapsed sphere just preserves the damage — the whole
+        # promise of a locked meta atom is that the distance you set is the
+        # distance you get, so it is re-asserted here rather than assumed.
+        symbols = list(s.symbols)
+        if frozen_meta:
+            for index in meta_mod.all_meta(s):
+                spec = meta_mod.get_meta(s, index)
+                if spec is not None and spec.locked:
+                    meta_mod.idealize(s, index, spec)
+            # And the force field is handed the element the centre STANDS FOR,
+            # never the `Xx` dummy. Both RDKit tiers refuse an unknown element
+            # outright ("mmff94: unknown element 'Xx'", "uff: unknown element
+            # 'Xx'"), so every meta complex fell through to OpenBabel UFF —
+            # which, until now, ignored `fixed` entirely. That combination is
+            # what collapsed the coordination sphere to 0.655 A on Christian's
+            # meta-test file: nothing was frozen and the dummy had no radius.
+            symbols = meta_mod.resolved_symbols(s)
         self.optimize_panel.set_running(
             True, "Running {} on {}{}...".format(
                 method, obj.name,
                 " (holding {} meta centre(s))".format(
                     len(meta_mod.all_meta(s))) if frozen_meta else ""))
         self._opt_target = obj.id
-        self._opt_worker = OptimizeWorker(list(s.symbols), s.coords.copy(),
+        self._opt_worker = OptimizeWorker(symbols, s.coords.copy(),
                                           list(s.bonds), method, steps,
                                           fixed, self)
         self._opt_worker.done.connect(self._optimize_done)
@@ -1960,11 +2077,11 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "Optimized {}: {}".format(obj.name, note.splitlines()[0]), 8000)
 
-    def on_shuttle(self):
+    def on_shuttle(self, third_person=False):
         obj = self._active_obj()
         if obj is None:
             return
-        self.viewport.start_shuttle(obj.id)
+        self.viewport.start_shuttle(obj.id, third_person=third_person)
 
     def on_origin_snap(self):
         obj = self._active_obj()
@@ -2039,7 +2156,8 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            img = self.viewport.render_image()
+            img = self.viewport.render_image(
+                crop_to_content=self.viewport.render_crop)
         except Exception as e:      # driver without FBO support, etc.
             self.statusBar().showMessage(
                 "High-quality render failed ({}), grabbing the viewport "
@@ -2206,11 +2324,26 @@ class MainWindow(QMainWindow):
             return self.scene.get(next(iter(ids)))
         return self._active_obj()
 
+    @staticmethod
+    def _smiles_symbols(obj):
+        """The element list to hand a CHEMISTRY tool, with meta dummies
+        resolved to what they stand for.
+
+        `Xx` has atomic number 0, so RDKit refuses it outright and the whole
+        SMILES fails with "unknown element 'Xx'" - Christian: "Copy SMILES does
+        not work on structures with meta atoms". A meta centre already declares
+        the element it becomes on export, and that is the only sensible answer
+        here too: a SMILES is a statement about chemistry, and a placeholder is
+        not an element. Same fix as the force field's (round 62), and the same
+        one function answers both.
+        """
+        return meta_mod.resolved_symbols(obj.structure)
+
     def on_copy_smiles(self):
         obj = self._selected_object()
         if obj is None or obj.structure.n_atoms == 0:
             return
-        smiles, err = io.structure_to_smiles(obj.structure.symbols,
+        smiles, err = io.structure_to_smiles(self._smiles_symbols(obj),
                                              obj.structure.bonds)
         if smiles is None:
             QMessageBox.warning(self, "SMILES", "Could not derive a SMILES "
@@ -2226,7 +2359,7 @@ class MainWindow(QMainWindow):
         obj = self._selected_object()
         if obj is None or obj.structure.n_atoms == 0:
             return
-        smiles, err = io.structure_to_smiles(obj.structure.symbols,
+        smiles, err = io.structure_to_smiles(self._smiles_symbols(obj),
                                              obj.structure.bonds)
         if smiles is None:
             QMessageBox.warning(self, "Name lookup", err or "no SMILES")
@@ -2234,6 +2367,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "Looking {} up on PubChem...".format(smiles), 4000)
         QApplication.processEvents()
+        # Imported HERE, not at module scope: it pulls in urllib/http/email,
+        # about 130 ms, for a lookup most launches never make.
+        from ..core import resolve as resolve_mod
         name = resolve_mod.name_for_smiles(smiles)
         if not name:
             self.statusBar().showMessage(
@@ -3696,6 +3832,13 @@ class MainWindow(QMainWindow):
         self._after_edit()
 
     def on_delete_selected(self):
+        # A hovered or selected MEASUREMENT is what Delete takes first: it is
+        # the thing under the cursor, it is drawn highlighted to say so, and it
+        # is not part of the structure — so this needs no undo entry and must
+        # not fall through to deleting atoms. Christian asked for both routes,
+        # "selecting + Delete or hovering over them + Delete".
+        if self.viewport.delete_measurement():
+            return
         sel = self.viewport.selection
         if not sel:
             return
@@ -3854,6 +3997,22 @@ class MainWindow(QMainWindow):
                 obj_id, properties_mod.DEFAULT_AMPLITUDE)),
             n_frames=int(self._mode_frames.get(
                 obj_id, vib_mod.DEFAULT_PERIOD_FRAMES)))
+        self._push_mode_selection()
+        self._sync_fractional()
+
+    def _push_mode_selection(self):
+        """Hand the ∿ page the atoms picked ON ITS OWN molecule.
+
+        Scoped to the active object on purpose: a mode belongs to one FREQ job,
+        so atoms selected in some other molecule are not part of the question,
+        and their indices would mean different atoms here anyway.
+        """
+        obj = self._active_obj()
+        if obj is None:
+            self.vibration_page.set_selection([], [])
+            return
+        rows = [i for o, i in self.viewport.selection if o == obj.id]
+        self.vibration_page.set_selection(rows, obj.structure.symbols)
 
     def _rest_for(self, obj):
         # type: (object) -> object
@@ -4075,39 +4234,60 @@ class MainWindow(QMainWindow):
                 return
             ligand = donors[names.index(choice)]
         marks = tpl_mod.get_ligating(ligand.structure)
+        # A MONODENTATE ligand is the one case where several placeholders do
+        # not have to be geminal: each one simply gets its own copy. Christian:
+        # "monodentate ligands are a nice exception in that we can allow to
+        # coordinate multiple times at once". With more donors the geminal rule
+        # still holds — a chelate has to span slots on ONE centre, and two
+        # centres would be a bridging ligand, which is a different operation.
+        if len(marks) == 1 and len(slots) > 1:
+            groups = [[i] for i in slots]
+        else:
+            groups = [list(slots)]
         try:
-            centre = tpl_mod.check_placeholders(host.structure, slots)
-            rot, trans = tpl_mod.coordinate(
-                host.structure.coords, slots, centre,
-                ligand.structure.coords, marks)
+            # Every transform is computed against the ORIGINAL coordinates,
+            # before anything is appended — the placeholders do not move, and
+            # doing it up front means a failure on the third of five leaves the
+            # molecule untouched rather than half-built.
+            plan = []
+            for group in groups:
+                centre = tpl_mod.check_placeholders(host.structure, group)
+                rot, trans = tpl_mod.coordinate(
+                    host.structure.coords, group, centre,
+                    ligand.structure.coords, marks)
+                plan.append((group, centre, rot, trans))
         except tpl_mod.TemplateError as exc:
             self.statusBar().showMessage("Coordinate ligand: {}".format(exc),
                                          10000)
             return
 
         self.push_undo()
-        # Bring a COPY of the ligand in, so the template stays reusable.
-        moved = ligand.structure.coords @ rot.T + trans
         s = host.structure
-        offset = s.n_atoms
-        for k, symbol in enumerate(ligand.structure.symbols):
-            edits.add_atom(s, symbol, moved[k])
-        for bond in ligand.structure.bonds:
-            order = bond[2] if len(bond) > 2 else 1
-            edits.add_bond(s, offset + int(bond[0]), offset + int(bond[1]),
-                           order=order)
-        for donor in marks:
-            edits.add_bond(s, centre, offset + donor, order=1)
-        # The placeholders have been replaced, so they go — last, because
-        # deleting reindexes everything above them.
-        edits.delete_atoms(s, slots)
+        for group, centre, rot, trans in plan:
+            # Bring a COPY of the ligand in, so the template stays reusable.
+            moved = ligand.structure.coords @ rot.T + trans
+            offset = s.n_atoms
+            for k, symbol in enumerate(ligand.structure.symbols):
+                edits.add_atom(s, symbol, moved[k])
+            for bond in ligand.structure.bonds:
+                order = bond[2] if len(bond) > 2 else 1
+                edits.add_bond(s, offset + int(bond[0]), offset + int(bond[1]),
+                               order=order)
+            for donor in marks:
+                edits.add_bond(s, centre, offset + donor, order=1)
+        # The placeholders have been replaced, so they go — last, and all at
+        # once, because deleting reindexes everything above them.
+        edits.delete_atoms(s, sorted(slots))
         meta_mod.prune(s)
         self.viewport.set_selection([])
         self._after_edit()
         self._sync_all()
         self.statusBar().showMessage(
-            "{} coordinated onto {} — {} bond(s) made, {} placeholder(s) "
-            "removed".format(ligand.name, host.name, len(marks), len(slots)),
+            "{} coordinated onto {} — {} cop{} placed, {} bond(s) made, {} "
+            "placeholder(s) removed".format(
+                ligand.name, host.name, len(plan),
+                "y" if len(plan) == 1 else "ies",
+                len(marks) * len(plan), len(slots)),
             9000)
 
     def on_join(self):
@@ -4309,10 +4489,29 @@ class MainWindow(QMainWindow):
         """
         show = (self.viewport.mode == MODE_EDIT
                 and not self.viewport.draw_tool_active)
+        if not show and self._ptable is None:
+            return                  # never built, nothing to hide
+        table = self.ptable
         if show:
-            self.ptable.set_current(self.viewport.draw_element)
+            table.set_current(self.viewport.draw_element)
             self._position_ptable()
-        self.ptable.setVisible(show)
+        table.setVisible(show)
+
+    @property
+    def ptable(self):
+        """The periodic table, built the first time it is needed.
+
+        A property rather than a `_build_ptable()` everyone must remember to
+        call: every existing use site keeps working unchanged, and a new one
+        cannot forget.
+        """
+        if self._ptable is None:
+            self._ptable = PeriodicTablePanel(self.viewport)
+            self._ptable.element_picked.connect(self.viewport.apply_element)
+            self._ptable.meta_atom_requested.connect(self.on_meta_atom)
+            self._ptable.set_current(self.viewport.draw_element)
+            self._ptable.hide()
+        return self._ptable
 
     def _position_ptable(self):
         """Glued to the right edge of the floating tool column."""
@@ -4608,7 +4807,7 @@ class MainWindow(QMainWindow):
             return
         vp = self.viewport
         times = anim_mod.frame_times(clock)
-        have_video = anim_mod.video_available()
+        have_video = anim_mod.video_available(self.ffmpeg_hint)
         # Inside a camera, the shot's own resolution is the default — the
         # frames come out of `render_image` cropped to the film back, so a
         # default taken from the WINDOW would have a different aspect and the
@@ -4617,10 +4816,17 @@ class MainWindow(QMainWindow):
             if vp.looking_through is not None else None
         default_size = (active_cam.render_size() if active_cam is not None
                         else (vp.width(), vp.height()))
-        dlg = AnimationExportDialog(self, len(times), clock.fps,
-                                    default_size, have_video)
+        dlg = AnimationExportDialog(
+            self, len(times), clock.fps, default_size, have_video,
+            remembered=(self._render_target.get(True) or {}).get("opts"),
+            ffmpeg_hint=self.ffmpeg_hint)
         if not dlg.exec():
             return
+        # An ffmpeg located from inside the dialog is remembered, or the next
+        # export would ask again for something already answered.
+        if dlg.ffmpeg_hint() and dlg.ffmpeg_hint() != self.ffmpeg_hint:
+            self.ffmpeg_hint = dlg.ffmpeg_hint()
+            self.settings.setValue("ffmpeg_path", self.ffmpeg_hint)
         opts = dlg.options()
         times = anim_mod.frame_times(clock, loops=opts["loops"])
         if not times:
@@ -4711,7 +4917,8 @@ class MainWindow(QMainWindow):
                                                  0, where["digits"]),
                                              "_%0{}d".format(where["digits"]))
         ok, note = anim_mod.encode(pattern, where["path"], opts["fps"],
-                                   where["format"])
+                                   where["format"],
+                                   hint=self.ffmpeg_hint)
         if ok:
             import shutil as _sh
             if temp:
@@ -4741,16 +4948,35 @@ class MainWindow(QMainWindow):
             else:
                 self.on_export_image()
             return
+        if remembered is not None and not remembered.get("path"):
+            self._render_target.pop(bool(animation), None)
+            return self.on_render_key(animation)
         if animation:
             self._render_animation_again(remembered)
         else:
             self._render_still_again(remembered)
 
+    def on_render_settings(self, animation):
+        """Forget the remembered target so the export ASKS again, and ask now.
+
+        F12's press-and-forget behaviour is right, but it left the settings
+        with no way back — the dialog only ever appeared on the first render.
+        This is the way back, and it reopens the dialog immediately rather than
+        just clearing the memory, because "ask me next time" is never what
+        someone wants when they went looking for the settings.
+        """
+        self._render_target.pop(bool(animation), None)
+        if animation:
+            self.on_export_animation()
+        else:
+            self.on_export_image()
+
     def _render_still_again(self, remembered):
         path = anim_mod.next_free(remembered["path"],
                                   remembered.get("increment", True))
         try:
-            image = self.viewport.render_image()
+            image = self.viewport.render_image(
+                crop_to_content=self.viewport.render_crop)
         except Exception:
             image = self.viewport.grabFramebuffer()
         if not image.save(path):
@@ -4957,14 +5183,22 @@ class MainWindow(QMainWindow):
                       "samples") if k in info)
         body += ("<br><i>Samples is the LIVE multisampling of the framebuffer "
                  "being drawn into, not what the surface format claims.</i>")
-        QMessageBox.information(
-            self, "Graphics device",
+        box = QMessageBox(self)
+        box.setWindowTitle("Graphics device")
+        box.setIcon(QMessageBox.Information)
+        box.setTextFormat(Qt.RichText)
+        box.setText(
             "MoloM draws through OpenGL, so the viewport runs on the GPU "
             "named below.<br><br>{}<br><br>"
             "If that is an integrated chip and the machine also has a "
             "discrete card, the choice is made by the driver, not by MoloM — "
             "set a per-application preference for <tt>python.exe</tt> in the "
             "graphics control panel to change it.".format(body))
+        # A driver string is the first thing anyone is asked to paste into a
+        # bug report, and a QMessageBox is not selectable by default.
+        box.setTextInteractionFlags(Qt.TextSelectableByMouse
+                                    | Qt.TextSelectableByKeyboard)
+        box.exec()
         self.statusBar().showMessage(
             "Drawing on: {}".format(info.get("renderer", "unknown")), 10000)
 
@@ -5603,8 +5837,17 @@ class MainWindow(QMainWindow):
         if obj is None or cell is None:
             self.crystal_page.set_cell(None, name="" if obj is None
                                        else obj.name)
+            # The EDITOR stays live with no cell - that is the case it exists
+            # for. Everything else on the page greys out, but "give this
+            # molecule a box" has to remain reachable.
+            self.crystal_page.cell_editor.setEnabled(obj is not None)
             return
         meta = obj.structure.metadata
+        # Keep the editor showing the cell it would change, so opening it never
+        # presents numbers belonging to a different molecule.
+        self.crystal_page.cell_editor.setEnabled(True)
+        self.crystal_page.set_cell_fields(cell, meta.get("spacegroup", ""))
+        self._sync_fractional()
         info = meta.get("cif_info") or {}
         naming = self.space_group_naming(obj.structure, cell)
         shown = (naming.text(self.sg_convention) if naming is not None
@@ -5869,9 +6112,132 @@ class MainWindow(QMainWindow):
                 len(meta.get("symops") or ()), n_asym,
                 obj.structure.n_atoms))
 
+    # ------------------------------------------------- defining a unit cell
+    def on_suggest_cell(self):
+        """Fill the editor with the molecule's own bounding box.
+
+        So "define a cell" does not open on 1x1x1 and demand six numbers before
+        anything can be seen.
+        """
+        obj = self._active_obj()
+        if obj is None:
+            return
+        cell = celledit.suggest_cell(obj.structure)
+        self.crystal_page.set_cell_fields(cell)
+        self.crystal_page.set_cell_note(
+            "Filled from the molecule's bounding box plus a 2 A margin. "
+            "Adjust and press Apply.")
+
+    def on_apply_cell(self):
+        """Put the typed cell onto the active molecule."""
+        obj = self._active_obj()
+        if obj is None:
+            return
+        values, group, keep_frac = self.crystal_page.cell_fields()
+        had = celledit.cell_of(obj.structure) is not None
+        try:
+            cell = celledit.make_cell(**values)
+        except celledit.CellError as exc:
+            # Refused, and SAID so on the page rather than in a status bar
+            # message that four seconds later is gone.
+            self.crystal_page.set_cell_note(str(exc), error=True)
+            return
+        symops = None
+        note_bits = []
+        if group:
+            # A symbol is resolved through the same Hall database a file's own
+            # symbol goes through (round 40), so a cell defined here expands
+            # exactly as an imported one would.
+            resolved = spacegroups.operators_for(group)
+            if resolved is None:
+                self.crystal_page.set_cell_note(
+                    "Space group {!r} was not recognised - the cell was not "
+                    "changed. Leave it empty for P1.".format(group), error=True)
+                return
+            symops = list(resolved.xyz)
+            note_bits.append("{} with {} operator(s)".format(
+                resolved.symbol or group, len(symops)))
+        self.push_undo()
+        report = celledit.apply_cell(obj.structure, cell,
+                                     keep_fractional=keep_frac,
+                                     symops=symops, spacegroup=group or None)
+        note_bits.insert(0, "Cell {}".format("updated" if had else "added"))
+        if report["kept"] == "fractional" and report["moved"]:
+            note_bits.append("{} atom(s) moved with the frame".format(
+                report["moved"]))
+        elif not had:
+            note_bits.append("atoms left where they are")
+        self.viewport.show_cell = True
+        self.viewport.refresh_geometry()
+        self._after_edit()
+        self._sync_all()
+        self.crystal_page.set_cell_note(" - ".join(note_bits))
+        self.statusBar().showMessage(" - ".join(note_bits), 8000)
+
+    def on_remove_cell(self):
+        obj = self._active_obj()
+        if obj is None:
+            return
+        self.push_undo()
+        if not celledit.clear_cell(obj.structure):
+            self.crystal_page.set_cell_note("This molecule has no cell.")
+            return
+        self.viewport.refresh_geometry()
+        self._after_edit()
+        self._sync_all()
+        self.crystal_page.set_cell_note(
+            "Cell removed - the atoms are untouched.")
+
+    def _frac_target(self):
+        """`(obj, atom_index)` when exactly one atom is picked on a molecule
+        that has a cell, else `(None, None)`."""
+        obj = self._active_obj()
+        if obj is None or celledit.cell_of(obj.structure) is None:
+            return None, None
+        rows = [i for o, i in self.viewport.selection if o == obj.id]
+        if len(rows) != 1 or rows[0] >= obj.structure.n_atoms:
+            return None, None
+        return obj, int(rows[0])
+
+    def _sync_fractional(self):
+        """Show the picked atom's fractional position on the ❖ page."""
+        obj, index = self._frac_target()
+        if obj is None:
+            self.crystal_page.set_frac_fields(None)
+            return
+        frac = celledit.fractional_of(obj.structure, index)
+        self.crystal_page.set_frac_fields(
+            frac, "{}{} of {}".format(obj.structure.symbols[index], index,
+                                      obj.name))
+
+    def on_apply_fractional(self):
+        """Move the picked atom to the typed fractional position."""
+        obj, index = self._frac_target()
+        if obj is None:
+            self.crystal_page.set_frac_fields(None)
+            return
+        values, wrap = self.crystal_page.frac_fields()
+        self.push_undo()
+        try:
+            celledit.set_fractional(obj.structure, index, values, wrap=wrap)
+        except celledit.CellError as exc:
+            self.crystal_page.frac_note.setText(str(exc))
+            return
+        self.viewport.refresh_geometry()
+        self._after_edit()
+        self._sync_fractional()
+        self.statusBar().showMessage(
+            "{}{} moved to ({:.4f}, {:.4f}, {:.4f})".format(
+                obj.structure.symbols[index], index, *values), 7000)
+
     def on_operator_search(self):
-        dlg = OperatorSearchDialog(self, self.ops, self)
+        # The last operator run is pre-selected on an empty search, so pressing
+        # F3-Enter repeats it. That is Blender's behaviour and it is what makes
+        # the palette usable for something you are doing over and over.
+        dlg = OperatorSearchDialog(self, self.ops, self,
+                                   last=self._last_operator)
         if dlg.exec() and dlg.chosen is not None:
+            self._last_operator = dlg.chosen.id
             dlg.chosen.run(self)
 
     # ------------------------------------------------------------- add-ons
@@ -5930,6 +6296,7 @@ class MainWindow(QMainWindow):
             atom_scale=self.viewport.atom_scale,
             render_scale=self.viewport.render_scale,
             render_subdiv=self.viewport.render_subdiv_bonus,
+            render_crop=self.viewport.render_crop,
             input_preset=self.viewport.input_preset,
             label_scale=self.viewport.label_scale,
             disorder_policy=self.disorder_policy,
@@ -5958,7 +6325,8 @@ class MainWindow(QMainWindow):
                     "strafe_factor": "fly_strafe_factor",
                     "roll_rate": "fly_roll_rate", "turn_rate": "fly_turn_rate",
                     "bank_angle": "fly_bank_angle",
-                    "aim_expo": "fly_aim_expo", "hold_ms": "fly_hold_ms"}
+                    "aim_expo": "fly_aim_expo", "hold_ms": "fly_hold_ms",
+                    "shuttle_factor": "shuttle_factor"}
 
     def _flight_tuning(self):
         # type: () -> dict
@@ -5978,6 +6346,16 @@ class MainWindow(QMainWindow):
             return
         if key == "aim_expo":
             fly["aim"].expo = max(float(value), 1.0)
+        elif key == "shuttle_factor":
+            # Live-applied to a SHUTTLE in progress only: it is the difference
+            # between the two modes, so pushing it into a camera flight would
+            # slow down the thing it does not describe. Rebuilt from the
+            # unscaled settings so repeated edits cannot compound.
+            if fly["obj_id"] is not None:
+                fly["model"].accel, fly["model"].max_speed = \
+                    flight_mod.shuttle_scaled(
+                        float(self.viewport.fly_accel),
+                        flight_mod.DEFAULT_MAX_SPEED, float(value))
         elif key not in ("turn_rate", "hold_ms"):
             # `hold_ms` and `turn_rate` are the viewport's, not the model's —
             # pushing them into FlightModel would invent attributes on it.
@@ -6007,8 +6385,11 @@ class MainWindow(QMainWindow):
             self.settings.setValue("atom_scale", dlg.atom_scale())
             self.viewport.render_scale = dlg.render_scale()
             self.viewport.render_subdiv_bonus = dlg.render_subdiv()
+            self.viewport.render_crop = dlg.render_crop()
             self.settings.setValue("render_scale", dlg.render_scale())
             self.settings.setValue("render_subdiv", dlg.render_subdiv())
+            self.settings.setValue("render_crop",
+                                   "true" if dlg.render_crop() else "false")
             self.settings.setValue(
                 "adjust_hydrogens",
                 "true" if dlg.adjust_hydrogens() else "false")

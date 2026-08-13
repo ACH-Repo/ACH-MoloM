@@ -223,3 +223,20 @@ def test_every_shipped_subpackage_is_declared():
             on_disk.add(rel)
     assert on_disk <= declared, \
         "not in pyproject's packages: {}".format(sorted(on_disk - declared))
+def test_every_shipped_ASSET_is_declared():
+    """The same hand-written-list bug one level down, and it had already bitten:
+    `package-data` globbed svg+png, round 63 then added `molom.ico`, and the one
+    asset added after the list was written was the one silently dropped from the
+    wheel. Checked as "every file in the directory matches some pattern" rather
+    than by naming extensions, so the next asset type cannot repeat it."""
+    import fnmatch
+    text = _pyproject()
+    block = re.search(r'(?ms)^\[tool\.setuptools\.package-data\].*?^"molom\.resources"\s*=\s*\[([^\]]*)\]',
+                      text)
+    assert block, "no package-data for molom.resources"
+    patterns = re.findall(r'"([^"]+)"', block.group(1))
+    folder = os.path.join(ROOT, "molom", "resources")
+    for name in os.listdir(folder):
+        if name.endswith(".py") or name == "__pycache__":
+            continue                      # code ships as code
+        assert any(fnmatch.fnmatch(name, pat) for pat in patterns),             "{} is in molom/resources/ and matches no package-data pattern "             "{}".format(name, patterns)

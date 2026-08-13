@@ -103,6 +103,27 @@ PITCH_LIMIT_DEG = 88.0
 #: DOUBLE-click (which latches) as the only way in.
 DEFAULT_HOLD_MS = 250.0
 
+#: Shuttle mode flies SLOWER than camera flight, and it should. Flying the
+#: camera is a navigation gesture - you want to cross the scene and arrive.
+#: Flying a MOLECULE is a placement gesture: the thing you are moving is the
+#: subject, it has to stay in frame, and at camera speeds it is out of the
+#: viewport before the key comes up. Christian: "shuttle mode must be at most
+#: half as fast". Scales the acceleration AND the top speed, so the feel is
+#: uniformly calmer rather than merely capped.
+DEFAULT_SHUTTLE_FACTOR = 0.45
+
+
+def shuttle_scaled(accel, max_speed, factor=DEFAULT_SHUTTLE_FACTOR):
+    # type: (float, float, float) -> tuple
+    """`(accel, max_speed)` for piloting a molecule rather than the camera.
+
+    Both are scaled, not just the cap: scaling only the top speed leaves the
+    thing lurching to it just as hard, which is the part that makes a molecule
+    hard to place.
+    """
+    f = max(float(factor), 1e-3)
+    return float(accel) * f, float(max_speed) * f
+
 
 class FlightModel(object):
     """World-space velocity with thrust, drag and a speed cap.
@@ -383,6 +404,217 @@ class AimReticle(object):
     def centred(self, short_side=600.0):
         # type: (float) -> bool
         return not bool(np.any(self.deflection(short_side)))
+
+
+# ------------------------------------------------------ third-person chase
+#: How far BEHIND the piloted molecule the camera sits, and how far ABOVE it,
+#: both as multiples of the molecule's own radius. Relative rather than
+#: absolute because MoloM's scenes run from a 3 A molecule to a 200 A
+#: framework, and a fixed distance would be either inside the ship or in the
+#: next postcode.
+CHASE_DISTANCE = 1.9
+CHASE_HEIGHT = 0.45
+#: How quickly the camera catches up, per second. This is the whole feel: a
+#: RIGID chase camera makes the world swing around the ship and is as
+#: disorienting as sitting inside it, which is the reason first person "leads
+#: to problems" in the first place. Lagging reads as following.
+CHASE_LAG = 5.0
+
+#: HOW FAR OFF THE VIEW AXIS THE SHIP MAY DRIFT, IN DEGREES - which is the
+#: quantity the slip limit was always trying to be.
+#:
+#: Rounds 66-71 capped the lag at 3 molecule RADII, and that number cannot do
+#: the job it exists for. The camera sits `CHASE_DISTANCE` = 1.9 radii back, so
+#: 3 radii of lag is 1.6x the viewing distance, i.e. the ship is allowed to
+#: wander about 58 degrees off the view axis - against a 40 degree field of
+#: view, whose half-angle is 20. The backstop therefore engaged only long after
+#: the ship had left the picture, which is why every measurement of it came
+#: back "the clamp never fires" while Christian was watching the molecule slide
+#: out of frame. Keeping the ship in FRAME is a statement about the frame, so
+#: the limit is an ANGLE and scales with the viewing distance, not with the
+#: molecule.
+CHASE_FRAME_ANGLE = 9.0
+
+
+def follow(current, target, lag=CHASE_LAG, dt=1.0 / 60.0):
+    # type: (np.ndarray, np.ndarray, float, float) -> np.ndarray
+    """Ease `current` toward `target`, framerate-independently.
+
+    `1 - exp(-lag*dt)` rather than a fixed fraction per frame: a per-frame lerp
+    makes the camera trail further at 30 fps than at 120, so the feel would
+    depend on the machine. This form converges at the same rate in seconds
+    whatever the step, which is the same reasoning behind the exponential drag
+    in `FlightModel`.
+    """
+    current = np.asarray(current, dtype=float)
+    target = np.asarray(target, dtype=float)
+    if lag <= 0.0 or dt <= 0.0:
+        return target.copy()
+    alpha = 1.0 - float(np.exp(-float(lag) * float(dt)))
+    return current + (target - current) * alpha
+
+
+#: The chase camera's up direction. ALWAYS world Z, never the camera's own up.
+#: Christian: "oftentimes the piloted mol is on the left hand side once a roll
+#: has been introduced". That was exactly this - the pivot was offset along the
+#: CAMERA's up, so rolling the ship swung the offset sideways and carried the
+#: molecule out of frame with it. World Z cannot roll, so the ship stays put.
+WORLD_UP = np.array([0.0, 0.0, 1.0])
+
+
+def chase_pivot(origin, up=None, radius=1.0, height=CHASE_HEIGHT):
+    # type: (np.ndarray, Optional[np.ndarray], float, float) -> np.ndarray
+    """Where the orbit PIVOT belongs for a chase view of a ship at `origin`.
+
+    The camera rig puts the eye `distance` behind the pivot, so aiming the
+    pivot slightly ABOVE the ship is what lifts the eye above it - and it also
+    drops the ship a little below the centre of frame, which is the chase-cam
+    look rather than a bug.
+
+    `up` defaults to WORLD Z and should stay that way: see WORLD_UP for what
+    happens when it is allowed to follow the camera.
+    """
+    origin = np.asarray(origin, dtype=float)
+    up = WORLD_UP if up is None else np.asarray(up, dtype=float)
+    norm = float(np.linalg.norm(up))
+    if norm < 1e-9:
+        return origin.copy()
+    return origin + (up / norm) * (float(height) * float(radius))
+
+
+def chase_distance(radius, factor=CHASE_DISTANCE, minimum=2.0):
+    # type: (float, float, float) -> float
+    """How far back to sit from a molecule of this radius."""
+    return max(float(minimum), float(factor) * max(float(radius), 1e-3))
+
+
+#: Where the spring starts stiffening, as a fraction of the cap. Below this the
+#: camera trails freely; above it, it pulls progressively harder.
+CHASE_SOFT_ZONE = 0.45
+#: How much harder. At the cap the follow rate is this multiple of `lag`.
+CHASE_STIFFEN = 12.0
+
+
+def slip_limit(distance, angle_deg=CHASE_FRAME_ANGLE):
+    # type: (float, float) -> float
+    """How far the pivot may lag behind the ship, in scene units.
+
+    Derived from the VIEWING DISTANCE and an angle, because the gap is only
+    ever felt as an angle: a lag of `g` at a viewing distance of `d` puts the
+    ship `atan(g/d)` off the middle of the picture, whatever either number is
+    in Angstrom. See `CHASE_FRAME_ANGLE` for why the old radius-based cap could
+    never hold the ship in frame.
+    """
+    return max(float(distance), 1e-3) * float(
+        np.tan(np.radians(float(angle_deg))))
+
+
+def follow_rate(speed, limit, lag=CHASE_LAG, soft=CHASE_SOFT_ZONE):
+    # type: (float, float, float, float) -> float
+    """The follow rate needed to hold a ship travelling at `speed` in frame.
+
+    An exponential follow settles at `gap = speed / rate`, so a FIXED rate
+    means the gap is proportional to the speed - and past a point no rate that
+    feels good at walking pace can hold a fast ship at all, because the camera
+    is being left behind faster than it can close. That is exactly Christian's
+    "as if the molecule has vastly more inertia than the camera": nothing was
+    wrong with the easing, it was simply being asked to close a gap that was
+    opening faster. The hard cap then took the correction in one step, which is
+    the jump; and since the speed varies with the thrust and the frame time,
+    the correction arrived sporadically, which is the judder.
+
+    So the rate is raised, when and only when it has to be, to whatever keeps
+    the steady-state gap inside the soft zone. At low speed this returns `lag`
+    unchanged and the trailing feel is untouched, which is the whole point of
+    the lag; at high speed the camera stiffens up by itself and the ship stays
+    where you can see it.
+    """
+    speed = max(float(speed), 0.0)
+    span = max(float(soft), 1e-3) * max(float(limit), 1e-6)
+    return max(float(lag), speed / span)
+
+
+def spring_lag(pivot, target, limit, lag=CHASE_LAG,
+               soft=CHASE_SOFT_ZONE, stiffen=CHASE_STIFFEN):
+    # type: (np.ndarray, np.ndarray, float, float, float, float) -> float
+    """The follow rate to use, stiffening as the gap opens.
+
+    `limit` is the cap in SCENE UNITS (see `slip_limit`), not a multiplier.
+
+    This replaces a HARD clamp, and the reason is exactly what Christian
+    described: "some kind of small camera jump that gets corrected quickly and
+    occurs sporadically as if the camera is colliding with a boundary... as if
+    the molecule has vastly more inertia than the camera". It was colliding
+    with a boundary - the old `clamp_slip` let the pivot ease freely until the
+    gap hit a cap and then SNAPPED it back to exactly the cap, every frame, for
+    as long as the burn lasted. Ease, wall, snap, ease: a judder that is not a
+    frame-rate problem and cannot be tuned away by changing `lag`.
+
+    A spring arm has no wall. The rate rises smoothly from `lag` at the soft
+    zone to `lag * stiffen` at the cap, so the gap ASYMPTOTES instead of
+    striking something, and the correction is spread over many frames rather
+    than landing in one.
+
+    The spring alone was not enough, and round 71 shipped it believing it was:
+    it handles a gap that is momentarily too large, and does nothing about a
+    gap that is too large in the STEADY STATE, which is what a fast ship
+    produces. `follow_rate` is the other half.
+    """
+    cap = float(limit)
+    span = float(np.linalg.norm(np.asarray(target, dtype=float)
+                                - np.asarray(pivot, dtype=float)))
+    if cap <= 0.0:
+        return float(lag)
+    over = (span / cap - float(soft)) / max(1.0 - float(soft), 1e-6)
+    if over <= 0.0:
+        return float(lag)
+    return float(lag) * (1.0 + (float(stiffen) - 1.0) * min(over, 1.0))
+
+
+def clamp_slip(pivot, target, limit):
+    # type: (np.ndarray, np.ndarray, float) -> np.ndarray
+    """Hard backstop, kept only for the pathological case.
+
+    `follow_rate` and `spring_lag` are what actually keep the ship in frame;
+    this exists so a huge dt (a stalled frame, a debugger pause) cannot leave
+    the pivot an arbitrary distance behind in a single step. In normal flight
+    the other two mean this never fires - which is the point, because a hard
+    clamp IS a wall and hitting one every frame is the judder Christian has
+    been reporting since round 66.
+
+    `limit` is the cap in SCENE UNITS (see `slip_limit`), not a multiplier.
+    """
+    pivot = np.asarray(pivot, dtype=float)
+    target = np.asarray(target, dtype=float)
+    gap = target - pivot
+    span = float(np.linalg.norm(gap))
+    cap = max(float(limit), 1e-9)
+    if span <= cap or span < 1e-9:
+        return pivot
+    return target - gap * (cap / span)
+
+
+#: FIRST PERSON: how far outside the cockpit ATOM's own drawn sphere the eye
+#: sits, as a multiple of that sphere's radius, and a floor for an atom drawn
+#: very small. The camera looks AT the cockpit atom from `distance` behind it,
+#: so a distance shorter than the sphere's radius puts the eye INSIDE the atom
+#: - which is where it has been: 0.35 A against a carbon drawn at 0.409, so the
+#: whole screen was the inside surface of one sphere.
+COCKPIT_CLEARANCE = 1.5
+COCKPIT_MIN_DISTANCE = 0.5
+
+
+def cockpit_distance(atom_radius, clearance=COCKPIT_CLEARANCE,
+                     minimum=COCKPIT_MIN_DISTANCE):
+    # type: (float, float, float) -> float
+    """How far behind the cockpit atom's centre the first-person eye belongs.
+
+    Always clear of the sphere, so nothing can clip through the near plane and
+    fill the view. The atom itself is still culled (see the viewport's `clip`),
+    but being outside it is what makes that culling a tidy-up rather than the
+    only thing standing between the pilot and the inside of a carbon.
+    """
+    return max(float(minimum), float(clearance) * max(float(atom_radius), 0.0))
 
 
 def clamp_pitch_delta(forward, d_pitch, limit_deg=PITCH_LIMIT_DEG):

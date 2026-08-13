@@ -116,7 +116,10 @@ def test_the_encoder_arguments_are_playable_ones():
 def test_a_missing_encoder_is_reported_not_raised(tmp_path, monkeypatch):
     """Video is the OPTIONAL tier. A missing ffmpeg must not take the export
     down — the frames are already on disk by then."""
-    monkeypatch.setattr(anim, "ffmpeg_executable", lambda: "")
+    # `*_a` because round 61 gave the resolver a `hint` parameter (an explicit
+    # ffmpeg path from Settings) — the stub has to accept whatever the caller
+    # passes, or the test fails on its own fixture rather than on the code.
+    monkeypatch.setattr(anim, "ffmpeg_executable", lambda *_a, **_k: "")
     ok, message = anim.encode("f_%04d.png", str(tmp_path / "o.mp4"), 24.0)
     assert ok is False and "ffmpeg" in message
 

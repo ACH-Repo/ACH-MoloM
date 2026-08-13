@@ -55,12 +55,32 @@ def main(argv=None):
 
     from PySide6.QtGui import QSurfaceFormat
     from PySide6.QtWidgets import QApplication
+    from molom import resources
     from molom.ui.viewport import default_surface_format
     from molom.ui.app import MainWindow, apply_dark_theme
 
     QSurfaceFormat.setDefaultFormat(default_surface_format())
+    # WINDOWS TASKBAR: a Python process inherits python.exe's taskbar identity,
+    # so the window icon can be set correctly and the taskbar STILL shows the
+    # Python logo and groups MoloM under "Python". The taskbar keys off the
+    # AppUserModelID, not off the window icon, and it has to be set before any
+    # window exists. Harmless and skipped everywhere else.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "ACH.MoloM.viewer.1")
+        except Exception:
+            pass                      # cosmetic only; never worth failing on
+
     app = QApplication(sys.argv[:1])
     app.setApplicationName("MoloM")
+    # Set on the APPLICATION, so every window and dialog inherits it and the
+    # taskbar entry gets it too. Without this the whole program shows the
+    # generic Python logo, which is what a user sees before anything else.
+    icon = resources.app_icon()
+    if icon is not None:
+        app.setWindowIcon(icon)
     apply_dark_theme(app)   # Blender-grey UI everywhere, not just the GL view
     win = MainWindow()
     win.show_startup()   # maximized by default; Settings offers windowed

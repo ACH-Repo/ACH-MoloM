@@ -2106,6 +2106,17 @@ def build_view(cell, asym_symbols, asym_frac, symops, mode="cell",
     offsets = supercell_offsets(cell, na, nb, nc)
     out_syms = []
     blocks = []
+    stride = len(symbols)
+    # The BONDS have to be repeated with the atoms. They were not, which is
+    # Christian's "supercells do not show bonds": every cell past the first
+    # drew as loose spheres, because `report["packed_bonds"]` still described
+    # one cell's worth of indices while the atom list had grown by a factor of
+    # na*nb*nc. Nothing failed and nothing warned — the picture was simply a
+    # cloud of atoms, which is also why it survived so long.
+    cell_bonds = [(int(i), int(j), int(o))
+                  for i, j, o in ((report or {}).get("packed_bonds") or [])]
+    out_bonds = [(i + n * stride, j + n * stride, o)
+                 for n in range(len(offsets)) for i, j, o in cell_bonds]
     for off in offsets:
         out_syms.extend(symbols)
         blocks.append(coords + off[None, :])
@@ -2126,22 +2137,54 @@ def build_view(cell, asym_symbols, asym_frac, symops, mode="cell",
     # atom drawn twice: invisible as a count, visible as z-fighting and as
     # doubled sticks, and it makes every downstream measurement wrong.
     if len(offsets) > 1 and len(out_xyz):
-        keep = _first_of_coincident(out_xyz, tol=tol)
+        keep, canonical = _coincident_map(out_xyz, tol=tol)
         if not keep.all():
             out_syms = [s for s, k in zip(out_syms, keep) if k]
             out_xyz = out_xyz[keep]
+            renumber = np.cumsum(keep) - 1
+            # A dropped atom is the SAME atom as the one it landed on, so its
+            # bonds are re-pointed through `canonical` and not thrown away —
+            # those are exactly the bonds that cross an internal face of the
+            # block, i.e. the ones holding the supercell together.
+            remapped = []
+            seen = set()
+            for i, j, o in out_bonds:
+                a = int(renumber[int(canonical[i])])
+                b = int(renumber[int(canonical[j])])
+                if a == b or a < 0 or b < 0:
+                    continue
+                key = (min(a, b), max(a, b))
+                if key in seen:
+                    continue        # two cells' copies of one shared-face bond
+                seen.add(key)
+                remapped.append((key[0], key[1], o))
+            out_bonds = remapped
             if report is not None and report.get("site_occupancy"):
-                renumber = np.cumsum(keep) - 1
                 report["site_occupancy"] = {
                     str(int(renumber[int(k)])): v
                     for k, v in report["site_occupancy"].items()
                     if int(k) < len(keep) and keep[int(k)]}
+    if report is not None and cell_bonds:
+        report["packed_bonds"] = [[int(i), int(j), int(o)]
+                                  for i, j, o in out_bonds]
     return out_syms, out_xyz
 
 
 def _first_of_coincident(xyz, tol=0.1):
     # type: (np.ndarray, float) -> np.ndarray
-    """Keep-mask dropping any atom that repeats an EARLIER one's position.
+    """Keep-mask dropping any atom that repeats an EARLIER one's position."""
+    return _coincident_map(xyz, tol=tol)[0]
+
+
+def _coincident_map(xyz, tol=0.1):
+    # type: (np.ndarray, float) -> tuple
+    """`(keep, canonical)` for a list of positions.
+
+    `keep` drops any atom that repeats an EARLIER one's position; `canonical[i]`
+    is the index of the atom `i` collapses onto (itself, when it is kept). The
+    second half is what lets BONDS survive the de-duplication: a dropped atom is
+    not gone, it is the same physical atom as the one it landed on, so an edge
+    that referenced it has to be re-pointed rather than discarded.
 
     Grid-hashed rather than an N^2 sweep, because a packing is the one place
     the atom count runs into six figures. The 27 neighbouring buckets are
@@ -2153,24 +2196,26 @@ def _first_of_coincident(xyz, tol=0.1):
     keys = np.floor(xyz / size).astype(np.int64)
     buckets = {}                      # type: dict
     keep = np.ones(len(xyz), dtype=bool)
+    canonical = np.arange(len(xyz), dtype=np.int64)
     neighbourhood = [(a, b, c) for a in (-1, 0, 1) for b in (-1, 0, 1)
                      for c in (-1, 0, 1)]
     for index in range(len(xyz)):
         key = tuple(int(v) for v in keys[index])
-        hit = False
+        onto = -1
         for delta in neighbourhood:
             probe = (key[0] + delta[0], key[1] + delta[1], key[2] + delta[2])
             for other in buckets.get(probe, ()):
                 if float(np.linalg.norm(xyz[index] - xyz[other])) <= tol:
-                    hit = True
+                    onto = other
                     break
-            if hit:
+            if onto >= 0:
                 break
-        if hit:
+        if onto >= 0:
             keep[index] = False
+            canonical[index] = onto
             continue
         buckets.setdefault(key, []).append(index)
-    return keep
+    return keep, canonical
 
 
 def supercell_offsets(cell, na=1, nb=1, nc=1):

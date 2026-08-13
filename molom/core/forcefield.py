@@ -174,9 +174,17 @@ def _rdkit_optimize(symbols, coords, bonds, method, steps, fixed):
                   "converged": converged == 0}), None
 
 
-def _openbabel_optimize(symbols, coords, bonds, steps):
+def _openbabel_optimize(symbols, coords, bonds, steps, fixed=None):
     """Last resort — OpenBabel UFF, the same fallback OWB uses when RDKit
-    cannot embed a structure (metal complexes, mostly)."""
+    cannot embed a structure (metal complexes, mostly).
+
+    `fixed` is honoured through `OBFFConstraints`. It used to be silently
+    DROPPED here — the parameter did not even exist — which mattered far more
+    than it looks: this is precisely the tier a metal complex lands on, so the
+    one case that most needs frozen atoms was the one case that never got them.
+    On a meta centre that meant nothing held the coordination sphere and the
+    donors collapsed onto the dummy (measured: 2.0 A set, 0.655 A after).
+    """
     try:
         from openbabel import openbabel as ob
     except ImportError:
@@ -201,7 +209,17 @@ def _openbabel_optimize(symbols, coords, bonds, steps):
         for i, j, o in bonds:
             mol.AddBond(int(i) + 1, int(j) + 1, int(o))
         ff = ob.OBForceField.FindForceField("UFF")
-        if ff is None or not ff.Setup(mol):
+        if ff is None:
+            return None, "OpenBabel UFF could not set up this molecule"
+        # OpenBabel indexes atoms from 1, unlike RDKit and unlike us.
+        constraints = None
+        if fixed:
+            constraints = ob.OBFFConstraints()
+            for i in fixed:
+                constraints.AddAtomConstraint(int(i) + 1)
+        ok = (ff.Setup(mol, constraints) if constraints is not None
+              else ff.Setup(mol))
+        if not ok:
             return None, "OpenBabel UFF could not set up this molecule"
         ff.ConjugateGradients(int(steps))
         ff.GetCoordinates(mol)
@@ -236,7 +254,7 @@ def optimize(symbols, coords, bonds, method=DEFAULT_METHOD, steps=500,
             info["notes"] = notes
             return out, info
         notes.append("{}: {}".format(m, err))
-    res, err = _openbabel_optimize(symbols, coords, bonds, steps)
+    res, err = _openbabel_optimize(symbols, coords, bonds, steps, fixed)
     if res is not None:
         out, info = res
         info["notes"] = notes + ["fell back to OpenBabel UFF"]

@@ -179,7 +179,8 @@ change only via the explicit operators above, the bond keys, or edit mode.
 |---|---|---|
 | Fit view — frames the **selection** when there is one, otherwise the whole scene | F / Home | scene not empty |
 | **Local view** — isolate the selected molecules and frame them; press again to restore what was visible | **/** | scene not empty |
-| **Shuttle mode** — UE5-style pilot for a whole molecule: the camera snaps into the molecule's origin and you fly it like a ship, on the same 6DoF model as right-mouse flight. **W/S** thrust, **A/D** strafe, **Space/Ctrl** up/down, **Q/E** roll, **scroll** steers (yaw + pitch), **Esc** lands and keeps the new position (the camera returns to where it was). Geometry too close to the cockpit is hidden so it cannot clip. F3 only, deliberately no hotkey | — (F3) | active molecule exists |
+| **Shuttle mode (cockpit)** — UE5-style pilot for a whole molecule: the camera snaps into the molecule's origin and you fly it like a ship, on the same 6DoF model as right-mouse flight. **W/S** thrust, **A/D** strafe, **Space/Ctrl** up/down, **Q/E** roll, **scroll** steers (yaw + pitch), **Esc** lands and keeps the new position (the camera returns to where it was). Geometry too close to the cockpit is hidden so it cannot clip. F3 only, deliberately no hotkey | — (F3) | active molecule exists |
+| **Shuttle mode (third person)** — the same flight, from a chase camera behind and above the ship. See below | — (F3) | active molecule exists |
 | Toggle perspective / orthographic | **Shift+O** | — |
 | View along +X/−X/+Y/−Y/+Z/−Z | compass ball click, or F3/menu — switches to ortho, next orbit pops back to perspective (Blender auto-persp). Compass hover: letters glow white; negative balls are full-size and show their −X/−Y/−Z labels | — |
 | Force field: optimize geometry (panel) | Ctrl+R | — |
@@ -484,6 +485,29 @@ the planned fix); the bond perception that runs after unwrapping is not
 periodic, so a *framework* still shows cut at the cell faces; packing is a
 destructive rebuild rather than a modifier; CIF export is not implemented.
 
+### Sort by: Viewport selection (round 63)
+A third ordering next to Frequency and IR intensity: **select atoms in the
+viewport and the modes that move THOSE atoms rank first.** The number it sorts
+on is drawn on each card as a percentage, because sorting by a figure you
+cannot see is a list you have to trust blindly.
+
+It is a **participation ratio** — the selected atoms' share of the mode's
+motion, over the whole — not a raw displacement sum. A raw sum ranks every
+loud mode above a mode that is genuinely localised on your selection, which is
+the opposite of the question you asked.
+
+**Mass-weighting is on by default**, and the tick appears only with this
+ordering. An eigenvector is a Cartesian displacement, so a C–H stretch is
+nearly all hydrogen motion by amplitude; unweighted, every mode involving a
+hydrogen scores highly and selecting a heavy atom returns almost nothing.
+Weighting by mass measures the share of the kinetic energy instead. Measured on
+the vendored H3PO4 job: phosphorus's best share is 0.176 unweighted, 0.431
+weighted. Selecting the three hydrogens puts the O–H stretches (3822–3831 cm⁻¹,
+94%) on top; selecting the phosphorus puts the P=O stretch (1346 cm⁻¹) on top.
+
+With nothing selected it falls back to Frequency — there is no question to
+answer yet, and an arbitrary order would be worse than the spectrum.
+
 ## Vibrational modes (∿ page)
 **Just open the ORCA FREQ output** — the modes are read off it as the file
 is imported. (F3 "load ORCA frequencies" still attaches a job to a molecule
@@ -624,13 +648,36 @@ frame changes, never on every interpolated tick.
 ## Measure
 The 📏 toolbar tool. Click **2** atoms for a distance, **3** for an angle
 (vertex on the middle pick), **4** for a dihedral in the atan2 convention.
-Clicking a picked atom again unpicks it; a fifth click starts over; **Esc**
-finishes. Picks are ringed and chained in the viewport and the value is drawn
-there too — it lived in the status bar before, where transient messages
-covered it and it read as a dead tool.
+Clicking a picked atom again unpicks it; **Esc** finishes. Picks are ringed and
+chained in the viewport and the value is drawn there too — it lived in the
+status bar before, where transient messages covered it and it read as a dead
+tool.
 
 It works in BOTH modes and **never touches the selection**, so you can
 measure without losing what you were about to edit.
+
+### They PERSIST (round 60)
+A finished measurement stays on screen, so a figure can carry several at once.
+
+| Gesture | What happens |
+|---|---|
+| A fifth click, or a click on empty space | **Keeps** the finished measurement and starts the next one. It used to discard it |
+| Turning the tool off, **Esc** | Keeps it too — putting the tool away is not a reason to lose a measurement |
+| Hover one | It lights up WHITE, which is the cue that Delete will take it |
+| **Delete** while hovering, or after clicking one | Deletes that measurement. With none targeted, Delete still deletes ATOMS as always |
+| Click a measurement's label | Selects it, for a Delete without hovering |
+| `F3 > Measurements: show or hide them all` | Hides them without deleting them |
+| `F3 > Measurements: delete every one` | Bins the lot |
+
+A kept measurement is drawn SOLID and the one being picked DASHED, so "still
+picking" and "finished" are distinguishable at a glance.
+
+They live on the VIEWPORT, not in the scene — a measurement is an annotation on
+the current view, so it stays out of `Scene.snapshot` (round 31's four-place
+checklist) and out of `.molom` savefiles. The consequence is deliberate: a
+measurement whose atom has been deleted is dropped rather than re-pointed at
+whatever now holds that index (`prune_measurements`, called from
+`refresh_geometry` as well as from the painter).
 
 ## Coordination polyhedra (MOFs and frameworks)
 The **Poly** switch on a crystal's outliner row draws a translucent solid
@@ -941,9 +988,10 @@ apex, and its film back is already on screen as the frame.
 |---|---|
 | **Orbit** (MMB / Alt+LMB drag) | **Leaves the camera**, keeping the pose you rotated to — Blender's rule |
 | **Esc**, **Numpad 0** | Leaves and restores the view from before you entered |
-| **Mouse wheel** | Resizes the FRAME (see below). Never moves the camera |
-| **Ctrl+drag** | The same frame zoom |
-| **Shift+drag** (left button, or Shift+MMB) | Trucks the CAMERA sideways — the last few pixels of framing. 1:1 on screen at any frame zoom, so scroll in for a finer nudge |
+| **Mouse wheel / two-finger scroll** | Resizes the FRAME (see below). Never moves the camera |
+| **Ctrl+scroll** | **DOLLIES** the camera along its own view axis — really closer to or further from the subject, so the perspective changes. The frame keeps its size and the contents grow |
+| **Alt+scroll**, **Alt+LMB drag** | Orbits, and therefore **LEAVES** the camera view. This is the trackpad's way out: every other scroll inside a camera is spoken for, and a trackpad has no middle button, so without it "rotate to exit" was unreachable there |
+| **Shift+scroll**, **Shift+drag** (left button, or Shift+MMB) | Trucks the CAMERA sideways — the last few pixels of framing. 1:1 on screen at any frame zoom, so scroll in for a finer nudge |
 | **Compass click / axis view / flight** | Leaves the camera — all view rotations |
 | **Tumbling a molecule** | Stays inside — that moves the MODEL, not the camera |
 
@@ -951,11 +999,20 @@ Numpad 0 is bound to **both** `Num+0` and `Num+Ins`, because with **Num Lock
 off** the numpad's 0 sends `Key_Insert` — binding only the first is a shortcut
 half the keyboards in the world never send.
 
-**The camera object never moves by accident.** Not by scrolling, not by
-dragging its frame, not by editing its lens or resolution. The two gestures
-that DO move it are deliberate and say so: **Shift+drag** re-frames the shot
-from inside, and **G** on a selected camera gizmo moves it from outside.
-("Camera: update the active one to this view" re-aims it wholesale.)
+**The camera object never moves by accident.** Not by a plain scroll, not by
+dragging its frame, not by editing its lens or resolution. The gestures that DO
+move it all carry a MODIFIER or a selection, and each says so in the status bar:
+**Shift+drag** and **Shift+scroll** truck it, **Ctrl+scroll** dollies it, and
+**G** on a selected camera gizmo moves it from outside. ("Camera: update the
+active one to this view" re-aims it wholesale.)
+
+Round 60 note: a plain scroll resizes the frame and the two MODIFIED scrolls
+move the camera. Round 58 sent every scroll to the frame zoom, which made
+Ctrl+scroll and Shift+scroll indistinguishable — the modifier is the deliberate
+statement, exactly as it is for Shift+drag. The routing reads the MODIFIER and
+not `input_map`'s resolved action on purpose: a mouse resolves a plain wheel to
+ZOOM and a trackpad resolves it to ORBIT, so keying off the action would give
+one gesture two meanings across the two dev machines.
 
 A Shift+drag moves the camera OBJECT, not the free view — which is the
 difference between an adjustment that survives leaving the shot and one that
@@ -1003,6 +1060,132 @@ you look through one. It uses `Camera.fly_look`'s convention, and
 `cameras.twist_rotation` is the single place that knows it — the Blender
 export built its own with the matrix transposed and therefore rolled the
 opposite way, which nothing noticed while the viewport ignored roll entirely.
+
+## Animation export (Ctrl+Shift+A) and the render keys
+
+| Key / operator | What it does |
+|---|---|
+| **Ctrl+Shift+E** / **Ctrl+Shift+A** | The deliberate routes. Always ask, every time |
+| **F12** / **Ctrl+F12** | Render NOW with the last settings, to the next free filename. The first press behaves like the deliberate route |
+| `F3 > Render settings: animation / still (ask again)` | Forgets the remembered target and reopens the dialog. Without these the settings were a **one-way door** — once F12 had a target the dialog never came back |
+
+The dialog reopens showing the LAST choices, not the defaults: someone who goes
+looking for the settings is nearly always there to change one of them.
+
+**A PNG image sequence is the primary format and needs no ffmpeg at all.** It is
+what feeds Blender or a journal, and a failed video encode still leaves every
+rendered frame on disk, because the video is always encoded FROM the written
+sequence.
+
+**GIF frame rates are snapped** (round 61). The format stores each frame's delay
+as a whole number of centiseconds, so the only rates it can hold exactly are
+100/n — 60 fps wants 1.667 cs, gets rounded unevenly, and plays as a stutter.
+MoloM snaps before encoding and says what it is going to do while you choose:
+60 → 50, 30 → 33.3, 24 → 25. **MP4 is not affected** (a rational timebase holds
+60 exactly) and a PNG sequence has no embedded timing at all.
+
+**ffmpeg is found, not shipped** (round 61, roadmap item 9). `imageio-ffmpeg` is
+an OPTIONAL extra (`pip install "molom[video]"`) rather than a required
+dependency — a ~25 MB static binary should not ride along on every install for a
+minority feature. The search order is a Settings hint, then `PATH`, then the
+usual install locations, then the bundled wheel LAST (a system ffmpeg is usually
+newer and has the codecs you installed it for). The dialog names which one it
+found *before* the render, and grows a **"Locate ffmpeg..."** button only when
+there is none.
+
+## Defining a unit cell (round 68)
+The ❖ page's **Define / edit the cell** block. Until now every cell control
+assumed a cell that came out of a `.cif`: a molecule with no cell could never
+be given one, and an imported cell could never be corrected.
+
+| Control | What it does |
+|---|---|
+| **a, b, c, alpha, beta, gamma** | The six parameters, editable |
+| **Fit to molecule** | Fills them from the bounding box plus a 2 Å margin, so there is something sensible to adjust |
+| **Space group** | A symbol (`P 21/c`). Resolved through the same Hall database a file's own symbol goes through, so a hand-made cell expands exactly as an imported one would. Empty means P1 |
+| **Keep fractional coordinates** | See below |
+| **Apply** / **Remove cell** | |
+
+**"Keep fractional coordinates" is the decision that matters**, and there is no
+right default for both cases:
+
+* **ON** — the atoms keep their fractional positions and move with the box, so
+  the structure stretches and shears with it. This is what a cell edit *means*
+  crystallographically: fractional coordinates are the structure, and a, b, c
+  are the frame they live in. Doubling `a` doubles every distance along **a**.
+* **OFF** — the atoms stay exactly where they are and only the drawn box
+  changes. This is what you want when putting a box around a molecule that
+  never had one.
+
+Giving a cell to a molecule that had none always keeps Cartesian regardless,
+because there are no fractional coordinates to preserve.
+
+**The angles are not independent.** Three angles only close into a cell when
+`1 − cos²α − cos²β − cos²γ + 2·cosα·cosβ·cosγ > 0` — the squared volume factor.
+Something like **30/30/120 passes every per-angle range check and describes no
+solid at all**; the faces cannot meet. That is refused with the reason written
+on the page, and nothing is written to the structure.
+
+**Removing a cell takes the crystallography with it** — operators, the stored
+asymmetric unit, the derived columns. Keeping a space group for a cell that no
+longer exists is how a later rebuild invents a structure from nothing.
+
+### Atom position (fractional), round 69
+Select **exactly one atom** on a molecule that has a cell and the block below
+shows its position in cell fractions, editable. "A quarter along **a**" is a
+statement about the structure; 3.47 Å is a statement about this particular
+cell, which is why typing a site is how a structure gets built by hand.
+
+**Wrap into the cell is off by default.** Bringing a value into [0, 1) is what
+you want when typing a site in, and emphatically not what you want when nudging
+an atom that legitimately sits outside one — a boundary copy, or a molecule
+that has been unwrapped to keep it whole.
+
+The move applies to every frame, and the block greys itself out (saying which
+condition is missing) rather than offering three live-looking fields that would
+apply to nothing.
+
+## Third-person shuttle (rounds 66 and 67)
+`F3 > Shuttle mode: pilot from behind`. The same flight model as the cockpit -
+same thrust, same coast, same steering - with the camera behind and above the
+molecule instead of inside it, and the **same steering instrument** (hull mark,
+travel ring, aim reticle, roll tick, speed).
+
+**Select ONE atom first and it becomes the cockpit.** The camera sits behind
+and slightly above that atom, which is what you want for anything long or
+hollow, where the centroid is nowhere near the nose. With nothing selected, or
+more than one atom, it falls back to the molecule's origin.
+
+**The camera's up is always world Z and it never rolls.** Q/E rolls the SHIP,
+which in third person you can see it do. Letting the camera roll tilted the
+horizon and - because the pivot used to be offset along the camera's own up -
+swung the molecule off to one side, which is exactly what "the piloted mol is
+on the left hand side once a roll has been introduced" was.
+
+Why it exists: in first person you cannot see the ship's orientation, and a
+molecule has no windscreen to give you a horizon, so the two cues that make
+flying legible are both missing. That is what "trying to do it FPS only leads
+to problems" means in practice.
+
+**The camera lags, and that is the feature.** A rigid chase camera swings the
+whole world around the ship and is as disorienting as sitting inside it, which
+would reproduce the problem being fixed. The pivot eases toward the ship with
+exponential smoothing, so acceleration is readable: the molecule pulls ahead in
+frame under thrust and settles back when you coast. The easing is
+framerate-independent (`1 - exp(-lag·dt)`), because a fixed fraction per frame
+would trail further at 30 fps than at 120 and the feel would depend on the
+machine.
+
+Two details that are deliberate:
+
+* **The gap is capped** at 3 molecule radii. Lag is a feel; losing the ship off
+  the edge of the screen during a long burn is a bug.
+* **Nothing is clipped.** The cockpit hides atoms too close to the camera so
+  they cannot fill the screen; here that rule would hide the ship itself.
+
+The chase distance and height scale with the molecule's own radius - these
+scenes run from a 3 Å molecule to a 200 Å framework, and a fixed distance would
+be either inside the ship or nowhere near it.
 
 ## Blender export (Ctrl+Shift+B, round 37)
 Writes a **`.blend`** (round 50). Christian: "I don't like having to load it in

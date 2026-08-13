@@ -100,9 +100,12 @@ def test_a_filter_that_matches_nothing_hides_everything(dlg):
 def test_the_flight_tuning_round_trips_every_key(dlg):
     from molom.core import flight
     tuning = dlg.flight_tuning()
+    # `shuttle_factor` joined in round 69: shuttle mode is deliberately slower
+    # than camera flight, and how much slower is a setting.
     assert set(tuning) == {"accel", "damping", "brake_factor",
                            "strafe_factor", "roll_rate", "bank_angle",
-                           "aim_expo", "turn_rate", "hold_ms"}
+                           "aim_expo", "turn_rate", "hold_ms",
+                           "shuttle_factor"}
     assert tuning["accel"] == pytest.approx(flight.DEFAULT_ACCEL)
     assert tuning["bank_angle"] == pytest.approx(flight.DEFAULT_BANK_ANGLE)
     assert tuning["hold_ms"] == pytest.approx(flight.DEFAULT_HOLD_MS)

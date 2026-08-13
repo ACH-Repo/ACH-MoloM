@@ -44,9 +44,10 @@ from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QApplication
 
 from .choice_popup import ChoicePopup
-from ..core import (bonding, edits, elements, flight, grid as grid_mod,
+from ..core import (bonding, crop as crop_mod, edits, elements, flight,
+                    grid as grid_mod,
                     input_map, internal,
-                    manipulate, measure, meshes, picking,
+                    manipulate, measure, meshes, meta as meta_mod, picking,
                     cameras as cameras_mod,
                     polyhedra as poly_mod, rotations,
                     selection2d, style as style_mod)
@@ -724,9 +725,16 @@ class MolViewport(QOpenGLWidget):
     selected_camera_id = None
     _camera_drag = None
     on_camera_look = None
-    #: Which camera the current Shift+drag is re-framing, so the whole
-    #: gesture is ONE undo entry rather than one per mouse-move event.
+    #: Which camera the current gesture is moving (Shift+drag re-framing,
+    #: Ctrl/Shift+scroll dolly and truck), so the whole gesture is ONE undo
+    #: entry rather than one per mouse-move or per scroll event.
+    #: Per-object draw blocks, cached ONLY while flying. None otherwise, so
+    #: nothing outside a flight can read a stale block.
+    _draw_cache = None
     _truck_gesture = None
+    #: When the last SCROLL-driven camera move happened. A drag ends at a
+    #: release; a scroll does not, so the gesture is closed by a pause.
+    _last_cam_wheel_t = -1e9
     _frame_drag = None
     _poly_key = None
     _poly_cache = None
@@ -847,6 +855,7 @@ class MolViewport(QOpenGLWidget):
         self.refused_bond_fade = style_mod.REFUSED_BOND_FADE
         self.render_subdiv_bonus = 2     # extra sphere subdivisions on render
         self.render_scale = 2            # resolution multiplier on render
+        self.render_crop = False         # trim the export to what was drawn
         self.adjust_h = True             # re-dress hydrogens on edits
         self.on_edit_begin = None        # app callback: () -> None (undo)
         self.on_camera_changed = None    # a frame drag finished
@@ -862,6 +871,27 @@ class MolViewport(QOpenGLWidget):
         self.measure_active = False      # measurement tool armed
         self._measure_picks = []         # type: List[Pick]  click order
         self.on_measure_changed = None   # app callback: (on) -> None
+        #: COMMITTED measurements, each `{"id", "picks"}`. They persist in the
+        #: viewport until deleted, so a figure can carry several at once
+        #: instead of the readout vanishing the moment you measure something
+        #: else. Held on the VIEWPORT rather than in the scene: a measurement
+        #: is an annotation on the current view, not part of the structure, so
+        #: it stays out of `Scene.snapshot`'s four-place checklist (round 31)
+        #: and out of savefiles. One consequence is deliberate — a measurement
+        #: whose atom has been deleted is dropped rather than resurrected.
+        self.measurements = []           # type: List[dict]
+        self._measure_next_id = 1
+        self.show_measurements = True
+        #: Which committed measurement is selected / under the cursor. Separate
+        #: fields from `selection` for round 56's reason: a measurement owns no
+        #: atoms, so every loop over `(obj_id, atom)` would have to learn to
+        #: skip it.
+        self.selected_measurement = None
+        self._hover_measurement = None
+        #: Screen rectangles of the drawn labels, rebuilt every paint, so a
+        #: click can find the measurement it landed on (the compass keeps its
+        #: hit list the same way).
+        self._measure_hits = []          # type: List[tuple]
         self.label_scale = 1.0           # Settings: atom-label size multiplier
         self._tumble_axis = None         # 0/1/2 world axis lock for tumbling
         self._tumble_local = False
@@ -888,6 +918,9 @@ class MolViewport(QOpenGLWidget):
         self.fly_aim_expo = flight.DEFAULT_AIM_EXPO
         self.fly_turn_rate = 1.0
         self.fly_hold_ms = flight.DEFAULT_HOLD_MS
+        #: How much slower SHUTTLE mode is than camera flight. See
+        #: `flight.shuttle_scaled` for why both accel and top speed are scaled.
+        self.shuttle_factor = flight.DEFAULT_SHUTTLE_FACTOR
         self._fly_anchor = QPoint(0, 0)   # captured pointer home, global px
         self._cam_key = None              # see _camera_frame
         self._cam_frame = None
@@ -922,6 +955,9 @@ class MolViewport(QOpenGLWidget):
     def refresh_geometry(self):
         self._needs_rebuild = True
         self._pick_dirty = True
+        # The atom list may have changed under a measurement, and a stale one
+        # would otherwise point at whatever now holds that index.
+        self.prune_measurements()
         self.update()
 
     def fit_view(self):
@@ -1178,13 +1214,29 @@ class MolViewport(QOpenGLWidget):
         # type: () -> bool
         return self._fly is not None
 
-    def _scene_scale(self):
+    def _scene_scale(self, obj_id=None):
         """A length that means "one scene" — flight speeds scale by it, so a
-        3 A cell and a 300 A framework feel the same to fly through."""
-        radius = 0.0
-        for obj in (self.scene.visible_objects() if self.scene else []):
-            if obj.structure.n_atoms:
-                radius = max(radius, float(obj.structure.bounding_radius()))
+        3 A cell and a 300 A framework feel the same to fly through.
+
+        SHUTTLE MODE MEASURES THE SHIP INSTEAD, and that is round 69's own
+        argument carried to its conclusion: flying the camera is a navigation
+        gesture judged against the scene you are crossing, flying a molecule is
+        a PLACEMENT gesture judged against the molecule. Scaling a placement by
+        the whole scene means a small molecule among big ones is flung about at
+        the big ones' speed - measured, a 3.7 A ship in a 60 A scene got a
+        105 A/s top speed, i.e. 1.75 A of travel per frame, which no chase
+        camera can hold in frame because the gap opens faster than any easing
+        closes it. Shift still boosts 3x for crossing the room.
+        """
+        obj = self.scene.get(obj_id) if (self.scene and obj_id is not None) \
+            else None
+        if obj is not None:
+            radius = float(obj.structure.bounding_radius())
+        else:
+            radius = 0.0
+            for o in (self.scene.visible_objects() if self.scene else []):
+                if o.structure.n_atoms:
+                    radius = max(radius, float(o.structure.bounding_radius()))
         return max(radius, self.camera.distance * 0.5, 1.0) / 6.0
 
     def start_fly(self, obj_id=None, latched=False):
@@ -1209,13 +1261,21 @@ class MolViewport(QOpenGLWidget):
         # Flying is a view rotation with the throttle open, so it leaves a
         # camera view for the same reason orbiting does.
         self.exit_camera_view("Left the camera view — flying")
-        model = flight.FlightModel(scale=self._scene_scale())
+        model = flight.FlightModel(scale=self._scene_scale(obj_id))
         model.accel = float(self.fly_accel)
         model.damping = float(self.fly_damping)
         model.brake_factor = float(self.fly_brake_factor)
         model.strafe_factor = float(self.fly_strafe_factor)
         model.roll_rate = float(self.fly_roll_rate)
         model.bank_angle = float(self.fly_bank_angle)
+        if obj_id is not None:
+            # SHUTTLE IS SLOWER. Flying the camera is a navigation gesture;
+            # flying a molecule is a PLACEMENT one, where the thing being moved
+            # is the subject and has to stay in frame. At camera speeds it
+            # leaves the viewport before the key comes up.
+            model.accel, model.max_speed = flight.shuttle_scaled(
+                model.accel, model.max_speed, self.shuttle_factor)
+        self._draw_cache = {}
         self._fly = {
             "model": model,
             "aim": flight.AimReticle(expo=self.fly_aim_expo),
@@ -1322,7 +1382,17 @@ class MolViewport(QOpenGLWidget):
             if fly["obj_id"] is None:
                 self.camera.fly_move(delta)
             else:
-                self._fly_object(fly["obj_id"], delta)
+                self._fly_object(fly["obj_id"], delta, dt=dt)
+        # THE CHASE CAMERA FOLLOWS EVERY TICK, not only when the ship
+        # translated. Steering rotates the molecule about its own origin, which
+        # swings the COCKPIT ATOM along an arc — so with the follow behind
+        # `if np.any(delta)` a pure turn moved the target and never moved the
+        # camera, and the pivot was left further behind with every turn.
+        # That is Christian's "unless a directional key is pressed the camera
+        # position drifts far away from the piloted mol", and it is also why a
+        # pivot that starts out of place could never converge. It runs for the
+        # COCKPIT view too, which had exactly the same fault a round longer.
+        self._follow_cockpit(dt)
         # STEERING. The reticle is a virtual stick: its offset from centre is
         # a sustained turn RATE, so the ship keeps turning for as long as the
         # mark is out there and only stops when it is brought back. Nothing
@@ -1359,6 +1429,11 @@ class MolViewport(QOpenGLWidget):
         """
         if self._fly is None:
             return
+        # The draw cache is only sound while a flight holds the keyboard and
+        # nothing can edit the other molecules. Dropping it here means no code
+        # path outside a flight can ever read a stale block, and the next
+        # rebuild is a full one.
+        self._draw_cache = None
         rolled = abs(self._fly["model"].roll) > 1e-9
         self._fly["model"].level()
         self._fly = None
@@ -1370,7 +1445,7 @@ class MolViewport(QOpenGLWidget):
             self.camera.fly_look(0.0, 0.0, roll=0.0)
         self.update()
 
-    def _fly_object(self, obj_id, delta):
+    def _fly_object(self, obj_id, delta, dt=1.0 / 60.0):
         """Shuttle mode: the MOLECULE moves and the camera rides along."""
         obj = self.scene.get(obj_id) if self.scene else None
         if obj is None:
@@ -1379,8 +1454,58 @@ class MolViewport(QOpenGLWidget):
         for k in range(obj.structure.n_frames):
             obj.structure.frames[k] = obj.structure.frames[k] + delta
         obj.origin = obj.origin + delta
-        self.camera.center = obj.origin.copy()
+        # The camera is NOT re-anchored here. It used to be, for first person
+        # only, which meant the cockpit view followed the ship when it moved
+        # and not when it merely turned - see `_follow_cockpit`, which now does
+        # it for both modes on every tick.
         self.refresh_geometry()
+
+    def _follow_cockpit(self, dt):
+        """Keep the camera on the cockpit. Runs EVERY tick, in BOTH modes.
+
+        Running it every tick is round 69's fix and it was only ever applied to
+        the chase camera: first person was re-anchored inside `_fly_object`,
+        i.e. only when the ship TRANSLATED, so a pure turn left the camera
+        behind. Measured on a molecule whose origin sits 8.1 A off its centroid
+        - Christian's `docking.molom` - three seconds of steering with no
+        thrust took the eye from 0.35 A off the cockpit atom to 9.41 A. Which
+        is the whole first-person complaint: it starts on the atom you picked
+        and leaves the moment you fly it.
+
+        FIRST PERSON SNAPS, THIRD PERSON LAGS. Snapping the chase pivot to the
+        ship makes the world swing around the molecule and is as disorienting
+        as flying from inside it; easing is what reads as "following" and is
+        what makes acceleration legible. Inside the cockpit there is nothing to
+        lag behind - the eye IS the ship - so any easing there is just the view
+        sliding off the nose.
+        """
+        sh = self._shuttle
+        if sh is None or self.scene is None:
+            return
+        obj = self.scene.get(sh["obj_id"])
+        if obj is None:
+            return
+        cockpit = self._cockpit_pos(obj)
+        if not sh.get("third_person"):
+            self.camera.center = cockpit.copy()
+            return
+        radius = float(sh.get("radius", 1.0))
+        target = flight.chase_pivot(cockpit, radius=radius)
+        # THE LIMIT IS AN ANGLE, not a multiple of the molecule's radius. The
+        # gap is only ever seen as an angle, and the old cap allowed about 58
+        # degrees of it against a 20 degree half-frame - so it never engaged
+        # and never could. See `flight.CHASE_FRAME_ANGLE`.
+        limit = flight.slip_limit(self.camera.distance)
+        # Two halves, and round 71 shipped only the second. `follow_rate`
+        # raises the rate to whatever holds the STEADY-state gap in frame at
+        # this speed (the camera cannot close a gap that is opening faster than
+        # it shuts); `spring_lag` then stiffens further for a transient.
+        speed = float(np.linalg.norm(self._fly["model"].velocity)) \
+            if self._fly is not None else 0.0
+        rate = flight.spring_lag(self.camera.center, target, limit,
+                                 lag=flight.follow_rate(speed, limit))
+        pivot = flight.follow(self.camera.center, target, lag=rate, dt=dt)
+        self.camera.center = flight.clamp_slip(pivot, target, limit)
 
     def _fly_eye(self):
         """Where the camera actually is — `center` is only the orbit pivot."""
@@ -1415,8 +1540,16 @@ class MolViewport(QOpenGLWidget):
                 [0.0, 0.0, self.camera.distance])
             self.update()
             return
+        sh = self._shuttle or {}
+        chase = bool(sh.get("third_person"))
+        # THE CHASE CAMERA NEVER ROLLS. Rolling it tilts the horizon and, with
+        # the pivot offset along the camera's own up, swung the ship out to one
+        # side - Christian's "the piloted mol is on the left hand side once a
+        # roll has been introduced". The roll belongs to the SHIP, which is the
+        # thing you are actually rolling, and in third person you can see it do
+        # so. In the cockpit the two are necessarily the same rotation.
         before = quat_to_mat3(self.camera.rotation)
-        self.camera.fly_look(d_yaw, d_pitch, roll=roll)
+        self.camera.fly_look(d_yaw, d_pitch, roll=0.0 if chase else roll)
         after = quat_to_mat3(self.camera.rotation)
         # The molecule takes the rotation the camera just made, about its own
         # origin, and the camera is put back — the cockpit view is unchanged
@@ -1424,9 +1557,43 @@ class MolViewport(QOpenGLWidget):
         rot = before.T @ after
         obj = self.scene.get(fly["obj_id"]) if self.scene else None
         if obj is not None:
+            # ROTATE ABOUT THE COCKPIT, in BOTH modes. An aircraft turns about
+            # its cockpit; a molecule rotated about anything else swings the
+            # cockpit atom along an arc instead, and since the camera tracks
+            # that atom the whole molecule then sweeps across the frame under
+            # nothing but a turn. That is Christian's "turning only without
+            # acceleration now moves the entire mol, and it is moving fast".
+            #
+            # Round 70 fixed it for the chase camera and left first person
+            # pivoting on `obj.origin`, on the reasoning that there the origin
+            # IS both the centroid and the eye. It is neither: `obj.origin` is
+            # only the centroid until something moves it, and round 71's own
+            # measurement of `docking.molom` - origin 8.10 A from the real
+            # centroid - is the counter-example. So the cockpit view turned
+            # about a point 8 A out in empty space and flung itself off the
+            # ship, which is the same bug the same file had already proved.
+            pivot = self._cockpit_pos(obj)
+            if chase:
+                # ...plus the roll the pilot has commanded since the last step,
+                # about the ship's own forward axis. Applied as a DELTA because
+                # `model.roll` is an absolute angle: replaying it every tick
+                # would spin the molecule up without limit.
+                applied = float(sh.get("roll_applied", 0.0))
+                d_roll = float(roll) - applied
+                if abs(d_roll) > 1e-9:
+                    forward = after.T @ np.array([0.0, 0.0, -1.0])
+                    rot = rot @ rotations.axis_angle_mat3(forward, -d_roll)
+                    sh["roll_applied"] = float(roll)
             for k in range(obj.structure.n_frames):
                 obj.structure.frames[k] = rotations.rotate_points_about(
-                    obj.structure.frames[k], rot.T, obj.origin)
+                    obj.structure.frames[k], rot.T, pivot)
+            # The origin is a POINT ON THE MOLECULE, so it has to travel with
+            # it — rotating the atoms about the cockpit and leaving the
+            # centroid behind would desynchronise the cell box, the modifier
+            # frames and every later transform from the atoms they describe.
+            obj.origin = rotations.rotate_points_about(
+                np.asarray(obj.origin, dtype=float).reshape(1, 3),
+                rot.T, pivot)[0]
             obj.orientation = quat_mul(quat_from_mat3(rot.T), obj.orientation)
             self.refresh_geometry()
         self.update()
@@ -1455,18 +1622,33 @@ class MolViewport(QOpenGLWidget):
 
     def _shuttle_hidden(self, coords):
         """Mask of atoms too close to the cockpit to draw (they would clip
-        through the near plane and fill the screen)."""
-        if self._shuttle is None:
+        through the near plane and fill the screen).
+
+        Nothing is hidden in THIRD person: the ship is the subject there, so
+        culling what is nearest the camera would cull the very thing you are
+        flying. `clip` is 0 in that mode, and this returns early on it.
+        """
+        if self._shuttle is None or not self._shuttle.get("clip"):
             return None
         d = np.linalg.norm(np.asarray(coords) - self._shuttle_eye(), axis=1)
         return d < self._shuttle["clip"]
 
-    def start_shuttle(self, obj_id):
-        # type: (int) -> None
-        """UE5-style pilot, for whole molecules: the camera snaps into the
-        molecule's origin and WASD flies it around. Turning the ship turns
-        the view with it, so it reads like a cockpit. Esc lands (keeping the
-        new position)."""
+    def start_shuttle(self, obj_id, third_person=False):
+        # type: (int, bool) -> None
+        """UE5-style pilot, for whole molecules.
+
+        FIRST PERSON (the original) snaps the camera into the molecule's origin
+        and WASD flies it around, so it reads like a cockpit. THIRD PERSON sits
+        the camera behind and above the ship instead - Christian: "3rd person
+        mode for piloting mols. trying to do it FPS only leads to problems",
+        and the problem is structural: inside the thing you are steering you
+        cannot see its orientation, and a molecule has no windscreen to give
+        you a horizon.
+
+        Both fly the same `FlightModel`; the only difference is where the
+        camera sits and whether its pivot LAGS. Esc lands, keeping the new
+        position.
+        """
         if self._shuttle is not None or self.scene is None:
             return
         obj = self.scene.get(obj_id)
@@ -1475,24 +1657,110 @@ class MolViewport(QOpenGLWidget):
             return
         cam = self.camera
         self._begin_model_edit()
+        radius = max(float(obj.structure.bounding_radius()), 1e-3)
         self._shuttle = {
             "obj_id": obj.id,
             "saved": (cam.center.copy(), float(cam.distance),
                       cam.rotation.copy(), bool(cam.orthographic)),
-            "clip": max(1.2, obj.structure.bounding_radius() * 0.25),
+            "third_person": bool(third_person),
+            "radius": radius,
         }
         cam.orthographic = False
         cam.auto_ortho = False
-        cam.center = obj.origin.copy()
-        cam.distance = 0.35
+        # THE COCKPIT IS AN ATOM when one is selected, in BOTH modes. Anchoring
+        # on the molecule's centroid is wrong for anything long or hollow - the
+        # nose of the ship is where you want to sit - and it was outright
+        # broken in first person, because `obj.origin` is only the centroid
+        # until something moves it. On Christian's `docking.molom` the
+        # meta-ship's stored origin is 8.10 A from its real centroid, with its
+        # nearest atom 3.07 A away, so the cockpit view was from a point in
+        # empty space nowhere near the hydrogen he had picked: "the piloted mol
+        # is still miles away from what FPS mode showed you". Falls back to the
+        # origin when the selection does not name exactly one atom.
+        self._shuttle["cockpit"] = self._cockpit_atom(obj)
+        if third_person:
+            cam.distance = flight.chase_distance(radius)
+            cam.center = flight.chase_pivot(self._cockpit_pos(obj),
+                                            radius=radius)
+            # Nothing is clipped in third person: the ship is the subject, so
+            # hiding what is near the camera would hide the ship itself.
+            self._shuttle["clip"] = 0.0
+            # LEVEL. The camera never rolls in third person (see below), so
+            # anything it inherited from a previous flight is cleared here.
+            self._fly_level_camera()
+        else:
+            cam.center = self._cockpit_pos(obj).copy()
+            # THE EYE MUST CLEAR THE COCKPIT ATOM'S OWN SPHERE. It looks AT
+            # that atom from `distance` behind it, and the flat 0.35 A it used
+            # to sit at is INSIDE an ordinary carbon (drawn radius 0.409 at the
+            # default sphere size) - so the picture was the inside surface of
+            # one atom, which is Christian's "not useful if all you see is the
+            # inside of an atom while steering".
+            nose = self._cockpit_radius(obj)
+            cam.distance = flight.cockpit_distance(nose)
+            # ...and the clip has to cover where the eye now is, or the sphere
+            # it is standing just outside of would be drawn across the whole
+            # screen instead. It reaches past the atom itself so a bonded
+            # neighbour cannot lean into the lens either.
+            self._shuttle["clip"] = max(1.2, radius * 0.25,
+                                        cam.distance + nose * 2.0)
         # Shuttle is FLIGHT with the molecule as the airframe: same model,
         # same acceleration, same coast — only the thing being moved differs.
         self.start_fly(obj_id=obj.id)
         self.status_message.emit(
-            "SHUTTLE {} — W/A/S/D thrust, Space/Ctrl up-down, Q/E roll "
+            "{} {} — W/A/S/D thrust, Space/Ctrl up-down, Q/E roll "
             "(Shift boost, Alt creep), drag or scroll to steer, Esc to "
-            "land".format(obj.name))
+            "land".format("CHASE" if third_person else "SHUTTLE", obj.name))
         self.refresh_geometry()
+
+    def _cockpit_atom(self, obj):
+        """Index of the single selected atom on `obj`, or None.
+
+        "Select single atom (cockpit)" - one atom names the nose of the ship,
+        which is what a chase camera needs to sit behind. Anything other than
+        exactly one is ambiguous and falls back to the origin.
+        """
+        rows = [i for o, i in self.selection if o == obj.id]
+        if len(rows) == 1 and rows[0] < obj.structure.n_atoms:
+            return int(rows[0])
+        return None
+
+    def _cockpit_pos(self, obj):
+        """Where the chase camera is anchored: the cockpit atom, or the
+        molecule's own origin when none was picked."""
+        sh = self._shuttle or {}
+        index = sh.get("cockpit")
+        coords = obj.structure.coords
+        if index is not None and index < len(coords):
+            return np.asarray(coords[index], dtype=float)
+        return np.asarray(obj.origin, dtype=float)
+
+    def _cockpit_radius(self, obj):
+        """The DRAWN radius of the cockpit atom - what the eye has to clear.
+
+        Read the same way `_build_object_block` computes it (element VdW
+        through the object's style, then the user's sphere-size slider unless
+        the style pins a fixed radius), because a clearance measured against a
+        different number from the one being rendered is no clearance at all.
+        """
+        index = (self._shuttle or {}).get("cockpit")
+        s = obj.structure
+        if index is None or index >= s.n_atoms:
+            return 0.0
+        st = self._object_style(obj)
+        z = elements.atomic_number(s.symbols[index])
+        r = float(st.atom_radius(elements.radius_vdw(z)))
+        if st.fixed_atom_radius is None:
+            r *= float(self.atom_scale)
+        return r
+
+    def _fly_level_camera(self):
+        """Put the camera's up back on world Z, keeping where it looks.
+
+        `Camera.fly_look` rebuilds the rotation from an azimuth/elevation pair,
+        so passing roll=0 IS a level camera - there is no residue to unwind.
+        """
+        self.camera.fly_look(0.0, 0.0, roll=0.0)
 
     # (`_shuttle_apply` is gone: translation and rotation both go through the
     # shared flight model now — `_fly_object` and `_fly_look` — so the
@@ -1633,29 +1901,172 @@ class MolViewport(QOpenGLWidget):
         if on == self.measure_active:
             return
         self.measure_active = on
-        self._measure_picks = []
+        # Turning the tool off KEEPS whatever was finished rather than binning
+        # it — measurements persist in the viewport now, so putting the tool
+        # away is not a reason to lose them.
+        self.commit_measurement()
         self.status_message.emit(
             "Measure: click 2 atoms for a distance, 3 for an angle, 4 for a "
-            "dihedral (click again to unpick, Esc to finish)"
-            if on else "Measure tool off")
+            "dihedral. They stay on screen; hover one and press Delete to "
+            "remove it (Esc finishes)"
+            if on else "Measure tool off — measurements kept")
         if self.on_measure_changed is not None:
             self.on_measure_changed(on)
         self.update()
 
     def _measure_click(self, pos):
+        # A click on an existing measurement SELECTS it rather than starting a
+        # new pick — it is the only way to say "this one" for a Delete, and a
+        # label drawn over the molecule would otherwise be an unclickable
+        # decoration.
+        landed = self._measurement_at(pos)
+        if landed is not None:
+            self.selected_measurement = landed
+            self.update()
+            return
         hit = self._pick_at(pos)
         if hit is None:
-            self._measure_picks = []
+            # Clicking empty space commits what is in progress instead of
+            # throwing it away. Losing a finished measurement to a stray click
+            # on the background is the kind of thing you only notice after it
+            # has happened.
+            self.commit_measurement()
             self.update()
             return
         pick = self._atom_map[hit]
+        self.selected_measurement = None
         if pick in self._measure_picks:
             self._measure_picks.remove(pick)      # click again to unpick
         elif len(self._measure_picks) >= 4:
-            self._measure_picks = [pick]          # start a new measurement
+            # A dihedral is full, so this click starts the next measurement —
+            # and the finished one is KEPT now rather than discarded.
+            self.commit_measurement()
+            self._measure_picks = [pick]
         else:
             self._measure_picks.append(pick)
         self.update()
+
+    def commit_measurement(self):
+        """Move the in-progress picks into the persistent list.
+
+        Anything under two picks is not a measurement yet and is simply
+        dropped — there is nothing to state about a single atom.
+        """
+        picks = list(self._measure_picks)
+        self._measure_picks = []
+        if len(picks) < 2:
+            return None
+        entry = {"id": self._measure_next_id, "picks": picks}
+        self._measure_next_id += 1
+        self.measurements.append(entry)
+        self.status_message.emit("Measurement kept — {} ({} total)".format(
+            self._measure_entry_text(entry), len(self.measurements)))
+        return entry["id"]
+
+    def delete_measurement(self, ident=None):
+        """Remove one measurement, or the hovered/selected one by default.
+
+        Returns True if something went. The caller (Delete) needs to know,
+        because if nothing did the key has to fall through to deleting ATOMS.
+        """
+        if ident is None:
+            ident = (self._hover_measurement
+                     if self._hover_measurement is not None
+                     else self.selected_measurement)
+        if ident is None:
+            return False
+        before = len(self.measurements)
+        self.measurements = [m for m in self.measurements
+                             if m["id"] != int(ident)]
+        if len(self.measurements) == before:
+            return False
+        if self.selected_measurement == ident:
+            self.selected_measurement = None
+        if self._hover_measurement == ident:
+            self._hover_measurement = None
+        self.status_message.emit("Measurement deleted ({} left)".format(
+            len(self.measurements)))
+        self.update()
+        return True
+
+    def prune_measurements(self):
+        """Drop measurements whose atoms have gone.
+
+        Its own method rather than a side effect of painting: pruning inside
+        `_paint_measure` meant a measurement only disappeared once a frame was
+        drawn, which is both a hidden mutation in a paint path and untestable
+        offscreen (the offscreen platform never runs `paintGL`). Called from
+        the painter AND from `refresh_geometry`, so the list is correct
+        whether or not anything has been redrawn.
+        """
+        if not self.measurements or self.scene is None:
+            return 0
+        kept = [m for m in self.measurements if self._measure_entry_text(m)]
+        dropped = len(self.measurements) - len(kept)
+        if dropped:
+            gone = {m["id"] for m in self.measurements} - {m["id"] for m in kept}
+            if self.selected_measurement in gone:
+                self.selected_measurement = None
+            if self._hover_measurement in gone:
+                self._hover_measurement = None
+            self.measurements = kept
+        return dropped
+
+    def has_measurement_target(self):
+        """Is there a measurement Delete would take? Public because the
+        `delete_selected` operator's enabled-predicate has to ask: `run_op`
+        refuses to run a disabled operator, so a predicate that only looked at
+        the atom selection would stop the key ever reaching the measurement."""
+        return (self._hover_measurement is not None
+                or self.selected_measurement is not None)
+
+    def clear_measurements(self):
+        """Drop every measurement, committed and in progress."""
+        count = len(self.measurements)
+        self.measurements = []
+        self._measure_picks = []
+        self.selected_measurement = None
+        self._hover_measurement = None
+        self.status_message.emit(
+            "Cleared {} measurement(s)".format(count) if count
+            else "No measurements to clear")
+        self.update()
+        return count
+
+    def set_show_measurements(self, on):
+        """Show or hide every measurement without deleting any of them."""
+        self.show_measurements = bool(on)
+        self.status_message.emit("Measurements shown" if self.show_measurements
+                                 else "Measurements hidden")
+        self.update()
+
+    def _measurement_at(self, pos):
+        """The id of the committed measurement under `pos`, or None.
+
+        Tested against the LABEL rectangles collected during the last paint —
+        the label is the part of a measurement that is reliably big enough to
+        hit, where the dashed line is a couple of pixels wide.
+        """
+        if not self.show_measurements:
+            return None
+        x, y = float(pos.x()), float(pos.y())
+        for ident, rx, ry, rw, rh in reversed(self._measure_hits):
+            if rx <= x <= rx + rw and ry <= y <= ry + rh:
+                return ident
+        return None
+
+    def _measure_entry_text(self, entry):
+        """The distance / angle / dihedral of one stored measurement."""
+        if self.scene is None:
+            return ""
+        picks = []
+        for p in entry["picks"]:
+            c = self.scene.pick_coords(p)
+            if c is not None:
+                picks.append((self.scene.pick_label(p), c))
+        if len(picks) != len(entry["picks"]):
+            return ""            # an atom has gone; the caller drops the entry
+        return measure.describe_picks(picks)
 
     def measure_text(self):
         # type: () -> str
@@ -2822,14 +3233,50 @@ class MolViewport(QOpenGLWidget):
                 out[i] = cache[key]
         return out or None
 
-    def _rebuild(self):
+    def _object_block(self, obj):
+        """One object's contribution to the instance buffers.
+
+        Cached per object WHILE FLYING. The molecule being piloted is excluded
+        from the cache (its coordinates change every tick, which is the whole
+        point), so what is reused is every OTHER object - which cannot change
+        during a flight, because the viewport holds the keyboard and no edit
+        can reach them. The cache is dropped the moment flight ends, so
+        nothing outside that window can read a stale block.
+        """
+        fly = self._fly
+        cache = self._draw_cache
+        # A CLIPPED block is camera-dependent, so it cannot be cached. The
+        # cockpit cull (`_shuttle_hidden`) measures every atom against the EYE,
+        # which moves on every tick of the flight the cache exists to speed up
+        # - so a block built once and reused froze the mask of the moment it
+        # was built, and flying the ship up to another molecule then drew that
+        # molecule's atoms straight through the lens: the inside of an atom
+        # again, from the one mode that is supposed to cull them. Third person
+        # clips nothing and camera flight has no shuttle at all, so the case
+        # round 71 measured the cache on keeps it.
+        if (self._shuttle or {}).get("clip"):
+            cache = None
+        flown = fly.get("obj_id") if fly is not None else None
+        if cache is not None and obj.id != flown:
+            hit = cache.get(obj.id)
+            if hit is not None:
+                return hit
+        block = self._build_object_block(obj)
+        if cache is not None and obj.id != flown:
+            cache[obj.id] = block
+        return block
+
+    def _build_object_block(self, obj):
+        """The uncached per-object draw lists."""
         sphere_mats, sphere_cols = [], []
         split_mats, split_segs = [], []
         cyl_starts, cyl_ends, cyl_rads, cyl_cols = [], [], [], []
         wire_rows = []
-        self._ensure_pick_data()
-
-        for obj in (self.scene.visible_objects() if self.scene else []):
+        # A single-iteration LOOP rather than `if True:` so the object-level
+        # `continue` statements below keep their original meaning - they used
+        # to skip to the next object, and here "skip the rest of this block"
+        # is exactly the same thing, since one call handles one object.
+        for _once in (0,):
             s = obj.structure
             if s.n_atoms == 0:
                 continue
@@ -2841,6 +3288,20 @@ class MolViewport(QOpenGLWidget):
             zs = np.array([elements.atomic_number(x) for x in sym_e],
                           dtype=int)
             colors = np.array([elements.color_f(z) for z in zs])
+            # A META ATOM wears the colour of the element it STANDS FOR.
+            # Christian: "meta atoms should just have the element color of the
+            # regular element they are using as a placeholder. The halo will
+            # distinguish them as meta-atoms well enough." The dummy `Xx` grey
+            # said nothing about what the centre is going to become, and the
+            # glow already says "this is not an ordinary atom".
+            meta_table = meta_mod.all_meta(s)
+            if meta_table:
+                base_n = max(s.n_atoms, 1)
+                for i in range(len(colors)):
+                    spec = meta_table.get(i % base_n)
+                    if spec is not None and spec.element:
+                        colors[i] = elements.color_f(
+                            elements.atomic_number(spec.element))
             # per-atom overrides from the outliner (VESTA-style). Modifier
             # copies inherit the base atom's colour: idx % n_base.
             if obj.atom_colors:
@@ -2901,6 +3362,13 @@ class MolViewport(QOpenGLWidget):
                     if obj.atom_hidden and (i % base_n in obj.atom_hidden
                                             or j % base_n in obj.atom_hidden):
                         continue
+                    # ...and the same for an atom culled at the cockpit. This
+                    # was missing, so first person hid the sphere you were
+                    # standing inside and kept every stick attached to it: the
+                    # eye ended up inside the CYLINDERS instead, which looks
+                    # exactly like being inside the atom.
+                    if hide is not None and (hide[i] or hide[j]):
+                        continue
                     p1, p2 = coords[i], coords[j]
                     mid = (p1 + p2) / 2.0
                     if st.wireframe:
@@ -2945,7 +3413,37 @@ class MolViewport(QOpenGLWidget):
                     cyl_ends += [mid, p2]
                     cyl_rads += [r_ref, r_ref]
                     cyl_cols += [c1, c2]
+        return {"sphere_mats": sphere_mats, "sphere_cols": sphere_cols,
+                "split_mats": split_mats, "split_segs": split_segs,
+                "cyl_starts": cyl_starts, "cyl_ends": cyl_ends,
+                "cyl_rads": cyl_rads, "cyl_cols": cyl_cols,
+                "wire_rows": wire_rows}
 
+    def _rebuild(self):
+        """Concatenate every visible object's draw lists and upload them.
+
+        The per-object work is CACHED while flying (see `_object_block`): only
+        one molecule moves in shuttle mode, and rebuilding the whole scene for
+        it every tick cost 3.6 ms on a 91-atom scene - 22% of a 60 Hz frame,
+        and it grew with the SCENE rather than with the thing that changed.
+        """
+        names = ('sphere_mats', 'sphere_cols', 'split_mats', 'split_segs', 'cyl_starts', 'cyl_ends', 'cyl_rads', 'cyl_cols', 'wire_rows')
+        parts = dict((n, []) for n in names)
+        self._ensure_pick_data()
+
+        for obj in (self.scene.visible_objects() if self.scene else []):
+            block = self._object_block(obj)
+            for n in names:
+                parts[n] += block[n]
+        sphere_mats = parts["sphere_mats"]
+        sphere_cols = parts["sphere_cols"]
+        split_mats = parts["split_mats"]
+        split_segs = parts["split_segs"]
+        cyl_starts = parts["cyl_starts"]
+        cyl_ends = parts["cyl_ends"]
+        cyl_rads = parts["cyl_rads"]
+        cyl_cols = parts["cyl_cols"]
+        wire_rows = parts["wire_rows"]
         self._sphere.upload(
             np.array(sphere_mats) if sphere_mats else np.zeros((0, 4, 4)),
             np.array(sphere_cols) if sphere_cols else np.zeros((0, 4)))
@@ -3194,38 +3692,52 @@ class MolViewport(QOpenGLWidget):
                                          (len(self._poly_edge_cache), 1))
         return built
 
-    def _paint_meta_glow(self, view, proj):
-        """Layered translucent shells around every meta centre.
+    #: How many shells the glow is built from, and how far out it reaches.
+    #: Three shells was too few and it SHOWED — Christian saw "multiple
+    #: distinct rings" instead of a bloom, because three big alpha steps are
+    #: three visible edges. Many thin shells with a smooth falloff read as one
+    #: soft halo; the cost is a few more instances of a mesh that is already
+    #: uploaded once per frame.
+    GLOW_SHELLS = 16
+    GLOW_REACH = 3.1            # outermost shell, in atom radii
+    GLOW_STRENGTH = 0.30        # scales the whole halo
+    GLOW_FALLOFF = 2.0          # exponent; higher = tighter, dimmer rim
 
-        A cheap stand-in for a bloom pass: three concentric additively-blended
-        shells fall off outward, which reads as a glow without a second render
+    def _glow_shells(self):
+        """`[(radius_factor, alpha), ...]` from the centre outward.
+
+        The falloff is a smooth power of the shell's fractional distance
+        (`(1 - t)**GLOW_FALLOFF`), which is what a bloom looks like — bright
+        and tight in the middle, fading to nothing at the rim. A LINEAR ramp
+        still bands, because the eye picks out the constant step between
+        neighbouring shells; a curve puts most of the change where the shells
+        are brightest and closest together, so no single boundary stands out.
+
+        Alpha is divided down as the count rises (`3.0 / n`) so more shells
+        make the glow SMOOTHER rather than BRIGHTER — they blend additively, so
+        without that the halo would blow out as soon as the count went up, and
+        the two knobs could not be tuned independently.
+        """
+        out = []
+        n = max(int(self.GLOW_SHELLS), 1)
+        for k in range(n):
+            t = (k + 1) / float(n)                # 0 (centre) .. 1 (rim)
+            radius = 1.0 + (float(self.GLOW_REACH) - 1.0) * t
+            alpha = (float(self.GLOW_STRENGTH)
+                     * ((1.0 - t) ** float(self.GLOW_FALLOFF)) * (3.0 / n))
+            if alpha > 0.0005:
+                out.append((radius, alpha))
+        return out
+
+    def _paint_meta_glow(self, view, proj):
+        """A soft additive halo around every meta centre.
+
+        A cheap stand-in for a bloom pass: concentric additively-blended shells
+        with a smooth falloff, which reads as a glow without a second render
         target or a post-process. Meta atoms are dummies — they must not look
         like an ordinary element sitting in the structure.
         """
-        from ..core import meta as meta_mod
-        if self.scene is None:
-            return
-        mats, rgba = [], []
-        for obj in self.scene.visible_objects():
-            table = meta_mod.all_meta(obj.structure)
-            if not table:
-                continue
-            st = self._object_style(obj)
-            for index in table:
-                if index >= obj.structure.n_atoms:
-                    continue
-                z = elements.atomic_number(obj.structure.symbols[index])
-                base = st.atom_radius(elements.radius_vdw(z))
-                if st.fixed_atom_radius is None:
-                    base *= self.atom_scale
-                base = max(base, 0.30)
-                for shell, alpha in ((1.35, 0.30), (1.9, 0.16), (2.6, 0.07)):
-                    m = np.zeros((4, 4))
-                    m[0, 0] = m[1, 1] = m[2, 2] = base * shell
-                    m[:3, 3] = obj.structure.coords[index]
-                    m[3, 3] = 1.0
-                    mats.append(m)
-                    rgba.append(_META_GLOW + (alpha,))
+        mats, rgba = self._meta_glow_instances()
         if not mats:
             return
         GL.glEnable(GL.GL_BLEND)
@@ -3237,6 +3749,43 @@ class MolViewport(QOpenGLWidget):
         GL.glDepthMask(GL.GL_TRUE)
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
         GL.glDisable(GL.GL_BLEND)
+
+    def _meta_glow_instances(self):
+        """The halo's shells as (matrices, colours) — split out of the paint so
+        the cockpit cull below can be tested without a GL context."""
+        from ..core import meta as meta_mod
+        if self.scene is None:
+            return [], []
+        mats, rgba = [], []
+        for obj in self.scene.visible_objects():
+            table = meta_mod.all_meta(obj.structure)
+            if not table:
+                continue
+            st = self._object_style(obj)
+            # The cockpit cull again: the halo is a stack of shells around the
+            # atom, bigger than the atom, so a camera parked on one is inside
+            # every shell and the additive blend washes the whole frame out.
+            # Not hypothetical - the ship being flown in the report that opened
+            # this round is a meta complex.
+            hide = self._shuttle_hidden(obj.structure.coords)
+            for index in table:
+                if index >= obj.structure.n_atoms:
+                    continue
+                if hide is not None and hide[index]:
+                    continue
+                z = elements.atomic_number(obj.structure.symbols[index])
+                base = st.atom_radius(elements.radius_vdw(z))
+                if st.fixed_atom_radius is None:
+                    base *= self.atom_scale
+                base = max(base, 0.30)
+                for shell, alpha in self._glow_shells():
+                    m = np.zeros((4, 4))
+                    m[0, 0] = m[1, 1] = m[2, 2] = base * shell
+                    m[:3, 3] = obj.structure.coords[index]
+                    m[3, 3] = 1.0
+                    mats.append(m)
+                    rgba.append(_META_GLOW + (alpha,))
+        return mats, rgba
 
     def outline_width(self):
         # type: () -> float
@@ -3277,9 +3826,21 @@ class MolViewport(QOpenGLWidget):
             s = obj.structure
             xyz = obj.display_coords()
             chosen = set(rows)
+            # AND THE COCKPIT CULL. The outline is an ENLARGED sphere with its
+            # front faces culled, so a camera inside one sees its whole inner
+            # surface - and in the cockpit the selected atom IS the atom the
+            # camera is sitting on, always, because that is how the cockpit is
+            # named. So flying first person filled the entire viewport with
+            # flat orange: Christian's "all you see is the inside of an atom
+            # while steering", and the loudest of the five causes of it. The
+            # cull was applied to the scene spheres and to nothing else, and
+            # this pass has had its own buffers since round 35.
+            hide = self._shuttle_hidden(xyz)
             for i in rows:
                 if i in obj.atom_hidden:
                     continue          # invisible atoms get no outline either
+                if hide is not None and hide[i]:
+                    continue
                 z = elements.atomic_number(s.symbols[i])
                 base = st.atom_radius(elements.radius_vdw(z))
                 if st.fixed_atom_radius is None:
@@ -3298,6 +3859,8 @@ class MolViewport(QOpenGLWidget):
                     if i not in chosen or j not in chosen:
                         continue
                     if i in obj.atom_hidden or j in obj.atom_hidden:
+                        continue
+                    if hide is not None and (hide[i] or hide[j]):
                         continue
                     cylinders.append((xyz[i], xyz[j],
                                       st.bond_radius + width))
@@ -3347,8 +3910,14 @@ class MolViewport(QOpenGLWidget):
         GL.glDepthMask(GL.GL_TRUE)
 
     # ------------------------------------------------------------ 2D overlays
-    def _paint_export_overlays(self, image, view, proj, w, h):
-        """The cell box and labels onto an EXPORTED image.
+    def _paint_export_overlays(self, image, view, proj, w, h, labels=True):
+        """The cell box, symmetry elements and labels onto an EXPORTED image.
+
+        `labels` is the only genuinely optional one. ATOM LABELS are a reading
+        aid and round 13's argument against them in a published still stands;
+        the cell box and the symmetry elements are part of the crystallography
+        and are each already behind their own checkbox, so if one is on it
+        belongs in the picture.
 
         The overlay painters all work in widget coordinates (they project
         through `self.width()`/`height()`), so the painter is scaled by the
@@ -3366,7 +3935,8 @@ class MolViewport(QOpenGLWidget):
             if self.show_cell:
                 self._paint_cells(p)
             self._paint_symmetry(p)
-            self._paint_labels(p)
+            if labels:
+                self._paint_labels(p)
         finally:
             p.end()
 
@@ -3429,8 +3999,9 @@ class MolViewport(QOpenGLWidget):
         p.setPen(QPen(QColor(self.CAMERA_FRAME.red(), self.CAMERA_FRAME.green(),
                              self.CAMERA_FRAME.blue(), 150), 1.0))
         p.drawText(int(x) + 6, int(y + h) + 14,
-                   "orbit / Esc / Numpad 0 to leave  |  drag the handles to "
-                   "move the shot's borders, scroll to resize the frame")
+                   "Esc / Numpad 0 / Alt+scroll or Alt+drag to leave  |  "
+                   "handles move the borders, scroll resizes the frame, "
+                   "Ctrl+scroll dollies, Shift+scroll or Shift+drag re-frames")
 
     def _paint_overlays(self, view, proj, empty):
         p = QPainter(self)
@@ -3483,6 +4054,57 @@ class MolViewport(QOpenGLWidget):
             self._paint_edit_mode(p)
         p.end()
 
+    def _paint_aim(self, p, colour, alpha=190, hull=9):
+        """The steering instrument: hull mark, travel ring, aim reticle, roll.
+
+        Shared by right-mouse flight AND the shuttle, because they are the same
+        control - the shuttle used to draw a bare circle with none of it, so
+        the one mode where you are steering a whole molecule was the mode with
+        the least information on screen. Christian asked for "the steering in
+        full from flying mode (the same circle and navigation gizmo)".
+        """
+        fly = self._fly
+        if fly is None:
+            return
+        cx, cy = self.width() // 2, self.height() // 2
+        pen = QPen(QColor(colour.red(), colour.green(), colour.blue(),
+                          alpha), 1.3)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        # The HULL mark sits dead centre and is where the nose actually
+        # points; the RETICLE drifts behind it under turn. Separating the two
+        # is what makes the rate of turn readable — one mark can only tell
+        # you where you are aimed, never how hard you are pulling.
+        p.drawEllipse(cx - hull, cy - hull, hull * 2, hull * 2)
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            p.drawLine(cx + dx * (hull + 4), cy + dy * (hull + 4),
+                       cx + dx * (hull + 10), cy + dy * (hull + 10))
+        # The aim reticle: a virtual stick, so where it sits IS the turn you
+        # have commanded. Its travel limit is drawn as a faint ring, because
+        # a stick you cannot see the extent of is one you cannot centre.
+        short = min(self.width(), self.height())
+        limit = fly["aim"].limit(short)
+        dx_r, dy_r = fly["aim"].offset
+        faint = QColor(colour.red(), colour.green(), colour.blue(),
+                       int(alpha * 0.28))
+        p.setPen(QPen(faint, 1.0))
+        p.drawEllipse(int(cx - limit), int(cy - limit),
+                      int(limit * 2), int(limit * 2))
+        if abs(dx_r) + abs(dy_r) > 1.0:
+            rx, ry = int(cx + dx_r), int(cy + dy_r)
+            p.setPen(QPen(QColor(colour.red(), colour.green(), colour.blue(),
+                                 int(alpha * 0.85)), 1.4))
+            p.drawEllipse(rx - 6, ry - 6, 12, 12)
+            p.drawLine(cx, cy, rx, ry)
+        p.setPen(pen)
+        # Roll: a tick on the reticle ring showing which way is up, so a
+        # rolled horizon is readable even against an empty background.
+        roll = float(fly["model"].roll)
+        if abs(roll) > 1e-3:
+            ux, uy = np.sin(roll), -np.cos(roll)
+            p.drawLine(int(cx + ux * hull), int(cy + uy * hull),
+                       int(cx + ux * (hull + 6)), int(cy + uy * (hull + 6)))
+
     def _paint_fly(self, p):
         """Right-mouse flight HUD: a small reticle and the controls.
 
@@ -3498,40 +4120,7 @@ class MolViewport(QOpenGLWidget):
         alpha = 90 if fly["released"] else 190
         pen = QPen(QColor(_FLY_COLOR.red(), _FLY_COLOR.green(),
                           _FLY_COLOR.blue(), alpha), 1.3)
-        p.setPen(pen)
-        p.setBrush(Qt.NoBrush)
-        # The HULL mark sits dead centre and is where the nose actually
-        # points; the RETICLE drifts behind it under turn. Separating the two
-        # is what makes the rate of turn readable — one mark can only tell
-        # you where you are aimed, never how hard you are pulling.
-        p.drawEllipse(cx - 9, cy - 9, 18, 18)
-        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            p.drawLine(cx + dx * 13, cy + dy * 13, cx + dx * 19, cy + dy * 19)
-        # The aim reticle: a virtual stick, so where it sits IS the turn you
-        # have commanded. Its travel limit is drawn as a faint ring, because
-        # a stick you cannot see the extent of is one you cannot centre.
-        short = min(self.width(), self.height())
-        limit = fly["aim"].limit(short)
-        dx_r, dy_r = fly["aim"].offset
-        faint = QColor(_FLY_COLOR.red(), _FLY_COLOR.green(),
-                       _FLY_COLOR.blue(), int(alpha * 0.28))
-        p.setPen(QPen(faint, 1.0))
-        p.drawEllipse(int(cx - limit), int(cy - limit),
-                      int(limit * 2), int(limit * 2))
-        if abs(dx_r) + abs(dy_r) > 1.0:
-            rx, ry = int(cx + dx_r), int(cy + dy_r)
-            p.setPen(QPen(QColor(_FLY_COLOR.red(), _FLY_COLOR.green(),
-                                 _FLY_COLOR.blue(), int(alpha * 0.85)), 1.4))
-            p.drawEllipse(rx - 6, ry - 6, 12, 12)
-            p.drawLine(cx, cy, rx, ry)
-        p.setPen(pen)
-        # Roll: a tick on the reticle ring showing which way is up, so a
-        # rolled horizon is readable even against an empty background.
-        roll = float(fly["model"].roll)
-        if abs(roll) > 1e-3:
-            ux, uy = np.sin(roll), -np.cos(roll)
-            p.drawLine(int(cx + ux * 9), int(cy + uy * 9),
-                       int(cx + ux * 15), int(cy + uy * 15))
+        self._paint_aim(p, colour=_FLY_COLOR, alpha=alpha)
         if fly["released"]:
             return
         f = QFont()
@@ -3553,19 +4142,24 @@ class MolViewport(QOpenGLWidget):
     def _paint_shuttle(self, p):
         """Cockpit HUD: reticle + a reminder of the flight controls."""
         obj = self.scene.get(self._shuttle["obj_id"]) if self.scene else None
-        cx, cy = self.width() // 2, self.height() // 2
-        p.setPen(QPen(QColor(120, 220, 255, 200), 1.4))
-        p.setBrush(Qt.NoBrush)
-        p.drawEllipse(cx - 16, cy - 16, 32, 32)
-        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            p.drawLine(cx + dx * 20, cy + dy * 20, cx + dx * 30, cy + dy * 30)
+        # The SAME instrument as right-mouse flight, not a bare circle: this is
+        # the mode where you are steering a whole molecule, so it should not be
+        # the one with the least on screen.
+        self._paint_aim(p, colour=QColor(120, 220, 255), alpha=200, hull=16)
+        speed = float(self._fly["model"].velocity_magnitude) \
+            if (self._fly is not None
+                and hasattr(self._fly["model"], "velocity_magnitude")) \
+            else (float(np.linalg.norm(self._fly["model"].velocity))
+                  if self._fly is not None else 0.0)
         f = QFont()
         f.setPointSize(10)
         f.setBold(True)
         p.setFont(f)
-        text = "SHUTTLE  |  {}  |  hold WASD + Q/E to fly, drag or scroll " \
-               "to steer, Shift boost, Esc land".format(
-                   obj.name if obj is not None else "?")
+        text = "{}  |  {}  |  hold WASD + Q/E to fly, drag or scroll " \
+               "to steer, Shift boost, Esc land  |  {:.1f} A/s".format(
+                   "CHASE" if (self._shuttle or {}).get("third_person")
+                   else "SHUTTLE",
+                   obj.name if obj is not None else "?", speed)
         # horizontalAdvance, NOT boundingRect: the tight rect ignores a bold
         # face's side bearings, so the banner cropped its own last glyph.
         fm = p.fontMetrics()
@@ -4240,12 +4834,38 @@ class MolViewport(QOpenGLWidget):
                 p.drawEllipse(x - 4, y - 4, 8, 8)
 
     def _paint_measure(self, p):
-        """Ringed picks, the chain between them, and the value — drawn OVER
-        the molecule, which is the one place it cannot be covered up."""
-        if not self._measure_picks or self.scene is None:
+        """Every KEPT measurement plus the one being picked, drawn OVER the
+        molecule — the one place a readout cannot be covered up.
+
+        Also rebuilds `_measure_hits`, the label rectangles a click tests
+        against, so what you can click is by construction what you can see.
+        """
+        self._measure_hits = []
+        if self.scene is None or not self.show_measurements:
             return
+        self.prune_measurements()
+        for entry in self.measurements:
+            text = self._measure_entry_text(entry)
+            if not text:
+                continue
+            live = entry["id"] in (self._hover_measurement,
+                                   self.selected_measurement)
+            self._draw_one_measure(p, entry["picks"], text, kept=True,
+                                   ident=entry["id"], highlight=live)
+        if self._measure_picks:
+            self._draw_one_measure(p, self._measure_picks, self.measure_text(),
+                                   kept=False)
+
+    def _draw_one_measure(self, p, picks, text, kept, ident=None,
+                          highlight=False):
+        """One measurement: ringed picks, the chain between them, the value.
+
+        A KEPT one is drawn solid and a live one dashed, so "still picking" and
+        "finished" are distinguishable at a glance; a hovered or selected one
+        is drawn white, which is also the cue that Delete will take it.
+        """
         pts = []
-        for pick in self._measure_picks:
+        for pick in picks:
             c = self.scene.pick_coords(pick)
             if c is None:
                 continue
@@ -4254,8 +4874,9 @@ class MolViewport(QOpenGLWidget):
                 pts.append((float(xy[0, 0]), float(xy[0, 1])))
         if not pts:
             return
-        pen = QPen(_MEASURE_COLOR, 1.6, Qt.DashLine)
-        p.setPen(pen)
+        colour = QColor(255, 255, 255) if highlight else _MEASURE_COLOR
+        p.setPen(QPen(colour, 2.0 if highlight else 1.6,
+                      Qt.SolidLine if kept else Qt.DashLine))
         p.setBrush(Qt.NoBrush)
         for a, b in zip(pts, pts[1:]):
             p.drawLine(int(a[0]), int(a[1]), int(b[0]), int(b[1]))
@@ -4263,10 +4884,10 @@ class MolViewport(QOpenGLWidget):
         f.setPixelSize(11)
         p.setFont(f)
         for k, (x, y) in enumerate(pts):
-            p.setPen(QPen(_MEASURE_COLOR, 2.0))
+            p.setPen(QPen(colour, 2.0))
             p.drawEllipse(int(x) - 9, int(y) - 9, 18, 18)
-            p.drawText(int(x) + 11, int(y) - 9, str(k + 1))
-        text = self.measure_text()
+            if not kept:            # the order only matters while picking
+                p.drawText(int(x) + 11, int(y) - 9, str(k + 1))
         if not text:
             return
         f.setPixelSize(13)
@@ -4277,10 +4898,17 @@ class MolViewport(QOpenGLWidget):
         x = int(min(max(pts[-1][0] + 18, 8), max(self.width() - w - 8, 8)))
         y = int(min(max(pts[-1][1] + 14, 8), max(self.height() - h - 8, 8)))
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(0, 0, 0, 165))
+        p.setBrush(QColor(30, 30, 30, 200) if highlight
+                   else QColor(0, 0, 0, 165))
         p.drawRoundedRect(QRect(x, y, w, h), 4, 4)
-        p.setPen(_MEASURE_COLOR)
+        if highlight:
+            p.setPen(QPen(colour, 1.0))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(QRect(x, y, w, h), 4, 4)
+        p.setPen(colour)
         p.drawText(QRect(x, y, w, h), Qt.AlignCenter, text)
+        if kept and ident is not None:
+            self._measure_hits.append((ident, x, y, w, h))
 
     def _paint_tumble_lock(self, p):
         """Dashed guide for an axis-locked anchored tumble (same look as the
@@ -4821,11 +5449,16 @@ class MolViewport(QOpenGLWidget):
         # every label at once.
         ball = self._compass_hit_at(pos.x(), pos.y())
         bond = self._bond_at(pos) if self.mode == MODE_EDIT else None
+        # Hovering a measurement lights it up, which is what makes
+        # "hover + Delete" discoverable rather than a secret.
+        measured = self._measurement_at(pos)
         if (hover != self._compass_hover or ball != self._compass_hover_item
-                or bond != self._hover_bond):
+                or bond != self._hover_bond
+                or measured != self._hover_measurement):
             self._compass_hover = hover
             self._compass_hover_item = ball
             self._hover_bond = bond
+            self._hover_measurement = measured
             self.update()
         if self._drag_last is None:
             return
@@ -5024,6 +5657,37 @@ class MolViewport(QOpenGLWidget):
             return None
         i, j, _o = s.bonds[k]
         return (obj.id, i, j)
+
+    def _bond_object_at(self, pos, radius=0.28):
+        """The id of the visible molecule whose BOND is under the cursor.
+
+        `_bond_at` is deliberately scoped to the edited molecule (it exists for
+        hover-and-press-a-number), so in OBJECT mode it always answers None —
+        which is why double-clicking a stick selected nothing. This one searches
+        every visible molecule, and picks the NEAREST hit rather than the first
+        object that happens to match, or a bond in a molecule behind would win
+        over one in front.
+        """
+        if self.scene is None:
+            return None
+        if self._pick_at(pos) is not None:
+            return None            # an atom under the cursor wins
+        origin, direction = self._ray_at(pos)
+        best, best_d = None, None
+        for obj in self.scene.visible_objects():
+            _sym, coords, bonds = obj.evaluated()
+            if not len(bonds) or not len(coords):
+                continue
+            p1 = np.array([coords[i] for i, _j, _o in bonds])
+            p2 = np.array([coords[j] for _i, j, _o in bonds])
+            k = picking.pick_segment(origin, direction, p1, p2, radius)
+            if k is None:
+                continue
+            mid = (p1[k] + p2[k]) * 0.5
+            d = float(np.dot(mid - origin, direction))
+            if d > 0 and (best_d is None or d < best_d):
+                best, best_d = obj.id, d
+        return best
 
     def set_hovered_bond_order(self, order):
         # type: (int) -> bool
@@ -5312,16 +5976,61 @@ class MolViewport(QOpenGLWidget):
             self._apply_internal()
             return
         if self.looking_through is not None and not self.modal_active():
-            # Inside a camera the wheel resizes the FRAME. Every scroll
-            # gesture, not just the zoom one: a camera you are looking through
-            # must not move, so there is nothing else for a scroll to mean,
-            # and leaving pan or orbit live here would be a way to move it by
-            # accident. Orbiting still exits, but through a DRAG (see
-            # `_orbit_input`) — a stray trackpad swipe should not throw you
-            # out of a shot you are composing.
+            # Inside a camera, a PLAIN scroll resizes the FRAME and leaves the
+            # camera exactly where it stands (round 58). The two MODIFIED
+            # gestures move the camera object itself, which is what Christian
+            # asked for: Ctrl DOLLIES it along its own view axis ("actually
+            # move it closer/further from the object") and Shift TRUCKS it
+            # sideways for final framing. Both survive leaving the shot,
+            # because they move the camera OBJECT and so reach the savefile,
+            # the render and the Blender export.
+            #
+            # Round 58 sent every scroll to the frame zoom on the argument that
+            # a camera must not move by accident. The argument holds for the
+            # PLAIN gesture and not for a held modifier, which is the same
+            # reasoning round 59 used to put re-framing on Shift+drag: a
+            # modifier plus a gesture IS the deliberate statement. Before this,
+            # Ctrl+scroll and Shift+scroll both fell through to the frame zoom,
+            # which is exactly the reported "Shift+drag is doing the same thing
+            # as Ctrl+drag".
+            #
+            # Keyed on the MODIFIERS, not on `input_map`'s resolved action, and
+            # that is deliberate: a mouse resolves a plain wheel to ZOOM while
+            # a trackpad resolves it to ORBIT, so keying off the action would
+            # make the unmodified gesture dolly on one machine and resize the
+            # frame on the other — two meanings for one gesture across two
+            # machines, which is the round-16 mistake. Inside a camera the
+            # modifier is the whole statement, so it is read directly.
             steps = (ad.y() / _WHEEL_NOTCH) if ev.pixelDelta().isNull() \
                 else dy / 40.0
-            self.zoom_camera_frame(steps)
+            if mods & Qt.AltModifier:
+                # ORBIT, which LEAVES the camera view — the trackpad's way out.
+                # Every scroll gesture inside a camera is spoken for (plain
+                # resizes the frame, Ctrl dollies, Shift trucks), so on a
+                # trackpad, where a two-finger scroll IS the orbit gesture and
+                # there is no middle button, there was no scroll left that
+                # could exit: "I cannot exit camera view by rotating the view
+                # using two finger touch pad drag". Alt is the same escape
+                # hatch Alt+LMB already provides for mice whose wheel-click is
+                # unusable (round 16), so it is the consistent answer rather
+                # than a new idea.
+                self._orbit_input(-dx, -dy, cursor_pos=ev.position())
+                self.update()
+                return
+            if mods & Qt.ControlModifier:
+                self.dolly_camera(steps)
+            elif mods & Qt.ShiftModifier:
+                # Measured in PIXELS, like the drag, so the shot slides by as
+                # many pixels as the fingers moved. A notched wheel reports no
+                # pixelDelta, so its detents are converted the same way the
+                # ordinary pan branch below converts them.
+                if ev.pixelDelta().isNull():
+                    self.truck_camera(ad.x() / _WHEEL_NOTCH * _NOTCH_PAN_PX,
+                                      ad.y() / _WHEEL_NOTCH * _NOTCH_PAN_PX)
+                else:
+                    self.truck_camera(dx, dy)
+            else:
+                self.zoom_camera_frame(steps)
             return
         if action == input_map.ZOOM:
             # A detent is a fixed 120 units, so a mouse zooms in even steps;
@@ -5349,20 +6058,30 @@ class MolViewport(QOpenGLWidget):
         self.update()
 
     def render_image(self, scale=None, subdiv_bonus=None,
-                     transparent=True, furniture=False):
+                     transparent=True, furniture=False, crop_to_content=False,
+                     crop_margin=16):
         """Offscreen render for image export.
 
         Differs from a framebuffer grab in three ways that matter for a
-        figure: no viewport furniture (compass, origin dot, labels, grid,
-        selection halos — none of it belongs in a published image), finer
-        meshes (the interactive icosphere is deliberately cheap), and a
-        resolution multiplier. Returns a QImage.
+        figure: no viewport furniture (compass, origin dot, grid, selection
+        halos — none of it belongs in a published image), finer meshes (the
+        interactive icosphere is deliberately cheap), and a resolution
+        multiplier. Returns a QImage.
 
-        `furniture` puts back the things a FIGURE usually does not want but an
-        ANIMATION often does — the unit cell box above all, since a crystal
-        rotating inside nothing is hard to read. It is deliberately not the
-        default: round 13 excluded them because a published still is better
-        without them, and that has not changed.
+        Everything that describes the STRUCTURE is always included — the cell
+        box, coordination polyhedra, occupancy pie spheres, symmetry elements
+        and the wireframe buffer — because each is already behind its own
+        toggle and an export that silently disagrees with the screen is the
+        round-37 rule. `furniture` now adds only the ATOM LABELS, which are a
+        reading aid rather than a fact about the crystal.
+
+        `crop_to_content` trims the result to what was actually drawn, plus
+        `crop_margin` pixels of air. The viewport is whatever shape the window
+        happens to be and the molecule sits wherever the camera left it, so an
+        export routinely carries a third of its pixels as background that then
+        has to be cropped by hand somewhere else. Applied AFTER the camera crop
+        — a camera's film back is a deliberate framing and must win, so this
+        only tightens what is left inside it.
         """
         from PySide6.QtGui import QImage
         from PySide6.QtOpenGL import (QOpenGLFramebufferObject,
@@ -5426,18 +6145,27 @@ class MolViewport(QOpenGLWidget):
                                   1, GL.GL_TRUE, proj)
             self._sphere.draw()
             self._cylinder.draw()
-            if furniture:
-                self._draw_occupancy(view, proj)
-                self._draw_lines(self._wire_lines, view, proj)
-                self._draw_polyhedra(view, proj)
-                # The cell box and the labels are QPainter overlays, so they
-                # go on AFTER the GL passes and against the FBO's image —
-                # painting into the FBO directly would need a paint device
-                # this function does not own.
-                image = fbo.toImage()
-                self._paint_export_overlays(image, view, proj, w, h)
-            else:
-                image = fbo.toImage()
+            # STRUCTURE is always drawn. These five were behind `furniture`
+            # and should never have been: they are statements about the
+            # crystal, not viewport aids. Christian reported the visible half
+            # of it — "screenshots of cifs are missing the unit cell
+            # boundaries, not legible without them" — but the same gate was
+            # also dropping coordination polyhedra, occupancy pie spheres,
+            # symmetry elements, and, worst of all, the WIREFRAME buffer, so
+            # exporting a wireframe-styled molecule produced an empty image.
+            # Every one of them is already behind its own user-facing toggle,
+            # so drawing them here just means the export agrees with the
+            # screen (round 37's rule).
+            self._draw_occupancy(view, proj)
+            self._draw_lines(self._wire_lines, view, proj)
+            self._draw_polyhedra(view, proj)
+            # The cell box, symmetry elements and labels are QPainter
+            # overlays, so they go on AFTER the GL passes and against the
+            # FBO's image — painting into the FBO directly would need a paint
+            # device this function does not own.
+            image = fbo.toImage()
+            self._paint_export_overlays(image, view, proj, w, h,
+                                        labels=furniture)
         finally:
             fbo.release()
             self._sphere, self._cylinder = saved
@@ -5452,7 +6180,45 @@ class MolViewport(QOpenGLWidget):
                 image = image.scaled(crop["target"][0], crop["target"][1],
                                      _Qt.IgnoreAspectRatio,
                                      _Qt.SmoothTransformation)
+        if crop_to_content:
+            box = self._content_box(image, transparent,
+                                    margin=int(crop_margin) * scale)
+            if box is not None:
+                image = image.copy(*box)
         return image
+
+    def _content_box(self, image, transparent, margin=16):
+        """Where the drawn content sits in `image`, or None if it cannot tell.
+
+        Two ways of asking, because the export has two modes: a transparent PNG
+        carries an ALPHA channel that says exactly what was drawn, while an
+        opaque one only differs from the background colour. The geometry is in
+        `core/crop.py` so the rules are testable without a GL context; all that
+        happens here is the QImage -> numpy conversion.
+        """
+        from PySide6.QtGui import QImage
+        try:
+            converted = image.convertToFormat(QImage.Format_RGBA8888)
+            width, height = converted.width(), converted.height()
+            if width <= 0 or height <= 0:
+                return None
+            ptr = converted.constBits()
+            # bytesPerLine can exceed 4*width (row padding), so index by the
+            # real stride and then slice the pixels back out — assuming a tight
+            # buffer silently shears the image on some drivers.
+            stride = converted.bytesPerLine()
+            buf = np.frombuffer(bytes(ptr)[:stride * height], dtype=np.uint8)
+            rows = buf.reshape(height, stride)[:, :width * 4]
+            rgba = rows.reshape(height, width, 4)
+            if transparent:
+                mask = crop_mod.alpha_mask(rgba[:, :, 3])
+            else:
+                back = tuple(int(round(c * 255.0)) for c in self.background)
+                mask = crop_mod.colour_mask(rgba[:, :, :3], back)
+            return crop_mod.content_box(mask, margin=int(margin))
+        except Exception:
+            # A crop is a convenience; failing it must never lose the render.
+            return None
 
     #: An offscreen buffer this many times the widget is already generous;
     #: past it the crop is scaled instead. Without a cap, a frame pulled small
@@ -5831,10 +6597,7 @@ class MolViewport(QOpenGLWidget):
         cam = self.active_camera_object()
         if cam is None:
             return False
-        if self._truck_gesture != cam.id:
-            self._truck_gesture = cam.id
-            if self.on_edit_begin is not None:
-                self.on_edit_begin()
+        self._begin_camera_gesture(cam)
         rot = quat_to_mat3(cam.rolled_rotation())
         # World units per SCREEN pixel, from the widget's field of view — so
         # the shot slides by exactly as many pixels as the hand moved, at any
@@ -5852,6 +6615,52 @@ class MolViewport(QOpenGLWidget):
         self.status_message.emit("{}: re-framing".format(cam.name))
         self.update()
         return True
+
+    def dolly_camera(self, steps):
+        """Ctrl+scroll inside a camera view: move the CAMERA along its own view
+        axis, so the shot really gets closer to the subject.
+
+        This is a DOLLY, not the frame zoom. `zoom_camera_frame` changes how big
+        the film back is drawn and leaves the camera where it stands; this walks
+        the camera in and out, which changes perspective — the thing you cannot
+        fake with a lens. Round 58's arithmetic is what makes the difference
+        visible: the scene's on-screen scale is `Z / distance`, so the frame
+        keeps exactly its size while everything inside it grows.
+
+        Exponential, and the same 0.88 per step as `Camera.zoom`, so a dolly
+        inside a camera feels like a zoom outside one.
+        """
+        cam = self.active_camera_object()
+        if cam is None:
+            return False
+        self._begin_camera_gesture(cam)
+        cam.distance = float(np.clip(cam.distance * (0.88 ** float(steps)),
+                                     Camera.MIN_DISTANCE, 1e6))
+        cam.apply_to(self.camera)
+        self.sync_camera_lens()
+        self.status_message.emit(
+            "{}: {:.2f} A from the pivot".format(cam.name, cam.distance))
+        self.update()
+        return True
+
+    def _begin_camera_gesture(self, cam):
+        """One undo step per gesture, for the camera moves driven by SCROLL.
+
+        A drag ends at a mouse release and `mouseReleaseEvent` clears the flag
+        there. A scroll has no release at all, so without a timeout every
+        Ctrl+scroll for the rest of the session would coalesce into the single
+        undo step the first one opened. Same 0.6 s pause that separates two
+        orbit gestures (`_orbit_input`), for the same reason and by the same
+        constant.
+        """
+        now = time.monotonic()
+        if now - self._last_cam_wheel_t > _GESTURE_GAP_S:
+            self._truck_gesture = None
+        self._last_cam_wheel_t = now
+        if self._truck_gesture != cam.id:
+            self._truck_gesture = cam.id
+            if self.on_edit_begin is not None:
+                self.on_edit_begin()
 
     def zoom_camera_frame(self, steps):
         """The wheel inside a camera view: resize the FRAME, never the camera.
@@ -5930,6 +6739,14 @@ class MolViewport(QOpenGLWidget):
                                           | Qt.ShiftModifier))
         hit = self._pick_at(ev.position())
         if hit is None:
+            # A BOND is part of the molecule too, and on a big structure a
+            # stick is often the easiest thing to hit — Christian: "bonds
+            # cannot be used to select mols via double click when hovering over
+            # them in object mode".
+            obj_id = self._bond_object_at(ev.position())
+            if obj_id is not None:
+                self.select_whole_molecules([obj_id], additive=additive)
+                return
             if not additive:
                 self.set_selection([])
             return

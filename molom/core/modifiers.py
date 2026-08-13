@@ -17,6 +17,8 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+from . import bonding
+
 
 class Modifier:
     """Base: name, on/off, and a transform from one geometry to another."""
@@ -144,10 +146,21 @@ class SymmetryModifier(Modifier):
             packed=False)
         if not out_symbols:
             return symbols, coords, bonds
-        # Bonds are NOT carried: the copies are new atoms whose connectivity
-        # is a perception job, and guessing it here would be wrong at the
-        # cell faces anyway (see the framework note in core/cif.py).
-        return out_symbols, np.asarray(out_coords) + origin, []
+        # The copies are NEW atoms, so the base structure's bond indices do not
+        # describe them and cannot be carried across. They used to be replaced
+        # by an EMPTY list, which meant adding a symmetry modifier removed
+        # every bond in the picture - including the ones on the asymmetric unit
+        # you started from - and the molecule fell apart into loose spheres
+        # (Christian: "no bonds are shown once a symmetry modifier is added").
+        # Connectivity is a perception job, so it is perceived, once, on the
+        # output. `evaluate` runs per REBUILD and not per frame, so this is
+        # affordable at the sizes this modifier is for.
+        out_coords = np.asarray(out_coords) + origin
+        try:
+            out_bonds = bonding.perceive_bonds(out_symbols, out_coords)
+        except Exception:
+            out_bonds = []          # never let a display modifier raise
+        return out_symbols, out_coords, out_bonds
 
     def to_dict(self):
         d = super().to_dict()

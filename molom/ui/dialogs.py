@@ -9,7 +9,8 @@ from typing import Optional
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog,
-                               QDialogButtonBox, QDoubleSpinBox, QFormLayout,
+                               QDialogButtonBox, QDoubleSpinBox, QFileDialog,
+                               QFormLayout,
                                QFrame, QHBoxLayout, QLabel, QLineEdit,
                                QListWidget, QListWidgetItem, QPushButton,
                                QScrollArea, QSlider, QSpinBox, QVBoxLayout,
@@ -18,8 +19,8 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog,
 from ..core import blender_export as bx
 from ..core import cif as cif_mod
 from ..core import flight, input_map
-from ..core import resolve as resolve_mod
 from ..core import style as style_mod
+from .widgets import make_text_selectable
 
 
 class SettingsDialog(QDialog):
@@ -28,6 +29,7 @@ class SettingsDialog(QDialog):
     def __init__(self, parent, rotate_speed, start_maximized,
                  precision_factor=0.5, undo_limit=30, adjust_h=True,
                  atom_scale=1.0, render_scale=2, render_subdiv=2,
+                 render_crop=False,
                  input_preset=input_map.PRESET_AUTO, label_scale=1.0,
                  disorder_policy=None, sg_convention=None,
                  on_speed_change=None, on_atom_scale_change=None,
@@ -223,7 +225,15 @@ class SettingsDialog(QDialog):
                  "the full turn rate."),
                 ("turn_rate", "Turn rate", 20, 400, 1.0,
                  "Mouse-look sensitivity while flying. The response is "
-                 "strictly 1:1 with the mouse; this only scales it.")):
+                 "strictly 1:1 with the mouse; this only scales it."),
+                ("shuttle_factor", "Shuttle speed", 5, 100,
+                 flight.DEFAULT_SHUTTLE_FACTOR,
+                 "How fast SHUTTLE mode is relative to camera flight, scaling "
+                 "both the acceleration and the top speed. Flying the camera "
+                 "is a navigation gesture; flying a molecule is a placement "
+                 "one, where the thing you are moving has to stay in frame - "
+                 "at camera speeds it leaves the viewport before the key comes "
+                 "up. 1.00 makes them identical.")):
             # Acceleration is in whole A/s^2 (default 60); everything else is
             # a small multiplier held to 2 dp. Getting this wrong silently
             # CLAMPS the slider — the readout showed 60.00 while the slider
@@ -287,8 +297,19 @@ class SettingsDialog(QDialog):
             "Extra mesh subdivisions for the render pass. Applies to the "
             "sphere/cylinder styles (ball and stick, licorice, VdW).")
         form.addRow("Render smoothness:", self.render_subdiv_spin)
-        form.addRow("", QLabel("Renders exclude the grid, compass, labels\n"
-                               "and gizmos, on a transparent background."))
+        self.render_crop_check = QCheckBox("Crop to content")
+        self.render_crop_check.setChecked(bool(render_crop))
+        self.render_crop_check.setToolTip(
+            "Trim the exported image to what was actually drawn, plus a small "
+            "margin, instead of keeping the whole viewport rectangle. The "
+            "window is whatever shape it happens to be and the molecule sits "
+            "wherever the camera left it, so an export otherwise carries a lot "
+            "of empty background. A camera object's film back still wins — "
+            "this only tightens what is inside it.")
+        form.addRow("", self.render_crop_check)
+        form.addRow("", QLabel("Renders exclude the grid, compass and gizmos,\n"
+                               "on a transparent background. The unit cell,\n"
+                               "polyhedra and occupancy spheres are kept."))
 
         # OK/Cancel stay OUTSIDE the scroll area — buttons you have to scroll
         # to find are buttons people think are missing.
@@ -431,6 +452,9 @@ class SettingsDialog(QDialog):
 
     def render_subdiv(self):
         return int(self.render_subdiv_spin.value())
+
+    def render_crop(self):
+        return bool(self.render_crop_check.isChecked())
 
     def rotate_speed(self):
         return self.speed_slider.value() / 10.0
@@ -704,6 +728,24 @@ class BlenderExportDialog(QDialog):
         self.shade_smooth.setChecked(bool(opts.shade_smooth))
         form.addRow("", self.shade_smooth)
 
+        self.subsurf = QCheckBox("Subdivision Surface modifier on atoms")
+        self.subsurf.setChecked(bool(opts.subsurf))
+        self.subsurf.setToolTip(
+            "Smooth shading fixes the inside of a sphere but not its "
+            "silhouette, so a baked icosphere still looks faceted against the "
+            "background. This adds a real modifier you can raise in Blender "
+            "afterwards, instead of baking the detail in here.")
+        form.addRow("", self.subsurf)
+
+        self.meta_glow = QCheckBox("Meta atoms glow (emissive)")
+        self.meta_glow.setChecked(bool(opts.meta_glow))
+        self.meta_glow.setToolTip(
+            "Carries the viewport's meta-atom halo into Blender as an emissive "
+            "material. Off by default: a glowing atom is a deliberate look "
+            "rather than a fact about the structure, and an emitter lights "
+            "everything near it.")
+        form.addRow("", self.meta_glow)
+
         self.unit_cell = QCheckBox("Unit cell box (as cylinders, a/b/c "
                                    "coloured)")
         self.unit_cell.setChecked(bool(opts.unit_cell))
@@ -857,6 +899,8 @@ class BlenderExportDialog(QDialog):
             sphere_subdivisions=self.subdiv.value(),
             bond_sides=self.bond_sides.value(),
             shade_smooth=self.shade_smooth.isChecked(),
+            subsurf=self.subsurf.isChecked(),
+            meta_glow=self.meta_glow.isChecked(),
             unit_cell=self.unit_cell.isChecked(),
             polyhedra=self.polyhedra.isChecked(),
             polyhedra_alpha=self.polyhedra_alpha.value(),
@@ -964,12 +1008,18 @@ class OperatorSearchDialog(QDialog):
     listed greyed at the bottom — visible so the palette teaches what exists,
     but not runnable."""
 
-    def __init__(self, parent, registry, ctx):
+    def __init__(self, parent, registry, ctx, last=None):
         super().__init__(parent)
         self.setWindowTitle("Search operation")
         self.registry = registry
         self.ctx = ctx
         self.chosen = None      # type: Optional[object]
+        #: The operator run last time, pre-selected on an EMPTY search so a
+        #: single Enter repeats it - Blender's behaviour, and the reason F3 is
+        #: usable for a thing you are doing over and over. It only applies to
+        #: the unfiltered list: once you have typed, the best MATCH is what
+        #: should be selected, not a memory of something else.
+        self.last_id = last
         lay = QVBoxLayout(self)
         self.edit = QLineEdit(self)
         self.edit.setPlaceholderText("Type to search operations...")
@@ -1016,8 +1066,14 @@ class OperatorSearchDialog(QDialog):
                 self.list.addItem(item)
                 if enabled and first_enabled is None:
                     first_enabled = self.list.count() - 1
+                # Remember where the LAST-RUN operator landed, so an empty
+                # search can open straight on it.
+                if enabled and op.id == self.last_id and not text.strip():
+                    last_row = self.list.count() - 1
+                    first_enabled = last_row
         if first_enabled is not None:
             self.list.setCurrentRow(first_enabled)
+            self.list.scrollToItem(self.list.currentItem())
 
     def _run_current(self):
         item = self.list.currentItem()
@@ -1049,6 +1105,9 @@ class _ResolveWorker(QThread):
         self.query = query
 
     def run(self):
+        # Deferred with the same reasoning as app.py's: the network stack
+        # is only needed once someone actually resolves a name.
+        from ..core import resolve as resolve_mod
         self.done.emit(resolve_mod.resolve(self.query))
 
 
@@ -1094,6 +1153,10 @@ class ResolveNameDialog(QDialog):
         self.edit.returnPressed.connect(self._start_resolve)
         self.ok_btn.clicked.connect(self.accept)
         cancel.clicked.connect(self.reject)
+        # The resolved SMILES is the whole reason someone opens this, and it is
+        # the kind of thing you paste into the next program — so it has to be
+        # markable.
+        make_text_selectable(self)
         self.resize(430, 300)
 
     def _start_resolve(self):
@@ -1259,11 +1322,21 @@ class AnimationExportDialog(QDialog):
     """
 
     def __init__(self, parent, n_images=0, fps=30.0, size=(1280, 720),
-                 have_video=True):
+                 have_video=True, remembered=None, ffmpeg_hint=""):
         super().__init__(parent)
         from ..core import animation as anim
         self._anim = anim
+        self._ffmpeg_hint = ffmpeg_hint or ""
+        self._ffmpeg_source = anim.ffmpeg_source(self._ffmpeg_hint)[1]
         self.setWindowTitle("Export animation")
+        # Reopening the dialog shows what you LAST chose, not the defaults —
+        # someone who goes looking for the settings is nearly always there to
+        # change one of them, and re-picking the other six is pure friction.
+        remembered = remembered or {}
+        if remembered.get("size"):
+            size = remembered["size"]
+        if remembered.get("fps"):
+            fps = remembered["fps"]
         form = QFormLayout(self)
 
         self.head = QLabel("")
@@ -1345,6 +1418,18 @@ class AnimationExportDialog(QDialog):
         self.transparent.toggled.connect(self._refresh)
         form.addRow("", self.transparent)
 
+        # A way OUT of "no ffmpeg" that does not involve closing the dialog and
+        # going to read documentation. Only offered when there is none to find:
+        # a browse button for something already working is just clutter.
+        self.ffmpeg_button = QPushButton("Locate ffmpeg...")
+        self.ffmpeg_button.setToolTip(
+            "Point MoloM at an ffmpeg executable. Remembered in Settings, and "
+            "only needed when there is no ffmpeg on PATH and imageio-ffmpeg "
+            "is not installed.")
+        self.ffmpeg_button.clicked.connect(self._locate_ffmpeg)
+        self.ffmpeg_button.setVisible(not have_video)
+        form.addRow("", self.ffmpeg_button)
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok
                                    | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText("Choose file...")
@@ -1353,23 +1438,67 @@ class AnimationExportDialog(QDialog):
         form.addRow(buttons)
         self._n_images = int(n_images)
         self._have_video = bool(have_video)
+        # Restore the rest of the remembered choices. Done after every widget
+        # exists so nothing has to be constructed in a particular order.
+        for key, widget in (("furniture", self.furniture),
+                            ("increment", self.increment),
+                            ("transparent", self.transparent)):
+            if key in remembered:
+                widget.setChecked(bool(remembered[key]))
+        if remembered.get("loops"):
+            self.loops.setValue(float(remembered["loops"]))
+        if remembered.get("format"):
+            index = self.format_combo.findData(remembered["format"])
+            if index >= 0 and self.format_combo.model().item(index).isEnabled():
+                self.format_combo.setCurrentIndex(index)
         self._refresh()
+
+    def _locate_ffmpeg(self):
+        """Browse for an ffmpeg, then re-enable the video formats in place."""
+        path, _f = QFileDialog.getOpenFileName(
+            self, "Locate ffmpeg", "",
+            "ffmpeg (ffmpeg.exe ffmpeg);;All files (*)")
+        if not path:
+            return
+        self._ffmpeg_hint = path
+        found, source = self._anim.ffmpeg_source(path)
+        self._ffmpeg_source = source
+        self._have_video = bool(found)
+        for row in range(self.format_combo.count()):
+            if self.format_combo.itemData(row) in self._anim.VIDEO_FORMATS:
+                self.format_combo.model().item(row).setEnabled(self._have_video)
+        self.ffmpeg_button.setVisible(not self._have_video)
+        self._refresh()
+
+    def ffmpeg_hint(self):
+        """The path the user browsed to, so the window can remember it."""
+        return self._ffmpeg_hint
 
     def _refresh(self, *_a):
         fmt = self.format_combo.currentData()
         total = max(int(round(self._n_images * self.loops.value())), 1)
         bits = [self._anim.summarise(total, self.fps.value(), fmt)]
         if not self._have_video:
-            bits.append("No ffmpeg found, so only a PNG sequence can be "
-                        "written. `pip install imageio-ffmpeg` adds video.")
+            bits.append(self._anim.NO_FFMPEG_HELP)
+        elif self._ffmpeg_source:
+            # Say WHICH ffmpeg before the render, not after. "No ffmpeg" and
+            # "using the one you pointed me at" are very different things to
+            # someone looking at a disabled combo box.
+            bits.append("Video via {}.".format(self._ffmpeg_source))
         self.head.setText("  ".join(bits))
         # H.264 refuses odd dimensions, with a message nobody reads to the end
         odd = fmt in self._anim.EVEN_DIMENSIONS and (
             self.res_x.value() % 2 or self.res_y.value() % 2)
-        self.res_note.setText(
-            "H.264 needs even dimensions — {} x {} will be used."
-            .format(self._anim.even(self.res_x.value()),
-                    self._anim.even(self.res_y.value())) if odd else "")
+        notes = []
+        if odd:
+            notes.append("H.264 needs even dimensions — {} x {} will be used."
+                         .format(self._anim.even(self.res_x.value()),
+                                 self._anim.even(self.res_y.value())))
+        # A GIF cannot hold an arbitrary frame rate, and finding that out by
+        # watching the finished file stutter is the worst way to learn it.
+        if fmt == self._anim.FORMAT_GIF:
+            notes.append(self._anim.gif_note(self.fps.value()))
+        self.res_note.setText("  ".join(n for n in notes if n))
         # a transparent background cannot survive an MP4
         self.transparent.setEnabled(fmt != self._anim.FORMAT_MP4)
 

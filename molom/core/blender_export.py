@@ -49,8 +49,13 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from . import elements, polyhedra
+from . import meta as meta_mod
 from . import style as style_mod
 from .camera import quat_to_mat3
+
+#: Materials whose name starts with this are EMISSIVE meta centres. The name
+#: carries the fact so the collector needs no parallel bookkeeping.
+META_MATERIAL_PREFIX = "MoloM meta "
 
 #: Blender ships these world HDRIs with every install (the ones the Material
 #: Preview shading mode offers). They live under
@@ -113,6 +118,18 @@ class ExportOptions(object):
         self.sphere_subdivisions = 3
         self.bond_sides = 24
         self.shade_smooth = True
+        # A real Subdivision Surface MODIFIER on every atom. Smooth shading
+        # fixes the inside of a sphere and not its silhouette, so a baked
+        # icosphere still reads as faceted; a modifier is also what a Blender
+        # user expects to find and can raise afterwards.
+        self.subsurf = True
+        self.subsurf_viewport = 1
+        self.subsurf_render = 2
+        # The viewport's meta-atom halo, as an emissive material. OFF by
+        # default: a glowing atom is a deliberate look, not a fact about the
+        # structure, and an emitter lights everything near it.
+        self.meta_glow = False
+        self.meta_glow_strength = 2.0
         self.unit_cell = True
         self.cell_radius = 0.04
         self.polyhedra = True           # follow the ❖ toggle into the render
@@ -168,8 +185,8 @@ def material_name(symbol, rgb, custom):
 
 
 # ------------------------------------------------------------------ geometry
-def object_geometry(obj, style, atom_scale=1.0):
-    # type: (object, object, float) -> Tuple[list, list, dict]
+def object_geometry(obj, style, atom_scale=1.0, meta_glow=0.0):
+    # type: (object, object, float, float) -> Tuple[list, list, dict]
     """(atoms, bonds, materials) for one MolObject, following exactly what the
     viewport draws — the modifier stack's output, per-atom colours, per-atom
     sizes, hidden atoms and the multi-bond layout.
@@ -185,13 +202,27 @@ def object_geometry(obj, style, atom_scale=1.0):
     coords = np.asarray(coords, dtype=float)
     base_n = max(s.n_atoms, 1)
     zs = [elements.atomic_number(x) for x in symbols]
+    # A META centre is drawn as the element it STANDS FOR, exactly as the
+    # viewport draws it (round 62) - an export that disagrees with the screen
+    # is the round-37 rule broken.
+    meta_table = meta_mod.all_meta(s)
     colors, names, radii = [], [], []
     for i, z in enumerate(zs):
         base_i = i % base_n          # modifier copies follow their base atom
+        spec = meta_table.get(base_i)
+        if spec is not None and spec.element:
+            z = elements.atomic_number(spec.element)
         custom = obj.atom_colors.get(base_i)
         rgb = tuple(custom) if custom is not None else elements.color_f(z)
         sym = elements.symbol(z)
+        glow = float(meta_glow) if spec is not None else 0.0
         name = material_name(sym, rgb, custom is not None)
+        if glow > 0.0:
+            # Its OWN material, or every atom of that element would light up.
+            # The NAME carries the fact, so no parallel bookkeeping has to be
+            # threaded through the collector - the strength is one option, so
+            # the prefix is all the spec builder needs to know.
+            name = META_MATERIAL_PREFIX + sym
         materials[name] = (rgb, sym, 1.0)
         colors.append(rgb)
         names.append(name)
@@ -453,7 +484,10 @@ def collect(scene, style, options, camera=None, width=1920, height=1080,
         st = style
         if obj.style_key and obj.style_key in style_mod.STYLE_BY_KEY:
             st = style_mod.STYLE_BY_KEY[obj.style_key]
-        a, b, m = object_geometry(obj, st, options.atom_scale)
+        a, b, m = object_geometry(
+            obj, st, options.atom_scale,
+            meta_glow=(float(options.meta_glow_strength)
+                       if options.meta_glow else 0.0))
         atoms += a
         bonds += b
         materials.update(m)
@@ -505,6 +539,8 @@ def collect(scene, style, options, camera=None, width=1920, height=1080,
             "roughness": round(float(options.roughness)
                                * (0.7 if metallic else 1.0), 4),
             "metallic": 1.0 if metallic else 0.0,
+            "emission": (round(float(options.meta_glow_strength), 3)
+                         if name.startswith(META_MATERIAL_PREFIX) else 0.0),
             "alpha": round(float(alpha), 4),
             "display": [round(float(c), 4) for c in rgb] + [round(float(alpha),
                                                                  4)],
@@ -627,6 +663,21 @@ def make_material(spec):
         bsdf.inputs["Base Color"].default_value = (r, g, b, 1.0)
         bsdf.inputs["Roughness"].default_value = spec["roughness"]
         bsdf.inputs["Metallic"].default_value = spec["metallic"]
+        # A meta centre can be made EMISSIVE, which is what the viewport's halo
+        # stands in for. Off by default: a glowing atom is a deliberate look,
+        # not a fact about the structure, and it lights everything near it.
+        # The socket was renamed between Blender versions, so both are tried.
+        glow = float(spec.get("emission", 0.0) or 0.0)
+        if glow > 0.0:
+            for name in ("Emission Color", "Emission"):
+                if name in bsdf.inputs:
+                    try:
+                        bsdf.inputs[name].default_value = (r, g, b, 1.0)
+                        break
+                    except (TypeError, ValueError):
+                        pass
+            if "Emission Strength" in bsdf.inputs:
+                bsdf.inputs["Emission Strength"].default_value = glow
         if alpha < 1.0:
             bsdf.inputs["Alpha"].default_value = alpha
             # EEVEE needs telling; Cycles honours Alpha on its own. The
@@ -690,6 +741,30 @@ def new_object(name, mesh, material, matrix, collection):
         ob.material_slots[0].link = "OBJECT"
         ob.material_slots[0].material = material
     return ob
+
+
+def add_subsurf(ob):
+    """A real Subdivision Surface MODIFIER on an atom, not baked geometry.
+
+    Smooth shading fixes the interior of a sphere but not its SILHOUETTE, so a
+    baked icosphere still reads as faceted against the background - Christian:
+    "in blender atoms do not show a modifier and look a little blocky". A
+    modifier is also what a Blender user expects to find and reach for: the
+    levels are theirs to raise afterwards, which baked geometry never allows.
+
+    The mesh is shared by every atom as a linked duplicate, so this has to be
+    per OBJECT. That is the normal Blender arrangement and costs nothing until
+    it renders.
+    """
+    if not OPTIONS.get("subsurf"):
+        return None
+    try:
+        mod = ob.modifiers.new(name="Subdivision", type="SUBSURF")
+    except (AttributeError, RuntimeError, TypeError):
+        return None
+    mod.levels = int(OPTIONS.get("subsurf_viewport", 1))
+    mod.render_levels = int(OPTIONS.get("subsurf_render", 2))
+    return mod
 
 
 def build_polyhedra(coll, mats):
@@ -907,8 +982,9 @@ def main():
         label = mat_name.replace("MoloM ", "")
         m = Matrix.Translation(Vector(position)) @ Matrix.Diagonal(
             (radius, radius, radius, 1.0))
-        new_object("{0}.{1}".format(label, n), sphere,
-                   mats.get(mat_name), m, atom_coll)
+        ob = new_object("{0}.{1}".format(label, n), sphere,
+                        mats.get(mat_name), m, atom_coll)
+        add_subsurf(ob)
 
     bond_coll = sub_collection(root, "bonds")
     for n, (mat_name, start, end, radius) in enumerate(BONDS):
@@ -1012,6 +1088,9 @@ def build_script(data, options, title="scene", version="", basename="",
         "sphere_subdivisions": int(options.sphere_subdivisions),
         "bond_sides": int(options.bond_sides),
         "shade_smooth": bool(options.shade_smooth),
+        "subsurf": bool(options.subsurf),
+        "subsurf_viewport": int(options.subsurf_viewport),
+        "subsurf_render": int(options.subsurf_render),
         "polyhedra_alpha": float(options.polyhedra_alpha),
         "engine": str(options.engine),
         "samples": int(options.samples),

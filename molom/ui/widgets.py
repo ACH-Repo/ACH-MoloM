@@ -5,11 +5,36 @@ Used by the N transform panel. Thin: evaluation is core.mathexpr."""
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QCursor
-from PySide6.QtWidgets import QLineEdit
+from PySide6.QtWidgets import QLabel, QLineEdit
 
 from ..core import mathexpr
 
 _DRAG_SLOP_PX = 3
+
+
+def make_text_selectable(root):
+    """Let the user MARK AND COPY the text of every QLabel under `root`.
+
+    Qt labels are not selectable by default, so everything MoloM computes and
+    then displays — a resolved SMILES, the cell parameters, the space group, a
+    density, the GL renderer string — was readable and impossible to copy.
+    Christian: "I just tried to mark the resolved SMILES from name so I could
+    copy it, but the highlighting is not possible."
+
+    Applied to a CONTAINER rather than to each label by hand, because the
+    failure mode of the hand-written version is a label added later that
+    quietly is not selectable. Only labels that actually carry text are
+    touched, and `TextSelectableByMouse` leaves the widget's appearance and
+    layout alone — it does not make the label focusable or steal Tab.
+    """
+    flags = Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
+    for label in root.findChildren(QLabel):
+        # A label acting as a BUDDY carries a mnemonic ("&Name:") and must keep
+        # its click-to-focus behaviour, so it is left alone.
+        if label.buddy() is not None:
+            continue
+        label.setTextInteractionFlags(flags)
+    return root
 
 
 class DragValueEdit(QLineEdit):

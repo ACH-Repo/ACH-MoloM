@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "molom"
-version = "0.3.0"
+version = "0.4.0"
 description = "Molecule viewer, builder and crystal visualiser with Blender-style ergonomics: OpenGL ball-and-stick, CIF crystallography, coordination polyhedra, saved cameras and a Blender export"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -46,9 +46,6 @@ dependencies = [
     "numpy",
     "PySide6",
     "PyOpenGL",
-    # Animation export. Ships a STATIC ffmpeg binary, so there is no system
-    # install and no PATH hunting; a system ffmpeg is used if present.
-    "imageio-ffmpeg",
     # Space-group symbol -> symmetry operations, for the CIFs that name their
     # group and leave the operator loop out. NOT optional like rdkit and
     # openbabel: those degrade to "cannot read this format", which is visible,
@@ -59,6 +56,14 @@ dependencies = [
 
 [project.optional-dependencies]
 chem = ["rdkit", "openbabel-wheel"]
+# VIDEO export only. `imageio-ffmpeg` ships a ~25 MB static ffmpeg binary, and
+# making every install carry it to serve the minority who export MP4 or GIF is
+# the wrong trade: a PNG image sequence is the primary animation format and
+# needs no ffmpeg at all. A system ffmpeg on PATH is preferred over this wheel
+# anyway (see `core.animation.ffmpeg_candidates`), so most people who want
+# video already have what they need.
+video = ["imageio-ffmpeg"]
+all = ["rdkit", "openbabel-wheel", "imageio-ffmpeg"]
 
 [project.urls]
 Homepage = "https://github.com/ACH-Repo/ACH-MoloM"
@@ -74,4 +79,19 @@ molom = "molom.__main__:main"
 # `molom.addons` was, and add-ons are imported BY NAME at run time, so the
 # omission would have shipped as a broken feature rather than an ImportError.
 # `tests/test_round59_release.py` compares this list against what is on disk.
-packages = ["molom", "molom.core", "molom.ui", "molom.addons"]
+packages = ["molom", "molom.core", "molom.ui", "molom.addons",
+            "molom.resources"]
+
+[tool.setuptools.package-data]
+# The application icon. Without this the wheel carries the module and none of
+# the images, and MoloM falls back to the generic Python logo on an installed
+# copy while looking perfect in the source tree — the worst kind of packaging
+# bug, because it cannot be reproduced where it is developed.
+#
+# `.ico` is here because round 63 added `molom.ico` (the Explorer file-type
+# icon) and this glob still said svg+png only, so the one asset added AFTER the
+# list was written was the one being dropped. That is round 59's hand-written-
+# list bug in the data glob instead of the package list, so
+# `tests/test_round59_release.py` now checks every file in the directory
+# against these patterns rather than naming extensions.
+"molom.resources" = ["*.svg", "*.png", "*.ico"]

@@ -133,17 +133,26 @@ ORCA normal modes are baked onto that same clock as ordinary frames, so a
 vibration plays, scrubs and exports with no vibration-specific code anywhere in
 the UI — the two frequency jobs animating together above are just two more
 tracks, sharing the scene with everything else that has been imported into it.
-Export is a PNG sequence with no extra dependency, or video through
-`imageio-ffmpeg` — always encoded *from* the written sequence, so a failed
-encode still leaves every frame on disk.
+
+Export is a **PNG sequence with no dependency at all** — which is what feeds
+Blender or a journal anyway — or MP4/GIF through whatever ffmpeg you already
+have. MoloM looks for one on `PATH` first, then in the usual install
+locations, then falls back to the optional `imageio-ffmpeg` wheel, and the
+export dialog says which it found *before* the render starts rather than after.
+Video is always encoded *from* the written sequence, so a failed encode still
+leaves every frame on disk. GIF frame rates are snapped to what the format can
+actually store (whole centiseconds per frame), because 60 fps is not
+representable and silently becomes a stutter.
 
 ---
 
 ## Install
 
 ```bash
-pip install molom              # core: numpy, PySide6, PyOpenGL, spglib, imageio-ffmpeg
+pip install molom              # core: numpy, PySide6, PyOpenGL, spglib
 pip install "molom[chem]"      # + rdkit, openbabel-wheel (SMILES and non-xyz formats)
+pip install "molom[video]"     # + imageio-ffmpeg (MP4/GIF export; PNG needs nothing)
+pip install "molom[all]"       # everything
 ```
 
 ```bash
