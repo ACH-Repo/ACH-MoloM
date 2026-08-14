@@ -453,3 +453,67 @@ def test_a_file_with_no_heat_of_formation_returns_None_rather_than_raising():
     geometry."""
     from molom.addons import mopac_optimize as m
     assert m.read_heat_of_formation("nothing to see here") is None
+
+
+# ------------------------------------- loading it the way the DIALOG does
+def _purge():
+    """Add-on modules are cached in `sys.modules` under `molom_addon_*`
+    deliberately (enabling twice must not re-execute), which makes a loaded
+    add-on shared across the whole suite - round 46's trap."""
+    import sys
+    for name in [n for n in list(sys.modules) if n.startswith("molom_addon_")]:
+        del sys.modules[name]
+
+
+def test_every_bundled_addon_ENABLES_through_the_real_loader(win):
+    """The test that was missing, and the bug it would have caught.
+
+    `core/addons.py` imports an add-on BY PATH under a synthetic module name,
+    so the module has NO package context and any relative import fails with
+    "attempted relative import with no known parent package" - a failure to
+    load at all, shown as a red line in the preferences dialog. The MOPAC
+    add-on shipped with `from ..core import forcefield` and did exactly that.
+
+    Every other test here imported the module as `molom.addons.mopac_optimize`,
+    which HAS package context and works perfectly - so the whole file passed
+    while the feature was unreachable in the application. Same shape as round
+    59's "a mechanism with tests and no gesture test is a feature nobody can
+    reach": the tests exercised the module, never the loading path.
+
+    Written over ALL bundled add-ons rather than just this one, because the
+    next add-on is the one that will repeat it.
+    """
+    from molom.core import addons as addons_mod
+    _purge()
+    try:
+        manager = addons_mod.AddOnManager()
+        bundled = [a for a in addons_mod.discover()
+                   if os.path.abspath(os.path.dirname(a.path))
+                   == os.path.abspath(addons_mod.bundled_dir())]
+        assert bundled, "no bundled add-ons discovered"
+        for info in bundled:
+            ok, message = manager.enable(info.id, win)
+            assert ok, "{} failed to enable: {}".format(info.id, message)
+            manager.disable(info.id, win)
+    finally:
+        _purge()
+
+
+def test_no_bundled_addon_uses_a_RELATIVE_import():
+    """The same claim as a static one, so it fails at the line rather than at
+    the symptom - and without needing a window."""
+    import ast
+    from molom.core import addons as addons_mod
+    folder = addons_mod.bundled_dir()
+    offenders = []
+    for name in sorted(os.listdir(folder)):
+        if not name.endswith(".py"):
+            continue
+        tree = ast.parse(open(os.path.join(folder, name),
+                              encoding="utf-8").read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.level:
+                offenders.append("{}:{}".format(name, node.lineno))
+    assert not offenders, (
+        "relative imports cannot work in an add-on loaded by path: "
+        + ", ".join(offenders))

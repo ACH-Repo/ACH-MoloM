@@ -43,7 +43,14 @@ import tempfile
 
 import numpy as np
 
-from ..core import forcefield
+# ABSOLUTE, not relative. `core/addons.py` imports an add-on BY PATH under a
+# synthetic module name (`molom_addon_<id>`), so the module has no package
+# context and `from ..core import ...` dies with "attempted relative import
+# with no known parent package" - which is a failure to LOAD AT ALL, reported
+# in the preferences dialog as a red line under the add-on's name. Every other
+# bundled add-on already imports absolutely; this file followed `core/` and
+# `ui/`'s convention instead of `addons/`'s.
+from molom.core import forcefield
 
 ADDON = {
     "id": "mopac_optimize",
@@ -221,7 +228,7 @@ def read_output_geometry(path, timeout=60.0):
     writes the geometry repeatedly as it goes, so the final block is the
     converged one.
     """
-    from ..core import io as io_mod
+    from molom.core import io as io_mod      # absolute: see the header import
     structs, err = io_mod._read_with_openbabel(path, "mopout", timeout=timeout)
     if not structs:
         raise forcefield.ForceFieldError(

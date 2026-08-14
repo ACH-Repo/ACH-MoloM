@@ -248,6 +248,21 @@ being true half an hour later and would never have been true on the laptop. A
 test about the missing-binary path has to FORCE the absence
 (`monkeypatch.setattr(m, "find_mopac", ...)`), and the live jobs are behind a
 `skipif` so the suite is honest on a machine without it. 1545 tests.
+**AND IT SHIPPED UNLOADABLE, which is round 59's lesson exactly.** Christian's
+first run showed a red line under the add-on in the preferences dialog:
+`ImportError: attempted relative import with no known parent package`. The
+module used `from ..core import forcefield`, and `core/addons.py` imports an
+add-on **BY PATH** under a synthetic name (`molom_addon_<id>`), so it has no
+package context and a relative import cannot resolve - every other bundled
+add-on already imports absolutely, and this file followed `core/`'s convention
+instead of `addons/`'s. **All 34 tests passed while the feature was
+unreachable**, because every one of them imported it as
+`molom.addons.mopac_optimize`, which HAS package context: the tests exercised
+the MODULE and never the LOADING PATH, which is precisely round 59's "a
+mechanism with tests and no gesture test is a feature nobody can reach". Two
+tests now close it - one enables every BUNDLED add-on through the real
+`AddOnManager`, one refuses any relative import in `molom/addons/` via the AST
+so it fails at the line rather than at the symptom.
 **Also this round: `docs/OPEN_ITEMS.md`** - every scoped-but-unbuilt item swept
 out of this file into one inventory, because they had accumulated across 73
 rounds of prose where nobody could see them at once. And
