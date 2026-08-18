@@ -20,7 +20,8 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDockWidget,
                                QLineEdit, QSlider,
                                QDoubleSpinBox, QFormLayout, QFrame,
                                QHBoxLayout, QLabel, QPushButton, QRadioButton,
-                               QScrollArea, QSizePolicy, QSpinBox,
+                               QProgressBar, QScrollArea,
+                               QSizePolicy, QSpinBox,
                                QStackedWidget, QToolButton, QVBoxLayout,
                                QWidget)
 
@@ -1221,6 +1222,7 @@ class VibrationPage(QWidget):
     mode_selected = Signal(int)                 # mode index -> animate it
     settings_changed = Signal(float, int)       # amplitude, frames/period
     load_requested = Signal()
+    calculate_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1237,6 +1239,25 @@ class VibrationPage(QWidget):
             "file directly picks them up on its own.")
         self.load_btn.clicked.connect(self.load_requested)
         lay.addWidget(self.load_btn)
+
+        # CALCULATE, from the page rather than only from F3. The empty state
+        # used to say "open an ORCA FREQ output" and stop there, which is a
+        # dead end for anyone who has MOPAC installed and no ORCA job - the
+        # one thing that could produce data was reachable only by knowing an
+        # F3 operator's name. Hidden when nothing can provide frequencies, so
+        # a machine without MOPAC is not offered a button that cannot work.
+        self.calc_btn = QPushButton("Calculate frequencies")
+        self.calc_btn.clicked.connect(self.calculate_requested)
+        self.calc_btn.setVisible(False)
+        lay.addWidget(self.calc_btn)
+
+        # A job is minutes, not seconds, and the only feedback was a status
+        # bar message that a 4 s timeout wipes. An indeterminate bar is honest
+        # here: MOPAC reports no percentage, so a percentage would be a lie.
+        self.busy = QProgressBar()
+        self.busy.setRange(0, 0)
+        self.busy.setVisible(False)
+        lay.addWidget(self.busy)
 
         # ---- per-OBJECT settings, above the mode list
         self.settings_box = QWidget()
@@ -1398,6 +1419,35 @@ class VibrationPage(QWidget):
             self.settings_changed.emit(self.amplitude(),
                                        self.frames_spin.value())
 
+    def set_providers(self, labels):
+        """Which engines can compute frequencies, from the app.
+
+        A list rather than a bool so the button can name what it will run -
+        "Calculate frequencies (MOPAC PM7)" tells you which physics you are
+        about to get, which matters when the answer is semiempirical.
+        """
+        labels = list(labels or [])
+        self.calc_btn.setVisible(bool(labels))
+        if labels:
+            self.calc_btn.setText("Calculate frequencies ({})".format(
+                labels[0]))
+            self.calc_btn.setToolTip(
+                "Optimise this molecule and compute its normal modes with "
+                "{}. Runs in the background; the molecule stays "
+                "usable.".format(labels[0]))
+
+    def set_busy(self, running, message=""):
+        """Show that a job is running ON THIS MOLECULE.
+
+        Scoped to the molecule rather than to the window, because several can
+        run at once - so switching to a molecule with no job must not show a
+        bar borrowed from another one's.
+        """
+        self.busy.setVisible(bool(running))
+        self.calc_btn.setEnabled(not running)
+        if running:
+            self.summary.setText(message or "Calculating frequencies...")
+
     # ------------------------------------------------------------- content
     def set_modes(self, modes, active=None, name="",
                   amplitude=DEFAULT_AMPLITUDE,
@@ -1527,12 +1577,33 @@ class VibrationPage(QWidget):
 
         # The intensity is on the card, not just in the sort order: sorting
         # by a number you cannot see is a list you have to trust blindly.
-        intensity = QLabel("" if mode.intensity is None
-                           else "{:.0f}".format(mode.intensity))
+        #
+        # The UNIT comes from the mode, because two engines report two
+        # different quantities: ORCA an IR intensity in km/mol, MOPAC the
+        # transition dipole it derives from. Printing a 0.53 D dipole under a
+        # "km/mol" tooltip would be wrong, and `{:.0f}` would render it as a
+        # flat "0" - a number that is both mislabelled and invisible.
+        unit = getattr(mode, "intensity_unit", vibrations.INTENSITY_KM_MOL)
+        km = unit == vibrations.INTENSITY_KM_MOL
+        intensity = QLabel("" if mode.intensity is None else
+                           ("{:.0f}" if km else "{:.2f}").format(
+                               mode.intensity))
         intensity.setStyleSheet("color: rgba(190,205,225,170);")
-        intensity.setToolTip("IR intensity, km/mol")
+        intensity.setToolTip("IR intensity, km/mol" if km else
+                             "Transition dipole, {} (IR intensity goes as its "
+                             "square, so the ordering is the same)".format(
+                                 unit))
         intensity.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         intensity.setMinimumWidth(38)
+
+        # MOPAC names each mode's irreducible representation and ORCA does
+        # not, so this appears only where there is something to say.
+        symmetry = None
+        if getattr(mode, "symmetry", None):
+            symmetry = QLabel(mode.symmetry)
+            symmetry.setStyleSheet("color: rgba(150,200,255,180);")
+            symmetry.setToolTip("Symmetry of this mode (Mulliken symbol)")
+            symmetry.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         # Same rule for the selection share — when that is the ordering, the
         # number it sorted on has to be visible on the row.
@@ -1554,10 +1625,139 @@ class VibrationPage(QWidget):
             share.setMinimumWidth(38)
 
         head.addWidget(title, 1)
+        if symmetry is not None:
+            head.addWidget(symmetry)
         if share is not None:
             head.addWidget(share)
         head.addWidget(intensity)
         return card
+
+
+class StripPage(QWidget):
+    """The selected animation strip: what it is and where it sits in time.
+
+    SCOPED to grow. Today it reports the numbers a strip has - where it
+    starts, how long it runs, how fast, what it does at the end - and lets
+    the ones that are genuinely the strip's own be edited. The reason it is
+    a page rather than a tooltip is that a strip is going to accumulate
+    properties (per-strip amplitude, a source label, an offset in seconds
+    rather than frames), and each of those wants a row, not a corner of a
+    bar three pixels tall.
+
+    It reads a `timeline.Track`, which is UI-free, so everything shown here
+    is testable without a window.
+    """
+
+    start_changed = Signal(int, float)     # obj_id, start
+    speed_changed = Signal(int, float)
+    end_mode_changed = Signal(int, str)
+    remove_requested = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._obj_id = None
+        self._loading = False
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+
+        self.title = QLabel("No strip selected.")
+        self.title.setWordWrap(True)
+        lay.addWidget(self.title)
+
+        self.box = QWidget()
+        form = QFormLayout(self.box)
+        form.setContentsMargins(0, 2, 0, 2)
+        form.setSpacing(4)
+
+        self.start_spin = QDoubleSpinBox()
+        self.start_spin.setRange(-100000.0, 100000.0)
+        self.start_spin.setDecimals(2)
+        self.start_spin.setSuffix(" frames")
+        self.start_spin.setToolTip(
+            "Where this strip begins on the scene clock. Dragging the bar in "
+            "the track pane changes the same number.")
+        form.addRow("Start:", self.start_spin)
+
+        self.speed_spin = QDoubleSpinBox()
+        self.speed_spin.setRange(0.01, 100.0)
+        self.speed_spin.setDecimals(2)
+        self.speed_spin.setSingleStep(0.1)
+        self.speed_spin.setToolTip(
+            "Playback rate for this strip alone: 2.0 runs it twice as fast, "
+            "so several trajectories can play at different rates.")
+        form.addRow("Speed:", self.speed_spin)
+
+        self.end_combo = QComboBox()
+        for key, label in (("hold", "Hold last frame"), ("loop", "Loop"),
+                           ("pingpong", "Ping-pong")):
+            self.end_combo.addItem(label, key)
+        self.end_combo.setToolTip("What happens after the strip runs out.")
+        form.addRow("At the end:", self.end_combo)
+
+        self.length = QLabel("")
+        form.addRow("Length:", self.length)
+        self.ends = QLabel("")
+        form.addRow("Ends at:", self.ends)
+        lay.addWidget(self.box)
+
+        self.remove_btn = QPushButton("Remove from player")
+        self.remove_btn.setToolTip(
+            "Takes the strip off the timeline. The molecule and its frames "
+            "are untouched - this is the animation's track, not its data.")
+        self.remove_btn.clicked.connect(self._emit_remove)
+        lay.addWidget(self.remove_btn)
+        lay.addStretch(1)
+
+        self.start_spin.valueChanged.connect(self._emit_start)
+        self.speed_spin.valueChanged.connect(self._emit_speed)
+        self.end_combo.currentIndexChanged.connect(self._emit_end)
+        self.set_strip(None, None, "")
+
+    # ------------------------------------------------------------ content
+    def set_strip(self, obj_id, track, name=""):
+        """Show one strip, or nothing. Guarded like every other page here:
+        `setValue` emits whether or not a hand moved it (round 30)."""
+        self._obj_id = None if track is None else int(obj_id)
+        live = track is not None
+        self.box.setEnabled(live)
+        self.remove_btn.setEnabled(live)
+        if not live:
+            self.title.setText(
+                "No strip selected.\nClick one in the track pane below "
+                "the transport bar.")
+            self.length.setText("")
+            self.ends.setText("")
+            return
+        self._loading = True
+        try:
+            self.title.setText("<b>{}</b>".format(name or obj_id))
+            self.start_spin.setValue(float(track.start))
+            self.speed_spin.setValue(float(track.speed))
+            index = self.end_combo.findData(track.end)
+            self.end_combo.setCurrentIndex(max(index, 0))
+            self.length.setText("{} frames at {:g}x = {:g}".format(
+                track.n_frames, track.speed, track.length))
+            self.ends.setText("{:g}".format(track.end_time))
+        finally:
+            self._loading = False
+
+    def _emit_start(self, value):
+        if not self._loading and self._obj_id is not None:
+            self.start_changed.emit(self._obj_id, float(value))
+
+    def _emit_speed(self, value):
+        if not self._loading and self._obj_id is not None:
+            self.speed_changed.emit(self._obj_id, float(value))
+
+    def _emit_end(self, _index):
+        if not self._loading and self._obj_id is not None:
+            self.end_mode_changed.emit(self._obj_id,
+                                       self.end_combo.currentData())
+
+    def _emit_remove(self):
+        if self._obj_id is not None:
+            self.remove_requested.emit(self._obj_id)
 
 
 class PropertiesDock(QDockWidget):

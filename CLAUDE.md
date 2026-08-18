@@ -198,6 +198,185 @@ other side, and the two export fixes are verified in `tools/smoke_gui.py`
 instead, which now measures the crop and counts ink with and without the cell
 box. 1310 tests.
 
+Round 76 (2026-08-18, Christian's MOPAC batch - and the one that changed an
+answer was CHARGE):
+**(1) NOBODY COULD SET A CHARGE, so every semiempirical run was neutral.**
+`_active_charge_and_spin` read `Structure.charge` correctly and nothing on
+screen could write it - the only producer was the SMILES importer. Measured on
+Christian's own square-planar PtCl4: as neutral it holds **2.170 A**, as the
+real [PtCl4]2- it goes to **2.321 A** against an experimental ~2.31, with the
+heat of formation moving +3.6 -> -89.0. Same geometry, same method, a different
+species. So his "converges correctly at 2.169" was a real converged answer to
+the wrong question. Charge and Multiplicity are spin boxes on the Optimize
+panel now, stored on the MOLECULE (metadata, so they ride undo and savefiles)
+and guarded on refresh, because `setValue` emits whether or not a hand moved it
+and an unguarded page writes one molecule's charge onto the next (round 30).
+**(2) TWO FREQUENCY JOBS AT ONCE COULD KILL ONE**, which is exactly what he
+asked about. The worker was held in a single attribute, so starting a second
+dropped the only Python reference to the first and its QThread could be
+collected mid-run. Keyed per molecule now, with a second job on the SAME
+molecule refused; each already had its own scratch directory, which is why
+concurrent jobs on different molecules were otherwise fine. Output files go to
+a `mkdtemp` deleted in a `finally` - nothing accumulates, nothing is heavy.
+**(3) CONSOLE WINDOWS FLASHING** - "a lot of windows being opened ... which
+look effectively like a blur on screen". Every helper MoloM shells out to is a
+console program, and on Windows each `subprocess.run` pops a window; a FREQ job
+runs four of them. `io.quiet_subprocess_kwargs()` is the one place that knows
+about `CREATE_NO_WINDOW`, applied to all five call sites (OpenBabel, MOPAC x2,
+Blender, ffmpeg) - so ordinary IMPORTS stopped flashing too.
+**(4) FERROCENE CAME IN AS A CYCLOPENTADIENIDE, and OPSIN was innocent.** It
+returns the structure correctly; MoloM's own salt-stripping then kept only the
+largest fragment by heavy-atom count, so Fe2+ (one atom) and one ring were
+discarded. The rule is right for sodium acetate and wrong for every
+coordination compound - and `fragments_of` already recorded `has_metal`, so the
+information to tell them apart was there. The line drawn: **a LONE group 1/2
+cation is a counter-ion; any other metal is the compound.** Ferrocene keeps its
+iron, sodium acetate and NaCl strip as before, and the mixed case is now right
+too - disodium tetrachloridopalladate loses both sodiums and keeps [PtCl4]-like
+[PdCl4]2- intact. SMILES still cannot express hapticity, so a metallocene
+arrives as separate pieces; what it no longer does is silently lose the metal.
+**(5) A META ATOM'S DISTANCE IS A CONSTRAINT, not a default.** Changing a
+donor's element ran `adjust_bond_lengths`, which pushed the bond to a
+covalent-radius sum - computed, doubly wrongly, from the `Xx` dummy at atomic
+number 0. `ideal_bond_length` returns the meta atom's stated distance when
+either end is a meta centre, so H -> Br leaves all four donors at 2.4000.
+**(6) THE VIBRATIONS PAGE HAD NO WAY IN.** Its empty state said "open an ORCA
+FREQ output" and stopped, while the one thing that could produce data was
+reachable only by knowing an F3 operator's name. A "Calculate frequencies
+(MOPAC PM7)" button, which NAMES the engine because semiempirical is a
+statement about physics, plus an indeterminate busy bar scoped to that
+molecule - indeterminate deliberately, since MOPAC reports no percentage and a
+percentage would be a lie. Core still does not know MOPAC exists: the add-on
+registers through a provider list, the same shape as
+`forcefield.register_method`.
+**(7) COMMENTS.** Right-click a molecule -> a plain-text editor, stored in
+metadata and written to the .xyz COMMENT LINE as plain text - the one place
+every other program already looks, where our JSON is readable only to us.
+**(8) ANIMATION STRIPS ARE OBJECTS NOW.** They can be selected (orange, the
+same colour and meaning as the viewport's selection outline), deleted, panned
+and scrolled through, and they have a properties page. Two decisions worth
+keeping: **Delete takes the strip off the PLAYER and never touches the
+frames** - this is the animation's track, not its data; and the removal is
+REMEMBERED (`Timeline.exclude`), because `sync` rebuilds a track for every
+scene object and would otherwise put it straight back, which is round 52's
+"once the user has said otherwise, stop regenerating" in a new place.
+
+Round 75 (2026-08-18, computed layers on a molecule, and what an edit does to
+them - `core/attachments.py`):
+Christian's design, and the heart of it is that **an isosurface and a set of
+normal modes fail DIFFERENTLY**, so one "invalidate" flag would be wrong for
+one of them. An isosurface "is a property that belongs to a particular
+conformer that cannot be retained the moment anything changes about a mol even
+slightly. And it should be pretty easy to recalculate if it is lost" ->
+`POLICY_VOLATILE`, dropped on any edit including a geometry one. Modes are the
+opposite: "I might want to calculate the modes of a mol, but change some
+elements for the sake of a comparative visualisation in powerpoint that is not
+intended to be accurate. So there an edit should not get rid of modes, only
+declare itself as no longer physical in the GUI and in any potential export" ->
+`POLICY_FRAGILE`, kept and flagged. Throwing away a twenty-minute calculation
+because somebody swapped an oxygen is the worse failure.
+**A geometry edit deliberately does NOT stale a fragile layer.** Moving a whole
+molecule is a rigid placement and the modes travel with it; flagging there
+would put a warning on the commonest gesture in the program, which is round
+40's "a warning that fires always is a warning nobody reads". Dragging ONE atom
+does invalidate them and is not caught - a stated gap rather than an oversight.
+**OVERWRITE PROTECTION, on the objects that need it and no others.** An object
+locks itself on receiving its first attachment and unlocks with its last, so an
+ordinary molecule never shows a lock it has no use for - Christian: "Only add
+overwrite protections to outliner objects that actually require them." A lock
+on something with nothing to lose is noise, and noise is what teaches people to
+click through warnings.
+**Making the edit path REFUSABLE was the one architecturally interesting
+piece.** `viewport._begin_edit()` returned nothing, so an edit could be
+announced and never refused - and protection IS a refusal. It returns a bool
+now and all seven chemistry call sites honour it (a guard some paths ignore is
+worse than none, because the protection then depends on which gesture you
+used). `on_edit_begin` goes to the new `begin_chemistry_edit`, while
+`on_model_edit_begin` still goes straight to `begin_model_edit`, which is what
+keeps geometry ungated. The flag is set AFTER the undo snapshot, so Ctrl+Z
+gives back a molecule that is not still marked unphysical - tested, not
+assumed.
+**THE OUTLINER ROW is Christian's sketch**: the tick boxes sit ABOVE the
+expandable element rows, in a WRAPPING `FlowLayout` because the count is not
+ours to bound once add-ons contribute them ("people will need to fit like 16 of
+them in there because they never turn off an add-on"). Round 45 had already
+written that layout for the same reason, so it moved to `ui/widgets.py` rather
+than being written twice. `Attachment.toggleable` is the one call not in the
+brief: a visibility tick on MODES would have nothing to do - they are a data
+source for the animation, not a layer painted over the molecule - so they
+render as a label and keep only the lock and the stale marking. An inert tick
+box is the thing this project keeps finding as a bug.
+**AND REPOINTING THE CALLBACK GATED SOMETHING THAT IS NOT AN EDIT.**
+`on_edit_begin` changed meaning - from "take an undo snapshot" to "may I make a
+chemistry edit?" - and two callers wanted only the snapshot: **grabbing a
+CAMERA and trucking one**. So a molecule's overwrite lock refused to let you
+move the camera, and popped a dialog to say so. In the test suite that dialog
+had nobody to click it, so the run HUNG rather than failed - which is worse,
+because a hang has no name attached to it. Found with
+`faulthandler.dump_traceback_later` around pytest, which named the line in
+seconds after several minutes of guessing; worth reaching for immediately next
+time a suite stops rather than fails. Both moved to `on_model_edit_begin`, and
+a test now pins that only `_begin_edit` may read `on_edit_begin` at all,
+because the next person adding a gesture will reach for the same hook.
+**HIDDEN ATOMS ARE DIAGONAL STRIPES NOW, and red belongs to unphysical.**
+Christian: "Red should not be used for it." He is right - red is the loudest
+mark the outliner has and hiding a few hydrogens is a routine display choice,
+so spending red on it left nothing louder for the state that IS a correctness
+problem. Round 31's actual claim is untouched and its test still makes it, now
+about the red mark: it must survive selection, because a foreground brush loses
+to `HighlightedText` and the one row you clicked is the one that stops warning
+you. Stripes cannot be lost that way at all, being painted over the row rather
+than being a text colour. 1586 tests.
+
+Round 74 (2026-08-17, MOPAC FORCE feeds the vibrations page - a reader, and
+nothing else):
+Christian asked what else MOPAC does, then "do the vibrations reader". **The
+point of this round is how little there is of it.** Rounds 27-31 and 63 built
+the whole vibrational UI - mode cards, the mode baked onto the scene clock, the
+IR sort, the mass-weighted selection ranking - and every bit of it consumes
+`vibrations.Mode` and nothing else, so `parse_mopac_frequencies` sits next to
+`parse_orca_frequencies` and **not one line downstream changed**. That is the
+dividend of round 27's decision to make the animation ordinary frames.
+**THE TRAP IS WHICH BLOCK TO READ.** MOPAC prints the eigenvectors TWICE, under
+`NORMAL COORDINATE ANALYSIS (Total motion = 1 Angstrom)` and again under
+`MASS-WEIGHTED COORDINATE ANALYSIS`, laid out identically with the same
+`Root No.` header. The mass-weighted one would animate every hydrogen far too
+little and every heavy atom far too much - a wrong animation that looks
+entirely plausible. The parse stops at the mass-weighted header, and the test
+that pins it is CHEMISTRY rather than a byte offset: in Cartesian displacements
+water's hydrogens move more than three times as far as its oxygen, which is
+exactly what mass-weighting removes.
+**Two things MOPAC gives that ORCA does not, and one it gives differently.**
+It names each mode's irreducible representation (`1 A1`, `2 A"`), so `Mode`
+grew a `symmetry` field and the card shows it - the leading number counts modes
+within that representation and is not part of the symbol. And it reports a
+TRANSITION DIPOLE where ORCA reports an IR intensity in km/mol. The conversion
+between them is not something to invent, so `Mode.intensity_unit` carries the
+number's unit and the card formats and labels accordingly, rather than printing
+0.53 D under a "km/mol" tooltip - where `{:.0f}` would have rendered it as a
+flat, mislabelled "0". Sorting is unaffected: intensity goes as the square of
+the dipole, and squaring is monotonic over non-negative values, so the order is
+the same.
+**`run_frequencies` OPTIMISES FIRST, and that is chemistry, not convenience.**
+`FORCE` computes the Hessian at the geometry it is given, so at a
+non-stationary point the imaginary frequencies are an artefact of the gradient
+rather than a transition state - MOPAC's own shipped example is a FORCE run "of
+a relaxed water molecule" for that reason. `optimise_first=False` is there for
+looking at a real saddle point.
+**`OperatorRegistry.unregister` had to exist**: `register` raises on a
+duplicate id, so an add-on that registers an F3 operator and cannot remove it
+fails to enable the SECOND time it is switched on - an ordinary thing to do
+while trying one out. Safe only for operators registered after startup, since
+`_install_shortcuts` builds its QActions once and a built-in's would be
+stranded.
+**Verified in a real window by driving the operator** (round 73's lesson: the
+module working is not the feature working). Water comes back as A1 1396.5, B2
+2810.8, A1 2861.0 with the properties dock opening on the mode list. Both
+fixtures are verbatim from MOPAC v23.2.5; the methanol one is the valuable
+one, because its 12 modes WRAP into two column blocks (a reader that handled
+only the first would return 8 and look fine), it has a genuine imaginary mode,
+and its A' / A" labels defeat any numeric parse. 1563 tests.
+
 Round 73 (2026-08-14, MOPAC as an add-on - roadmap item 7, and the extension
 point is the whole design):
 Christian's constraint from the scoping was the design brief: "idk how well we
@@ -3106,7 +3285,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1545 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1586 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.

@@ -69,6 +69,27 @@ class OperatorRegistry:
         self._by_id[op_id] = op
         return op
 
+    def unregister(self, op_id):
+        # type: (str) -> bool
+        """Remove an operator. True if there was one.
+
+        For ADD-ONS: `register` raises on a duplicate id, so an add-on that
+        registers an operator and cannot take it away again fails to enable the
+        second time it is switched on - which is an ordinary thing for a user
+        to do while trying one out.
+
+        Safe for an operator registered AFTER startup, which is every add-on's:
+        `MainWindow._install_shortcuts` builds its QActions once, so a late
+        operator has no action or menu entry to leave dangling, and F3 reads
+        the registry live. Removing a built-in one would strand its QAction,
+        so do not.
+        """
+        op = self._by_id.pop(op_id, None)
+        if op is None:
+            return False
+        self._ops = [o for o in self._ops if o.id != op_id]
+        return True
+
     def get(self, op_id):
         # type: (str) -> Optional[Operator]
         return self._by_id.get(op_id)

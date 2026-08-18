@@ -122,7 +122,9 @@ class Timeline(object):
         # covering a trajectory that grows or shrinks under it.
         self.range_start = 0.0
         self.range_end = None    # type: Optional[float]
-        self._tracks = {}        # type: Dict[int, Track]
+        self._tracks = {}             # type: Dict[int, Track]
+        #: Objects the user has taken off the player by hand.
+        self._excluded = set()        # type: set
 
     # ---------------------------------------------------------- subdivision
     @property
@@ -192,13 +194,38 @@ class Timeline(object):
         """Reconcile against the scene: [(obj_id, n_frames), ...].
 
         Objects that vanished lose their track; new ones gain a default one.
+        EXCLUDED ones gain nothing - taking a strip off the player is a
+        decision, and a decision that the next rebuild silently undoes is not
+        one. (Round 52 made the same call about an edited cell: once the user
+        has said otherwise, stop regenerating.)
         """
         seen = set()
         for obj_id, n_frames in pairs:
+            if int(obj_id) in self._excluded:
+                continue
             self.set_track(obj_id, n_frames)
             seen.add(int(obj_id))
         for obj_id in [k for k in self._tracks if k not in seen]:
             del self._tracks[obj_id]
+
+    def exclude(self, obj_id):
+        # type: (int) -> None
+        """Take this object OFF the player and keep it off.
+
+        The frames are untouched - this is the animation's track, not the
+        molecule's data, which is the whole point of Delete in the track pane
+        being safe.
+        """
+        self._excluded.add(int(obj_id))
+        self._tracks.pop(int(obj_id), None)
+
+    def include(self, obj_id):
+        # type: (int) -> None
+        """Put it back; the next `sync` gives it a fresh default track."""
+        self._excluded.discard(int(obj_id))
+
+    def is_excluded(self, obj_id):
+        return int(obj_id) in self._excluded
 
     # -------------------------------------------------------------- clock
     @property

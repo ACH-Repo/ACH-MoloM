@@ -13,6 +13,7 @@ import numpy as np
 from . import elements, modifiers
 from .camera import quat_identity, quat_to_mat3
 from . import cameras as cameras_mod
+from . import attachments
 from .structure import Structure
 
 
@@ -50,6 +51,16 @@ class MolObject:
         self.atom_hidden = set()     # idx NOT drawn (still there, still real)
         self.atom_scales = {}        # idx -> sphere-radius multiplier
         self.label_mode = "element"  # element | index | element_index | custom
+        # Computed layers drawn OVER this molecule - normal modes, and later
+        # isosurfaces. Per-molecule rather than per-atom, so they get their own
+        # tick-box row in the outliner rather than a column on the element
+        # rows. See `core/attachments.py` for what an edit does to them, which
+        # differs by attachment and is the whole reason they are modelled at
+        # all. `edit_locked` is the overwrite protection: only meaningful
+        # while there IS an attachment, so an ordinary molecule never shows a
+        # lock it has no use for.
+        self.attachments = {}        # key -> attachments.Attachment
+        self.edit_locked = False
         # Set by the scene clock while playing: a FRACTIONAL frame position,
         # or None to show the stored frame as-is. Display only — never
         # written back into `structure.frames`.
@@ -547,6 +558,14 @@ class Scene:
                 "atom_scales": {int(k): float(v)
                                 for k, v in o.atom_scales.items()},
                 "label_mode": o.label_mode,
+                # Round 31's checklist, honoured on arrival this time: a new
+                # per-object field that is not in BOTH `snapshot` and
+                # `restore` is silently thrown away by every undo AND by every
+                # cancelled viewport gesture, which reads as the feature being
+                # broken rather than as undo being lossy.
+                "attachments": [a.to_dict()
+                                for _k, a in sorted(o.attachments.items())],
+                "edit_locked": bool(o.edit_locked),
             })
         return {"objects": objs, "next_id": self._next_id,
                 # Cameras ride the snapshot stack and the savefile like
@@ -630,5 +649,10 @@ class Scene:
             obj.atom_scales = {int(k): float(v) for k, v
                                in (d.get("atom_scales") or {}).items()}
             obj.label_mode = d.get("label_mode", "element")
+            obj.attachments = {}
+            for entry in (d.get("attachments") or []):
+                att = attachments.Attachment.from_dict(entry)
+                obj.attachments[att.key] = att
+            obj.edit_locked = bool(d.get("edit_locked", False))
             self.objects.append(obj)
         self._next_id = snap["next_id"]

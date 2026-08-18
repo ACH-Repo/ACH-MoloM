@@ -307,9 +307,26 @@ def read_smiles_file(path):
 
 # ------------------------------------------------------------- xyz native
 
-def write_xyz(path, atoms, metadata=None):
-    # type: (str, List[Atom], Optional[dict]) -> None
-    """Write an .xyz; metadata (if given) goes in the comment line as JSON."""
+def write_xyz(path, atoms, metadata=None, comment=""):
+    # type: (str, List[Atom], Optional[dict], str) -> None
+    """Write an .xyz; metadata (if given) goes in the comment line as JSON.
+
+    A user COMMENT wins the line and is written as PLAIN TEXT, because the
+    comment line is the one place every other program already looks and JSON
+    there is only readable to us. MoloM's own reader treats an unparseable
+    comment as no metadata, so a commented file still opens - it just carries
+    no name, which is what any foreign .xyz does anyway.
+    """
+    if comment:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        one_line = " ".join(str(comment).split())
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{}\n{}\n".format(len(atoms), one_line))
+            for symbol, x, y, z in atoms:
+                clean = "".join(ch for ch in symbol if ch.isalpha())
+                f.write("{:<2} {:10.5f} {:10.5f} {:10.5f}\n".format(
+                    clean, x, y, z))
+        return
     comment = json.dumps(metadata) if metadata else ""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -389,13 +406,14 @@ def _xyz_block(atoms, name=""):
 MULTI_STRUCTURE_FORMATS = ("xyz", "sdf", "pdb", "mol2")
 
 
-def write_structure_file(path, atoms, name=""):
-    # type: (str, List[Atom], str) -> str
+def write_structure_file(path, atoms, name="", comment=""):
+    # type: (str, List[Atom], str, str) -> str
     """Write atoms in the format the EXTENSION names (.xyz native; else
     OpenBabel, RDKit fallback for mol/sdf/pdb). Returns the backend used."""
     ext = os.path.splitext(path)[1].lower().lstrip(".") or "xyz"
     if ext == "xyz":
-        write_xyz(path, atoms, {"name": name} if name else None)
+        write_xyz(path, atoms, {"name": name} if name else None,
+                  comment=comment)
         return "native"
     if ext in ("cif", "mmcif"):
         # NEVER through OpenBabel: it is handed an xyz block, so the file came
@@ -611,13 +629,33 @@ def import_name_filters():
     return filters
 
 
+def quiet_subprocess_kwargs():
+    # type: () -> dict
+    """Keyword arguments that stop a console window flashing up on Windows.
+
+    Every helper MoloM shells out to - OpenBabel's reader, MOPAC, Blender,
+    ffmpeg - is a console program, and on Windows each `subprocess.run` of one
+    pops a console window for as long as it lives. Individually they are a
+    flicker; a MOPAC frequency job runs four of them and the screen visibly
+    blinks, which is what Christian reported ("a lot of windows being opened
+    ... which look effectively like a blur on screen").
+
+    `CREATE_NO_WINDOW` is Windows-only and does not exist as an attribute on
+    other platforms, so it is looked up rather than referenced, and an empty
+    dict everywhere else keeps every call site identical.
+    """
+    flag = getattr(subprocess, "CREATE_NO_WINDOW", None)
+    return {"creationflags": flag} if (os.name == "nt" and flag) else {}
+
+
 def _read_with_openbabel(path, fmt, timeout=IMPORT_READ_TIMEOUT_S):
     # type: (str, str, float) -> Tuple[Optional[list], Optional[str]]
     """Read all records via OpenBabel in a killable subprocess."""
     cmd = [sys.executable, "-m", "molom.core._obabel_worker", fmt, path]
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              timeout=timeout)
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=timeout,
+                              **quiet_subprocess_kwargs())
     except subprocess.TimeoutExpired:
         return None, ("reading timed out after {}s - the OpenBabel reader for '{}' "
                       "hung on this file (the format/file may be unreadable).".format(

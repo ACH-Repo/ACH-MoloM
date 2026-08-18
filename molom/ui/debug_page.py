@@ -35,73 +35,7 @@ QPushButton:disabled { color: rgba(150,150,150,120); }
 """
 
 
-class FlowLayout(QLayout):
-    """A horizontal row that WRAPS instead of being cut off.
-
-    The dock is narrow and its scroll area refuses horizontal scrolling (the
-    round-21 lesson: fixed widths make part of a panel unreachable). A plain
-    QHBoxLayout of nine buttons would push the last ones off the edge with no
-    hint they were there, so the row wraps onto a second line instead.
-    """
-
-    def __init__(self, parent=None, spacing=4):
-        super().__init__(parent)
-        self._items = []
-        self.setSpacing(spacing)
-        self.setContentsMargins(0, 0, 0, 0)
-
-    def addItem(self, item):
-        self._items.append(item)
-
-    def count(self):
-        return len(self._items)
-
-    def itemAt(self, index):
-        return self._items[index] if 0 <= index < len(self._items) else None
-
-    def takeAt(self, index):
-        if 0 <= index < len(self._items):
-            return self._items.pop(index)
-        return None
-
-    def expandingDirections(self):
-        return Qt.Orientations(Qt.Orientation(0))
-
-    def hasHeightForWidth(self):
-        return True
-
-    def heightForWidth(self, width):
-        return self._layout(QRect(0, 0, width, 0), apply=False)
-
-    def setGeometry(self, rect):
-        super().setGeometry(rect)
-        self._layout(rect, apply=True)
-
-    def sizeHint(self):
-        return self.minimumSize()
-
-    def minimumSize(self):
-        size = QSize()
-        for item in self._items:
-            size = size.expandedTo(item.minimumSize())
-        return size
-
-    def _layout(self, rect, apply):
-        x, y, line_height = rect.x(), rect.y(), 0
-        space = self.spacing()
-        for item in self._items:
-            hint = item.sizeHint()
-            nxt = x + hint.width()
-            if nxt > rect.right() and line_height > 0:
-                x = rect.x()
-                y = y + line_height + space
-                nxt = x + hint.width()
-                line_height = 0
-            if apply:
-                item.setGeometry(QRect(x, y, hint.width(), hint.height()))
-            x = nxt + space
-            line_height = max(line_height, hint.height())
-        return y + line_height - rect.y()
+from .widgets import FlowLayout            # moved; re-exported here
 
 
 class PipelinePage(QWidget):

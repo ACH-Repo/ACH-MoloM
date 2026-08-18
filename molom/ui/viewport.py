@@ -857,7 +857,10 @@ class MolViewport(QOpenGLWidget):
         self.render_scale = 2            # resolution multiplier on render
         self.render_crop = False         # trim the export to what was drawn
         self.adjust_h = True             # re-dress hydrogens on edits
-        self.on_edit_begin = None        # app callback: () -> None (undo)
+        #: Permission for a CHEMISTRY edit: `() -> bool`, False refusing.
+        #: Anything that only wants an undo snapshot must use
+        #: `on_model_edit_begin` instead - see `_begin_edit`.
+        self.on_edit_begin = None
         self.on_camera_changed = None    # a frame drag finished
         #: Called when a view rotation drops us out of a camera view, so the
         #: window can forget the remembered free view and refresh its panels.
@@ -2127,7 +2130,8 @@ class MolViewport(QOpenGLWidget):
         obj = self.edit_object()
         rows = [i for o, i in self.selection if obj is not None and o == obj.id]
         if obj is not None and rows:
-            self._begin_edit()
+            if not self._begin_edit():
+                return
             crystal = is_crystal(obj)
             rows, copies = _with_boundary_copies(obj, rows)
             added, removed = edits.set_element_adjusted(
@@ -2151,8 +2155,21 @@ class MolViewport(QOpenGLWidget):
         self.refresh_geometry()
 
     def _begin_edit(self):
-        if self.on_edit_begin is not None:
-            self.on_edit_begin()
+        """Ask permission for a CHEMISTRY edit. False means do not proceed.
+
+        It used to return nothing, which meant an edit could be announced but
+        never refused - and overwrite protection is exactly a refusal. The
+        callback answering False is the molecule's lock (see
+        `MainWindow.begin_chemistry_edit`); None keeps the old meaning, so an
+        embedder that installs a plain undo hook is unaffected.
+
+        Every call site must honour it. A guard that some paths ignore is
+        worse than none, because the protection then depends on which gesture
+        you happened to use.
+        """
+        if self.on_edit_begin is None:
+            return True
+        return self.on_edit_begin() is not False
 
     def _draw_click(self, pos, hit):
         """Draw tool: on an atom -> convert it to the draw element; on empty
@@ -2168,7 +2185,8 @@ class MolViewport(QOpenGLWidget):
             if obj.structure.symbols[idx] == self.draw_element:
                 self.set_selection([(obj_id, idx)])
                 return
-            self._begin_edit()
+            if not self._begin_edit():
+                return
             crystal = is_crystal(obj)
             targets, _copies = _with_boundary_copies(obj, [idx])
             added, removed = edits.set_element_adjusted(
@@ -2187,7 +2205,8 @@ class MolViewport(QOpenGLWidget):
                                      self._view_dir())
             if p is None:
                 return
-            self._begin_edit()
+            if not self._begin_edit():
+                return
             edits.add_atom(obj.structure, self.draw_element, p)
             new_idx = obj.structure.n_atoms - 1
             added = removed = 0
@@ -2220,7 +2239,8 @@ class MolViewport(QOpenGLWidget):
         obj = self.scene.get(sel[0][0])
         if obj is None:
             return
-        self._begin_edit()
+        if not self._begin_edit():
+            return
         if order <= 0:
             edits.remove_bond(obj.structure, sel[0][1], sel[1][1])
             note = "Bond removed"
@@ -5558,7 +5578,8 @@ class MolViewport(QOpenGLWidget):
         obj = self.edit_object()
         if obj is None:
             return
-        self._begin_edit()
+        if not self._begin_edit():
+            return
         s = obj.structure
         origin, direction = self._ray_at(pos)
         depth = obj.origin if s.n_atoms else np.zeros(3)
@@ -5589,7 +5610,8 @@ class MolViewport(QOpenGLWidget):
         obj = self.edit_object()
         if obj is None:
             return
-        self._begin_edit()
+        if not self._begin_edit():
+            return
         s = obj.structure
         # Dragging off a terminal HYDROGEN grows from the heavy atom it hangs
         # on, consuming the H — the new substituent takes its place, which is
@@ -5698,7 +5720,8 @@ class MolViewport(QOpenGLWidget):
         obj = self.scene.get(hb[0]) if self.scene else None
         if obj is None:
             return False
-        self._begin_edit()
+        if not self._begin_edit():
+            return False
         if order <= 0:
             edits.remove_bond(obj.structure, hb[1], hb[2])
             note = "Bond removed"
@@ -6452,8 +6475,12 @@ class MolViewport(QOpenGLWidget):
         cam = self.selected_camera()
         if cam is None:
             return False
-        if self.on_edit_begin is not None:
-            self.on_edit_begin()             # one undo entry for the gesture
+        # `on_model_edit_begin`, NOT `on_edit_begin`: this wants an undo
+        # snapshot, and `on_edit_begin` now ASKS PERMISSION for a chemistry
+        # edit. Routing a camera move through it made a molecule's overwrite
+        # lock refuse to let you move the CAMERA - and pop a dialog to say so.
+        if self.on_model_edit_begin is not None:
+            self.on_model_edit_begin()       # one undo entry for the gesture
         self._camera_drag = {
             "id": cam.id, "rotate": bool(rotate),
             "center": np.array(cam.center, dtype=float),
@@ -6659,8 +6686,8 @@ class MolViewport(QOpenGLWidget):
         self._last_cam_wheel_t = now
         if self._truck_gesture != cam.id:
             self._truck_gesture = cam.id
-            if self.on_edit_begin is not None:
-                self.on_edit_begin()
+            if self.on_model_edit_begin is not None:
+                self.on_model_edit_begin()   # undo only - see start_camera_grab
 
     def zoom_camera_frame(self, steps):
         """The wheel inside a camera view: resize the FRAME, never the camera.

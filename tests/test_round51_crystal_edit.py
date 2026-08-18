@@ -53,9 +53,25 @@ def test_a_chemistry_edit_captures_the_pose_like_a_geometry_edit_does(win):
     delete — goes through `on_edit_begin`, and that was wired straight to
     `push_undo`. So `cell_pose` got measured AFTER the atom had moved, read
     the move as a rotation of the whole crystal, and baked it into the cell
-    reference."""
-    assert win.viewport.on_edit_begin == win.begin_model_edit
-    assert win.viewport.on_model_edit_begin == win.begin_model_edit
+    reference.
+
+    Round 75 put a permission gate in front of the chemistry hook (overwrite
+    protection for a molecule carrying computed layers), so the two callbacks
+    are no longer the same object - `begin_chemistry_edit` asks, then delegates
+    to `begin_model_edit`. The pose capture is what this test is about, so it
+    is asserted as BEHAVIOUR now rather than as callback identity, which is
+    what made it break on a change that did not touch the thing it guards.
+    """
+    win.open_path(FERROCENE)
+    obj = win._active_obj()
+    win.viewport.set_mode("edit", obj.id)
+    win._pose_before_edit = None
+    assert win.viewport.on_edit_begin() is not False       # the chemistry hook
+    assert win._pose_before_edit is not None,         "a chemistry edit did not capture the crystal's pose first"
+    assert win._pose_before_edit[0] == obj.id
+    win._pose_before_edit = None
+    win.viewport.on_model_edit_begin()                     # the geometry hook
+    assert win._pose_before_edit is not None
 
 
 def test_changing_an_element_leaves_the_cell_box_where_it_was(win):

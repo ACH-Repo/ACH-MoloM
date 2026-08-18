@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..core import align as align_mod
+from ..core import attachments as attach_mod
 from ..core import blender_export as blender_mod
 from ..core import build as build_mod
 from ..core import modifiers as modifiers_mod
@@ -55,7 +56,7 @@ from .crystal_ribbon import CrystalRibbon
 from .optimize_panel import OptimizeDock, OptimizeWorker, TASK_SELECTION
 from . import properties as properties_mod
 from .properties import (CameraPage, CrystalPage, ModifierPage,
-                         PropertiesDock, VibrationPage)
+                         PropertiesDock, StripPage, VibrationPage)
 from .timeline_panel import TimelinePanel
 from .toolbar import ViewportToolbar
 from .outliner import OutlinerPanel
@@ -199,7 +200,7 @@ class MainWindow(QMainWindow):
             lambda restore=False: self.leave_camera(restore=restore,
                                                     message="")
         self.viewport.on_camera_look = self.on_activate_camera
-        self.viewport.on_edit_begin = self.begin_model_edit
+        self.viewport.on_edit_begin = self.begin_chemistry_edit
         self.viewport.on_mode_changed = self._on_mode_changed
         self.viewport.on_new_molecule = self.new_empty_molecule
         self.viewport.on_toggle_mode = \
@@ -296,6 +297,11 @@ class MainWindow(QMainWindow):
         self.outliner.crystal_box_toggled.connect(
             lambda _oid, on: self._set_cell_box(on))
         self.outliner.crystal_poly_toggled.connect(self._on_crystal_poly)
+        self.outliner.comment_requested.connect(self.on_edit_comment)
+        self.outliner.attachment_toggled.connect(
+            self.on_attachment_toggled)
+        self.outliner.attachment_lock_toggled.connect(
+            self.on_attachment_lock_toggled)
         self.outliner.crystal_exterior_toggled.connect(
             self._on_crystal_exterior)
         self.outliner.crystal_advanced.connect(self._on_crystal_advanced)
@@ -310,6 +316,8 @@ class MainWindow(QMainWindow):
 
         self.optimize_panel = OptimizeDock(self)
         self.optimize_panel.start_requested.connect(self.on_optimize)
+        self.optimize_panel.species_changed.connect(
+            self.on_species_changed)
         # Round 15 moved this dock's WIDGET into the properties dock as a page
         # and left the dock itself behind, parented to the window but never
         # added to a dock area. `QWidget.show()` shows every child that has not
@@ -327,6 +335,8 @@ class MainWindow(QMainWindow):
         self.vibration_page.mode_selected.connect(self.on_animate_mode)
         self.vibration_page.settings_changed.connect(self._on_mode_settings)
         self.vibration_page.load_requested.connect(self.on_load_frequencies)
+        self.vibration_page.calculate_requested.connect(
+            self.on_calculate_frequencies)
         self.crystal_page = CrystalPage()
         self.crystal_page.view_changed.connect(self.on_crystal_view)
         self.crystal_page.occupancy_toggled.connect(
@@ -354,6 +364,13 @@ class MainWindow(QMainWindow):
             lambda on: self._set_obj_flag("show_ghosts", on))
         for _key, _box in self.crystal_page.kind_checks.items():
             _box.toggled.connect(lambda _on: self._sync_symmetry_kinds())
+        self.strip_page = StripPage()
+        self.strip_page.start_changed.connect(self.on_strip_start)
+        self.strip_page.speed_changed.connect(self.on_strip_speed)
+        self.strip_page.end_mode_changed.connect(
+            self.on_strip_end_mode)
+        self.strip_page.remove_requested.connect(
+            self.on_strip_removed)
         self.camera_page = CameraPage()
         self.camera_page.changed.connect(lambda: self.camera_changed())
         self.camera_page.activate_requested.connect(
@@ -375,6 +392,8 @@ class MainWindow(QMainWindow):
               self.vibration_page),
              ("camera", "🎥", "Camera — lens, frame and roll",
               self.camera_page),
+             ("strip", "▤", "Animation strip — start, speed, end mode",
+              self.strip_page),
              ("forcefield", "⚛", "Force field",
               self.optimize_panel.widget())], self)
         self.addDockWidget(Qt.RightDockWidgetArea, self.properties)
@@ -1430,6 +1449,177 @@ class MainWindow(QMainWindow):
                                   if obj is not None else None)
         self.push_undo()
 
+    def _edit_target(self):
+        """Whichever molecule an edit is about to touch, or None."""
+        obj_id = getattr(self.viewport, "edit_obj_id", None)
+        obj = self.scene.get(obj_id) if obj_id is not None else None
+        return obj if obj is not None else self._active_obj()
+
+    def begin_chemistry_edit(self):
+        """Permission for an edit that changes what a molecule IS.
+
+        Returns False to REFUSE, which is the whole of the overwrite
+        protection: a molecule carrying computed layers is locked, and an edit
+        to its composition or connectivity has to be agreed to first. Modelled
+        on ORCA Workbench, where a tick box has to be cleared before the
+        information behind it can be altered.
+
+        The dialog is not a nag. It appears only while the molecule is locked,
+        it says what will be lost and what will merely stop being physical -
+        which are different fates, decided per attachment (see
+        `core/attachments.py`) - and agreeing to it clears the lock, so the
+        rest of an editing session is uninterrupted.
+
+        Geometry edits deliberately do not come through here: `on_model_edit_
+        begin` is still wired straight to `begin_model_edit`. Moving a whole
+        molecule is a rigid placement that leaves its modes exactly as valid,
+        and a dialog on every grab is a dialog nobody reads.
+        """
+        obj = self._edit_target()
+        if obj is not None and attach_mod.is_locked(obj):
+            if not self._confirm_unlock(obj):
+                return False
+            attach_mod.set_locked(obj, False)
+        self.begin_model_edit()
+        if obj is not None:
+            # Marked HERE, after the undo snapshot `begin_model_edit` just
+            # pushed, so Ctrl+Z restores a molecule whose layers are intact
+            # rather than one that is still flagged unphysical.
+            dropped, flagged = attach_mod.note_edit(
+                obj, attach_mod.KIND_CHEMISTRY)
+            if dropped or flagged:
+                self._announce_attachment_change(obj, dropped, flagged)
+        return True
+
+    def _confirm_unlock(self, obj):
+        # type: (object) -> bool
+        """The "you are about to make this unphysical" dialog."""
+        from PySide6.QtWidgets import QMessageBox
+        table = attach_mod.attachments_of(obj)
+        lost = sorted(a.label for a in table.values()
+                      if a.policy == attach_mod.POLICY_VOLATILE)
+        kept = sorted(a.label for a in table.values()
+                      if a.policy != attach_mod.POLICY_VOLATILE and not a.stale)
+        bits = []
+        if lost:
+            bits.append("{} will be DISCARDED - it cannot survive a change to "
+                        "the structure and is meant to be recomputed.".format(
+                            ", ".join(lost)))
+        if kept:
+            bits.append("{} will be KEPT but marked as no longer physical: it "
+                        "was computed for this molecule as it stands, and will "
+                        "say so wherever it is shown or exported.".format(
+                            ", ".join(kept)))
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Edit a protected molecule?")
+        box.setText("{} is protected because it carries computed data.".format(
+            obj.name))
+        box.setInformativeText("\n\n".join(bits) if bits else
+                               "Its computed layers will be affected.")
+        unlock = box.addButton("Unlock and edit", QMessageBox.AcceptRole)
+        box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(unlock)
+        box.exec()
+        return box.clickedButton() is unlock
+
+    def _announce_attachment_change(self, obj, dropped, flagged):
+        table = attach_mod.attachments_of(obj)
+        bits = []
+        if dropped:
+            bits.append("{} discarded".format(len(dropped)))
+        if flagged:
+            bits.append("{} no longer physical".format(
+                ", ".join(sorted(table[k].label for k in flagged
+                                 if k in table))))
+        self.statusBar().showMessage(
+            "{}: {}".format(obj.name, "; ".join(bits)), 8000)
+        self._sync_outliner()
+
+    # ------------------------------------------------- attachment tick boxes
+    def on_edit_comment(self, obj_id):
+        """A plain-text note on a molecule, which follows it into exports.
+
+        Kept in `Structure.metadata["comment"]`, so it rides undo and
+        savepoints with no new bookkeeping (round 43's pattern) - and lands in
+        the .xyz COMMENT LINE, which is the one place every downstream tool
+        already looks and nobody has to be taught about.
+        """
+        from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QLabel,
+                                       QPlainTextEdit, QVBoxLayout)
+        obj = self.scene.get(obj_id)
+        if obj is None:
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Comment - {}".format(obj.name))
+        dlg.resize(520, 300)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel(
+            "Notes on <b>{}</b>. Written to the comment line of an exported "
+            ".xyz.".format(obj.name)))
+        edit = QPlainTextEdit(
+            str((obj.structure.metadata or {}).get("comment", "")))
+        edit.setPlaceholderText(
+            "e.g. PM7 optimised, charge -2; ligand geometry taken from "
+            "1ABC.cif")
+        lay.addWidget(edit, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok
+                                   | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self.push_undo()
+        text = edit.toPlainText().strip()
+        if text:
+            obj.structure.metadata["comment"] = text
+        else:
+            obj.structure.metadata.pop("comment", None)
+        self._sync_all()
+        self.statusBar().showMessage(
+            "Comment {} on {}".format("saved" if text else "cleared",
+                                      obj.name), 5000)
+
+    def on_attachment_toggled(self, obj_id, key, visible):
+        obj = self.scene.get(obj_id)
+        att = attach_mod.attachments_of(obj).get(key) if obj else None
+        if att is None:
+            return
+        att.visible = bool(visible)
+        self.viewport.refresh_geometry()
+
+    def on_attachment_lock_toggled(self, obj_id, locked):
+        obj = self.scene.get(obj_id)
+        if obj is not None:
+            attach_mod.set_locked(obj, bool(locked))
+
+    def set_modes(self, obj, modes, detail=""):
+        """Store normal modes AND register them as an attachment.
+
+        One place, so the three routes that can produce modes - opening a FREQ
+        file, the F3 loader, and the MOPAC add-on - cannot disagree about
+        whether the molecule is protected or how it is labelled.
+
+        `toggleable=False`: modes are a data source for the animation, not a
+        layer painted over the molecule, so a visibility tick would have
+        nothing to do. They still belong in the row, because the lock and the
+        unphysical marking are exactly what they need.
+        """
+        self._modes[obj.id] = modes
+        real = [m for m in modes if not m.is_trivial]
+        attach_mod.attach(obj, attach_mod.Attachment(
+            "modes", "Modes", policy=attach_mod.POLICY_FRAGILE,
+            toggleable=False,
+            detail=detail or "{} vibrational modes".format(len(real))))
+        self._sync_outliner()
+
+    def _sync_outliner(self):
+        try:
+            self.outliner.sync(self.scene, self.active_id)
+        except Exception:
+            pass
+
     def _edited_crystal(self):
         """Whichever crystal an edit is about to touch, or None."""
         obj_id = getattr(self.viewport, "edit_obj_id", None)
@@ -1992,6 +2182,88 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "Repeated: duplicated and offset by ({:+.3f}, {:+.3f}, {:+.3f}) A"
             .format(*d), 6000)
+
+    # ------------------------------------------------- animation strips
+    def _selected_strip(self):
+        obj_id = getattr(self.traj_bar.rows, "selected", None)
+        if obj_id is None:
+            return None, None
+        return obj_id, self.timeline.get(obj_id)
+
+    def on_strip_selected(self, obj_id):
+        """Show the selected strip on its page. -1 means nothing selected."""
+        if obj_id is None or int(obj_id) < 0:
+            self.strip_page.set_strip(None, None, "")
+            return
+        obj = self.scene.get(int(obj_id))
+        self.strip_page.set_strip(int(obj_id), self.timeline.get(int(obj_id)),
+                                  obj.name if obj is not None else "")
+
+    def _sync_strip_page(self):
+        obj_id, track = self._selected_strip()
+        obj = self.scene.get(obj_id) if obj_id is not None else None
+        self.strip_page.set_strip(obj_id, track,
+                                  obj.name if obj is not None else "")
+
+    def on_strip_start(self, obj_id, start):
+        track = self.timeline.get(int(obj_id))
+        if track is not None:
+            track.start = float(start)
+            self._apply_timeline()
+            self._sync_traj_bar()
+            self._sync_strip_page()
+
+    def on_strip_speed(self, obj_id, speed):
+        track = self.timeline.get(int(obj_id))
+        if track is not None:
+            track.speed = max(float(speed), 0.01)
+            self._apply_timeline()
+            self._sync_traj_bar()
+            self._sync_strip_page()
+
+    def on_strip_end_mode(self, obj_id, mode):
+        track = self.timeline.get(int(obj_id))
+        if track is not None:
+            track.end = str(mode)
+            self._apply_timeline()
+            self._sync_traj_bar()
+
+    def on_strip_removed(self, obj_id):
+        """Take a strip off the player. THE FRAMES STAY: this is the
+        animation's track, not the molecule's data."""
+        self.timeline.exclude(int(obj_id))
+        self.traj_bar.rows.selected = None
+        self.strip_page.set_strip(None, None, "")
+        self._sync_traj_bar()
+        obj = self.scene.get(int(obj_id))
+        self.statusBar().showMessage(
+            "{} removed from the player - its frames are untouched".format(
+                obj.name if obj is not None else obj_id), 6000)
+
+    def on_species_changed(self, charge, multiplicity):
+        """Write the panel's charge/spin onto the ACTIVE molecule.
+
+        They live in `Structure.metadata`, so they ride undo and savepoints for
+        free (round 43's pattern) and `Structure.charge` picks them up with no
+        second source of truth.
+        """
+        obj = self._active_obj()
+        if obj is None:
+            return
+        meta = obj.structure.metadata
+        meta["charge"] = int(charge)
+        meta["multiplicity"] = max(1, int(multiplicity))
+        obj.structure.charge = int(charge)
+        obj.structure.multiplicity = max(1, int(multiplicity))
+
+    def sync_species_panel(self):
+        """Show whichever molecule is active - called from `_sync_all`."""
+        obj = self._active_obj()
+        if obj is None:
+            return
+        self.optimize_panel.show_species(
+            getattr(obj.structure, "charge", 0),
+            getattr(obj.structure, "multiplicity", 1))
 
     def on_optimize(self, task, method, steps):
         """Run the force field on the active molecule. With the 'selection'
@@ -2815,6 +3087,7 @@ class MainWindow(QMainWindow):
 
     def _sync_all(self, fit=False):
         self._flush_stale_bonds()
+        self.sync_species_panel()
         self.outliner.sync(self.scene, self.active_id)
         self.viewport.refresh_geometry()
         if fit:
@@ -3024,13 +3297,20 @@ class MainWindow(QMainWindow):
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 text = fh.read()
-            if "VIBRATIONAL FREQUENCIES" not in text:
+            # Which PROGRAM wrote it is decided by the header, not by the
+            # extension: both ORCA and MOPAC write `.out`, so the suffix says
+            # nothing. Each parser's own header is the discriminator.
+            if "VIBRATIONAL FREQUENCIES" in text:
+                modes = vib_mod.parse_orca_frequencies(
+                    text, n_atoms=obj.structure.n_atoms)
+            elif vib_mod.MOPAC_FREQ_HEADER in text:
+                modes = vib_mod.parse_mopac_frequencies(
+                    text, n_atoms=obj.structure.n_atoms)
+            else:
                 return None
-            modes = vib_mod.parse_orca_frequencies(
-                text, n_atoms=obj.structure.n_atoms)
         except (vib_mod.VibrationError, OSError, ValueError):
             return None                  # a geometry-only job: nothing to add
-        self._modes[obj.id] = modes
+        self.set_modes(obj, modes)
         self._rest_geometry[obj.id] = obj.structure.coords.copy()
         self._sync_vibration_page()
         real = [m for m in modes if not m.is_trivial]
@@ -3185,6 +3465,8 @@ class MainWindow(QMainWindow):
     def _build_trajectory_bar(self):
         """The timeline pane: transport bar + expandable per-track rows."""
         self.traj_bar = TimelinePanel(self)
+        self.traj_bar.strip_selected.connect(self.on_strip_selected)
+        self.traj_bar.strip_removed.connect(self.on_strip_removed)
         self.traj_bar.play_pause.connect(self.on_play_pause)
         self.traj_bar.seek_requested.connect(self.on_seek)
         self.traj_bar.smoothing_changed.connect(self._on_smoothing_changed)
@@ -3654,7 +3936,17 @@ class MainWindow(QMainWindow):
                 atoms += [(sym[i], float(xyz[i][0]), float(xyz[i][1]),
                            float(xyz[i][2])) for i in range(len(sym))]
                 total += len(sym)
-            backend = io.write_structure_file(path, atoms, name=name)
+            # The molecules' own comments, joined when several are being
+            # written into one file - a comment that silently applied to only
+            # the first of five would be worse than none.
+            notes = []
+            for o in vis:
+                text = str((o.structure.metadata or {}).get("comment", ""))
+                if text.strip():
+                    notes.append("{}: {}".format(o.name, text.strip())
+                                 if len(vis) > 1 else text.strip())
+            backend = io.write_structure_file(path, atoms, name=name,
+                                              comment=" | ".join(notes))
             return backend, len(vis), total
         return backend, len(vis), sum(o.structure.n_atoms for o in vis)
 
@@ -3958,7 +4250,7 @@ class MainWindow(QMainWindow):
             self._install_structure(s, path=path)
             obj = self._active_obj()
         self._modes.setdefault(obj.id, [])
-        self._modes[obj.id] = modes
+        self.set_modes(obj, modes)
         self.settings.setValue("last_dir", os.path.dirname(path))
         real = [m for m in modes if not m.is_trivial]
         imaginary = [m for m in modes if m.is_imaginary]
@@ -3971,6 +4263,48 @@ class MainWindow(QMainWindow):
             "page".format(obj.name, len(modes), len(real),
                           ", {} IMAGINARY".format(len(imaginary))
                           if imaginary else ""), 12000)
+
+    #: Engines that can COMPUTE normal modes, contributed by add-ons as
+    #: `(label, callable)` where the callable takes the MainWindow. Core knows
+    #: the contract and never the implementation - the same extension point
+    #: `forcefield.register_method` is, for the same reason: MoloM must not
+    #: learn what MOPAC is in order to offer a button that runs it.
+    frequency_providers = None
+
+    def register_frequency_provider(self, label, run):
+        if self.frequency_providers is None:
+            self.frequency_providers = []
+        self.frequency_providers = [
+            e for e in self.frequency_providers if e[0] != label]
+        self.frequency_providers.append((str(label), run))
+        self._sync_vibration_page()
+
+    def unregister_frequency_provider(self, label):
+        self.frequency_providers = [
+            e for e in (self.frequency_providers or []) if e[0] != label]
+        self._sync_vibration_page()
+
+    def on_calculate_frequencies(self):
+        providers = self.frequency_providers or []
+        if not providers:
+            return
+        providers[0][1](self)          # the add-on owns everything past here
+
+    # ---- which molecules have a job in flight, so the page can say so
+    def freq_job_started(self, obj_id, label=""):
+        jobs = getattr(self, "_freq_jobs", None)
+        if jobs is None:
+            jobs = {}
+            self._freq_jobs = jobs
+        jobs[int(obj_id)] = str(label)
+        self._sync_vibration_page()
+
+    def freq_job_finished(self, obj_id):
+        (getattr(self, "_freq_jobs", None) or {}).pop(int(obj_id), None)
+        self._sync_vibration_page()
+
+    def freq_job_running(self, obj_id):
+        return int(obj_id) in (getattr(self, "_freq_jobs", None) or {})
 
     def _sync_vibration_page(self):
         """Refresh the ∿ page for the active molecule.
@@ -3997,6 +4331,18 @@ class MainWindow(QMainWindow):
                 obj_id, properties_mod.DEFAULT_AMPLITUDE)),
             n_frames=int(self._mode_frames.get(
                 obj_id, vib_mod.DEFAULT_PERIOD_FRAMES)))
+        # The button and the busy bar, AFTER `set_modes` - which rewrites the
+        # summary label the busy state also writes to, so doing it first would
+        # have the running message immediately overwritten by "has no
+        # vibrational data".
+        self.vibration_page.set_providers(
+            [label for label, _run in (self.frequency_providers or [])])
+        running = obj is not None and self.freq_job_running(obj.id)
+        self.vibration_page.set_busy(
+            running,
+            "Calculating frequencies for {}...\nThis runs in the background "
+            "- the molecule stays usable.".format(obj.name)
+            if running else "")
         self._push_mode_selection()
         self._sync_fractional()
 

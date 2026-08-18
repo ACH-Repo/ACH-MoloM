@@ -47,10 +47,12 @@ class OptimizeWorker(QThread):
 class OptimizeDock(QDockWidget):
 
     start_requested = Signal(str, str, int)     # task, method, steps
+    species_changed = Signal(int, int)          # charge, multiplicity
 
     def __init__(self, parent=None):
         super().__init__("Optimize", parent)
         self.setObjectName("optimize_panel")
+        self._loading = False        # see `show_species`
         w = QWidget(self)
         form = QFormLayout(w)
         form.setContentsMargins(10, 8, 10, 8)
@@ -71,6 +73,36 @@ class OptimizeDock(QDockWidget):
         self.steps_spin.setSingleStep(100)
         self.steps_spin.setSuffix(" steps")
         form.addRow("Max steps:", self.steps_spin)
+
+        # CHARGE AND SPIN, because a semiempirical method needs them and a
+        # force field does not - which is why nothing asked for them until
+        # MOPAC arrived. Measured on Christian's own square-planar PtCl4:
+        # optimised as neutral it holds 2.170 A, as the real [PtCl4]2- it goes
+        # to 2.321 A against an experimental ~2.31. Same geometry, same method,
+        # different species - so leaving this to a default of 0 silently
+        # optimises something the user did not draw.
+        #
+        # They belong to the MOLECULE (`Structure.metadata`), not to the
+        # panel: they are facts about the compound, they ride undo and
+        # savefiles, and the SMILES importer already sets them where a name
+        # implies a charge. The panel is only where they are visible at the
+        # moment they matter.
+        self.charge_spin = QSpinBox()
+        self.charge_spin.setRange(-20, 20)
+        self.charge_spin.setToolTip(
+            "Net charge of the molecule. Used by semiempirical methods "
+            "(MOPAC); force fields ignore it.")
+        form.addRow("Charge:", self.charge_spin)
+
+        self.mult_spin = QSpinBox()
+        self.mult_spin.setRange(1, 11)
+        self.mult_spin.setValue(1)
+        self.mult_spin.setToolTip(
+            "Spin multiplicity: 1 = singlet, 2 = doublet, 3 = triplet. Used "
+            "by semiempirical methods; force fields ignore it.")
+        form.addRow("Multiplicity:", self.mult_spin)
+        self.charge_spin.valueChanged.connect(self._emit_species)
+        self.mult_spin.valueChanged.connect(self._emit_species)
 
         self.start_btn = QPushButton("↓  Start")
         self.start_btn.clicked.connect(self._emit_start)
@@ -93,6 +125,26 @@ class OptimizeDock(QDockWidget):
         self.setWidget(w)
         self.setFeatures(QDockWidget.DockWidgetClosable
                          | QDockWidget.DockWidgetMovable)
+
+    def _emit_species(self, _value=0):
+        if not self._loading:
+            self.species_changed.emit(int(self.charge_spin.value()),
+                                      int(self.mult_spin.value()))
+
+    def show_species(self, charge, multiplicity):
+        """Display the ACTIVE molecule's charge and spin.
+
+        Guarded, because `setValue` emits `valueChanged` whether or not a hand
+        moved it - and an unguarded refresh writes one molecule's charge onto
+        the next as soon as you click a different row. That is round 30's
+        TimelinePanel bug, and it is exactly the shape that keeps recurring.
+        """
+        self._loading = True
+        try:
+            self.charge_spin.setValue(int(charge or 0))
+            self.mult_spin.setValue(max(1, int(multiplicity or 1)))
+        finally:
+            self._loading = False
 
     def refresh_methods(self):
         """Rebuild the Method list from `forcefield.all_methods()`.

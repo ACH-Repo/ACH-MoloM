@@ -226,10 +226,24 @@ def test_a_molecule_with_hidden_atoms_is_marked_in_the_outliner(win):
 
 def test_the_hidden_mark_survives_being_selected(win):
     """A plain foreground brush loses to the selection highlight, so the one
-    row you clicked was the one that stopped warning you (Issue 1)."""
+    row you clicked was the one that stopped warning you (Issue 1).
+
+    The MARK changed in the attachments round - hidden atoms are drawn as
+    diagonal stripes now, because red is the loudest signal the outliner has
+    and hiding a few hydrogens is a routine display choice rather than a
+    problem. Red went to the state that IS a problem: an attachment that no
+    longer describes the structure it was computed for.
+
+    Round 31's actual claim is untouched and is what this still tests: the
+    mark must survive selection, whichever mark it is. The stripes cannot be
+    lost to the highlight because they are painted over the row rather than
+    being a text colour, and the red one is still asserted through the
+    palette, below.
+    """
     from PySide6.QtWidgets import QStyleOptionViewItem
-    from molom.ui.outliner import ROLE_HIDDEN
+    from molom.ui.outliner import ROLE_HIDDEN, ROLE_UNPHYSICAL
     from PySide6.QtGui import QPalette
+    from molom.core import attachments as attach_mod
     obj = win.scene.objects[0]
     obj.hide_atoms([0])
     win.outliner.sync(win.scene, win.active_id)
@@ -237,7 +251,20 @@ def test_the_hidden_mark_survives_being_selected(win):
     item = tree.topLevelItem(0)
     item.setSelected(True)
     index = tree.indexFromItem(item, 0)
+    # Hidden: still flagged, and NOT a colour any more.
     assert index.data(ROLE_HIDDEN) is True
+    option = QStyleOptionViewItem()
+    win.outliner._hidden_delegate.initStyleOption(option, index)
+    assert option.palette.color(QPalette.Text) != win.outliner.HIDDEN_MARK
+
+    # Unphysical: red, and it survives the highlight for round 31's reason.
+    attach_mod.attach(obj, attach_mod.Attachment("modes", "Modes"))
+    attach_mod.note_edit(obj, attach_mod.KIND_CHEMISTRY)
+    win.outliner.sync(win.scene, win.active_id)
+    item = tree.topLevelItem(0)
+    item.setSelected(True)
+    index = tree.indexFromItem(item, 0)
+    assert index.data(ROLE_UNPHYSICAL) is True
     option = QStyleOptionViewItem()
     win.outliner._hidden_delegate.initStyleOption(option, index)
     mark = win.outliner.HIDDEN_MARK

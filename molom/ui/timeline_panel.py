@@ -50,6 +50,10 @@ _LIMIT = QColor(150, 195, 120)         # the loop-range handles
 _LIMIT_GRAB = 5                        # px either side of a limit line
 
 
+#: Blender's selection orange, matching `viewport._OUTLINE_COLOR`.
+_SELECTED = QColor(255, 150, 40)
+
+
 def _tick_step(span):
     """A round tick interval giving roughly 6-12 labels."""
     for step in (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000):
@@ -64,12 +68,26 @@ class TrackRows(QWidget):
     seek_requested = Signal(float)
     tracks_changed = Signal()
     range_moved = Signal()      # a limit was dragged; already on the clock
+    strip_selected = Signal(int)     # obj_id, or -1 for none
+    strip_removed = Signal(int)      # obj_id: taken OFF the player only
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.timeline = None
         self.names = {}
         self._drag = None          # {"obj_id", "grab_dt"} while moving a track
+        #: Which strip is selected, or None. A strip is a thing you act on -
+        #: grab it, delete it, read its numbers - so it needs to be nameable,
+        #: and ORANGE is what "selected" already means everywhere else in
+        #: MoloM (the viewport outline, round 34).
+        self.selected = None
+        #: Horizontal pan, in the same units as the axis, and a vertical one
+        #: in pixels. The pane shows every track at once and a scene with
+        #: twenty of them does not fit; without this the ones past the bottom
+        #: are simply unreachable, which is the round-21 lesson again.
+        self.offset = 0.0
+        self.scroll_y = 0
+        self.setFocusPolicy(Qt.StrongFocus)     # or Delete never arrives
         self.setMouseTracking(True)
         self.setMinimumHeight(_MIN_ROWS_H)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -96,16 +114,65 @@ class TrackRows(QWidget):
 
     def _x_for(self, time):
         usable = max(self.width() - _GUTTER - _PAD, 1)
-        return _GUTTER + (float(time) / self._span()) * usable
+        return _GUTTER + ((float(time) - self.offset) / self._span()) * usable
 
     def _time_for(self, x):
         usable = max(self.width() - _GUTTER - _PAD, 1)
-        return (float(x) - _GUTTER) / usable * self._span()
+        return (float(x) - _GUTTER) / usable * self._span() + self.offset
+
+    def _row_top(self, index):
+        return _RULER_H + index * _ROW_H - self.scroll_y
 
     def _row_at(self, y):
-        index = int((y - _RULER_H) // _ROW_H)
+        index = int((y - _RULER_H + self.scroll_y) // _ROW_H)
         rows = self.rows()
         return rows[index] if 0 <= index < len(rows) else None
+
+    def _max_scroll(self):
+        rows = self.rows()
+        return max(0, len(rows) * _ROW_H - (self.height() - _RULER_H))
+
+    def wheelEvent(self, ev):
+        """Trackpad and wheel: vertical scrolls the ROWS, horizontal (or
+        Shift) pans TIME.
+
+        Both axes are read from `pixelDelta` where the device gives one, so a
+        trackpad's two-finger swipe works in both directions on the gesture
+        the hand already makes - the round-16 rule about not assuming a mouse.
+        """
+        pixels = ev.pixelDelta()
+        dx = pixels.x() if not pixels.isNull() else 0
+        dy = pixels.y() if not pixels.isNull() else ev.angleDelta().y() / 8.0
+        if ev.modifiers() & Qt.ShiftModifier and not dx:
+            dx, dy = dy, 0
+        if dy:
+            self.scroll_y = int(min(max(self.scroll_y - dy, 0),
+                                    self._max_scroll()))
+        if dx:
+            usable = max(self.width() - _GUTTER - _PAD, 1)
+            self.offset -= dx / usable * self._span()
+        self.update()
+        ev.accept()
+
+    def keyPressEvent(self, ev):
+        """Delete takes the strip OFF THE PLAYER and nothing else.
+
+        The frames stay on the molecule - this is the animation's track, not
+        its data, and a Delete here that destroyed a trajectory would be
+        unforgivable. Re-adding it is one click on the object.
+        """
+        if ev.key() in (Qt.Key_Delete, Qt.Key_Backspace)                 and self.selected is not None:
+            obj_id = int(self.selected)
+            self.selected = None
+            if self.timeline is not None:
+                self.timeline.exclude(obj_id)
+            self.strip_removed.emit(obj_id)
+            self.strip_selected.emit(-1)
+            self.tracks_changed.emit()
+            self.update()
+            ev.accept()
+            return
+        super().keyPressEvent(ev)
 
     def _limit_at(self, x):
         """"start" / "end" if the cursor is on a loop-range handle."""
@@ -126,7 +193,9 @@ class TrackRows(QWidget):
         font.setPixelSize(11)
         p.setFont(font)
         for i, track in enumerate(rows):
-            top = _RULER_H + i * _ROW_H
+            top = self._row_top(i)
+            if top + _ROW_H < _RULER_H or top > self.height():
+                continue                      # scrolled out of view
             row_rect = QRect(0, top, self.width(), _ROW_H)
             p.fillRect(row_rect, _ROW_ALT if i % 2 else _ROW_BG)
 
@@ -146,8 +215,14 @@ class TrackRows(QWidget):
             x0 = self._x_for(track.start)
             x1 = self._x_for(track.end_time)
             bar = QRect(int(x0), top + 4, max(int(x1 - x0), 3), _ROW_H - 9)
+            chosen = self.selected == track.obj_id
             p.setBrush(_BAR if track.enabled else _BAR_OFF)
-            p.setPen(QPen(_BAR_EDGE if track.enabled else _BAR_OFF, 1))
+            # ORANGE for the selected strip, the same colour and the same
+            # meaning as the viewport's selection outline (round 34) - a
+            # second convention for "this is the one you are acting on" would
+            # be one to learn for nothing.
+            p.setPen(QPen(_SELECTED, 2) if chosen else
+                     QPen(_BAR_EDGE if track.enabled else _BAR_OFF, 1))
             p.drawRoundedRect(bar, 3, 3)
             if bar.width() > 58:
                 p.setPen(QColor(255, 255, 255, 190))
@@ -161,7 +236,7 @@ class TrackRows(QWidget):
         # Everything outside the looping interval is veiled: the limits are
         # only comprehensible if you can SEE which part of the scene they cut
         # off, and a veil says that without redrawing the rows twice.
-        bottom = _RULER_H + len(rows) * _ROW_H
+        bottom = min(self._row_top(len(rows)), self.height())
         if self.timeline is not None and rows:
             lo = int(self._x_for(self.timeline.play_start))
             hi = int(self._x_for(self.timeline.play_end))
@@ -252,12 +327,27 @@ class TrackRows(QWidget):
             return
         x0, x1 = self._x_for(track.start), self._x_for(track.end_time)
         if x0 - 3 <= pos.x() <= x1 + 3:
-            # grab the bar: dragging slides the track's START offset
+            # SELECT, then grab: clicking a strip is how you name the thing a
+            # Delete or the strip page will act on, and the drag that slides
+            # its start offset begins from the same press.
+            self._select(track.obj_id)
             self._drag = {"obj_id": track.obj_id,
                           "grab": self._time_for(pos.x()) - track.start}
             self.setCursor(QCursor(Qt.ClosedHandCursor))
             return
+        self._select(None)         # empty track space: deselect and seek
         self.seek_requested.emit(max(self._time_for(pos.x()), 0.0))
+
+    def _select(self, obj_id):
+        if self.selected == obj_id:
+            return
+        self.selected = obj_id
+        self.strip_selected.emit(-1 if obj_id is None else int(obj_id))
+        self.update()
+
+    def select_strip(self, obj_id):
+        """Select from outside (the strip page, the outliner)."""
+        self._select(None if obj_id is None else int(obj_id))
 
     def mouseMoveEvent(self, ev):
         pos = ev.position()
@@ -364,6 +454,8 @@ class TimelinePanel(QWidget):
     fps_changed = Signal(int)
     range_changed = Signal(float, float)
     tracks_changed = Signal()
+    strip_selected = Signal(int)     # obj_id, or -1 for none
+    strip_removed = Signal(int)      # taken off the player, data untouched
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -449,6 +541,8 @@ class TimelinePanel(QWidget):
         self.rows = TrackRows(self)
         self.rows.seek_requested.connect(self.seek_requested)
         self.rows.tracks_changed.connect(self.tracks_changed)
+        self.rows.strip_selected.connect(self.strip_selected)
+        self.rows.strip_removed.connect(self.strip_removed)
         # A dragged limit has already been written to the clock, so it only
         # needs the same "re-apply and re-sync" a track edit gets.
         self.rows.range_moved.connect(self.tracks_changed)

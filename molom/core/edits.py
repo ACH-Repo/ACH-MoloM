@@ -255,7 +255,24 @@ def adjust_hydrogens(structure, indices, add=True, remove=True):
 
 def ideal_bond_length(structure, i, j):
     # type: (Structure, int, int) -> float
-    """Covalent-radius sum for the i-j pair (the length a single bond wants)."""
+    """The length this bond wants: a META atom's stated distance if one end is
+    a meta centre, otherwise the covalent-radius sum.
+
+    A META ATOM'S DISTANCE IS A CONSTRAINT THE USER TYPED, not a default to be
+    improved on. Christian: "changing atom types from hydrogen to another
+    element on a meta-atom auto adjusts the bond length away from the
+    constrained one". It did, and doubly wrongly - the dummy `Xx` is atomic
+    number 0 with no covalent radius, so the radius sum was not even a
+    meaningful number for the element the centre stands for. The whole promise
+    of a locked meta atom is that the distance you set is the distance you
+    get (round 62), and swapping a donor's element must not quietly break it.
+    """
+    from . import meta as meta_mod
+    table = meta_mod.all_meta(structure)
+    for centre, other in ((int(i), int(j)), (int(j), int(i))):
+        spec = table.get(centre)
+        if spec is not None and other in structure.bonded_neighbors(centre):
+            return float(spec.distance)
     zi = elements.atomic_number(structure.symbols[int(i)])
     zj = elements.atomic_number(structure.symbols[int(j)])
     ri = elements.radius_covalent(zi) or 1.0

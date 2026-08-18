@@ -45,6 +45,11 @@ _MODE_HEADER = "NORMAL MODES"
 _FREQ_LINE = re.compile(r"^\s*(\d+):\s*(-?\d+\.\d+)\s*cm\*\*-1")
 _TRIVIAL_CM = 1.0        # |v| below this is a translation/rotation
 
+#: Units an engine can report a mode's brightness in. ORCA gives a real IR
+#: intensity; MOPAC gives the transition dipole it comes from.
+INTENSITY_KM_MOL = "km/mol"
+INTENSITY_DEBYE = "D"
+
 
 class VibrationError(ValueError):
     """Raised when a file carries no usable frequency data."""
@@ -53,12 +58,25 @@ class VibrationError(ValueError):
 class Mode(object):
     """One normal mode: a frequency and a displacement per atom."""
 
-    def __init__(self, index, wavenumber, displacements, intensity=None):
+    def __init__(self, index, wavenumber, displacements, intensity=None,
+                 intensity_unit=INTENSITY_KM_MOL, symmetry=None):
         self.index = int(index)
         self.wavenumber = float(wavenumber)       # cm^-1, negative = imaginary
         self.displacements = np.asarray(displacements,
                                         dtype=float).reshape(-1, 3)
         self.intensity = intensity
+        #: WHAT `intensity` IS MEASURED IN, because two engines report two
+        #: different quantities. ORCA gives an IR intensity in km/mol; MOPAC
+        #: reports a TRANSITION DIPOLE, and the conversion between them is not
+        #: something to invent - so the number is carried with its unit rather
+        #: than silently displayed under the wrong one. Sorting is unaffected
+        #: either way: intensity goes as the square of the transition dipole,
+        #: and squaring is monotonic over non-negative values, so the ORDER a
+        #: dipole gives is the order an intensity would give.
+        self.intensity_unit = intensity_unit
+        #: Mulliken symbol for the mode ("A1", "B2", "A'"), where the engine
+        #: says. MOPAC prints it; ORCA does not, so this is usually None.
+        self.symmetry = symmetry
 
     def __repr__(self):
         return "Mode({}, {:.2f} cm-1)".format(self.index, self.wavenumber)
@@ -118,6 +136,176 @@ def parse_orca_frequencies(text, n_atoms=None):
         modes.append(Mode(k, freq, vectors[:, k].reshape(count, 3),
                           intensity=intensities.get(k)))
     return modes
+
+
+#: Public, because the app has to tell an ORCA `.out` from a MOPAC one and
+#: the extension cannot: both programs write `.out`.
+MOPAC_FREQ_HEADER = "NORMAL COORDINATE ANALYSIS"
+_MOPAC_CART_HEADER = MOPAC_FREQ_HEADER
+_MOPAC_MASS_HEADER = "MASS-WEIGHTED COORDINATE ANALYSIS"
+_MOPAC_ROOT = "Root No."
+
+
+def parse_mopac_frequencies(text, n_atoms=None):
+    # type: (str, Optional[int]) -> List[Mode]
+    """Frequencies + normal modes from a MOPAC FORCE output.
+
+    MoloM's whole vibrational UI - the mode cards, the baked animation on the
+    scene clock, the IR sort, round 63's selection ranking - was built against
+    ORCA and needs nothing but a list of `Mode`. So this is a reader and
+    nothing else; not one line downstream changes.
+
+    **The trap is which block to read.** MOPAC prints the eigenvectors TWICE,
+    under `NORMAL COORDINATE ANALYSIS (Total motion = 1 Angstrom)` and then
+    again under `MASS-WEIGHTED COORDINATE ANALYSIS`, and both are laid out
+    identically with the same `Root No.` header. The second is in mass-weighted
+    coordinates, so animating it would move every hydrogen far too little and
+    every heavy atom far too much - a plausible-looking, wrong animation. Only
+    the first is a Cartesian displacement, which is what `Mode.displacements`
+    means, so the search stops at the mass-weighted header.
+
+    Rows are 3N Cartesian components in atom order (x, y, z per atom), columns
+    are modes, wrapped eight at a time. MOPAC lists only the 3N-6 genuine
+    vibrations here - translations and rotations are already removed.
+    """
+    lines = str(text).splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if _MOPAC_CART_HEADER in line:
+            start = i                    # later blocks win, as with ORCA
+    if start is None:
+        raise VibrationError(
+            "no NORMAL COORDINATE ANALYSIS block found - is this a MOPAC "
+            "FORCE output?")
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if _MOPAC_MASS_HEADER in lines[i]:
+            end = i
+            break
+
+    freqs, syms, columns = [], [], []
+    i = start
+    while i < end:
+        if _MOPAC_ROOT not in lines[i]:
+            i += 1
+            continue
+        roots = [int(t) for t in lines[i].split() if t.isdigit()]
+        n = len(roots)
+        i += 1
+        # The frequency line is the first all-numeric line with one value per
+        # root. Anything non-blank before it is the symmetry-label line, which
+        # is identified by ELIMINATION rather than by position - it is absent
+        # for some point groups, and a label can carry a prime or a quote
+        # ("1 A'", '2 A"') that no numeric test would accept anyway.
+        block_syms, block_freqs = None, None
+        while i < end:
+            parts = lines[i].split()
+            if not parts:
+                i += 1
+                continue
+            values = _floats(parts)
+            if values is not None and len(values) == n:
+                block_freqs = values
+                i += 1
+                break
+            if block_syms is None:
+                # "1 A1  1 B2  2 A1" -> one label per root, when it divides.
+                block_syms = ([" ".join(parts[k:k + 2])
+                               for k in range(0, len(parts), 2)]
+                              if len(parts) == 2 * n else None)
+            i += 1
+        if block_freqs is None:
+            break
+        rows = []
+        while i < end:
+            parts = lines[i].split()
+            if len(parts) == n + 1 and parts[0].isdigit():
+                values = _floats(parts[1:])
+                if values is None:
+                    break
+                rows.append(values)
+                i += 1
+                continue
+            if not parts:
+                i += 1
+                if rows:
+                    break
+                continue
+            break
+        if not rows:
+            break
+        freqs.extend(block_freqs)
+        syms.extend(block_syms or [None] * n)
+        columns.append(np.array(rows, dtype=float))     # (3N, n)
+
+    if not freqs:
+        raise VibrationError("MOPAC frequency block found but no modes in it")
+    vectors = np.hstack(columns)
+    count = vectors.shape[0] // 3
+    if n_atoms is not None and count != int(n_atoms):
+        raise VibrationError(
+            "the file has {} atoms but the structure has {}".format(
+                count, n_atoms))
+    dipoles = _parse_mopac_transition_dipoles(lines)
+    modes = []
+    for k, freq in enumerate(freqs):
+        if k >= vectors.shape[1]:
+            break
+        modes.append(Mode(k, freq, vectors[:, k].reshape(count, 3),
+                          intensity=dipoles.get(k),
+                          intensity_unit=INTENSITY_DEBYE,
+                          symmetry=_clean_symmetry(syms[k])))
+    return modes
+
+
+def _floats(tokens):
+    """The tokens as floats, or None if any of them is not a number."""
+    out = []
+    for t in tokens:
+        try:
+            out.append(float(t))
+        except ValueError:
+            return None
+    return out
+
+
+def _clean_symmetry(raw):
+    """'1 A1' -> 'A1'. The leading number is the mode's index WITHIN its
+    irreducible representation, not the symbol, and the card wants the
+    symbol."""
+    if not raw:
+        return None
+    parts = str(raw).split()
+    return parts[-1] if parts else None
+
+
+_MOPAC_DIPOLE = re.compile(r"^\s*TRANSITION DIPOLE\s+(-?\d+\.\d+)")
+_MOPAC_VIBRATION = re.compile(r"^\s*VIBRATION\s+(\d+)")
+
+
+def _parse_mopac_transition_dipoles(lines):
+    # type: (list) -> dict
+    """Mode index -> transition dipole, from DESCRIPTION OF VIBRATIONS.
+
+    Zero-based to match `Mode.index`, where MOPAC numbers from one. Absent for
+    a job that did not print the block, and that is not an error: the modes are
+    perfectly usable and anything sorting by intensity already copes with None
+    (round 31).
+    """
+    out = {}
+    current = None
+    for line in lines:
+        m = _MOPAC_VIBRATION.match(line)
+        if m:
+            current = int(m.group(1)) - 1
+            continue
+        if current is None:
+            continue
+        m = _MOPAC_DIPOLE.match(line)
+        if m:
+            out[current] = float(m.group(1))
+            current = None
+    return out
 
 
 _IR_HEADER = "IR SPECTRUM"

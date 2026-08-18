@@ -51,6 +51,7 @@ import numpy as np
 # bundled add-on already imports absolutely; this file followed `core/` and
 # `ui/`'s convention instead of `addons/`'s.
 from molom.core import forcefield
+from molom.core import io as io_mod
 
 ADDON = {
     "id": "mopac_optimize",
@@ -261,6 +262,99 @@ def read_heat_of_formation(text):
 
 
 # ------------------------------------------------------------------- run it
+def run_deck(symbols, coords, keywords, fixed=None, executable=None,
+             timeout=DEFAULT_TIMEOUT_S, workdir=None, title="MoloM"):
+    """Run one MOPAC job and return `(out_path, text, folder)`.
+
+    Split out so an optimisation and a FORCE run share exactly one invocation
+    path - the input writing, the timeout, the "did it produce an output at
+    all" check and the error wording are things that must not drift between
+    two calculation types. The caller owns `folder` when it passed `workdir`.
+    """
+    exe = executable or find_mopac()
+    if not exe:
+        raise MopacNotFound(
+            "MOPAC was not found. Install it (conda install -c conda-forge "
+            "mopac, or the installer from github.com/openmopac/mopac) or set "
+            "the path in Preferences > Add-ons.")
+    deck = build_input(symbols, coords, keywords, fixed=fixed, title=title)
+    folder = workdir or tempfile.mkdtemp(prefix="molom_mopac_")
+    stem = os.path.join(folder, "job")
+    with open(stem + ".mop", "w", encoding="ascii", errors="replace") as fh:
+        fh.write(deck)
+    try:
+        proc = subprocess.run([exe, stem + ".mop"], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=timeout,
+                              cwd=folder, **io_mod.quiet_subprocess_kwargs())
+    except subprocess.TimeoutExpired:
+        raise forcefield.ForceFieldError(
+            "MOPAC did not finish within {:.0f} s.".format(timeout))
+    except OSError as e:
+        raise forcefield.ForceFieldError(
+            "could not run MOPAC at {}: {}".format(exe, e))
+    out_path = stem + ".out"
+    if not os.path.isfile(out_path):
+        tail = (proc.stderr or proc.stdout or b"").decode(
+            "utf-8", "replace").strip()
+        raise forcefield.ForceFieldError(
+            "MOPAC wrote no output file{}".format(
+                ": " + tail[:200] if tail else ""))
+    text = open(out_path, encoding="utf-8", errors="replace").read()
+    return out_path, text, folder
+
+
+def run_frequencies(symbols, coords, fixed=None, hamiltonian="PM7", charge=0,
+                    multiplicity=1, optimise_first=True, executable=None,
+                    timeout=DEFAULT_TIMEOUT_S):
+    """A FORCE job. Returns `(symbols, coords, modes, info)`.
+
+    **It optimises first by default, and that is chemistry rather than
+    convenience.** `FORCE` computes the Hessian AT THE GEOMETRY IT IS GIVEN,
+    and a Hessian at a point that is not stationary has imaginary frequencies
+    that mean nothing - they are an artefact of the gradient, not a transition
+    state. MOPAC's own shipped example is a FORCE run "of a relaxed water
+    molecule" for exactly this reason. Pass `optimise_first=False` when the
+    geometry is already a stationary point and you want the Hessian there,
+    which is also how you would look at a real transition state.
+
+    The modes come back parsed by `core.vibrations`, so everything the
+    ∿ page already does with an ORCA job works on these unchanged.
+    """
+    from molom.core import vibrations as vib
+
+    symbols = list(symbols)
+    xyz = np.asarray(coords, dtype=float).reshape(-1, 3)
+    notes = []
+    folder = tempfile.mkdtemp(prefix="molom_mopac_")
+    try:
+        if optimise_first:
+            xyz, opt_info = run_mopac(symbols, xyz, fixed=fixed,
+                                      hamiltonian=hamiltonian, charge=charge,
+                                      multiplicity=multiplicity,
+                                      executable=executable, timeout=timeout)
+            notes += list(opt_info.get("notes", []))
+        keywords = build_keywords(hamiltonian, charge, multiplicity,
+                                  extra="FORCE")
+        _path, text, _folder = run_deck(symbols, xyz, keywords, fixed=fixed,
+                                        executable=executable,
+                                        timeout=timeout, workdir=folder)
+        modes = vib.parse_mopac_frequencies(text, n_atoms=len(symbols))
+        imaginary = [m for m in modes if m.is_imaginary]
+        if imaginary:
+            # Reported, never hidden: an imaginary mode after an optimisation
+            # says the structure is a saddle point, which is a fact about the
+            # molecule and often the most interesting thing in the output.
+            notes.append("{} imaginary mode(s) - this is a saddle point, not "
+                         "a minimum".format(len(imaginary)))
+        heat = read_heat_of_formation(text)
+        info = {"engine": "mopac", "method": hamiltonian,
+                "energy": heat if heat is not None else 0.0,
+                "converged": True, "notes": notes}
+        return symbols, xyz, modes, info
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 def run_mopac(symbols, coords, bonds=None, steps=None, fixed=None,
               hamiltonian="PM7", charge=0, multiplicity=1, extra="",
               executable=None, timeout=DEFAULT_TIMEOUT_S, workdir=None):
@@ -292,7 +386,8 @@ def run_mopac(symbols, coords, bonds=None, steps=None, fixed=None,
             proc = subprocess.run([exe, stem + ".mop"],
                                   stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, timeout=timeout,
-                                  cwd=folder)
+                                  cwd=folder,
+                                  **io_mod.quiet_subprocess_kwargs())
         except subprocess.TimeoutExpired:
             raise forcefield.ForceFieldError(
                 "MOPAC did not finish within {:.0f} s.".format(timeout))
@@ -381,6 +476,103 @@ def _make(hamiltonian, window):
     return optimise
 
 
+FREQ_OP_ID = "mopac_frequencies"
+
+
+def _run_frequencies_op(window):
+    """F3: optimise the active molecule and compute its normal modes.
+
+    Off the GUI thread, for the same reason `OptimizeWorker` exists: a FORCE
+    calculation is a Hessian, which on anything past a few dozen atoms is
+    minutes rather than seconds, and a frozen window looks like a crash.
+    """
+    from PySide6.QtCore import QThread, Signal
+
+    obj = window._active_obj()
+    if obj is None:
+        window.statusBar().showMessage("Select a molecule first", 4000)
+        return
+    s = obj.structure
+    if s.n_atoms < 2:
+        window.statusBar().showMessage("Nothing to vibrate", 4000)
+        return
+
+    class _FreqWorker(QThread):
+        done = Signal(object, object)          # (modes, info) or (None, error)
+
+        def __init__(self, args, parent=None):
+            super().__init__(parent)
+            self._args = args
+
+        def run(self):
+            symbols, coords, charge, spin = self._args
+            try:
+                _sym, _xyz, modes, info = run_frequencies(
+                    symbols, coords, charge=charge, multiplicity=spin)
+            except Exception as e:
+                self.done.emit(None, "{}: {}".format(type(e).__name__, e))
+                return
+            self.done.emit(modes, info)
+
+    obj_id = obj.id
+    running = getattr(window, "_mopac_freq_jobs", None) or {}
+    if obj_id in running:
+        window.statusBar().showMessage(
+            "{} already has a frequency job running".format(obj.name), 5000)
+        return
+    charge, spin = _active_charge_and_spin(window)
+    worker = _FreqWorker((list(s.symbols), s.coords.copy(), charge, spin),
+                         window)
+
+    def finished(modes, info):
+        if modes is None:
+            window.statusBar().showMessage("MOPAC: {}".format(info), 10000)
+            return
+        # Straight into the machinery the ORCA path already uses - the modes
+        # are `vibrations.Mode`, so the page, the baked animation and the
+        # selection ranking need to know nothing about where they came from.
+        # `set_modes` also registers them as an ATTACHMENT, which is what puts
+        # the molecule under overwrite protection and gets them marked
+        # unphysical if it is edited afterwards.
+        obj = window.scene.get(obj_id)
+        if obj is None:
+            return
+        window.set_modes(obj, modes, detail="{} modes, MOPAC {}".format(
+            len(modes), info.get("method", "PM7")))
+        window.properties.setVisible(True)
+        window.properties.show_page("vibrations")
+        window._sync_vibration_page()
+        real = [m for m in modes if not m.is_trivial]
+        window.statusBar().showMessage(
+            "MOPAC {}: {} modes ({} vibrational){} - pick one in the "
+            "∿ page".format(
+                info.get("method", "PM7"), len(modes), len(real),
+                "; " + "; ".join(info["notes"]) if info.get("notes") else ""),
+            12000)
+
+    worker.done.connect(finished)
+    # Held on the window PER MOLECULE, not in a single slot. One attribute
+    # meant starting a second job dropped the only Python reference to the
+    # first, so its QThread could be collected mid-run - the classic way a
+    # QThread dies silently, and exactly what Christian asked about ("could it
+    # lead to issues if multiple mols are selected and calcs started
+    # simultaneously?"). Each job also gets its own scratch directory, so two
+    # running at once cannot read each other's output.
+    jobs = getattr(window, "_mopac_freq_jobs", None)
+    if jobs is None:
+        jobs = {}
+        window._mopac_freq_jobs = jobs
+    jobs[obj_id] = worker
+    worker.finished.connect(lambda: jobs.pop(obj_id, None))
+    # Tell the window, so the ∿ page can show a busy bar for THIS molecule.
+    if hasattr(window, "freq_job_started"):
+        window.freq_job_started(obj_id, "MOPAC PM7")
+        worker.finished.connect(lambda: window.freq_job_finished(obj_id))
+    window.statusBar().showMessage(
+        "MOPAC: optimising, then computing the Hessian...", 0)
+    worker.start()
+
+
 def register(window):
     """Add the Hamiltonians to the Optimize panel's Method list.
 
@@ -396,6 +588,17 @@ def register(window):
     panel = getattr(window, "optimize_panel", None)
     if panel is not None and hasattr(panel, "refresh_methods"):
         panel.refresh_methods()
+    if hasattr(window, "register_frequency_provider"):
+        window.register_frequency_provider(
+            "MOPAC PM7", lambda w: _run_frequencies_op(w))
+    ops = getattr(window, "ops", None)
+    if ops is not None and ops.get(FREQ_OP_ID) is None:
+        ops.register(
+            FREQ_OP_ID, "MOPAC: vibrational frequencies (FORCE)",
+            lambda: _run_frequencies_op(window),
+            enabled=lambda ctx: window._active_obj() is not None,
+            category="Compute",
+            aliases=("normal modes", "ir spectrum", "hessian", "vibrations"))
 
 
 def unregister(window):
@@ -404,3 +607,8 @@ def unregister(window):
     panel = getattr(window, "optimize_panel", None)
     if panel is not None and hasattr(panel, "refresh_methods"):
         panel.refresh_methods()
+    if hasattr(window, "unregister_frequency_provider"):
+        window.unregister_frequency_provider("MOPAC PM7")
+    ops = getattr(window, "ops", None)
+    if ops is not None:
+        ops.unregister(FREQ_OP_ID)

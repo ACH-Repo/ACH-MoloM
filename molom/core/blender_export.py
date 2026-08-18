@@ -1257,11 +1257,14 @@ def write_blend(exe, script_path, blend_path, timeout=600):
     script behind.
     """
     import subprocess
+
+    from . import io as _io
     exe = _real_executable(exe)
     if not exe:
         return False, "No Blender executable"
     try:
         proc = subprocess.run(blend_command(exe, script_path, blend_path),
+                              **_io.quiet_subprocess_kwargs(),
                               stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as e:

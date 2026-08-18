@@ -25,6 +25,8 @@ that stutters once per cycle and is invisible in any single frame.
 import os
 import shutil
 import subprocess
+
+from . import io as _io
 from typing import List, Optional, Tuple
 
 #: Output formats, best-supported first.
@@ -265,7 +267,8 @@ def encode(pattern, out_path, fps, fmt=FORMAT_MP4, quality=18, timeout=1800,
         proc = subprocess.run(encode_command(exe, pattern, out_path, fps, fmt,
                                              quality),
                               stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT, timeout=timeout)
+                              stderr=subprocess.STDOUT, timeout=timeout,
+                              **_io.quiet_subprocess_kwargs())
     except (OSError, subprocess.SubprocessError) as e:
         return False, str(e)
     out = (proc.stdout or b"").decode("utf-8", "replace")

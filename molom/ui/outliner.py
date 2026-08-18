@@ -16,15 +16,17 @@ and looking costs nothing.
 from typing import Optional
 
 from PySide6.QtCore import QEvent, QPoint, QSize, Qt, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QPalette
+from PySide6.QtGui import QAction, QBrush, QColor, QPalette, QPen
 from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox,
                                QHBoxLayout, QHeaderView, QInputDialog,
                                QLabel, QMenu, QStyledItemDelegate,
                                QFrame, QToolButton, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
+from ..core import attachments as attach_mod
 from ..core import elements
 from ..core import style as style_mod
+from .widgets import FlowLayout
 
 _STYLE_CHOICES = [("", "(app style)")] + [(s.key, s.label)
                                           for s in style_mod.STYLES]
@@ -50,6 +52,7 @@ ROLE_KIND = Qt.UserRole          # "object" | "element" | "atom" | "add"
 ROLE_OBJ = Qt.UserRole + 1
 ROLE_ATOM = Qt.UserRole + 2
 ROLE_HIDDEN = Qt.UserRole + 3    # this molecule has hidden atoms
+ROLE_UNPHYSICAL = Qt.UserRole + 4  # an attachment no longer matches it
 
 # Short codes for the label-type square
 _MODE_CODE = {"element": "El", "index": "#", "element_index": "E#",
@@ -72,14 +75,28 @@ class _Divider(QFrame):
 
 
 class _HiddenMarkDelegate(QStyledItemDelegate):
-    """Paints a hidden-atoms row in the mark colour, selected or not.
+    """Marks the two states a molecule's row has to be able to declare.
 
-    A plain `setForeground` loses to the selection highlight: Qt's style
-    draws selected text with `QPalette.HighlightedText`, so the row turns
-    white on blue and the warning vanishes exactly when you click it. Both
-    palette roles are overridden here, which is the only way that holds for
-    every style.
+    **HIDDEN ATOMS: diagonal stripes, not colour.** They used to be painted in
+    red, and Christian's objection is a good one - red is the strongest signal
+    the outliner has and hiding a few hydrogens is a routine display choice,
+    not a problem. Spending red on it leaves nothing louder for the state that
+    IS a problem. Stripes say "part of this is not being shown" without
+    claiming anything is wrong, and they read at a glance in a long list.
+
+    **UNPHYSICAL: red text.** An attachment that no longer describes the
+    structure it was computed for (modes kept across an element change) is a
+    correctness warning, and now has the loud colour to itself.
+
+    Both are ROLES rather than brushes. Setting the foreground directly works
+    until the row is selected, at which point the style paints the text in
+    `HighlightedText` and the mark disappears against the blue - so the one row
+    you are looking at is the one that stops telling you anything (round 32).
     """
+
+    #: Faint, because it is information rather than a warning.
+    STRIPE = QColor(255, 255, 255, 26)
+    STRIPE_STEP = 7
 
     def __init__(self, colour, parent=None):
         super().__init__(parent)
@@ -87,10 +104,91 @@ class _HiddenMarkDelegate(QStyledItemDelegate):
 
     def initStyleOption(self, option, index):
         super().initStyleOption(option, index)
-        if index.data(ROLE_HIDDEN):
+        if index.data(ROLE_UNPHYSICAL):
             for role in (QPalette.Text, QPalette.HighlightedText,
                          QPalette.WindowText, QPalette.ButtonText):
                 option.palette.setColor(role, self._colour)
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        if not index.data(ROLE_HIDDEN):
+            return
+        painter.save()
+        painter.setClipRect(option.rect)
+        pen = QPen(self.STRIPE)
+        pen.setWidth(2)
+        painter.setPen(pen)
+        r = option.rect
+        # 45-degree hatching over the whole cell. Drawn from -height so the
+        # leading edge is covered as well; the step is what keeps it reading
+        # as texture rather than as a fill.
+        x = r.left() - r.height()
+        while x < r.right():
+            painter.drawLine(x, r.bottom(), x + r.height(), r.top())
+            x += self.STRIPE_STEP
+        painter.restore()
+
+
+class AttachmentControls(QWidget):
+    """The tick boxes for a molecule's computed layers, and its lock.
+
+    Christian's sketch: "Additional visualisation states that are Global for an
+    entire mol (such as isosurfaces), that can also originate from an add-on
+    get put in an additional row above the expandable element rows, if present,
+    as check boxes. Allow for wrapping just in case the amount of checkboxes
+    becomes huge."
+
+    So it WRAPS (`FlowLayout`), because the count is not ours to bound - once
+    add-ons contribute these, a molecule can accumulate a dozen and a plain row
+    would push the rest off the edge of a narrow dock with no hint they were
+    there (the round-21 lesson, which is why `FlowLayout` existed already).
+
+    The LOCK sits at the front rather than the end: it governs the whole row,
+    and a control that governs the others reads wrongly when it trails them.
+    """
+
+    #: Red is now free for this - see `_HiddenMarkDelegate`.
+    STALE = "color: rgb(255,105,105);"
+
+    toggled = Signal(int, str, bool)      # obj_id, key, visible
+    lock_toggled = Signal(int, bool)      # obj_id, locked
+
+    def __init__(self, obj_id, attachments, locked, parent=None):
+        super().__init__(parent)
+        self.obj_id = int(obj_id)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        lay = FlowLayout(self, spacing=6)
+
+        self.lock = QCheckBox("Lock")
+        self.lock.setChecked(bool(locked))
+        self.lock.setToolTip(
+            "Overwrite protection. While this is ticked, edits that would "
+            "change what this molecule IS - an element, a bond, deleting an "
+            "atom - are refused, because the layers below were computed for "
+            "the structure as it stands.\n\nUntick to edit anyway.")
+        self.lock.toggled.connect(
+            lambda on: self.lock_toggled.emit(self.obj_id, bool(on)))
+        lay.addWidget(self.lock)
+
+        for key, att in sorted(attachments.items()):
+            # A layer that cannot be switched off gets a LABEL, not a dead
+            # tick box - see `Attachment.toggleable`.
+            box = QCheckBox(att.label) if att.toggleable else QLabel(att.label)
+            if att.toggleable:
+                box.setChecked(bool(att.visible))
+            bits = [att.detail] if att.detail else []
+            if att.source:
+                bits.append("from the {} add-on".format(att.source))
+            if att.stale:
+                box.setStyleSheet(self.STALE)
+                bits.append("NO LONGER PHYSICAL - computed before this "
+                            "molecule was edited")
+            box.setToolTip("\n".join(bits) if bits else att.label)
+            if att.toggleable:
+                box.toggled.connect(
+                    lambda on, k=key: self.toggled.emit(self.obj_id, k,
+                                                        bool(on)))
+            lay.addWidget(box)
 
 
 class CrystalControls(QWidget):
@@ -472,6 +570,9 @@ class OutlinerPanel(QWidget):
     crystal_box_toggled = Signal(int, bool)
     crystal_poly_toggled = Signal(int, bool)
     crystal_exterior_toggled = Signal(int, bool)
+    attachment_toggled = Signal(int, str, bool)   # obj_id, key, visible
+    attachment_lock_toggled = Signal(int, bool)   # obj_id, locked
+    comment_requested = Signal(int)               # obj_id
     crystal_advanced = Signal(int)           # open the unit-cell page
     objects_selected = Signal(list)          # every molecule row selected
 
@@ -572,6 +673,7 @@ class OutlinerPanel(QWidget):
                 lambda _i, oid=obj.id, c=combo:
                 self.style_changed.emit(oid, c.currentData()))
             self.tree.setItemWidget(item, 2, combo)
+            self._add_attachment_row(item, obj)
             self._add_crystal_row(item, obj)
             self._add_element_groups(item, obj)
             if obj.id == active_id:
@@ -646,10 +748,43 @@ class OutlinerPanel(QWidget):
         role and overrides both palette entries instead.
         """
         item.setData(0, ROLE_HIDDEN, True if obj.has_hidden else None)
-        item.setToolTip(0, "{} of {} atoms hidden — tick the eye off and "
-                           "on, or Alt+H, to bring them back".format(
-                               len(obj.atom_hidden), obj.structure.n_atoms)
-                        if obj.has_hidden else "")
+        # UNPHYSICAL is a separate mark from HIDDEN and they can both be on:
+        # hiding is a display choice (stripes), a stale attachment is a
+        # correctness warning (red). Round 32's reason for using a role rather
+        # than a brush applies to both - see `_HiddenMarkDelegate`.
+        stale = attach_mod.describe_stale(obj)
+        item.setData(0, ROLE_UNPHYSICAL, True if stale else None)
+        tips = []
+        if obj.has_hidden:
+            tips.append("{} of {} atoms hidden — tick the eye off and on, or "
+                        "Alt+H, to bring them back".format(
+                            len(obj.atom_hidden), obj.structure.n_atoms))
+        if stale:
+            tips.append(stale)
+        item.setToolTip(0, "\n".join(tips))
+
+    def _add_attachment_row(self, parent_item, obj):
+        """The computed-layer tick boxes, ABOVE the element groups.
+
+        Nothing is added for a molecule that has none, which is most of them -
+        Christian: "Only add overwrite protections to outliner objects that
+        actually require them." A lock on an object with nothing to lose is
+        noise, and noise is what teaches people to click through warnings.
+        """
+        table = attach_mod.attachments_of(obj)
+        if not table:
+            return
+        row = QTreeWidgetItem(["", "", ""])
+        row.setData(0, ROLE_KIND, "attachments")
+        row.setData(0, ROLE_OBJ, obj.id)
+        row.setFlags(Qt.ItemIsEnabled)
+        parent_item.addChild(row)
+        controls = AttachmentControls(obj.id, table,
+                                      attach_mod.is_locked(obj))
+        controls.toggled.connect(self.attachment_toggled)
+        controls.lock_toggled.connect(self.attachment_lock_toggled)
+        row.setFirstColumnSpanned(True)
+        self.tree.setItemWidget(row, 0, controls)
 
     def _add_crystal_row(self, parent_item, obj):
         """A crystal gets one extra child row carrying its own switches.
@@ -886,6 +1021,8 @@ class OutlinerPanel(QWidget):
                  lambda: item.setCheckState(
                      1, Qt.Unchecked if item.checkState(1) == Qt.Checked
                      else Qt.Checked)),
+                ("Edit comment...",
+                 lambda: self.comment_requested.emit(obj_id)),
                 ("Delete", lambda: self.delete_requested.emit(obj_id))):
             act = QAction(text, menu)
             act.triggered.connect(slot)

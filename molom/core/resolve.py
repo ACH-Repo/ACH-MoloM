@@ -260,6 +260,13 @@ def resolve(query, allow_network=True, get=None, cache=None):
     return res
 
 
+#: Group 1 and 2. A LONE cation of these is a counter-ion to be stripped;
+#: any other metal means the structure is a coordination compound and the
+#: metal is the point of it. See `_finish`.
+_COUNTER_ION_SYMBOLS = {"Li", "Na", "K", "Rb", "Cs", "Fr",
+                        "Be", "Mg", "Ca", "Sr", "Ba", "Ra"}
+
+
 def _finish(res, raw):
     clean, formula, charge, n = sanitize(raw)
     if clean is None:
@@ -269,7 +276,49 @@ def _finish(res, raw):
     res.formula, res.charge = formula, charge
     if n > 1:
         res.fragments = fragments_of(raw)
-        res.note = "stripped {} extra fragment(s) (salt/solvent); kept the largest".format(n - 1)
+        # A COORDINATION COMPOUND IS NOT A SALT, and salt-stripping destroys
+        # it. "Ferrocene" resolves correctly to
+        # `[CH-]1C=CC=C1.[CH-]1C=CC=C1.[Fe+2]`, and keeping only the largest
+        # fragment by heavy-atom count throws away the iron (1 heavy atom)
+        # and one ring, leaving a bare cyclopentadienide - which is exactly
+        # what Christian got. The rule is right for sodium acetate and wrong
+        # for every metal complex, and `fragments_of` already records which
+        # fragments carry a metal, so the information to tell them apart was
+        # there all along.
+        #
+        # SMILES cannot express hapticity, so there is no single fragment that
+        # IS ferrocene and nothing here can build one. What it can do is
+        # refuse to silently discard the metal: all the pieces are kept and
+        # the note says what arrived, so the user can assemble them (which is
+        # what meta atoms and the ligand templates are for).
+        # A LONE GROUP 1/2 CATION IS A COUNTER-ION; ANY OTHER METAL IS THE
+        # COMPOUND. That is the line between a salt and a coordination
+        # compound, and it is the one a chemist would draw: sodium acetate is
+        # acetate with a sodium sitting next to it, ferrocene is not two rings
+        # with an iron sitting next to them.
+        #
+        # It also gets the mixed case right, which the old rule could not:
+        # disodium tetrachloridopalladate loses its two sodiums and keeps the
+        # [PdCl4]2- intact.
+        kept = [f for f in res.fragments
+                if not (f.get("n_heavy") == 1
+                        and (f.get("formula") or "").rstrip("+-0123456789")
+                        in _COUNTER_ION_SYMBOLS)]
+        complexed = [f for f in kept if f.get("has_metal")]
+        if complexed and len(kept) > 1:
+            res.smiles = ".".join(f["smiles"] for f in kept)
+            res.note = (
+                "a metal complex, kept whole: {} fragment(s) including {}. "
+                "SMILES cannot express metal-ligand bonding, so these arrive "
+                "as separate pieces to be assembled{}".format(
+                    len(kept),
+                    ", ".join(sorted({f["formula"] for f in complexed})),
+                    "; {} counter-ion(s) stripped".format(
+                        len(res.fragments) - len(kept))
+                    if len(kept) != len(res.fragments) else ""))
+        else:
+            res.note = ("stripped {} extra fragment(s) (salt/solvent); kept "
+                        "the largest".format(n - 1))
     return res
 
 
