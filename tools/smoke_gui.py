@@ -236,7 +236,7 @@ def main(paths):
         win.on_animate_mode(modes[-1].index, amplitude=0.8)
         win.viewport.set_selection([(obj.id, i) for i in range(3)])
         for k in range(4):
-            win.timeline.advance_images(3)
+            win.timeline.advance_frames(3)
             win._apply_timeline()
             app.processEvents()
             grab("97_vibration_{}".format(k))

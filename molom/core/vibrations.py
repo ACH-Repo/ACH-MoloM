@@ -437,7 +437,13 @@ def _parse_normal_modes(lines, n_modes):
     return matrix if seen_any else None
 
 
-DEFAULT_PERIOD_FRAMES = 20      # a multiple of 4 — see period_frames()
+#: A multiple of 4 (see `period_frames`) AND of the player's default
+#: strip length (`timeline.DEFAULT_STRIP_FRAMES`), so a freshly baked
+#: mode plays one whole period per second at 60 fps with every drawn
+#: frame a REAL sample of the sine rather than a chord between two.
+#: Round 77 raised it from 20, which relied on the player's global
+#: smoothing to look continuous - and that knob no longer exists.
+DEFAULT_PERIOD_FRAMES = 60
 
 
 def period_frames(n):
@@ -471,8 +477,9 @@ def mode_frames(coords, mode, amplitude=0.6, n_frames=DEFAULT_PERIOD_FRAMES):
     joins seamlessly and the timeline can simply set the track to LOOP.
 
     `n_frames` is snapped by `period_frames` so both turning points are
-    sampled exactly; the player's own smoothing then subdivides between these
-    frames, which is why a fairly small count still looks continuous.
+    sampled exactly. It is the number of frames GENERATED - what the player
+    then does with them is the strip's own frame count, and the two defaults
+    are equal so that out of the box no frame is interpolated at all.
     """
     base = np.asarray(coords, dtype=float).reshape(-1, 3)
     vector = np.asarray(mode.displacements, dtype=float).reshape(-1, 3)

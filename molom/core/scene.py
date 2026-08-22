@@ -6,7 +6,7 @@ per-object style override, unique Blender-style names ("water", "water.001").
 Atom identity anywhere above this layer is a (obj_id, atom_index) pair.
 """
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -66,6 +66,84 @@ class MolObject:
         # written back into `structure.frames`.
         self.play_position = None    # type: Optional[float]
         self.play_rigid = True
+        #: Do these frames close on themselves (a baked normal mode)? Set by
+        #: the clock each tick from the strip, so the interpolation across the
+        #: wrap blends the last sample into the first instead of freezing on
+        #: it. Display-only, like the two above - never snapshotted.
+        self.play_cyclic = False
+
+    # ------------------------------------------------------ renumbering
+    #: Every per-atom map on this object. They are all keyed by atom INDEX and
+    #: are all sparse, so a delete leaves each of them perfectly valid and
+    #: quietly describing different atoms - which is why they are enumerated
+    #: once here rather than remembered at each call site (round 80). Anything
+    #: added beside them belongs in this tuple; a test asserts as much.
+    ATOM_MAPS = ("atom_colors", "atom_labels", "atom_label_text",
+                 "atom_label_colors", "atom_label_modes", "atom_hidden",
+                 "atom_scales")
+
+    def remap_atoms(self, old_to_new):
+        # type: (dict) -> None
+        """Reindex the display maps after the atoms were renumbered.
+
+        `old_to_new` is `edits.delete_atoms`'s report: survivors only, so an
+        entry whose atom is gone is dropped rather than carried onto whatever
+        inherited its index.
+        """
+        for name in self.ATOM_MAPS:
+            current = getattr(self, name)
+            if not current:
+                continue
+            if isinstance(current, set):
+                setattr(self, name, {old_to_new[i] for i in current
+                                     if i in old_to_new})
+            else:
+                setattr(self, name, {old_to_new[int(k)]: v
+                                     for k, v in current.items()
+                                     if int(k) in old_to_new})
+
+    def delete_atoms(self, indices, with_hydrogens=False):
+        # type: (Sequence[int], bool) -> dict
+        """Delete atoms AND keep this object's own per-atom maps in step.
+
+        The paired call to `edits.delete_atoms`: that one can only reach what
+        is on the structure, and a molecule's colours, labels, hidden atoms
+        and sphere sizes are not. Delete through here whenever there is an
+        object to hand.
+        """
+        from . import edits
+        report = {}
+        edits.delete_atoms(self.structure, indices,
+                           with_hydrogens=with_hydrogens, report=report)
+        self.remap_atoms(report.get("remap") or {})
+        return report
+
+    def adjust_hydrogens(self, indices, **kw):
+        # type: (Sequence[int], object) -> tuple
+        """Re-dress hydrogens, keeping the display maps in step.
+
+        Adding a hydrogen appends and disturbs nothing; REMOVING one - which
+        is what happens on C -> O, or when a bond order goes up - renumbers
+        every atom above it, so a colour or a hidden flag would slide onto a
+        different atom exactly as a delete does.
+        """
+        from . import edits
+        report = {}
+        result = edits.adjust_hydrogens(self.structure, indices,
+                                        report=report, **kw)
+        self.remap_atoms(report.get("remap") or {})
+        return result
+
+    def set_element_adjusted(self, indices, symbol, **kw):
+        # type: (Sequence[int], str, object) -> tuple
+        """Change element(s) and re-dress their hydrogens, keeping the
+        display maps in step - see `adjust_hydrogens`."""
+        from . import edits
+        report = {}
+        result = edits.set_element_adjusted(self.structure, indices, symbol,
+                                            report=report, **kw)
+        self.remap_atoms(report.get("remap") or {})
+        return result
 
     def atom_scale_for(self, index):
         # type: (int) -> float
@@ -188,7 +266,8 @@ class MolObject:
             return s.coords
         from . import interpolate
         return interpolate.coords_at(s.frames, self.play_position,
-                                     rigid=self.play_rigid)
+                                     rigid=self.play_rigid,
+                                     cyclic=self.play_cyclic)
 
     def evaluated(self):
         # type: () -> tuple

@@ -22,6 +22,7 @@ most of what can go wrong — an off-by-one at a loop boundary produces a video
 that stutters once per cycle and is invisible in any single frame.
 """
 
+import math
 import os
 import shutil
 import subprocess
@@ -50,27 +51,31 @@ class ExportError(RuntimeError):
 
 def frame_times(clock, loops=1.0, whole_scene=False):
     # type: (object, float, bool) -> List[float]
-    """The scene TIMES to render, in order.
+    """The scene FRAMES to render, in order.
 
     Taken from the clock's own looping interval, so what you export is what
-    the transport bar plays — the alternative (an independent range on the
+    the transport bar plays - the alternative (an independent range on the
     export dialog) is two sources of truth for the same thing.
 
-    The last image of a loop is dropped when there is more than one, because
-    it is the same picture as the first of the next: a cycle of n distinct
-    images played back to back must not show frame 0 twice, which reads as a
-    hitch once per revolution and is invisible in any single frame.
+    The interval is INCLUSIVE (round 77): Frame Start 0 / Frame End 59 is
+    sixty frames, and frame 60 is frame 0 again. So a loop no longer has a
+    last image to drop - the drop moved to where it belongs, which is the
+    frame range itself and each strip's own length. Playing two loops back to
+    back therefore repeats the plan exactly, with no picture shown twice in a
+    row and no hitch once per revolution.
     """
     start = 0.0 if whole_scene else float(clock.play_start)
     end = float(clock.duration) if whole_scene else float(clock.play_end)
-    smoothing = max(int(getattr(clock, "smoothing", 1)), 1)
-    per_loop = max(int(round((end - start) * smoothing)), 0)
+    per_loop = int(round(end - start)) + 1
     loops = max(float(loops), 0.0)
-    if per_loop <= 0:
+    if per_loop <= 1:
         return [start] if loops > 0 else []
-    total = int(round(per_loop * loops))
-    step = 1.0 / float(smoothing)
-    return [start + (k % per_loop) * step for k in range(total)]
+    # Half-way cases round UP explicitly. Python's `round` is banker's,
+    # so half of a five-frame loop would come out as two frames while
+    # half of a seven-frame one came out as four - the same trap
+    # `vibrations.period_frames` documents.
+    total = int(math.floor(per_loop * loops + 0.5))
+    return [start + float(k % per_loop) for k in range(total)]
 
 
 def even(value):
@@ -85,7 +90,7 @@ def sequence_path(directory, base, index, digits=4, suffix=".png"):
                                               int(digits), suffix))
 
 
-def plan(path, fmt, n_images):
+def plan(path, fmt, n_frames):
     # type: (str, str, int) -> dict
     """Where the output goes, and how many digits the numbering needs.
 
@@ -98,7 +103,7 @@ def plan(path, fmt, n_images):
         raise ExportError("unknown format: {!r}".format(fmt))
     root, _ext = os.path.splitext(path)
     base = os.path.basename(root) or "molom"
-    digits = max(4, len(str(max(int(n_images) - 1, 0))))
+    digits = max(4, len(str(max(int(n_frames) - 1, 0))))
     if fmt == FORMAT_PNG:
         return {"format": fmt, "directory": root, "base": base,
                 "digits": digits, "path": root}
@@ -280,11 +285,11 @@ def encode(pattern, out_path, fps, fmt=FORMAT_MP4, quality=18, timeout=1800,
     return True, out
 
 
-def summarise(n_images, fps, fmt):
+def summarise(n_frames, fps, fmt):
     # type: (int, float, str) -> str
-    seconds = float(n_images) / max(float(fps), 1e-6)
+    seconds = float(n_frames) / max(float(fps), 1e-6)
     return "{} image(s) at {:g} fps — {:.1f} s of {}".format(
-        n_images, fps, seconds, str(fmt).upper())
+        n_frames, fps, seconds, str(fmt).upper())
 
 
 def next_free(path, enabled=True, limit=9999):

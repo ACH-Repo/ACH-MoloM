@@ -1,15 +1,15 @@
-"""Round 30: frames vs images vs seconds, loop limits, and the ∿ page.
+"""Round 30: loop limits, sampling the extremes, and the ∿ page.
 
 Christian's playback spec (2026-08-03) separated three things the player had
-muddled into one number:
+muddled into one number - frames, images and seconds - and round 77 then
+collapsed two of them back together on purpose: an IMAGE and a scene FRAME
+are now the same thing, `fps` is scene frames per second, and the
+subdivision that used to be global (`smoothing`) is each strip's own frame
+count. See `tests/test_round77_player.py` for that half.
 
-  * FRAMES come from the input file and vary with the data;
-  * IMAGES are what the player draws — `smoothing` per frame interval;
-  * `fps` is IMAGES per second, and is global.
-
-Plus: normal modes have no inherent frames, so the generated sampling must
-always land on the extremes of the oscillation, and the count must be
-settable per imported FREQ object — on a page that can actually be opened.
+What is round 30's and still stands is here: the looping interval, the rule
+that a generated mode must be sampled on its extremes, and the ∿ page being
+reachable at all.
 """
 
 import os
@@ -36,95 +36,37 @@ def _traj(name, n, axis=0, step=0.5):
     return s
 
 
-# --------------------------------------------------------- images vs frames
-def test_smoothing_is_a_count_not_a_switch():
-    """The old `Smooth` tick box could say whether to interpolate but not
-    how much, which is the whole complaint."""
-    tl = timeline.Timeline(smoothing=10)
-    assert tl.smoothing == 10
-    assert tl.step == pytest.approx(0.1)
-    tl.smoothing = 1
-    assert tl.step == pytest.approx(1.0)
-    assert tl.smoothing >= 1            # never zero, never negative
-    tl.smoothing = 0
-    assert tl.smoothing == 1
-
-
-def test_interpolate_still_reads_as_a_boolean():
-    """Existing callers ask 'are we interpolating?' — that is just
-    'is the subdivision greater than one?'."""
-    tl = timeline.Timeline(smoothing=8)
-    assert tl.interpolate
-    tl.interpolate = False
-    assert tl.smoothing == 1 and not tl.interpolate
-    tl.interpolate = True
-    assert tl.smoothing == 8            # the count it had is remembered
-
-
-def test_one_image_per_tick_at_the_chosen_framerate():
-    """30 fps with 10 images per frame = 3 source frames a second."""
-    tl = timeline.Timeline(fps=30.0, smoothing=10)
-    tl.set_track(1, 101)
+# ------------------------------------------------------- one tick, one frame
+def test_one_frame_per_tick_at_the_chosen_framerate():
+    """Round 30's claim, in round 77's units: the timer runs at `fps` and
+    each tick is exactly one picture. There is no second factor."""
+    tl = timeline.Timeline(fps=30.0)
+    tl.set_track(1, 101, frames=101)
     for _ in range(30):
-        tl.advance_images(1)
-    assert tl.time == pytest.approx(3.0)
+        tl.advance_frames(1)
+    assert tl.time == pytest.approx(30.0)
+    assert tl.time / tl.fps == pytest.approx(1.0)
 
 
-def test_more_smoothing_at_a_fixed_framerate_plays_slower():
-    """The consequence of `fps` meaning IMAGES per second, and worth pinning
-    because it is the one thing about the two knobs that can surprise: twice
-    as many images in the same second is half the trajectory per second —
-    smoother AND slower, exactly like shooting video at 60 fps and playing it
-    back at 30. Raise the framerate too if you want the original speed."""
-    slow = timeline.Timeline(fps=30.0, smoothing=10)
-    fine = timeline.Timeline(fps=30.0, smoothing=20)
-    for tl in (slow, fine):
-        tl.set_track(1, 101)
-        tl.advance(1.0)                 # one second of wall clock
-    assert slow.time == pytest.approx(3.0)
-    assert fine.time == pytest.approx(1.5)
-    # ...and both drew the same number of IMAGES in that second.
-    assert slow.image_of(slow.time) == fine.image_of(fine.time) == 30
-
-    matched = timeline.Timeline(fps=60.0, smoothing=20)
-    matched.set_track(1, 101)
-    matched.advance(1.0)
-    assert matched.time == pytest.approx(slow.time)
-
-
-def test_image_counts_follow_the_subdivision():
-    tl = timeline.Timeline(smoothing=10)
-    tl.set_track(1, 5)                  # 4 frame intervals
-    assert tl.duration == pytest.approx(4.0)
-    assert tl.n_images == 41            # 40 steps, plus the first image
-    tl.smoothing = 1
-    assert tl.n_images == 5             # just the frames themselves
-
-
-def test_images_and_times_round_trip():
-    tl = timeline.Timeline(smoothing=10)
-    tl.set_track(1, 5)
-    for image in (0, 7, 25, 40):
-        assert tl.image_of(tl.time_of_image(image)) == image
-
-
-# ------------------------------------------------------------- loop limits
 def test_the_loop_runs_between_the_limits():
-    tl = timeline.Timeline(smoothing=1)
+    tl = timeline.Timeline()
     tl.end = timeline.LOOP
-    tl.set_track(1, 21)                 # 0 .. 20
+    tl.set_track(1, 21, frames=21)      # 0 .. 20
     tl.set_range(5.0, 9.0)
     tl.seek(5.0)
-    for _ in range(12):
+    for _ in range(15):
         tl.step_frames(1.0)
         assert 5.0 - 1e-9 <= tl.time <= 9.0 + 1e-9
-    assert tl.time == pytest.approx(5.0)   # 12 steps over a span of 4
+    # The interval is INCLUSIVE (round 77), so 5-9 is FIVE frames and fifteen
+    # steps land back on the start. The old exclusive wrap skipped frame 9.
+    assert tl.time == pytest.approx(5.0)
+    assert tl.n_frames == 5
 
 
 def test_seeking_outside_the_limits_parks_on_them():
     """Scrubbing must not teleport: a wrap under the cursor is unreadable."""
     tl = timeline.Timeline()
-    tl.set_track(1, 21)
+    tl.set_track(1, 21, frames=21)
     tl.set_range(5.0, 9.0)
     assert tl.seek(0.0) == pytest.approx(5.0)
     assert tl.seek(100.0) == pytest.approx(9.0)
@@ -132,7 +74,7 @@ def test_seeking_outside_the_limits_parks_on_them():
 
 def test_limits_that_cross_are_swapped_not_rejected():
     tl = timeline.Timeline()
-    tl.set_track(1, 21)
+    tl.set_track(1, 21, frames=21)
     tl.set_range(12.0, 3.0)
     assert (tl.play_start, tl.play_end) == pytest.approx((3.0, 12.0))
 
@@ -141,42 +83,23 @@ def test_an_open_end_follows_a_growing_scene():
     """range_end=None means 'to the end', so appending frames keeps them in
     the loop instead of silently cutting them off."""
     tl = timeline.Timeline()
-    tl.set_track(1, 11)
+    tl.set_track(1, 11, frames=11)
     tl.set_range(0.0, None)
     assert tl.play_end == pytest.approx(10.0)
-    tl.set_track(1, 31)
+    tl.set_track(1, 31, frames=31)
     assert tl.play_end == pytest.approx(30.0)
 
 
-def test_limits_are_stored_in_frames_so_smoothing_cannot_move_them():
-    tl = timeline.Timeline(smoothing=10)
-    tl.set_track(1, 21)
-    tl.set_range(4.0, 8.0)
-    assert tl.range_images() == (40, 80)
-    tl.smoothing = 5                    # the same moment in the trajectory
-    assert (tl.play_start, tl.play_end) == pytest.approx((4.0, 8.0))
-    assert tl.range_images() == (20, 40)
-
-
 def test_the_clock_round_trips_with_its_new_settings():
-    tl = timeline.Timeline(fps=24.0, smoothing=6)
-    tl.set_track(1, 21)
+    tl = timeline.Timeline(fps=24.0)
+    tl.set_track(1, 21, frames=21)
     tl.set_range(2.0, 8.0)
     tl.seek(5.0)
     again = timeline.Timeline.from_dict(tl.to_dict())
-    again.set_track(1, 21)
-    assert again.smoothing == 6
     assert again.fps == pytest.approx(24.0)
     assert (again.play_start, again.play_end) == pytest.approx((2.0, 8.0))
     assert again.time == pytest.approx(5.0)
-
-
-def test_an_old_savepoint_still_loads():
-    """Pre-round-30 files carry the boolean, not a count."""
-    off = timeline.Timeline.from_dict({"fps": 12.0, "interpolate": False})
-    assert off.smoothing == 1
-    on = timeline.Timeline.from_dict({"fps": 12.0, "interpolate": True})
-    assert on.smoothing > 1
+    assert again.get(1).frames == 21
 
 
 # -------------------------------------------------------- normal modes
@@ -227,14 +150,13 @@ def win():
     return w
 
 
-def test_the_bar_reads_in_images(win):
+def test_the_bar_reads_in_scene_frames(win):
     win._install_structure(_traj("t", 5))
     win._sync_traj_bar()
-    win.timeline.smoothing = 10
     win._apply_timeline()
-    assert win.traj_bar.label.text().startswith("1 / 41")
-    assert win.traj_bar.smooth_spin.value() == 10
-    assert win.traj_bar.smooth_spin.suffix() == " img"
+    # A 5-frame trajectory gets the default 60-frame strip, so the range is
+    # 0-59 and the readout counts scene frames, not a second unit.
+    assert win.traj_bar.label.text().startswith("0 / 59")
     assert win.traj_bar.fps_spin.suffix() == " fps"
 
 
@@ -242,25 +164,46 @@ def test_there_is_no_smooth_tick_box_any_more(win):
     assert not hasattr(win.traj_bar, "interp_check")
 
 
-def test_the_loop_limits_are_on_the_bar(win):
+def test_the_bar_carries_three_numbers_and_no_more(win):
+    """Christian's brief: "The global settings should only be Frame Start,
+    Frame End, Framerate." Smoothing is a strip property now, so there is
+    nowhere on the bar to set it."""
+    from PySide6.QtWidgets import QSpinBox
+    bar = win.traj_bar
+    assert not hasattr(bar, "smooth_spin")
+    assert not hasattr(bar, "smoothing_changed")
+    playback = {id(bar.start_spin), id(bar.end_spin), id(bar.fps_spin)}
+    viewing = {id(bar.view_start), id(bar.view_end)}
+    row = bar.play_btn.parent()          # the transport row itself
+    spins = {id(s) for s in row.findChildren(QSpinBox)}
+    assert spins == playback | viewing
+    # Round 78 put the View boxes on the same row (Christian asked why they
+    # were not), and they are still not a fourth playback number: they say
+    # what the PANE SHOWS and reach the clock through nothing at all.
+    assert not viewing & playback
+    win.traj_bar.view_start.setValue(1000)
+    assert (win.timeline.play_start, win.timeline.play_end) == (0.0, 0.0)
+    assert win.timeline.fps == pytest.approx(60.0)
+
+
+def test_the_frame_range_is_on_the_bar(win):
     win._install_structure(_traj("t", 5))
-    win.timeline.smoothing = 10                   # 4 frames -> 41 images
     win._sync_traj_bar()
     bar = win.traj_bar
-    assert bar.start_spin.value() == 1
-    assert bar.end_spin.value() == win.timeline.n_images == 41
-    bar.end_spin.setValue(21)                     # image 21 of 41 = frame 2
-    assert win.timeline.play_end == pytest.approx(2.0)
+    assert bar.start_spin.value() == 0
+    assert bar.end_spin.value() == 59            # inclusive, 60 frames
+    assert win.timeline.n_frames == 60
+    bar.end_spin.setValue(20)
+    assert win.timeline.play_end == pytest.approx(20.0)
     assert win.timeline.play_start == pytest.approx(0.0)
 
 
 def test_playing_stays_inside_the_limits(win):
     win._install_structure(_traj("t", 9))
-    win.timeline.smoothing = 10
     win._sync_traj_bar()
     win.timeline.end = timeline.LOOP
-    win.traj_bar.start_spin.setValue(11)          # frames 1 .. 3
-    win.traj_bar.end_spin.setValue(31)
+    win.traj_bar.start_spin.setValue(1)
+    win.traj_bar.end_spin.setValue(3)
     for _ in range(200):
         win._advance_frame()
         assert 1.0 - 1e-9 <= win.timeline.time <= 3.0 + 1e-9
@@ -270,22 +213,12 @@ def test_the_panel_does_not_push_its_own_defaults_back(win):
     """sync() writes every spin box; a programmatic write must not look like
     a user edit, or the panel overwrites the clock it is displaying."""
     win._install_structure(_traj("t", 5))
-    win.timeline.smoothing = 4
     win.timeline.fps = 17.0
+    win.timeline.set_range(2.0, 7.0)
     win._sync_traj_bar()
-    assert win.timeline.smoothing == 4
     assert win.timeline.fps == pytest.approx(17.0)
-
-
-def test_smoothing_one_snaps_to_whole_frames(win):
-    win._install_structure(_traj("t", 5))
-    obj = win.scene.objects[0]
-    win._sync_traj_bar()
-    win.traj_bar.smooth_spin.setValue(1)
-    win.timeline.seek(1.5)
-    win._apply_timeline()
-    assert obj.play_position is None
-    assert obj.display_coords()[0][0] == pytest.approx(1.0)
+    assert (win.timeline.play_start,
+            win.timeline.play_end) == pytest.approx((2.0, 7.0))
 
 
 # -------------------------------------------------- the ∿ page, reachable
@@ -324,7 +257,7 @@ def test_frames_per_period_is_settable_per_freq_object(win):
     _freq_win(win)
     obj = win._active_obj()
     win.on_animate_mode(6)
-    assert obj.structure.n_frames == 20
+    assert obj.structure.n_frames == vibrations.DEFAULT_PERIOD_FRAMES == 60
     win.vibration_page.frames_spin.setValue(40)
     assert win._mode_frames[obj.id] == 40
     _flush_rebake(win)
@@ -341,7 +274,7 @@ def test_mode_settings_belong_to_the_object_not_the_card(win):
     assert win._mode_amplitude[obj.id] == pytest.approx(0.35)
     win._sync_vibration_page()                  # a rebuild must not lose it
     assert win.vibration_page.amp_spin.value() == pytest.approx(0.35)
-    assert win.vibration_page.frames_spin.value() == 20
+    assert win.vibration_page.frames_spin.value() == 60
 
 
 def test_a_mode_plays_through_the_ordinary_scene_clock(win):
@@ -350,7 +283,10 @@ def test_a_mode_plays_through_the_ordinary_scene_clock(win):
     win.on_animate_mode(6)
     track = win.timeline.get(obj.id)
     assert track.end == timeline.LOOP
-    assert win.timeline.duration == pytest.approx(19.0)
+    assert track.cyclic                       # a period, not a run
+    # 60 samples over a 60-frame strip: one second at 60 fps, ending on 59,
+    # which is Christian's stated default (round 77).
+    assert win.timeline.duration == pytest.approx(59.0)
     assert win.traj_bar.isVisible()
 
 

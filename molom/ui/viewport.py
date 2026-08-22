@@ -2134,8 +2134,8 @@ class MolViewport(QOpenGLWidget):
                 return
             crystal = is_crystal(obj)
             rows, copies = _with_boundary_copies(obj, rows)
-            added, removed = edits.set_element_adjusted(
-                obj.structure, rows, symbol,
+            added, removed = obj.set_element_adjusted(
+                rows, symbol,
                 adjust_h=self.adjust_h and not crystal,
                 adjust_lengths=not crystal)
             # Converted atoms are DESELECTED: they are already the element
@@ -2189,8 +2189,8 @@ class MolViewport(QOpenGLWidget):
                 return
             crystal = is_crystal(obj)
             targets, _copies = _with_boundary_copies(obj, [idx])
-            added, removed = edits.set_element_adjusted(
-                obj.structure, targets, self.draw_element,
+            added, removed = obj.set_element_adjusted(
+                targets, self.draw_element,
                 adjust_h=self.adjust_h and not crystal,
                 adjust_lengths=not crystal)
             self.status_message.emit("{} -> {}{}{}".format(
@@ -2219,8 +2219,7 @@ class MolViewport(QOpenGLWidget):
                 added = meta_mod.dress_with_hydrogens(
                     obj.structure, new_idx, self.meta_template)
             elif self.adjust_h:
-                added, removed = edits.adjust_hydrogens(obj.structure,
-                                                        [new_idx])
+                added, removed = obj.adjust_hydrogens([new_idx])
             self.status_message.emit("Added {}{}".format(
                 self.draw_element, _h_note(added, removed)))
             self.set_selection([])
@@ -2248,8 +2247,8 @@ class MolViewport(QOpenGLWidget):
             edits.add_bond(obj.structure, sel[0][1], sel[1][1], order)
             note = "Bond order {}".format(order)
         if self.adjust_h:                 # free valence changed -> re-dress H
-            added, removed = edits.adjust_hydrogens(
-                obj.structure, [sel[0][1], sel[1][1]])
+            added, removed = obj.adjust_hydrogens(
+                [sel[0][1], sel[1][1]])
             note += _h_note(added, removed)
         self.status_message.emit(note)
         self.edit_committed.emit()
@@ -5622,7 +5621,7 @@ class MolViewport(QOpenGLWidget):
             heavy = s.bonded_neighbors(from_idx)
             if len(heavy) == 1:
                 anchor_idx = heavy[0]
-                edits.delete_atoms(s, [from_idx])
+                obj.delete_atoms([from_idx])
                 from_idx = anchor_idx - (1 if anchor_idx > from_idx else 0)
         start = s.coords[from_idx].copy()
         p = self._draw_plane_point(pos, start)
@@ -5734,8 +5733,7 @@ class MolViewport(QOpenGLWidget):
         # count must follow — otherwise every order edit leaves the molecule
         # needing a manual H fix before it can be optimised.
         if self.adjust_h:
-            added, removed = edits.adjust_hydrogens(obj.structure,
-                                                    [hb[1], hb[2]])
+            added, removed = obj.adjust_hydrogens([hb[1], hb[2]])
             note += _h_note(added, removed)
         self.status_message.emit(note)
         self.edit_committed.emit()
@@ -5829,12 +5827,12 @@ class MolViewport(QOpenGLWidget):
         if pos is not None:
             target = self._snap_target(pos, obj, d["index"], d["from"])
             if target is not None:
-                edits.delete_atoms(obj.structure, [d["index"]])
+                obj.delete_atoms([d["index"]])
                 src = d["from"] - (1 if d["from"] > d["index"] else 0)
                 tgt = target - (1 if target > d["index"] else 0)
                 edits.add_bond(obj.structure, src, tgt, order=1)
                 if self.adjust_h:
-                    edits.adjust_hydrogens(obj.structure, [src, tgt])
+                    obj.adjust_hydrogens([src, tgt])
                     edits.idealize_terminal_hydrogens(obj.structure, [src, tgt])
                 self.set_selection([])       # see the note in the tail below
                 self.status_message.emit("Ring closed: bonded {} to {}".format(
@@ -5847,8 +5845,8 @@ class MolViewport(QOpenGLWidget):
         if self.adjust_h:
             # The SOURCE atom is included: its coordination just changed, so
             # its hydrogen count and their positions both need revisiting.
-            added, removed = edits.adjust_hydrogens(
-                obj.structure, [d["from"], d["index"]])
+            added, removed = obj.adjust_hydrogens(
+                [d["from"], d["index"]])
             fixed = edits.idealize_terminal_hydrogens(
                 obj.structure, [d["from"], d["index"]])
         note = _h_note(added, removed)

@@ -469,7 +469,15 @@ def _unit(v):
 
 
 # ------------------------------------------------------------------ collect
+#: Sentinel for `collect(camera_id=...)`: use whichever camera the scene
+#: is currently looking through. An explicit None means the VIEWPORT pose,
+#: which is a different (and previously unreachable) request - Christian:
+#: "there is no way to specify which camera to use during blender export".
+_ACTIVE = object()
+
+
 def collect(scene, style, options, camera=None, width=1920, height=1080,
+            camera_id=_ACTIVE,
             cell_of=None):
     # type: (object, object, ExportOptions, object, int, int, object) -> dict
     """Everything the script needs, as plain Python data.
@@ -519,7 +527,8 @@ def collect(scene, style, options, camera=None, width=1920, height=1080,
     for stored in list(getattr(scene, "cameras", []) or []):
         spec = camera_object_setup(stored)
         saved.append(spec)
-        if stored.id == getattr(scene, "active_camera_id", None):
+        if stored.id == (getattr(scene, "active_camera_id", None)
+                         if camera_id is _ACTIVE else camera_id):
             active_name = spec["name"]
     if saved and active_name:
         # The active saved camera wins over the viewport pose: looking through

@@ -123,7 +123,7 @@ class AddOnsDialog(QDialog):
             bad.setToolTip(problem)
             lay.addWidget(bad)
 
-        line = QFrame()
+        line = QFrame(self)
         line.setFrameShape(QFrame.HLine)
         line.setStyleSheet("color: rgba(255,255,255,20);")
         lay.addWidget(line)

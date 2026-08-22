@@ -198,6 +198,274 @@ other side, and the two export fixes are verified in `tools/smoke_gui.py`
 instead, which now measures the crop and counts ink with and without the cell
 box. 1310 tests.
 
+Round 80 (2026-08-22, open item A1 - a delete renumbers, and almost nothing
+followed):
+**A1 as reported was one instance of a class, and the class is what got
+fixed.** `edits.delete_atoms` reindexed the BONDS and the cell reference
+(round 42c) and nothing else, so every other map keyed by atom index kept its
+old keys and quietly came to describe different atoms. Measured on cubane by
+marking atom 15 and deleting atom 0: the meta table, the colour, the hidden
+flag and the sphere scale all still said 15 while the molecule had 14 atoms.
+**The reason it survived twenty rounds is that it never looks broken.** An
+index map stays perfectly VALID after a renumbering - `meta.prune` was being
+called and only ever caught the entries that fell off the END, which is
+exactly the case that cannot happen when you delete an atom BELOW the marked
+one. A test reconstructs the old behaviour to state it: prune leaves the meta
+entry at index 4 in range, naming P, when it meant the S now at 3.
+**Two levels, because the maps live in two places.**
+`edits._remap_atom_metadata` handles what is on the STRUCTURE - the meta
+table (via `meta.remap`, which had existed since round 19 and was never
+called), plus `site_of`, `content_of`, `site_occupancy` and `refused_bonds`.
+The keys are enumerated in one place with a note on what each would do wrong,
+because the whole difficulty is that adding a new one and forgetting it is
+invisible. `MolObject.remap_atoms` handles what is on the OBJECT - the seven
+display maps - which `edits` cannot reach and must therefore be told about:
+`delete_atoms` fills a `report` with the old-to-new mapping, the same pattern
+`perceive_bonds` and `cif.expand` already use.
+**`MolObject.delete_atoms` is the paired call**, and every UI call site now
+goes through it. That is what makes the invariant hold rather than being
+remembered: if there is an object to hand, delete through the object.
+**THE SECOND RENUMBERING PATH IS `adjust_hydrogens`, and it is the one nobody
+would think of.** Adding a hydrogen appends and disturbs nothing; REMOVING
+one renumbers everything above it - and that is what C -> O does, and what
+raising a bond order does. Measured: colouring cubane's last atom and
+changing one carbon to oxygen left the colour key pointing PAST THE END of
+the atom list. `report=` threads through `adjust_hydrogens` and
+`set_element_adjusted`, with `MolObject` wrappers, and the eleven UI call
+sites go through those.
+**`MolObject.ATOM_MAPS` plus a test that compares it against every `atom_*`
+field on a live object** is what stops this recurring: a new per-atom map
+added beside the others fails at the line that introduced it rather than
+silently going unmapped. That is the round-31 four-place checklist made
+mechanical instead of remembered.
+1640 tests.
+
+Round 79 (2026-08-22, the trackpad, and one row instead of two):
+**(1) THE VIEW CONTROLS BELONG ON THE TRANSPORT ROW.** Christian: "Why did you
+put the view numbers and the fit button not on the same row as the playhead and
+loop interval numbers? I think this also messes with the expandable transform
+pane." Both halves right. They are read ALONGSIDE the frame range - the whole
+point is that one says what plays and the other what is shown - and a second
+bar under the rows was one more widget for the expand/collapse to fight with.
+The pane's children are now the transport row, the grip and the rows, and
+nothing else.
+**(2) A TRACKPAD SWIPE IS NEVER PURELY ONE AXIS**, which is the whole of
+"responsiveness is spotty... it works sometimes". The branch order asked `if dx
+and not mods` FIRST, so a vertical flick carrying three pixels of horizontal
+drift was handed to the pan branch and the zoom silently did not happen - about
+as often as not, depending on the hand. The axis is chosen by which one
+DOMINATES now.
+**(3) AND THE ACTION IS LATCHED FOR THE GESTURE**, which is round 8's rule
+("decided at gesture START, never per event") in a new place: without it a swipe
+that drifts diagonally flips between panning and zooming halfway through, which
+feels like the pane fighting you. `Qt.ScrollBegin`/`ScrollEnd` bound it where
+the device reports them and a 0.35 s gap does where it does not. Holding a
+modifier starts a NEW gesture, because that is a change of intent rather than a
+wobble.
+**(4) PANNING COULD NOT HAPPEN AT ALL on a device that reports horizontal
+scroll as `angleDelta`.** `dx` was read from `pixelDelta` only and `dy` fell
+back to `angleDelta` - so a tilt wheel, and any trackpad whose horizontal
+scroll arrives as angles, gave `dx = 0` forever. That is Christian's "panning
+doesn't even exist as a gesture", and it is one line: read BOTH axes from the
+same source.
+**(5) A wheel notch and 60 px of trackpad are now the same quantity**
+(`PANE_STEP_PIXELS`, `PANE_WHEEL_UNITS`). A trackpad delivers a stream of small
+deltas and a wheel one detent of 120, so a fixed per-event factor made the same
+physical movement zoom by wildly different amounts on the two machines - the
+other half of "spotty". The whole decision is `input_map.pane_scroll`, next to
+the rest of the trackpad-vs-mouse reasoning (round 16) and testable without a
+widget.
+**(6) THE STRIP PAGE DID NOT FOLLOW A DRAG.** `_on_tracks_edited` refreshed the
+clock and the bar and not the page, so dragging a bar left the Start box
+describing where the strip used to be - Christian: "Moving the strip manually
+does not seem to update the start number in the strip pane". A panel that shows
+a stale number is worse than one showing nothing, because nothing about it
+looks wrong.
+1628 tests.
+
+Round 78 (2026-08-21, the pane made workable, and a framerate that was a lie):
+Christian used round 77 in anger. Every complaint was real and they group into
+three.
+**(1) THE AXIS MOVED UNDER HIS HAND, from two independent causes.** Round 77
+left `play_end` following `duration` when no limit had been set, so **dragging
+a strip to the right dragged Frame End with it** - and `TrackRows.set_timeline`
+re-fitted the axis whenever the content outgrew the view, i.e. **on every mouse
+move of that same drag**. The strips visibly compressed and the pan jumped back
+to zero mid-gesture, which is his "moving a strip to the right fires the
+movement reset in grab mode". Both are the same mistake in two places: a
+VIEWING property being recomputed from the CONTENT. The frame range is now
+fitted ONCE, the first time there is anything to play (`fit_range`, called from
+`sync` only while `range_end` is None), and after that it is a fixed number
+that arranging strips never touches. The axis is only ever moved by something
+that means to - `fit_view`, the zoom, the pan, the View boxes. That leaves
+exactly one gap, and it is closed as a deliberate action rather than a side
+effect: a trajectory imported LATER sits outside the range, so the **⤢** button
+beside the frame boxes re-fits it.
+**(2) A STRIP START SNAPS TO A WHOLE FRAME**, and this is the "one frame too
+much or too little". A strip dragged by the mouse landed on 3.7, so its last
+frame fell BETWEEN two scene frames; fit a loop to that and the period is no
+longer a whole number of frames, so the wrap gains or loses one. Blender's
+sequencer snaps strips for the same reason, and nothing is lost because the
+playhead only ever stops on whole frames.
+**(3) TWO GESTURES DID NOTHING AT ALL.** `_gmove` (G) was armed by the key,
+painted a cursor, and was **never read by `mouseMoveEvent`** - so the strip sat
+still and the click that "confirmed" it committed a no-op. And
+`mousePressEvent` returned early when `_row_at` found no row, so **clicking
+below the strips left one selected**. Both were mechanisms with tests that
+tested the ARITHMETIC and no test that drove the GESTURE - round 59's lesson,
+which this file states and which I repeated anyway. `tests/test_round78_pane.py`
+drives real QMouseEvents and QKeyEvents through the widget.
+**Hotkeys are routed by focus OR THE POINTER** (`_live`). Relying on focus
+alone is the other half of why G looked dead: a click selects the strip, and
+anything that moves focus afterwards - the properties dock refreshing, the
+viewport's own focus-follows-cursor (round 12) - leaves the pane holding a
+selection it cannot act on. Blender routes a hotkey by which editor the mouse
+is over, which is what a Blender user expects.
+**(4) THE FRAMERATE WAS A LIE, and the arithmetic says why in one line.**
+Christian counted "~2 seconds of playtime for 60 frames at 60 FPS". Playback
+ran one frame per timer tick at `int(1000 / fps)` ms - **16 ms for 60 fps** -
+and Windows' default timer granularity is ~15.6 ms, so a 16 ms QTimer does not
+fire at 16 ms, it fires at **31.2**. Sixty frames therefore took **1.87 s**,
+which is his two seconds to the tenth. The same failure arrives from the other
+side the moment a repaint costs more than a frame: a per-tick scheme does not
+drop frames, it SLOWS DOWN, and the number in the box stops describing
+anything. So the timer is now only a wake-up (`_PLAY_TICK_MS = 4`,
+`Qt.PreciseTimer`) and the STEP comes from `perf_counter`: each tick advances
+by however much wall time has actually passed, carrying the remainder so the
+error cannot accumulate, and drawing nothing at all when less than a frame is
+due. Measured against a deliberately crippled 31.2 ms wake-up pattern: **one
+60-frame loop per 1.03 s of wall time**, with 32 of the 60 frames drawn and the
+rest skipped - which is what every player does and what keeps a preview and a
+render of the same range the same length.
+**(5) THE STRIP IS MEASURED IN SECONDS NOW.** Christian: "Change the main
+strip property from frames to time. That is intuitive to a user." Frames stay
+the MODEL's unit - they are what the clock counts, what the range bounds and
+what a render writes - and `frames_for_seconds` is the single place the two
+meet. Changing the framerate deliberately does NOT re-derive a strip's frame
+count: that would renumber the whole scene under a control that says "fps", so
+the duration readout moves instead, which is both honest and what Blender does.
+**(6) THE PANE HAS ITS OWN BOUNDS, AND THEY ARE NOT THE PLAY RANGE.** Wheel
+zooms about the cursor, Shift+wheel and a trackpad swipe pan, Ctrl+wheel
+scrolls the rows, Home and a Fit button frame everything, and View [start] -
+[end] states the interval exactly. Christian: "unless the pane limits can be
+set, we run into the whole zooming out problem" - and he is right that this is
+what turns a strip dragged far away from a dead end into an ordinary
+navigation.
+**(7) THE THINKING TASK: is smoothing irrelevant now? As a COUNT, entirely.**
+How many pictures a strip has follows from its duration and the framerate, so
+a third number could only disagree with the two that produced it - putting it
+back would re-create exactly the redundancy round 77 removed. But a count was
+never the only thing it could have said: what remains unspecified is whether
+those pictures BLEND or STEP. Blending invents intermediate geometries;
+stepping shows only the ones that were computed, which for an MD run is
+sometimes precisely what you want to look at. That is a per-strip tick
+(`Track.interpolated`, on by default) and it is the whole of what survives.
+1622 tests.
+
+Round 77 (2026-08-21, the player's units re-cut - and the mode loop was one
+frame short the whole time):
+Christian's brief: "The global settings should only be Frame Start, Frame End,
+Framerate. Smoothing is a property that should be unique to a particular strip
+... Just set one number of total frames inside the strip properties. User has
+to adjust them until they're satisfied with the fluidity of the animation.
+Default: 60 FPS, ergo 59 frames per oscillation animation." He also asked the
+right question about the abstraction: a mode is GENERATED and a trajectory is
+IMPORTED, so is interpolation even the same operation?
+**(1) THE ANSWER IS THAT ONE NUMBER COVERS BOTH, AND THE ONLY REAL DIFFERENCE
+IS WHETHER THE DATA CLOSES ON ITSELF.** A strip is now `frames` scene frames
+long, and that single number is its length, its speed and its smoothness at
+once - the old `speed` multiplier and the old global `smoothing` were one
+degree of freedom wearing two hats, and neither told you how long the shot was
+or whether the motion would look fluid. The mapping is one line with two
+spans: **cyclic** data (a baked mode, where `mode_frames` samples
+`sin(2*pi*k/n)` for k = 0..n-1 and deliberately omits the k = n duplicate)
+divides `frames` by `n`, so the strip's last frame sits one arc short of the
+start it came from; **linear** data (a trajectory, with two distinct ends)
+divides `frames - 1` by `n - 1`, so the strip's last frame lands exactly ON
+the last datum. The end mode (hold / loop / pingpong) is applied in the
+STRIP's own frames rather than in the source's, which is what lets one rule
+serve both. Interpolation is no longer a switch anywhere: it is simply what
+happens when a strip is longer than its data, and `subdivision` (= the old
+smoothing) is now DERIVED and shown on the page rather than set.
+**(2) THE REWORK EXPOSED A BUG THAT HAS BEEN IN EVERY VIBRATION MoloM HAS EVER
+ANIMATED.** The old LOOP wrapped a track at `n_frames - 1` local frames - i.e.
+it assumed the last stored frame duplicated the first. A baked mode does not
+store that duplicate. Measured on a 20-sample period: the animation covered
+**93.3% of the oscillation and then crossed the remaining 1.33 source frames
+in a single image**, a hitch once per revolution at four times the normal
+step. It was invisible in any still and easy to read as "the framerate is
+uneven". `interpolate.frame_pair` was the other half: it CLAMPED to [0, n-1],
+so a position in the closing arc froze on the last sample instead of blending
+it into the first - `cyclic=True` closes it. Both halves are pinned by
+measurement rather than by index arithmetic: the wrap step must equal an
+ordinary step for that part of the sine, and without the fix the last arc is
+frozen and then leapt.
+**(3) THE FRAME RANGE IS INCLUSIVE, which is where "subtract the last frame"
+actually belongs.** Frame End is the last frame PLAYED and the frame after it
+is Frame Start again - Blender's rule. The old `_wrap` ran over `end - start`,
+so **the last frame of the range was never shown at all**. Because the range
+is inclusive, `animation.frame_times` no longer has a last image to DROP
+(round 54's rule): a cycle cannot repeat its own first picture, because the
+strip's own length and the frame range already say where it ends. And it is
+where Christian's 59 comes from: 60 frames counted from 0 END at 59.
+**(4) THE DEFAULTS ARE MADE TO LINE UP RATHER THAN LEFT TO CHANCE.**
+`DEFAULT_STRIP_FRAMES` is 60 and `vibrations.DEFAULT_PERIOD_FRAMES` went from
+20 to 60, so a freshly baked mode is 60 real samples over a 60-frame strip:
+one whole period per second at 60 fps, Frame End 59, and **every drawn frame a
+true sample of the sine rather than a chord between two**. 20 samples only
+ever looked continuous because the global smoothing was subdividing them, and
+that knob no longer exists. One rule covers new strips of both kinds -
+`default_frames(n) = max(n, 60)`: never fewer frames than the data really has,
+never so few that a three-step optimisation flashes past in a twentieth of a
+second.
+**(5) WHAT WAS DELIBERATELY *NOT* DONE: the strip does not re-bake the mode.**
+"Pick the number of total subdivisions of the mode" reads as though the strip
+page's Frames box should regenerate the samples, and it very nearly does the
+same job - but round 76's own rule for this page is that **a strip is the
+animation's TRACK, not the molecule's data** (which is why Delete on a strip
+never touches the frames). Changing a playback length must not mutate a
+molecule and push an undo step. So "Frames / period" stays on the vibrations
+page as the DATA control and "Frames" on the strip page is the PLAYBACK one;
+the defaults being equal is what keeps them from feeling like two knobs for
+one job, and stretching past the sample count just interpolates.
+**(6) A LENGTH CHOSEN BY HAND IS REMEMBERED (`frames_locked`).** `sync` runs
+on every rebuild and re-derives a strip's default from the source count, so
+re-baking a mode at 40 samples would otherwise quietly overwrite a length the
+user had tuned. Set through `Timeline.set_frames`, which is the only thing
+that marks it - assigning `track.frames` directly does not, on purpose, so an
+internal adjustment is not mistaken for a decision. Round 52's "once the user
+has said otherwise, stop regenerating" in a third place.
+**(7) THE PLAYER IS SAVED NOW.** `Timeline.to_dict` existed since round 22 and
+**nothing had ever called it** - a `.molom` carried no strips at all. That
+cost nothing while a strip only held a start and a speed nobody set; it is a
+real loss the moment its length is the number you tune until the motion looks
+right. It rides `_ui_state`, so no savefile version bump, and the exclusion
+set rides with it (a strip taken off the player is a decision - round 52
+again). A pre-round-77 file is migrated: the old length in pictures was
+`(n - 1) / speed * smoothing`, a picture is now a frame, so that product IS
+the new `frames` and the whole axis - range, offsets, playhead - scales by
+`smoothing` with it.
+**(8) A FRAME IS A COLUMN ON THE AXIS, not a line.** Frame k occupies
+`[x(k), x(k+1))`, which is already why a strip is drawn out to its EXCLUSIVE
+`end_time`. With Frame End inclusive, drawing its handle through the frame
+itself veils the last frame that plays and says it is excluded - so the handle
+and the veil boundary sit one column further along, and dragging it sets one
+frame back. That is the only pixels-to-frames conversion left in the panel;
+the spin boxes now write scene frames straight onto the clock, where the bar
+used to convert to and from 1-based image numbers.
+**(9) AND THE NEW TESTS FAILED ONLY IN THE FULL RUN**, which is the oldest
+signature in this file. `tests/conftest.py` sandboxes QSettings so a test
+cannot write into the developer's config - and does nothing about one test
+writing into the NEXT test's, because `MainWindow` reads its preferences on
+construction. One line in round 22's playback tests
+(`win._fps_spin.setValue(10)`) had been handing **10 fps to every window
+built after it** for fifty rounds; nothing noticed until a test asserted
+something derived from the framerate (60 frames should be 1.00 s, and came
+out as 6.00). The sandbox is emptied after every test now. Same lesson as
+the round-37 circuit breaker and the round-46 module cache: shared state
+across a suite fails in a different file from the one that caused it.
+1608 tests.
+
 Round 76 (2026-08-18, Christian's MOPAC batch - and the one that changed an
 answer was CHARGE):
 **(1) NOBODY COULD SET A CHARGE, so every semiempirical run was neutral.**
@@ -2792,8 +3060,12 @@ modal — an axis key applies and stays live, another axis key replaces it
 undo step, right-click/Esc reverts exactly. The single-atom case still
 applies at once, as specified.
 
-Round 30 (2026-08-03, playback spec): **frames, images and seconds are three
-different things** and the player used to muddle them. A *frame* comes out of
+Round 30 (2026-08-03, playback spec) - **the IMAGES half of this was
+superseded by round 77**, which collapsed an image and a scene frame back
+into one thing and moved the subdivision onto each strip; the loop limits
+and the sample-the-extremes rule below still stand. Kept as written
+because the reasoning is what matters: **frames, images and seconds are
+three different things** and the player used to muddle them. A *frame* comes out of
 an input file and its count is a property of the data; an *image* is one
 picture drawn; `fps` is **images per second** and is global. So the `Smooth`
 tick box — a switch that could say whether to interpolate but never how much
@@ -3285,7 +3557,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1586 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1640 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -3353,13 +3625,27 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   whether the wheel event carried `pixelDelta`. The whole trackpad-vs-mouse
   decision, UI-free.
 - `core/timeline.py` — the SCENE CLOCK: one playhead in scene frames, one
-  `Track` per object (start offset / speed / hold-loop-pingpong). UI-free, so
-  the whole mapping is testable without a timer. Also owns the round-30
-  frames/images/seconds split (`smoothing`, `fps`, `advance_images`) and the
-  looping interval (`range_start`/`range_end`, `play_start`/`play_end`).
+  `Track` (a STRIP) per object. UI-free, so the whole mapping is testable
+  without a timer. **Round 77 re-cut its units**: the clock ticks in scene
+  frames at `fps` and a frame IS a picture, so the globals are only
+  `play_start`/`play_end` (Frame Start / End, INCLUSIVE) and `fps`; a strip
+  carries `frames` (how many scene frames it occupies - its length, speed
+  and smoothness in one) plus `cyclic` (does the source close on itself?).
+  `subdivision` is the old global `smoothing`, now derived per strip; round 78
+  made the strip's own control a DURATION in seconds (`frames_for_seconds`),
+  added `interpolated` (blend or step - all that a smoothing knob could still
+  have said), snapped `Track.start` to whole frames, and stopped the frame
+  range following the content (`fit_range`, called once).
+  Read `Track.frame_at`'s docstring before changing any of it: the whole
+  model exists so one formula serves a generated period and an imported
+  trajectory, and `CYCLIC_FRAMES` in a structure's metadata is what tells
+  them apart.
 - `core/interpolate.py` — coordinates BETWEEN frames. `rigid=True` splits the
   Kabsch rigid motion out and rotates it properly instead of cutting the
-  chord; only the residual deformation is lerped.
+  chord; only the residual deformation is lerped. `cyclic=True` (round 77)
+  says the frames are one closed period, so the arc from frame n-1 back to
+  frame 0 is interpolated instead of clamped — without it a baked mode
+  freezes for the last arc of every revolution.
 - `core/cif.py` — CIF parsing that keeps the crystallography: `Cell`
   (fractional<->Cartesian matrix, corners/edges for the box), `SymOp`
   (parses "-x+1/2, y, -z"), `parse_cif` -> asymmetric unit, `expand` ->
@@ -4440,12 +4726,81 @@ independent cross-check inside a single fixture.
   `setDefaultFormat` is NOT enough on Windows: the two-argument
   `QSettings(org, app)` constructor always uses NativeFormat (the registry),
   where `setPath` has no effect — the four-argument form has to be forced.
-- **`fps` means IMAGES per second, not frames per second** (round 30). With
-  `smoothing` images per source frame, a scene of `d` frames runs for
-  `d * smoothing / fps` seconds, so raising the smoothing at a fixed
-  framerate slows playback down. That is the correct reading of the spec
-  (more pictures in the same second), not a bug — the two knobs sit next to
-  each other on the bar precisely so the trade is visible.
+  **And the sandbox has to be EMPTIED between tests** (round 77). It stops a
+  test writing into the developer's config and does nothing about one test
+  writing into the next one's: `MainWindow` reads its preferences on
+  construction, so `win._fps_spin.setValue(10)` in one file hands 10 fps to
+  every window built after it. Round 77's playback tests were the first to
+  assert anything derived from the framerate and duly failed only in the
+  FULL RUN — passing alone, which is the signature of shared state and the
+  same shape as the round-37 circuit breaker and the round-46 module cache.
+  `tests/conftest.py::_fresh_settings` clears it after every test.
+- **A DELETE RENUMBERS, SO DELETE THROUGH THE OBJECT** (round 80).
+  `MolObject.delete_atoms` / `.adjust_hydrogens` / `.set_element_adjusted` are
+  the paired calls: `edits` can only reach what is on the STRUCTURE, and a
+  molecule's colours, labels, hidden atoms and sphere sizes are on the OBJECT.
+  Every per-atom map is enumerated in exactly two places -
+  `edits._PER_ATOM_*` and `MolObject.ATOM_MAPS` - and a test compares the
+  second against every `atom_*` field on a live object, so a new one cannot be
+  added and forgotten. **The failure is silent by construction**: an index map
+  stays perfectly VALID after a renumbering and simply means a different atom,
+  which is why `meta.prune` (out-of-range entries only) hid it for twenty
+  rounds. And note the path nobody thinks of: `adjust_hydrogens` REMOVING a
+  surplus H renumbers exactly as a delete does, which is what C -> O and a
+  raised bond order both do.
+- **A TRACKPAD SWIPE IS NEVER PURELY ONE AXIS** (round 79). Testing `if dx`
+  before `dy` hands every vertical flick that drifts a few pixels sideways to
+  the horizontal branch, so the gesture works about half the time - which is
+  what "spotty" means and is very hard to see in a test that sends clean
+  single-axis events. Choose by the DOMINANT axis, LATCH the action for the
+  whole gesture (round 8: decided at gesture start, never per event), and read
+  BOTH axes from the same source - `dx` from `pixelDelta` while `dy` falls back
+  to `angleDelta` means horizontal scroll simply never arrives on a device that
+  reports angles. A wheel notch and a fixed number of trackpad pixels must also
+  be normalised to one unit, or the same movement zooms by different amounts on
+  the two machines. It all lives in `core/input_map.py`, with the rest of the
+  round-16 reasoning.
+- **A PANEL SHOWING A STALE NUMBER IS WORSE THAN ONE SHOWING NOTHING**
+  (round 79), because nothing about it looks wrong. Anything that edits a value
+  a properties page displays has to refresh that page - dragging a strip in the
+  track pane changed the same Start the strip page shows, and only the clock
+  and the bar were re-synced.
+- **NEVER RECOMPUTE A VIEWING PROPERTY FROM THE CONTENT** (round 78, and it
+  cost two separate bugs in one gesture). The frame range followed `duration`
+  and the pane re-fitted its axis whenever the content outgrew the view - so
+  dragging a strip to the right moved Frame End AND rescaled the axis, on every
+  mouse move, which reads as the strips shrinking under the hand. A range and
+  an axis are DECISIONS: fit them once, or when something asks, and never as a
+  side effect of the data changing. The same rule already governs the camera
+  (`fit_view` is not run on every import).
+- **A UI POSITION SET BY THE MOUSE MUST SNAP TO THE GRID IT LIVES ON**
+  (round 78). A strip dragged to 3.7 has its last frame between two scene
+  frames, so a loop fitted to it is not a whole number of frames and the wrap
+  gains or loses one - reported as "one frame too much or too little", which
+  sounds like an arithmetic bug and is a snapping one.
+- **`int(1000 / fps)` IS NOT A FRAME INTERVAL ON WINDOWS** (round 78). It is
+  16 ms at 60 fps against a ~15.6 ms default timer granularity, so the timer
+  fires every 31.2 and playback runs at HALF the advertised rate - 60 frames in
+  1.87 s. Any one-frame-per-tick scheme also slows down (rather than dropping
+  frames) as soon as a repaint costs more than a frame. Advance by elapsed
+  `perf_counter` time, carry the remainder, and let the timer oversample.
+- **A LOOP OVER STORED FRAMES HAS TO KNOW WHETHER THE LAST ONE IS THE FIRST**
+  (round 77). `vibrations.mode_frames` stores k = 0..n-1 of a period and
+  deliberately omits the duplicate k = n, so wrapping at `n - 1` — which is
+  what the player did for fifty-odd rounds — covers 93.3% of a 20-sample
+  oscillation and then crosses the rest in ONE image, four times the normal
+  step. An imported trajectory is the opposite: its last frame is real data
+  and must be shown, and the cut back to the first is honest rather than
+  something to interpolate across. `timeline.CYCLIC_FRAMES` in the
+  structure's metadata is the one place that distinction is recorded, and
+  `interpolate.frame_pair(cyclic=)` is the other half — it CLAMPS by
+  default, which freezes the closing arc instead of blending it.
+- **A frame is a COLUMN on the timeline axis, not a line** (round 77).
+  Frame k occupies `[x(k), x(k+1))`, which is why a strip draws out to its
+  EXCLUSIVE `end_time` while `duration` and Frame End are the last frame
+  INCLUSIVE. Anything drawn at a range limit therefore belongs at
+  `x(play_end + 1)`: putting it at `x(play_end)` veils the last frame that
+  actually plays and says it is excluded.
 - **Sample a normal mode on a multiple of FOUR frames** (round 30). The
   turning points of `sin(2*pi*k/n)` are at k = n/4 and 3n/4, so any other n
   never reaches ±amplitude: n = 6 peaks at 0.87 of what was asked for, and
@@ -4864,7 +5219,10 @@ batches. Known next items, rough order:
      object, rows arrangeable) follows naturally once the clock is
      scene-level. Sensible order: scene clock -> interpolation -> multi-row
      pane. DELIVERED rounds 22/23; round 30 then split frames from images and
-     added the loop limits (see the round-30 entry).
+     added the loop limits (see the round-30 entry); **round 77 put frames
+     and images back together** and made a strip's LENGTH the one number
+     that describes its playback, which is also where interpolation now
+     comes from.
    - **Keyframes are a bigger step than they look — but not enormous**, and
      the ground is already prepared: a keyframe is "at time t, this property
      has this value", and `MolObject` already keeps `origin`/`orientation`

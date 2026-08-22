@@ -503,7 +503,8 @@ class BlenderExportDialog(QDialog):
                      ("sun", "Sun (hard shadows)"))
     _STYLE_FOLLOW = "Follow the viewport"
 
-    def __init__(self, parent, options=None, summary="", viewport_size=None):
+    def __init__(self, parent, options=None, summary="",
+                 viewport_size=None, scene=None):
         super().__init__(parent)
         self.setWindowTitle("Export to Blender")
         opts = options or bx.ExportOptions()
@@ -610,6 +611,26 @@ class BlenderExportDialog(QDialog):
             "Same position, same aim, same field of view - and orthographic "
             "if the viewport is. Turn it off to keep Blender's own camera.")
         form.addRow("", self.match_camera)
+
+        # WHICH saved camera renders. It worked only implicitly before -
+        # whichever one you happened to be looking through became Blender's
+        # `scene.camera` - so exporting the shot you wanted meant entering it
+        # first and there was no way to say so outright. Every saved camera is
+        # still exported as an object either way; this only chooses the active
+        # one. Hidden when the scene has none, so it never offers a choice
+        # that has nothing to choose between.
+        self.render_camera = QComboBox()
+        self.render_camera.addItem("Active / viewport view", None)
+        for cam in list(getattr(scene, "cameras", []) or []):
+            self.render_camera.addItem(cam.name, cam.id)
+        current = getattr(scene, "active_camera_id", None)
+        index = self.render_camera.findData(current)
+        self.render_camera.setCurrentIndex(max(index, 0))
+        self.render_camera.setToolTip(
+            "Which camera Blender opens on. The others are still exported as "
+            "camera objects you can switch to.")
+        if self.render_camera.count() > 1:
+            form.addRow("Render through:", self.render_camera)
 
         res = QHBoxLayout()
         self.res_x = QSpinBox()
@@ -877,6 +898,12 @@ class BlenderExportDialog(QDialog):
                 c.name(), "#000" if c.lightnessF() > 0.5 else "#fff"))
 
     # -------------------------------------------------------------- output
+    def render_camera_id(self):
+        """Which saved camera Blender should open on, or None for the
+        viewport pose. Separate from `options` because it is a property of the
+        SCENE, not of the render settings that get remembered."""
+        return self.render_camera.currentData()
+
     def options(self):
         # type: () -> bx.ExportOptions
         text = self.hdri_combo.currentText()
@@ -1321,7 +1348,7 @@ class AnimationExportDialog(QDialog):
     is not, rather than failing at the end of a long render.
     """
 
-    def __init__(self, parent, n_images=0, fps=30.0, size=(1280, 720),
+    def __init__(self, parent, n_frames=0, fps=30.0, size=(1280, 720),
                  have_video=True, remembered=None, ffmpeg_hint=""):
         super().__init__(parent)
         from ..core import animation as anim
@@ -1380,8 +1407,9 @@ class AnimationExportDialog(QDialog):
         self.fps.setValue(float(fps))
         self.fps.setSuffix(" fps")
         self.fps.setToolTip(
-            "Playback rate of the FILE. The scene clock decides how many "
-            "images there are; this decides how fast they go past.")
+            "Playback rate of the FILE. The scene's frame range decides "
+            "how many frames there are; this decides how fast they go "
+            "past.")
         self.fps.valueChanged.connect(self._refresh)
         form.addRow("Frame rate:", self.fps)
 
@@ -1390,9 +1418,9 @@ class AnimationExportDialog(QDialog):
         self.loops.setValue(1.0)
         self.loops.setSingleStep(0.5)
         self.loops.setToolTip(
-            "How many times round the loop. The last image of a cycle is "
-            "dropped, since it is the same picture as the first of the next - "
-            "keeping it makes a hitch once per revolution.")
+            "How many times round the loop. Frame End is the last frame "
+            "PLAYED and the frame after it is Frame Start again, so a "
+            "cycle never repeats its own first picture.")
         self.loops.valueChanged.connect(self._refresh)
         form.addRow("Loops:", self.loops)
 
@@ -1436,7 +1464,7 @@ class AnimationExportDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
-        self._n_images = int(n_images)
+        self._n_frames = int(n_frames)
         self._have_video = bool(have_video)
         # Restore the rest of the remembered choices. Done after every widget
         # exists so nothing has to be constructed in a particular order.
@@ -1476,7 +1504,7 @@ class AnimationExportDialog(QDialog):
 
     def _refresh(self, *_a):
         fmt = self.format_combo.currentData()
-        total = max(int(round(self._n_images * self.loops.value())), 1)
+        total = max(int(round(self._n_frames * self.loops.value())), 1)
         bits = [self._anim.summarise(total, self.fps.value(), fmt)]
         if not self._have_video:
             bits.append(self._anim.NO_FFMPEG_HELP)

@@ -266,7 +266,7 @@ def main():
             PROBLEMS.append("vibrations: no modes parsed")
             return
         win.on_animate_mode(modes[-1].index, amplitude=0.5)
-        win.timeline.advance_images(5)
+        win.timeline.advance_frames(5)
         win._apply_timeline()
         win.viewport.fit_view()
         shot("05-vibrations",

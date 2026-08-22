@@ -6,16 +6,29 @@ Struck-through items in CLAUDE.md are omitted; this is only what is left.
 
 Nothing here is urgent. It is an inventory, not a plan.
 
+**Since the sweep** (rounds 74-80, to 2026-08-22): **A1 is done** (round 80);
+nothing else on this list was closed, and nothing was added to it. Rounds 74-76 were the MOPAC
+frequency reader, computed layers (`core/attachments.py`) and Christian's
+MOPAC batch; rounds 77-79 reworked the player - one duration per strip, a
+frame range that stays put, wall-clock playback, and a pane you can zoom and
+pan. Two entries below are partly overtaken: **E3**'s input feel-check now
+holds for the TRACK PANE (round 79 normalised wheel and trackpad into one
+unit and latched the gesture) and still stands for the VIEWPORT; and **A2**'s
+"integrate on the paint" is the same diagnosis round 78 acted on for playback,
+so the fix there is a worked example for the shuttle.
+
 ---
 
 ## A. Real bugs, measured and standing
 
-**A1. The meta-atom table is not reindexed on delete.** `meta.remap`/`prune`
-exist and are **not called from `edits.delete_atoms`**, so deleting atoms
-around a meta centre leaves the table pointing at the wrong index — a meta spec
-silently attached to some other atom. This is the round-42 "a per-atom map must
-survive a renumbering" rule with the fix already written and never wired up.
-*Smallest real bug on this list, and the one most likely to bite.*
+~~**A1. The meta-atom table is not reindexed on delete.**~~ **DONE, round 80**
+— and it was one instance of a class. Nothing keyed by atom index followed a
+delete: not the meta table, not `site_of` / `content_of` / `site_occupancy` /
+`refused_bonds`, and not any of the seven per-atom display maps on
+`MolObject`. `adjust_hydrogens` removing a surplus H turned out to be a second
+renumbering path with the same hole. Fixed at both levels, with
+`MolObject.ATOM_MAPS` and a test that compares it against the live object so a
+new map cannot be added and forgotten.
 
 **A2. Third-person shuttle jitter** (roadmap 6b, diagnosed 2026-08-13).
 `_FLY_TICK_MS = 16` is 62.5 Hz against a 60 Hz display; the beat means a

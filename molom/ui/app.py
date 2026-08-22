@@ -6,6 +6,7 @@ The scene (multiple molecules) lives here; the viewport renders it.
 """
 
 import os
+import time
 from typing import List, Optional
 
 import numpy as np
@@ -366,7 +367,9 @@ class MainWindow(QMainWindow):
             _box.toggled.connect(lambda _on: self._sync_symmetry_kinds())
         self.strip_page = StripPage()
         self.strip_page.start_changed.connect(self.on_strip_start)
-        self.strip_page.speed_changed.connect(self.on_strip_speed)
+        self.strip_page.duration_changed.connect(self.on_strip_duration)
+        self.strip_page.interpolate_changed.connect(
+            self.on_strip_interpolate)
         self.strip_page.end_mode_changed.connect(
             self.on_strip_end_mode)
         self.strip_page.remove_requested.connect(
@@ -2119,8 +2122,8 @@ class MainWindow(QMainWindow):
                 bonding.perceive_structure_bonds(dup.structure)
                 bonding.perceive_structure_bond_orders(dup.structure)
                 if self.viewport.adjust_h:
-                    edits.adjust_hydrogens(
-                        dup.structure, list(range(dup.structure.n_atoms)))
+                    dup.adjust_hydrogens(
+                        list(range(dup.structure.n_atoms)))
             self.active_id = dup.id
             new_sel += [(dup.id, i) for i in range(dup.structure.n_atoms)]
         if not new_sel:
@@ -2168,8 +2171,8 @@ class MainWindow(QMainWindow):
                 bonding.perceive_structure_bonds(dup.structure)
                 bonding.perceive_structure_bond_orders(dup.structure)
                 if self.viewport.adjust_h:
-                    edits.adjust_hydrogens(
-                        dup.structure, list(range(dup.structure.n_atoms)))
+                    dup.adjust_hydrogens(
+                        list(range(dup.structure.n_atoms)))
             self._translate_object(dup, d)
             self.active_id = dup.id
             new_sel += [(dup.id, i) for i in range(dup.structure.n_atoms)]
@@ -2196,14 +2199,17 @@ class MainWindow(QMainWindow):
             self.strip_page.set_strip(None, None, "")
             return
         obj = self.scene.get(int(obj_id))
-        self.strip_page.set_strip(int(obj_id), self.timeline.get(int(obj_id)),
-                                  obj.name if obj is not None else "")
+        self.strip_page.set_strip(int(obj_id),
+                                  self.timeline.get(int(obj_id)),
+                                  obj.name if obj is not None else "",
+                                  fps=self.timeline.fps)
 
     def _sync_strip_page(self):
         obj_id, track = self._selected_strip()
         obj = self.scene.get(obj_id) if obj_id is not None else None
         self.strip_page.set_strip(obj_id, track,
-                                  obj.name if obj is not None else "")
+                                  obj.name if obj is not None else "",
+                                  fps=self.timeline.fps)
 
     def on_strip_start(self, obj_id, start):
         track = self.timeline.get(int(obj_id))
@@ -2213,12 +2219,27 @@ class MainWindow(QMainWindow):
             self._sync_traj_bar()
             self._sync_strip_page()
 
-    def on_strip_speed(self, obj_id, speed):
-        track = self.timeline.get(int(obj_id))
-        if track is not None:
-            track.speed = max(float(speed), 0.01)
+    def on_strip_duration(self, obj_id, seconds):
+        """The strip's length in SECONDS - its only playback knob.
+
+        Seconds because that is what a person means (round 78); the clock
+        still counts frames, and `set_duration` is the one place the two meet.
+        It goes through `set_frames`, which marks the length as CHOSEN: a
+        later re-sync - re-baking the mode at a different sample count, say -
+        must not quietly replace a number the user picked with the default
+        for the new data.
+        """
+        if self.timeline.set_duration(int(obj_id), float(seconds)) is not None:
             self._apply_timeline()
             self._sync_traj_bar()
+            self._sync_strip_page()
+
+    def on_strip_interpolate(self, obj_id, on):
+        """Blend between the source frames, or step from one to the next."""
+        track = self.timeline.get(int(obj_id))
+        if track is not None:
+            track.interpolated = bool(on)
+            self._apply_timeline()
             self._sync_strip_page()
 
     def on_strip_end_mode(self, obj_id, mode):
@@ -2501,10 +2522,11 @@ class MainWindow(QMainWindow):
             + (" +{} more".format(len(vis) - 3) if len(vis) > 3 else ""),
             sum(len(o.evaluated()[0]) for o in vis))
         dlg = BlenderExportDialog(self, self._blender_options(), summary,
-                                  (vp.width(), vp.height()))
+                                  (vp.width(), vp.height()), scene=self.scene)
         if not dlg.exec():
             return
         opts = dlg.options()
+        self._render_camera_id = dlg.render_camera_id()
         opts.atom_scale = vp.atom_scale
         for key in self._BLENDER_KEYS:
             self.settings.setValue("blender_" + key, getattr(opts, key))
@@ -2578,6 +2600,7 @@ class MainWindow(QMainWindow):
         data = blender_mod.collect(
             self.scene, style, options,
             camera=vp.camera if options.match_viewport else None,
+            camera_id=getattr(self, "_render_camera_id", blender_mod._ACTIVE),
             width=options.resolution[0], height=options.resolution[1],
             # ALWAYS the cell lookup, whatever the box option says: the
             # polyhedra need it to build from the periodic graph, and gating
@@ -3469,28 +3492,22 @@ class MainWindow(QMainWindow):
         self.traj_bar.strip_removed.connect(self.on_strip_removed)
         self.traj_bar.play_pause.connect(self.on_play_pause)
         self.traj_bar.seek_requested.connect(self.on_seek)
-        self.traj_bar.smoothing_changed.connect(self._on_smoothing_changed)
         self.traj_bar.fps_changed.connect(self._on_fps_changed)
         self.traj_bar.range_changed.connect(self._on_range_changed)
+        self.traj_bar.fit_range_requested.connect(self._on_fit_range)
         self.traj_bar.tracks_changed.connect(self._on_tracks_edited)
         self.traj_bar.setVisible(False)
         # kept as aliases so the older call sites keep reading naturally
         self._play_btn = self.traj_bar.play_btn
         self._frame_label = self.traj_bar.label
         self._fps_spin = self.traj_bar.fps_spin
-        self._smooth_spin = self.traj_bar.smooth_spin
-        # Both knobs persist: they describe how YOU like to watch an
+        # The framerate persists: it describes how YOU like to watch an
         # animation, not anything about the file that happens to be open.
+        # What used to sit beside it - the global smoothing - is now each
+        # STRIP's own frame count, so it belongs to the scene and rides
+        # the savefile rather than a preference.
         self.timeline.fps = float(self.settings.value(
             "playback_fps", timeline_mod.DEFAULT_FPS))
-        self.timeline.smoothing = int(self.settings.value(
-            "playback_smoothing", timeline_mod.DEFAULT_SMOOTHING))
-
-    def _on_smoothing_changed(self, images):
-        """How many images fill one source-frame interval."""
-        self.timeline.smoothing = int(images)
-        self.settings.setValue("playback_smoothing", int(images))
-        self._apply_timeline()
 
     def _on_fps_changed(self, fps):
         self.timeline.fps = float(fps)
@@ -3499,18 +3516,43 @@ class MainWindow(QMainWindow):
             self._play_timer.setInterval(int(1000 / max(int(fps), 1)))
 
     def _on_range_changed(self, first, last):
-        """The looping interval, as 0-based IMAGE indices from the spin
-        boxes. An end on the last image means 'follow the scene', so a
-        trajectory that grows later stays fully covered."""
-        start = self.timeline.time_of_image(first)
-        end = self.timeline.time_of_image(last)
+        """Frame Start / Frame End, in scene frames exactly as typed.
+
+        An end ON the last frame of the content means "follow the scene",
+        so a trajectory that grows later stays fully covered rather than
+        being cut off at whatever the range happened to say when it was
+        shorter.
+        """
+        end = float(last)
         self.timeline.set_range(
-            start, None if end >= self.timeline.duration - 1e-9 else end)
+            float(first),
+            None if end >= self.timeline.duration - 1e-9 else end)
         self._apply_timeline()
 
-    def _on_tracks_edited(self):
-        """A row was dragged, toggled or had its end mode cycled."""
+    def _on_fit_range(self):
+        """Bring every strip into the play range.
+
+        The range is fitted once and then left alone, so that arranging
+        strips cannot move it (round 78) - which leaves exactly one gap:
+        a trajectory imported later sits outside it. This is that gap,
+        closed as a deliberate action rather than as a side effect.
+        """
+        self.timeline.fit_range()
         self._apply_timeline()
+        self.statusBar().showMessage(
+            "Frame range fitted to the strips: {:g} - {:g}".format(
+                self.timeline.play_start, self.timeline.play_end), 5000)
+
+    def _on_tracks_edited(self):
+        """A strip was dragged, toggled or had its end mode cycled.
+
+        The strip PAGE has to follow: dragging a bar changes the same Start
+        the page shows, and a page still displaying where the strip used to be
+        is worse than one showing nothing - Christian: "Moving the strip
+        manually does not seem to update the start number in the strip pane".
+        """
+        self._apply_timeline()
+        self._sync_strip_page()
 
     def on_seek(self, time):
         self.timeline.seek(float(time))
@@ -3522,7 +3564,8 @@ class MainWindow(QMainWindow):
         The pane is the SCENE playhead, not the active molecule's frame
         index — every trajectory in the scene runs off it at once.
         """
-        self.timeline.sync([(o.id, o.structure.n_frames)
+        self.timeline.sync([(o.id, o.structure.n_frames,
+                             timeline_mod.frames_are_cyclic(o.structure))
                             for o in self.scene.objects])
         # Re-baking a mode at a different frame count changes the duration
         # under the playhead, so pull it back inside the looping interval.
@@ -3540,6 +3583,12 @@ class MainWindow(QMainWindow):
             self._play_timer.isActive())
         self.traj_bar.setVisible(True)
 
+    #: How often the playback timer wakes up, in ms. It is NOT the frame
+    #: interval: the clock is advanced by elapsed WALL TIME, so the timer only
+    #: has to wake often enough to land near each frame boundary. Oversampling
+    #: is what makes 60 fps possible on Windows at all - see `_advance_frame`.
+    _PLAY_TICK_MS = 4
+
     def on_play_pause(self):
         if self._play_timer.isActive():
             self._play_timer.stop()
@@ -3547,25 +3596,44 @@ class MainWindow(QMainWindow):
             self._play_btn.setText(">")
         else:
             self.timeline.playing = True
-            self._play_timer.start(int(1000 / self._fps_spin.value()))
+            self._play_clock = time.perf_counter()
+            self._play_timer.setTimerType(Qt.PreciseTimer)
+            self._play_timer.start(self._PLAY_TICK_MS)
             self._play_btn.setText("||")
 
     def _advance_frame(self):
-        """One timer tick draws exactly one IMAGE.
+        """Advance the clock by however much WALL TIME has actually passed.
 
-        The timer therefore runs at the framerate and the step is one
-        subdivision of a source frame — which is what makes the two spin
-        boxes independent: `fps` sets how fast images go by, `smoothing` sets
-        how many of them there are between two frames of the input file.
+        **The framerate used to be a lie, and this is why** (round 78).
+        Playback ran one frame per timer tick at `int(1000 / fps)` ms, which
+        for 60 fps is 16 ms - and Windows' default timer granularity is
+        ~15.6 ms, so a 16 ms timer does not fire at 16 ms, it fires at 31.2.
+        Sixty frames took **1.87 s instead of 1.00**, which is exactly the
+        "~2 seconds" Christian counted. Any per-tick scheme has the same
+        problem the moment a repaint costs more than a frame: the animation
+        does not drop frames, it slows down, and the number in the box stops
+        meaning anything.
+
+        So the timer is only a wake-up (`_PLAY_TICK_MS`, well under a frame)
+        and the STEP comes from `perf_counter`. The remainder is carried
+        rather than discarded, so the error cannot accumulate. If a frame
+        cannot be drawn in time the playhead skips one, which is what every
+        player does and what keeps a rendered animation and a previewed one
+        the same length.
         """
         if not self.timeline.has_animation:
             self._play_timer.stop()
             self.timeline.playing = False
             return
         fps = float(self._fps_spin.value())
-        self._play_timer.setInterval(int(1000 / fps))
         self.timeline.fps = fps
-        self.timeline.advance_images(1)
+        now = time.perf_counter()
+        elapsed = now - getattr(self, "_play_clock", now)
+        steps = int(elapsed * fps)
+        if steps <= 0:
+            return                      # not a frame's worth yet; draw nothing
+        self._play_clock += steps / fps
+        self.timeline.advance_frames(steps)
         self._apply_timeline()
 
     def _apply_timeline(self):
@@ -3576,15 +3644,30 @@ class MainWindow(QMainWindow):
         the frame, and re-running perception 30 times a second would dominate
         playback cost for no visible gain.
         """
-        interpolating = self.timeline.interpolate
         for obj in self.scene.objects:
             position = self.timeline.frame_for(obj.id)
             if position is None or obj.structure.n_frames < 2:
                 obj.play_position = None
                 continue
             obj.play_rigid = self._rigid_interp
-            obj.play_position = position if interpolating else None
+            # Interpolation is no longer a global switch: a strip either
+            # is longer than its data, in which case there is something
+            # between the frames to draw, or it is not, in which case the
+            # position lands on whole frames anyway and the blend is a
+            # no-op. So the position is simply always handed over.
+            track = self.timeline.get(obj.id)
+            obj.play_cyclic = bool(track is not None and track.cyclic)
+            # How MANY pictures there are follows from the strip's duration
+            # and the framerate; all that is left to say is what happens
+            # between two source frames - blend, or hold the nearer one.
+            obj.play_position = (position if track is None
+                                 or track.interpolated else None)
+            # A cyclic strip runs up to (but never reaches) n, so the
+            # nearest stored frame of a position just short of the end is
+            # frame 0 again - not a frame past the end of the list.
             nearest = int(round(position))
+            if obj.play_cyclic:
+                nearest %= obj.structure.n_frames
             if nearest != obj.structure.current_frame:
                 obj.structure.set_frame(nearest)
                 if bonding.bonds_are_fixed(obj.structure):
@@ -3686,7 +3769,57 @@ class MainWindow(QMainWindow):
         return {"center": [float(v) for v in cam.center],
                 "distance": float(cam.distance),
                 "rotation": [float(v) for v in cam.rotation],
-                "orthographic": bool(cam.orthographic)}
+                "orthographic": bool(cam.orthographic),
+                # WHICH camera you were looking through, so reopening a file
+                # puts you back in the shot rather than in a free view that
+                # merely happens to sit where the shot was. The pose above is
+                # not enough: a camera view also constrains the frame, the
+                # lens and what a render will produce.
+                "looking_through": self.viewport.looking_through,
+                "selected_camera": self.viewport.selected_camera_id}
+
+    def _modes_state(self):
+        """Normal modes, per object, for the savefile.
+
+        They lived only on the window, so a `.molom` carrying a molecule with
+        a whole FREQ job attached reopened with the ∿ page empty and no way to
+        tell that anything had been lost. Written as plain lists because the
+        savefile is JSON (round 6); a mode is a frequency plus 3N floats, so
+        even a large job costs a few hundred kB - far less than the frames the
+        file already carries.
+        """
+        out = {}
+        for obj_id, modes in (self._modes or {}).items():
+            if not modes:
+                continue
+            out[str(obj_id)] = [
+                {"index": m.index, "wavenumber": m.wavenumber,
+                 "intensity": m.intensity,
+                 "intensity_unit": getattr(m, "intensity_unit", "km/mol"),
+                 "symmetry": getattr(m, "symmetry", None),
+                 "displacements": [[float(c) for c in row]
+                                   for row in m.displacements]}
+                for m in modes]
+        return out
+
+    def _restore_modes(self, data):
+        for key, entries in (data or {}).items():
+            try:
+                obj_id = int(key)
+            except (TypeError, ValueError):
+                continue
+            obj = self.scene.get(obj_id)
+            if obj is None:
+                continue
+            modes = [vib_mod.Mode(
+                e.get("index", i), e.get("wavenumber", 0.0),
+                e.get("displacements") or [],
+                intensity=e.get("intensity"),
+                intensity_unit=e.get("intensity_unit", "km/mol"),
+                symmetry=e.get("symmetry"))
+                for i, e in enumerate(entries)]
+            if modes:
+                self.set_modes(obj, modes)
 
     def _ui_state(self):
         return {"style": self.viewport.style.key,
@@ -3694,7 +3827,27 @@ class MainWindow(QMainWindow):
                 "labels_index": self.viewport.show_labels_index,
                 "grid": self.viewport.show_grid,
                 "draw_element": self.viewport.draw_element,
-                "active_id": self.active_id}
+                "active_id": self.active_id,
+                # The player. It was never written before, which cost
+                # nothing while a strip only carried a start and a speed
+                # nobody set - but round 77 made a strip's LENGTH the
+                # number you tune by hand until the motion looks right,
+                # and losing that on save is losing the work.
+                "timeline": self.timeline.to_dict(),
+                "modes": self._modes_state()}
+
+    def _restore_timeline(self, data):
+        """Put the player back as it was saved.
+
+        Object ids are stable across a savefile (`Scene.from_dict`
+        restores them along with `next_id`), so a strip finds its
+        molecule again. A file written before round 77 is migrated by
+        `Timeline.from_dict`; one written before the player was saved at
+        all simply has no key, and the defaults stand.
+        """
+        if not data:
+            return
+        self.timeline = timeline_mod.Timeline.from_dict(data)
 
     def on_save_project(self):
         if not self.project_path:
@@ -3757,6 +3910,8 @@ class MainWindow(QMainWindow):
             act.setChecked(bool(ui.get("labels_" + key)))
             act.blockSignals(False)
         self.active_id = ui.get("active_id")
+        self._restore_modes(ui.get("modes"))
+        self._restore_timeline(ui.get("timeline"))
         view = payload.get("view") or {}
         cam = self.viewport.camera
         if "center" in view:
@@ -3765,6 +3920,10 @@ class MainWindow(QMainWindow):
             cam.rotation = np.asarray(view["rotation"], dtype=float)
             cam.orthographic = bool(view.get("orthographic", False))
             cam.auto_ortho = False
+        self.viewport.selected_camera_id = view.get("selected_camera")
+        through = view.get("looking_through")
+        if through is not None and self.scene.camera(through) is not None:
+            self.on_activate_camera(through)
         self.project_path = path
         self._push_recent(path)
         self._sync_all(fit="center" not in view)
@@ -4148,9 +4307,11 @@ class MainWindow(QMainWindow):
             # itself across its own faces.
             rows = packing_mod.images_of(obj.structure.metadata or {}, rows,
                                          obj.structure.n_atoms)
-            # take the hanging hydrogens with them
-            edits.delete_atoms(obj.structure, rows, with_hydrogens=True)
-            meta_mod.prune(obj.structure)
+            # take the hanging hydrogens with them. Through the OBJECT, so
+            # its own per-atom maps - colours, labels, hidden atoms, sphere
+            # sizes - are renumbered with the atoms rather than left naming
+            # whichever atoms inherited those indices (round 80).
+            obj.delete_atoms(rows, with_hydrogens=True)
             if obj.structure.n_atoms == 0:
                 # Emptying the molecule you are EDITING must not delete it:
                 # you are standing inside it with the draw tool, and removing
@@ -4456,6 +4617,13 @@ class MainWindow(QMainWindow):
         molecule is definitely standing still.
         """
         obj.structure.metadata[bonding.FIXED_BONDS] = True
+        # These frames are one CLOSED PERIOD: `mode_frames` samples
+        # sin(2*pi*k/n) for k = 0..n-1 and deliberately omits the k = n
+        # duplicate, so the player must divide the strip into n arcs and
+        # blend the last sample back into the first. Metadata rather than
+        # a flag on the track, so it rides undo and the savefile and a
+        # strip removed and re-added still describes a period.
+        obj.structure.metadata[timeline_mod.CYCLIC_FRAMES] = True
         self._stale_bonds.discard(obj.id)
         bonding.perceive_structure_bonds(obj.structure)
 
@@ -4623,8 +4791,7 @@ class MainWindow(QMainWindow):
                 edits.add_bond(s, centre, offset + donor, order=1)
         # The placeholders have been replaced, so they go — last, and all at
         # once, because deleting reindexes everything above them.
-        edits.delete_atoms(s, sorted(slots))
-        meta_mod.prune(s)
+        host.delete_atoms(sorted(slots))
         self.viewport.set_selection([])
         self._after_edit()
         self._sync_all()
@@ -4751,8 +4918,8 @@ class MainWindow(QMainWindow):
             obj = self.scene.get(obj_id)
             if obj is None:
                 continue
-            a, r = edits.adjust_hydrogens(
-                obj.structure, [i for o, i in sel if o == obj_id])
+            a, r = obj.adjust_hydrogens(
+                [i for o, i in sel if o == obj_id])
             added += a
             removed += r
         if not (added or removed):

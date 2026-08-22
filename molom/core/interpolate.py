@@ -18,12 +18,26 @@ import numpy as np
 from .cif import rigid_from_reference
 
 
-def frame_pair(n_frames, position):
-    # type: (int, float) -> tuple
-    """(index_a, index_b, blend) for a fractional frame position."""
-    last = max(int(n_frames) - 1, 0)
-    if last <= 0:
+def frame_pair(n_frames, position, cyclic=False):
+    # type: (int, float, bool) -> tuple
+    """(index_a, index_b, blend) for a fractional frame position.
+
+    `cyclic` says the frames are one CLOSED period whose last sample is
+    followed by its first - a baked normal mode, where `mode_frames` stores
+    k = 0..n-1 of `sin(2*pi*k/n)` and deliberately omits the duplicate. The
+    arc from frame n-1 back to frame 0 is then a real part of the period and
+    the position may legitimately sit inside `[n-1, n)`, which the clamping
+    branch below would freeze on the last sample instead of closing the loop
+    - round 77's half of the mode-loop hitch.
+    """
+    n = int(n_frames)
+    if n <= 1:
         return 0, 0, 0.0
+    if cyclic:
+        pos = float(position) % float(n)
+        a = int(np.floor(pos))
+        return a % n, (a + 1) % n, float(pos - a)
+    last = n - 1
     pos = max(0.0, min(float(position), float(last)))
     a = int(np.floor(pos))
     if a >= last:
@@ -104,12 +118,12 @@ def _axis_angle(axis, angle):
     ])
 
 
-def coords_at(frames, position, rigid=True):
-    # type: (list, float, bool) -> np.ndarray
+def coords_at(frames, position, rigid=True, cyclic=False):
+    # type: (list, float, bool, bool) -> np.ndarray
     """Interpolated coordinates at a fractional frame position."""
     if not frames:
         return np.zeros((0, 3))
-    a, b, t = frame_pair(len(frames), position)
+    a, b, t = frame_pair(len(frames), position, cyclic=cyclic)
     if a == b or t <= 0.0:
         return np.asarray(frames[a], dtype=float).copy()
     fa = np.asarray(frames[a], dtype=float)

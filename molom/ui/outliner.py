@@ -706,7 +706,7 @@ class OutlinerPanel(QWidget):
         rule.setFlags(Qt.ItemIsEnabled)
         rule.setSizeHint(0, QSize(1, 9))
         self.tree.addTopLevelItem(rule)
-        self.tree.setItemWidget(rule, 0, _Divider())
+        self.tree.setItemWidget(rule, 0, _Divider(self.tree))
 
         active = getattr(scene, "active_camera_id", None)
         for cam in cams:

@@ -19,44 +19,53 @@ DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 FERROCENE = os.path.join(DATA, "cod_2101932_ferrocene.cif")
 
 
-def _clock(n_frames=5, smoothing=1, fps=30.0):
-    clock = timeline_mod.Timeline(fps=fps, smoothing=smoothing)
-    clock.set_track(1, n_frames=n_frames)
+def _clock(n_frames=5, frames=None, fps=30.0):
+    """Round 77: a strip's length is its own number now, so the export plan
+    is `frames` long. `frames=None` means one scene frame per source frame,
+    which is what these tests were written against."""
+    clock = timeline_mod.Timeline(fps=fps)
+    clock.set_track(1, n_frames=n_frames,
+                    frames=n_frames if frames is None else frames)
     return clock
 
 
 # ----------------------------------------------------------- the frame plan
 def test_a_loop_does_not_repeat_its_own_first_image():
-    """The last image of a cycle is the same picture as the first of the
-    next. Keeping it makes a hitch once per revolution — audible in a loop,
-    and invisible in any single frame, which is exactly why it belongs in a
-    test rather than in an eyeball check."""
+    """A cycle must not show frame 0 twice, which reads as a hitch once per
+    revolution and is invisible in any single frame - which is exactly why it
+    belongs in a test rather than an eyeball check.
+
+    Round 77 moved WHERE that is arranged. The range is now inclusive and
+    Frame End is the last frame PLAYED, so the plan has no last image to drop
+    - the drop lives in the frame range and in each strip's own length, and
+    two loops are simply the plan twice."""
     clock = _clock(n_frames=5)
     once = anim.frame_times(clock)
     twice = anim.frame_times(clock, loops=2)
-    assert once == [0.0, 1.0, 2.0, 3.0]
+    assert once == [0.0, 1.0, 2.0, 3.0, 4.0]
     assert twice == once + once
-    assert len(twice) == 2 * len(once)
+    assert twice[len(once)] == twice[0]            # the cycle closes
+    assert all(a != b for a, b in zip(twice, twice[1:]))
 
 
-def test_smoothing_subdivides_the_plan():
-    clock = _clock(n_frames=5, smoothing=3)
+def test_a_longer_strip_subdivides_the_plan():
+    """What the global smoothing used to do, done per strip."""
+    clock = _clock(n_frames=5, frames=13)
     times = anim.frame_times(clock)
-    assert len(times) == 12                      # 4 intervals x 3
-    assert times[1] == pytest.approx(1.0 / 3.0)
+    assert len(times) == 13                      # the strip's own length
+    assert times[1] - times[0] == pytest.approx(1.0)
+    assert clock.get(1).subdivision == pytest.approx(3.0)
 
 
 def test_the_plan_follows_the_loop_RANGE_the_transport_bar_shows():
     """What you export is what the bar plays — the alternative is two sources
     of truth for the same interval."""
-    clock = _clock(n_frames=5, smoothing=2)
+    clock = _clock(n_frames=5, frames=9)
     clock.set_range(1.0, 3.0)
     times = anim.frame_times(clock)
-    assert times[0] == pytest.approx(1.0)
-    assert max(times) < 3.0
-    assert len(times) == 4
+    assert times == [1.0, 2.0, 3.0]              # inclusive
     whole = anim.frame_times(clock, whole_scene=True)
-    assert whole[0] == 0.0 and len(whole) == 8
+    assert whole[0] == 0.0 and len(whole) == 9
 
 
 def test_a_still_scene_still_gives_one_image():
@@ -67,7 +76,7 @@ def test_a_still_scene_still_gives_one_image():
 
 def test_fractional_loops_are_allowed():
     clock = _clock(n_frames=5)
-    assert len(anim.frame_times(clock, loops=0.5)) == 2
+    assert len(anim.frame_times(clock, loops=0.5)) == 3
 
 
 # --------------------------------------------------------------- the output

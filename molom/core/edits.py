@@ -33,14 +33,26 @@ def add_atom(structure, symbol, position, bond_to=None):
     return structure
 
 
-def delete_atoms(structure, indices, with_hydrogens=False):
-    # type: (Structure, Sequence[int], bool) -> Structure
+def delete_atoms(structure, indices, with_hydrogens=False, report=None):
+    # type: (Structure, Sequence[int], bool, Optional[dict]) -> Structure
     """Remove atoms by index; bonds touching them are dropped and the rest
     reindexed.
 
     `with_hydrogens` also removes the terminal hydrogens hanging off the
     doomed atoms — deleting a carbon and leaving its three H's floating in
     space is never what was meant.
+
+    **Everything keyed by atom index is reindexed with the bonds** (round 80).
+    A delete renumbers every atom above it, so any map keyed by index silently
+    comes to mean different atoms — the round-42 rule, which this function
+    obeyed for the bonds and the cell reference and for nothing else. See
+    `_remap_atom_metadata`.
+
+    `report` is filled with `remap` (old index -> new, survivors only) and
+    `deleted`, because the caller's own per-atom state — a `MolObject`'s
+    colours, labels, hidden set and sphere scales — lives outside the
+    structure and cannot be reached from here. `MolObject.delete_atoms` is
+    the paired call that uses it.
     """
     doomed = {int(i) for i in indices if 0 <= int(i) < structure.n_atoms}
     if with_hydrogens:
@@ -50,6 +62,9 @@ def delete_atoms(structure, indices, with_hydrogens=False):
                         and len(structure.bonded_neighbors(j)) == 1:
                     doomed.add(j)
     doomed = sorted(doomed)
+    if report is not None:
+        report["deleted"] = list(doomed)
+        report["remap"] = {i: i for i in range(structure.n_atoms)}
     if not doomed:
         return structure
     doomed_set = set(doomed)
@@ -67,7 +82,79 @@ def delete_atoms(structure, indices, with_hydrogens=False):
     structure.bonds = [(remap[i], remap[j], o) for i, j, o in structure.bonds
                        if i not in doomed_set and j not in doomed_set]
     _remap_cell_reference(structure, remap, doomed_set)
+    _remap_atom_metadata(structure, remap)
+    if report is not None:
+        report["remap"] = dict(remap)
     return structure
+
+
+#: Metadata that is a LIST parallel to the atoms.
+_PER_ATOM_LISTS = ("content_of", "site_of")
+#: Metadata that is a dict keyed by atom index (as a string — it round-trips
+#: through JSON in a savepoint, where an int key would come back as text).
+_PER_ATOM_KEYED = ("site_occupancy",)
+#: Metadata that is a list of atom PAIRS.
+_PER_ATOM_PAIRS = ("refused_bonds",)
+
+
+def _remap_atom_metadata(structure, remap):
+    """Reindex every per-atom map in the structure's metadata.
+
+    They are listed here rather than each module patching `delete_atoms`,
+    because the failure is silent in every case — a map keyed by index stays
+    perfectly VALID after a renumbering and simply means something else — so
+    the one thing that must not happen is a new one being added and forgotten.
+    One place to look, one place to add to.
+
+    What is covered, and what each would do wrong if it were not:
+      * `meta_atoms` — a meta centre's geometry and donor distance would
+        attach itself to some other atom, which is the bug that put this on
+        the open-items list;
+      * `site_of` / `content_of` — the crystal columns; an edit would reach
+        the wrong symmetry orbit or the wrong set of boundary copies;
+      * `site_occupancy` — the occupancy pie spheres would be drawn on
+        whichever atom inherited the index;
+      * `refused_bonds` — the round-43 override would draw sticks between
+        unrelated atoms.
+    """
+    meta = getattr(structure, "metadata", None)
+    if not meta:
+        return
+    from . import meta as meta_mod
+    meta_mod.remap(structure, remap)
+    n = structure.n_atoms
+    for key in _PER_ATOM_LISTS:
+        column = meta.get(key)
+        if not column:
+            continue
+        fresh = [None] * n
+        for old, new in remap.items():
+            if old < len(column):
+                fresh[new] = column[old]
+        if any(v is None for v in fresh):
+            meta.pop(key, None)     # cannot be trusted; round 51's rule
+        else:
+            meta[key] = fresh
+    for key in _PER_ATOM_KEYED:
+        table = meta.get(key)
+        if not table:
+            continue
+        fresh = {str(remap[int(k)]): v for k, v in table.items()
+                 if int(k) in remap}
+        if fresh:
+            meta[key] = fresh
+        else:
+            meta.pop(key, None)
+    for key in _PER_ATOM_PAIRS:
+        pairs = meta.get(key)
+        if not pairs:
+            continue
+        fresh = [(remap[int(i)], remap[int(j)]) for i, j in pairs
+                 if int(i) in remap and int(j) in remap]
+        if fresh:
+            meta[key] = fresh
+        else:
+            meta.pop(key, None)
 
 
 def _remap_cell_reference(structure, remap, doomed_set):
@@ -192,8 +279,9 @@ def _neighbor_dirs(structure, i):
     return structure.coords[nbrs] - origin
 
 
-def adjust_hydrogens(structure, indices, add=True, remove=True):
-    # type: (Structure, Sequence[int], bool, bool) -> Tuple[int, int]
+def adjust_hydrogens(structure, indices, add=True, remove=True,
+                     report=None):
+    # type: (Structure, Sequence[int], bool, bool, Optional[dict]) -> Tuple[int, int]
     """Add or remove hydrogens so the given atoms reach their typical
     valence. Returns (n_added, n_removed).
 
@@ -249,7 +337,10 @@ def adjust_hydrogens(structure, indices, add=True, remove=True):
                 to_delete.append(j)
                 removed += 1
     if to_delete:
-        delete_atoms(structure, to_delete)
+        # REMOVING renumbers, and the caller may hold per-atom maps that
+        # have to follow (round 80). Adding does not: a new hydrogen is
+        # appended, so every existing index still means what it did.
+        delete_atoms(structure, to_delete, report=report)
     return added, removed
 
 
@@ -364,8 +455,8 @@ def idealize_terminal_hydrogens(structure, indices):
 
 
 def set_element_adjusted(structure, indices, symbol, adjust_h=True,
-                         adjust_lengths=True):
-    # type: (Structure, Sequence[int], str, bool, bool) -> Tuple[int, int]
+                         adjust_lengths=True, report=None):
+    # type: (Structure, Sequence[int], str, bool, bool, Optional[dict]) -> Tuple[int, int]
     """Change element(s), stretch their bonds to the new covalent length, and
     re-dress their hydrogens (the edit-mode draw tool's behaviour: C -> N
     drops an H, H -> Zn lengthens the bond it hangs off)."""
@@ -374,7 +465,7 @@ def set_element_adjusted(structure, indices, symbol, adjust_h=True,
         adjust_bond_lengths(structure, indices)
     if not adjust_h:
         return (0, 0)
-    return adjust_hydrogens(structure, indices)
+    return adjust_hydrogens(structure, indices, report=report)
 
 
 def suggested_position(structure, bond_to=None, distance=None, symbol="C"):

@@ -292,7 +292,7 @@ def test_a_hidden_trajectory_does_not_re_perceive_bonds(win):
     try:
         obj.visible = False
         for _ in range(30):
-            win.timeline.advance_images(1)
+            win.timeline.advance_frames(1)
             win._apply_timeline()
         assert calls == [], "hidden molecule still re-perceived bonds"
 

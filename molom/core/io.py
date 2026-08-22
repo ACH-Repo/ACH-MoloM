@@ -629,6 +629,31 @@ def import_name_filters():
     return filters
 
 
+def python_executable():
+    # type: () -> str
+    """A real Python interpreter to run the reader worker with.
+
+    `sys.executable` is USUALLY the interpreter, but it is not guaranteed to
+    be: under a frozen build, an embedded interpreter, or some launcher
+    wrappers it is the host application instead - and then
+    `[sys.executable, "-m", "molom.core._obabel_worker"]` re-launches THAT,
+    which for MoloM means a second copy of the GUI flashing up and dying for
+    every file read. Checked rather than assumed, with `sys._base_executable`
+    and a sibling `python.exe` as fallbacks.
+    """
+    exe = sys.executable or ""
+    if os.path.basename(exe).lower().startswith("python"):
+        return exe
+    base = getattr(sys, "_base_executable", "") or ""
+    if base and os.path.basename(base).lower().startswith("python"):
+        return base
+    for name in ("python.exe", "pythonw.exe", "python"):
+        guess = os.path.join(os.path.dirname(exe), name)
+        if os.path.isfile(guess):
+            return guess
+    return exe
+
+
 def quiet_subprocess_kwargs():
     # type: () -> dict
     """Keyword arguments that stop a console window flashing up on Windows.
@@ -651,7 +676,8 @@ def quiet_subprocess_kwargs():
 def _read_with_openbabel(path, fmt, timeout=IMPORT_READ_TIMEOUT_S):
     # type: (str, str, float) -> Tuple[Optional[list], Optional[str]]
     """Read all records via OpenBabel in a killable subprocess."""
-    cmd = [sys.executable, "-m", "molom.core._obabel_worker", fmt, path]
+    cmd = [python_executable(), "-m", "molom.core._obabel_worker",
+           fmt, path]
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, timeout=timeout,

@@ -545,8 +545,10 @@ reaches the extremes of the oscillation — at n = 6 the animation peaks at
 0.87 of the amplitude you asked for, so the highest and lowest points of the
 chemical coordinate, which are the reason to look at the mode at all, are
 quietly cut off. Any count you type is snapped to the nearest multiple of
-four. The player's **Smoothing** then subdivides between these frames, which
-is why a fairly small count still looks continuous.
+four. It is the number of frames GENERATED - the data. How long the mode then
+plays for is the strip's own **Frames**, on the Animation strip page, and the
+two defaults are equal (60) so that out of the box every frame drawn is a real
+sample of the sine rather than a chord between two.
 
 Animating bakes one period of the mode into ordinary trajectory frames, so it
 arrives on the scene clock like any other track: it interpolates, it appears
@@ -572,40 +574,69 @@ re-perceives on request.
 ## Trajectory playback (the scene clock)
 There is **one playhead for the whole scene**, not one per molecule, so every
 trajectory loaded plays at the same time. The bar under the viewport is that
-playhead: play/pause (**Space**), the loop limits, the two playback knobs, a
-position readout, and a **▾** toggle that opens the track rows.
+playhead: play/pause (**Space**), the frame range, the framerate, a position
+readout, and a **▾** toggle that opens the track rows.
 
-### Frames, images and seconds
-Three different things, kept apart deliberately:
+### Three global numbers, and one per strip
+The bar carries **Frame Start**, **Frame End** and **Framerate**, and nothing
+else. A *scene frame* is one picture; the clock ticks one per tick at the
+framerate; a strip's own **Frames** says how many scene frames it occupies.
 
 | | |
 |---|---|
-| a **frame** | a coordinate set that came out of an input file. How many there are is a property of the data — a trajectory's steps, one sample of a normal mode — and nothing the player chooses. |
-| an **image** | one picture the player draws. **Smoothing** says how many fill the gap between two consecutive frames (1 = no interpolation, draw the frames themselves). |
-| **Framerate** | images per second. Global, because it is a property of the playback rather than of any one molecule. |
+| a **source frame** | a coordinate set that came out of an input file, or one generated sample of a normal mode. How many there are is a property of the data. |
+| a **scene frame** | one picture the player draws, and one position of the playhead. |
+| **Duration** (per strip) | how long that strip takes to play, in SECONDS. Its length, therefore its speed, therefore how finely its source data is subdivided — one number, on the Animation strip page. The frame count follows from it and the framerate. |
+| **Framerate** | scene frames per second. Global, because it is a property of the playback rather than of any one molecule. |
 
-So one source frame lasts `Smoothing / Framerate` seconds, and **Playback**
-counts images: `current / total`. Keeping the two knobs separate is what lets
-a 12-frame optimisation and a 200-frame trajectory both play at a watchable
-speed without touching the data.
+A strip therefore occupies `Duration x Framerate` frames, and it interpolates
+exactly when that is more than its data has. There is no global smoothing
+knob: lengthening one strip makes that molecule play longer and more smoothly
+and leaves every other strip alone, which is what the old global one could not
+do.
 
-One consequence is worth knowing: at a fixed framerate, doubling the
-smoothing plays *slower* as well as smoother — twice as many pictures in the
-same second is half the trajectory per second, exactly like shooting video at
-60 fps and playing it back at 30. Raise the framerate too if you want the
-original speed. Both knobs sit next to each other so the trade is visible.
+**Is smoothing gone for good?** As a COUNT, yes — how many pictures there are
+now follows from the duration and the framerate, so a third number could only
+disagree with them. What a count could never say is whether those pictures
+*blend* or *step*, and that is a real choice about a trajectory: blending
+invents intermediate geometries, stepping shows only the ones that were
+computed. That survives as the per-strip **Interpolate between frames** tick,
+on by default.
 
-### Loop limits
-**Loop [first] - [last]** bound the interval the playhead runs over, in
-images, so you can loop the interesting twenty frames of a five-hundred-frame
-run. They are also draggable in the track pane — the two green handles — and
-everything outside them is veiled. Leaving the end on its maximum means "to
-the end of the scene", so a trajectory that grows later stays covered.
+**Playback keeps real time.** The clock advances by elapsed wall time, not one
+frame per timer tick, so a scene that cannot be drawn at the framerate drops
+frames instead of playing slowly — `n_frames / Framerate` seconds is what a
+loop takes, and it matches what a render of the same range will produce.
 
-The limits are stored in frames, so changing the smoothing renumbers them but
-does not move them. Dragging the playhead past a limit parks it there rather
-than wrapping: a wrap under the cursor is unreadable while scrubbing.
-Playback itself still wraps, per the end mode.
+**Cyclic and linear data are sampled differently, and only there.** A baked
+normal mode is one closed period — the last stored sample is *not* a repeat of
+the first — so its `n` samples divide the strip into `n` equal arcs and the
+strip's last frame sits one arc short of home, which is what makes the loop
+seamless. An imported trajectory has two distinct ends, so `Frames - 1` scene
+intervals divide `n - 1` source intervals and the strip's last frame lands
+exactly on the last datum. The strip page says which it is.
+
+### The frame range
+**Frame [start] - [end]** bound the interval the playhead runs over, so you
+can loop the interesting twenty frames of a five-hundred-frame run. The range
+is **inclusive**: Frame End is the last frame played, and the frame after it
+is Frame Start again. They are also draggable in the track pane — the two
+green handles, which sit on the boundary *after* the frame they name — and
+everything outside them is veiled.
+
+**It does not follow the content.** The range is fitted once, the first time
+there is anything to play, and is then yours: arranging strips never moves it.
+The **⤢** button beside the boxes fits it to every strip again, which is how a
+trajectory imported later is brought into the loop.
+Having it track the content meant dragging a strip to the right dragged Frame
+End along with it, which re-scaled the pane mid-gesture, and a strip nudged to
+a fractional start made the loop period fractional too — which is how a loop
+ends up one frame long or short. **Strip starts snap to whole frames** for the
+same reason.
+
+Dragging the playhead past a limit parks it there rather than wrapping: a wrap
+under the cursor is unreadable while scrubbing. Playback itself still wraps,
+per the end mode.
 
 **The track pane** (▾, or drag the grip above it to resize) shows one row per
 animated molecule on a shared time axis with a single playhead across all of
@@ -619,21 +650,54 @@ line anywhere down the rows.
 |---|---|
 | drag the playhead / ruler | scrub the scene clock |
 | drag a green handle | move that end of the **looping interval** |
-| drag a bar sideways | slide that track's **start offset** |
-| click the dot in the gutter | enable / disable that track |
+| drag a bar sideways | slide that strip's **start**, snapped to whole frames |
+| click a bar | select it (orange), and show it on the strip page |
+| **G** | grab the selected strip: it follows the pointer, click or Enter drops it, **Esc** puts it back |
+| **X** / **Del** | take the selected strip off the player (the frames stay) |
+| click anywhere that is not a strip | deselect |
+| click the dot in the gutter | enable / disable that strip |
 | double-click a bar | cycle its end mode: hold → loop → pingpong |
 | click empty track space | seek the playhead there |
 
+| Moving the view | Does |
+|---|---|
+| **wheel / swipe up-down** | zoom time, keeping the frame under the cursor still |
+| **swipe left-right** | pan time |
+| **Shift+wheel** | pan time |
+| **Ctrl+wheel** | scroll the rows |
+| **Home**, the **Fit** button | frame every strip and the whole play range |
+| **View [start] - [end]** | show exactly that interval |
+
+A scroll is read by whichever axis DOMINATES, and the action is **latched for
+the whole gesture**: a trackpad swipe is never purely one axis, so a rule that
+checked the horizontal delta first handed most vertical flicks to the pan
+branch, and a swipe that drifted diagonally flipped between panning and zooming
+under the hand. Holding a modifier starts a new gesture, since that is a
+deliberate change of intent rather than a wobble. A wheel notch and 60 px of
+trackpad are the same quantity, so the two devices zoom by the same amount for
+the same movement.
+
+The pane's keys work when it has focus **or the pointer is over it**, which is
+how Blender routes a hotkey and is what keeps G from grabbing the molecule
+instead of the strip.
+
+**The View bounds are not the play range.** One says what the pane shows, the
+other what plays — and the pane needs its own or a strip dragged far to the
+right leaves everything a sliver with no way back. They sit on the transport
+row beside the frame range, not in a bar of their own.
+
 Rows are ordered by start time, so a staggered set reads top-to-bottom.
 
-Each object gets a **track** mapping scene time to its own frames through a
-**start offset**, a **speed**, and an end behaviour (**hold** the last frame,
-**loop**, or **pingpong**). So two trajectories can be staggered, or run at
-different rates, off the same clock. A molecule with one frame is a still and
-simply never moves. The scene runs as long as its longest track.
+Each object gets a **strip** mapping scene time to its own frames through a
+**start offset**, a **duration**, and an end behaviour (**hold** the last
+frame, **loop**, or **pingpong**). So two trajectories can be staggered, or
+run at different rates, off the same clock — a shorter strip over the same
+data plays faster. A molecule with one frame is a still and simply never
+moves.
 
-**Smoothing** above 1 interpolates between frames instead of stepping. A
-plain blend would send every atom along the straight chord between positions,
+**A strip longer than its data** interpolates between frames instead of
+stepping. A plain blend would send every atom along the straight chord
+between positions,
 which makes a *rotating* molecule contract toward its centroid halfway
 through the turn and spring back — bonds visibly losing length. Instead the
 rigid part of the motion is extracted (Kabsch) and turned as a real rotation,
@@ -644,6 +708,35 @@ Interpolated coordinates are **display only** — the stored frames are never
 written, so scrubbing cannot damage a trajectory, and editing always sees
 real frame data. Bond perception runs only when an object's nearest whole
 frame changes, never on every interpolated tick.
+
+For a **cyclic** strip the blend also carries across the wrap, from the last
+stored sample back into the first. Without that the closing arc of every
+revolution is frozen and then leapt in one frame — which is exactly what a
+baked mode did before round 77, covering 93.3% of a 20-sample period and
+crossing the rest at four times the normal step.
+
+### The Animation strip page
+Clicking a strip in the track pane selects it (orange, the same colour and
+meaning as the viewport's selection outline) and shows it on its own
+properties page:
+
+| Field | Means |
+|---|---|
+| **Start** | the scene frame the strip begins on. May be negative — the pane has canvas either side of the frame range for exactly that. Dragging the bar changes the same number. |
+| **Duration** | how long the strip takes to play, in seconds. The one number that decides its playback: its length, hence its speed, hence how finely its data is subdivided. Raise it until the motion looks fluid. The frame count follows from it and the framerate. |
+| **Interpolate between frames** | blend between the source frames, or hold each one until the next is due. All that is left of the old global Smoothing — see above. |
+| **At the end** | hold the last frame, loop, or ping-pong — applied in the strip's *own* frames, which is what lets one rule serve a period and a run alike. |
+| **Source** | frames in the underlying data, and whether they are one closed period or a run with two distinct ends. |
+| **Sampling** | scene frames drawn per source frame — the old global Smoothing, now read off rather than set. |
+| **Occupies** | the frames it covers, and how long that is in seconds at the current framerate. |
+
+**Remove from player** takes the strip off the timeline and leaves the frames
+alone: this is the animation's track, not the molecule's data. The removal is
+remembered, so the next rebuild does not put it straight back.
+
+Setting **Duration** never re-bakes anything either — a mode's sample count is
+the vibrations page's *Frames / period*, and a playback length must not
+quietly mutate a molecule and push an undo step.
 
 ## Measure
 The 📏 toolbar tool. Click **2** atoms for a distance, **3** for an angle

@@ -388,7 +388,7 @@ def test_a_vibration_never_loses_a_bond(win):
     assert expected, "the molecule has bonds at rest"
 
     for _ in range(60):                    # right through several periods
-        win.timeline.advance_images(1)
+        win.timeline.advance_frames(1)
         win._apply_timeline()
         assert list(win.scene.get(obj.id).structure.bonds) == expected
 

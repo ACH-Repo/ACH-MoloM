@@ -15,6 +15,7 @@ from PySide6.QtGui import QDoubleValidator
 from . import dragcheck
 from .widgets import make_text_selectable
 from ..core import cameras
+from ..core import timeline as timeline_mod
 from ..core import vibrations
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDockWidget,
                                QLineEdit, QSlider,
@@ -112,7 +113,7 @@ class ModifierPage(QWidget):
         """One modifier = one boxed row: a header that is always visible and
         a body that is COLLAPSED by default, so a stack of five reads as five
         lines instead of five screens."""
-        card = QFrame()
+        card = QFrame(self)
         card.setFrameShape(QFrame.StyledPanel)
         card.setStyleSheet(
             "QFrame { background: rgba(255,255,255,10); border: 1px solid"
@@ -1295,16 +1296,18 @@ class VibrationPage(QWidget):
         amp_holder.setLayout(amp_row)
 
         self.frames_spin = QSpinBox()
-        self.frames_spin.setRange(4, 120)
+        self.frames_spin.setRange(4, 480)
         self.frames_spin.setSingleStep(4)         # keeps the extremes sampled
-        self.frames_spin.setValue(20)
+        self.frames_spin.setValue(vibrations.DEFAULT_PERIOD_FRAMES)
         self.frames_spin.setMaximumWidth(80)
         self.frames_spin.setToolTip(
-            "Frames generated for one period of the mode. Steps in fours so "
-            "the sampling lands exactly on both turning points of the "
-            "oscillation — otherwise the highest and lowest points of the "
-            "coordinate are never reached. The player's Smoothing then "
-            "subdivides between these frames.")
+            "Frames GENERATED for one period of the mode - the data, not "
+            "the playback. Steps in fours so the sampling lands exactly on "
+            "both turning points of the oscillation, otherwise the highest "
+            "and lowest points of the coordinate are never reached. How "
+            "long the mode then plays for is the strip's own frame count, "
+            "on the Animation strip page; the default lines the two up so "
+            "every frame drawn is a real sample.")
         form.addRow("Amplitude:", amp_holder)
         form.addRow("Frames / period:", self.frames_spin)
 
@@ -1555,7 +1558,13 @@ class VibrationPage(QWidget):
         # boxes to say one thing - and once the selection share was added the
         # button was pushed off the right edge of a narrow dock. A row that
         # does one thing should be one clickable row.
-        card = _ModeRow(mode.index)
+        # PARENTED at construction. A parentless QWidget is a TOP-LEVEL
+        # WINDOW until something reparents it, and Qt can realise it in
+        # between - which is a MoloM-titled empty window flashing on screen,
+        # dozens of them while a page rebuilds. Round 59 met the same rule
+        # from the other side (an orphan dock shell floating over the menu
+        # bar); the cure is to never let one exist unparented.
+        card = _ModeRow(mode.index, self)
         card.clicked.connect(self.mode_selected.emit)
         lit = 34 if self._active == mode.index else 10
         card.setStyleSheet(
@@ -1636,21 +1645,27 @@ class VibrationPage(QWidget):
 class StripPage(QWidget):
     """The selected animation strip: what it is and where it sits in time.
 
-    SCOPED to grow. Today it reports the numbers a strip has - where it
-    starts, how long it runs, how fast, what it does at the end - and lets
-    the ones that are genuinely the strip's own be edited. The reason it is
-    a page rather than a tooltip is that a strip is going to accumulate
-    properties (per-strip amplitude, a source label, an offset in seconds
-    rather than frames), and each of those wants a row, not a corner of a
-    bar three pixels tall.
+    **Round 77 moved the smoothing here, and turned it into a length.**
+    Christian: "Smoothing is a property that should be unique to a particular
+    strip... Just set one number of total frames inside the strip properties.
+    User has to adjust them until they're satisfied with the fluidity of the
+    animation."
+
+    So `Frames` is the strip's whole playback description: how many scene
+    frames it occupies, hence how fast it runs, hence how finely its source
+    data is subdivided. It replaces the old `Speed`, which said the same
+    thing in a less useful unit - a multiplier tells you nothing about how
+    long the shot is or whether the motion will look smooth, and the two
+    together were one degree of freedom wearing two hats.
 
     It reads a `timeline.Track`, which is UI-free, so everything shown here
     is testable without a window.
     """
 
     start_changed = Signal(int, float)     # obj_id, start
-    speed_changed = Signal(int, float)
+    duration_changed = Signal(int, float)  # obj_id, seconds
     end_mode_changed = Signal(int, str)
+    interpolate_changed = Signal(int, bool)
     remove_requested = Signal(int)
 
     def __init__(self, parent=None):
@@ -1670,23 +1685,30 @@ class StripPage(QWidget):
         form.setContentsMargins(0, 2, 0, 2)
         form.setSpacing(4)
 
-        self.start_spin = QDoubleSpinBox()
-        self.start_spin.setRange(-100000.0, 100000.0)
-        self.start_spin.setDecimals(2)
-        self.start_spin.setSuffix(" frames")
+        # An INTEGER box: a strip start is a frame number, and round 78 snaps
+        # it to a whole frame anyway (a strip that begins at 3.7 puts its last
+        # frame between two scene frames, and a loop fitted to it is then not
+        # a whole number of frames). Decimals here would only ever be rounded
+        # away under the hand.
+        self.start_spin = QSpinBox()
+        self.start_spin.setRange(-100000, 100000)
         self.start_spin.setToolTip(
-            "Where this strip begins on the scene clock. Dragging the bar in "
-            "the track pane changes the same number.")
+            "The scene frame this strip begins on. Dragging the bar in the "
+            "track pane changes the same number, and it may be negative.")
         form.addRow("Start:", self.start_spin)
 
-        self.speed_spin = QDoubleSpinBox()
-        self.speed_spin.setRange(0.01, 100.0)
-        self.speed_spin.setDecimals(2)
-        self.speed_spin.setSingleStep(0.1)
-        self.speed_spin.setToolTip(
-            "Playback rate for this strip alone: 2.0 runs it twice as fast, "
-            "so several trajectories can play at different rates.")
-        form.addRow("Speed:", self.speed_spin)
+        self.seconds_spin = QDoubleSpinBox()
+        self.seconds_spin.setRange(0.01, 3600.0)
+        self.seconds_spin.setDecimals(2)
+        self.seconds_spin.setSingleStep(0.25)
+        self.seconds_spin.setSuffix(" s")
+        self.seconds_spin.setToolTip(
+            "How long this strip takes to play. The ONE number that decides "
+            "its playback: it is the length, so it is also the speed, and "
+            "since the source data is spread over it, it is also the "
+            "smoothness. Raise it until the motion looks fluid. "
+            "The frame count follows from it and the scene framerate.")
+        form.addRow("Duration:", self.seconds_spin)
 
         self.end_combo = QComboBox()
         for key, label in (("hold", "Hold last frame"), ("loop", "Loop"),
@@ -1695,10 +1717,34 @@ class StripPage(QWidget):
         self.end_combo.setToolTip("What happens after the strip runs out.")
         form.addRow("At the end:", self.end_combo)
 
-        self.length = QLabel("")
-        form.addRow("Length:", self.length)
+        self.source = QLabel("")
+        self.source.setToolTip(
+            "Frames in the underlying data, and whether they are one closed "
+            "period (a baked normal mode) or a run with two distinct ends "
+            "(an imported trajectory). A period divides the strip into n "
+            "equal arcs and never repeats its first frame; a trajectory puts "
+            "its last frame exactly on the strip's last frame.")
+        form.addRow("Source:", self.source)
+        self.interp_check = QCheckBox("Interpolate between frames")
+        self.interp_check.setToolTip(
+            "On, the player blends between the source frames, rotating rigid "
+            "parts rather than cutting across them. Off, it holds each source "
+            "frame until the next one is due - the frames as they were "
+            "computed, which is sometimes what you want from an MD run. "
+            "This is all that is left of the old global Smoothing: HOW MANY "
+            "pictures there are now follows from the duration and the "
+            "framerate, so the only thing left to say is what happens "
+            "between them.")
+        form.addRow("", self.interp_check)
+
+        self.sampling = QLabel("")
+        self.sampling.setToolTip(
+            "Scene frames drawn per source frame. 1 is the data as it came; "
+            "above that the player interpolates between real frames, "
+            "rotating rigid parts rather than cutting across them.")
+        form.addRow("Sampling:", self.sampling)
         self.ends = QLabel("")
-        form.addRow("Ends at:", self.ends)
+        form.addRow("Occupies:", self.ends)
         lay.addWidget(self.box)
 
         self.remove_btn = QPushButton("Remove from player")
@@ -1710,14 +1756,20 @@ class StripPage(QWidget):
         lay.addStretch(1)
 
         self.start_spin.valueChanged.connect(self._emit_start)
-        self.speed_spin.valueChanged.connect(self._emit_speed)
+        self.seconds_spin.valueChanged.connect(self._emit_seconds)
+        self.interp_check.toggled.connect(self._emit_interpolate)
         self.end_combo.currentIndexChanged.connect(self._emit_end)
         self.set_strip(None, None, "")
 
     # ------------------------------------------------------------ content
-    def set_strip(self, obj_id, track, name=""):
+    def set_strip(self, obj_id, track, name="", fps=None):
         """Show one strip, or nothing. Guarded like every other page here:
-        `setValue` emits whether or not a hand moved it (round 30)."""
+        `setValue` emits whether or not a hand moved it (round 30).
+
+        `fps` is passed in rather than reached for so the page can say how
+        long the strip LASTS - which is what someone judging fluidity is
+        actually asking - while still knowing nothing about the window.
+        """
         self._obj_id = None if track is None else int(obj_id)
         live = track is not None
         self.box.setEnabled(live)
@@ -1726,19 +1778,27 @@ class StripPage(QWidget):
             self.title.setText(
                 "No strip selected.\nClick one in the track pane below "
                 "the transport bar.")
-            self.length.setText("")
-            self.ends.setText("")
+            for label in (self.source, self.sampling, self.ends):
+                label.setText("")
             return
         self._loading = True
         try:
             self.title.setText("<b>{}</b>".format(name or obj_id))
-            self.start_spin.setValue(float(track.start))
-            self.speed_spin.setValue(float(track.speed))
+            rate = float(fps or timeline_mod.DEFAULT_FPS)
+            self.start_spin.setValue(int(track.start))
+            self.seconds_spin.setValue(round(track.seconds(rate), 2))
+            self.interp_check.setChecked(bool(track.interpolated))
             index = self.end_combo.findData(track.end)
             self.end_combo.setCurrentIndex(max(index, 0))
-            self.length.setText("{} frames at {:g}x = {:g}".format(
-                track.n_frames, track.speed, track.length))
-            self.ends.setText("{:g}".format(track.end_time))
+            self.source.setText("{} frames, {}".format(
+                track.n_frames,
+                "one closed period" if track.cyclic else "start to end"))
+            self.sampling.setText(
+                "{} scene frames, {:.2f} per source frame{}".format(
+                    track.frames, track.subdivision,
+                    "" if track.interpolates else "  (nothing to blend)"))
+            self.ends.setText("frames {:g} to {:g}  at  {:g} fps".format(
+                track.start, track.last_frame, rate))
         finally:
             self._loading = False
 
@@ -1746,9 +1806,13 @@ class StripPage(QWidget):
         if not self._loading and self._obj_id is not None:
             self.start_changed.emit(self._obj_id, float(value))
 
-    def _emit_speed(self, value):
+    def _emit_seconds(self, value):
         if not self._loading and self._obj_id is not None:
-            self.speed_changed.emit(self._obj_id, float(value))
+            self.duration_changed.emit(self._obj_id, float(value))
+
+    def _emit_interpolate(self, on):
+        if not self._loading and self._obj_id is not None:
+            self.interpolate_changed.emit(self._obj_id, bool(on))
 
     def _emit_end(self, _index):
         if not self._loading and self._obj_id is not None:
