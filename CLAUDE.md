@@ -198,6 +198,55 @@ other side, and the two export fixes are verified in `tools/smoke_gui.py`
 instead, which now measures the crop and counts ink with and without the cell
 box. 1310 tests.
 
+Round 81 (2026-08-22, open item A5 - a CIF viewer draws the FILE, on branch
+`crystal-overvalence`):
+**Christian settled this with an argument, not a preference, and the argument
+dissolves the item rather than patching it.** "We are visualising information
+that is recorded in a cif file, not the physical reality. If someone made a
+shit refinement, then the cif is flawed and the visualiser should reflect
+that... We should not be silently glossing over bad refinements. Just draw the
+bond, even if it exceeds valence. It's a crystal structure. Due to occupancies
+and disorder, that comes with the territory. And those types of over-valences
+are informative because they either expose real, physical limitations, or
+because they indicate bad data refinement."
+He is also right about the second half, and it is the sharper point: **longest
+first was always wrong for a crystal SPECIFICALLY because of hydrogen** - short
+bonds, low electron count - so every real C-C is longer than every real C-H and
+the cap sacrifices the skeleton to keep duplicate hydrogens. Round 41 patched
+the ORDER (`_removal_order` sends a last link to the back). Round 81 removes
+the question: `cif.display_bonds` passes `valence=False, cap_hydrogens=False`,
+so nothing is dropped and the picture is the distance test plus the file.
+**A5 was a CONSEQUENCE of dropping, which is why it dissolves.** Dropping a
+BOND does not drop an ATOM, so the hydrogens on the far end of the dropped
+bonds floated as unbonded spheres - 36 of them in that cell. Nothing is
+dropped now, so nothing floats. Measured on a synthetic disordered methyl
+(C-C 1.497, C-H 1.000, six H at 60 degrees - the numbers `4-ABA-oxime.cif`
+gives, rebuilt here because that file is CCDC and cannot be vendored):
+**capped, 4 edges, carbon degree 4, THREE orphan hydrogens; uncapped, 7 edges,
+degree 7, none.**
+**And it retires the idea I had been circling.** The geometric disorder sweep
+would have been the wrong instrument anyway: an idealised staggered methyl
+puts its closest H pair at **0.943 A**, outside `DISORDER_RADIUS` (0.8), so on
+ideal geometry the sweep finds NOTHING and on a real file it catches only the
+pairs the refinement happened to place under the threshold - which is exactly
+why a naive sweep left a 2-hydrogen methyl. The right answer was never to
+guess which atoms are real.
+**What is deliberately NOT relaxed, and the split is round 42d's rule read
+from the other side.** An impossibly short contact is still refused: that is
+not a valence judgement (no chemistry puts two nuclei at half their covalent
+radii) and round 43's tick already exists for looking at those. And
+`periodic_pairs` keeps the cap, because it answers "what belongs TOGETHER" for
+the fragment walks, the boundary completion and the percolation test - where
+round 38 measured that one bad contact fusing four molecules makes a whole
+cell read as a framework. So: **group by chemistry, draw by the file.**
+`perceive_bonds` gained the same two flags for symmetry; its defaults are
+unchanged, so a MOLECULE still gets the cap - the draw tool's C -> N dropping
+an H rests on it, and a molecule being built is not a refinement.
+Regression measured rather than assumed: both vendored crystals are unaffected
+(ferrocene 210 atoms / 300 bonds, the solid solution 21 / 23, no unbonded atoms
+either way), because the rule only bites where a file is over-valence.
+1648 tests.
+
 Round 80 (2026-08-22, open item A1 - a delete renumbers, and almost nothing
 followed):
 **A1 as reported was one instance of a class, and the class is what got
@@ -3557,7 +3606,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1640 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1648 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -4735,6 +4784,17 @@ independent cross-check inside a single fixture.
   FULL RUN — passing alone, which is the signature of shared state and the
   same shape as the round-37 circuit breaker and the round-46 module cache.
   `tests/conftest.py::_fresh_settings` clears it after every test.
+- **A CIF VIEWER DRAWS THE FILE, NOT THE CHEMISTRY IT WISHES IT HAD**
+  (round 81). Over-valence is DRAWN in a crystal - `cif.display_bonds` passes
+  `valence=False, cap_hydrogens=False` - because a carbon with six hydrogens is
+  what a methyl disordered over two orientations at full occupancy looks like,
+  and it is informative either as a real limitation of the model or as a bad
+  refinement. Capping forced a choice of which bond to sacrifice, and for a
+  crystal that choice is systematically wrong: every real C-C is longer than
+  every real C-H, so "longest first" sacrifices the skeleton to keep the
+  duplicates. The cap survives for MOLECULES (the draw tool's chemistry) and
+  for `periodic_pairs` (what belongs TOGETHER, for the fragment walks) - round
+  42d's rule read from the other side: group by chemistry, draw by the file.
 - **A DELETE RENUMBERS, SO DELETE THROUGH THE OBJECT** (round 80).
   `MolObject.delete_atoms` / `.adjust_hydrogens` / `.set_element_adjusted` are
   the paired calls: `edits` can only reach what is on the STRUCTURE, and a

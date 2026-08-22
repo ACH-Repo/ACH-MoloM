@@ -6,8 +6,9 @@ Struck-through items in CLAUDE.md are omitted; this is only what is left.
 
 Nothing here is urgent. It is an inventory, not a plan.
 
-**Since the sweep** (rounds 74-80, to 2026-08-22): **A1 is done** (round 80);
-nothing else on this list was closed, and nothing was added to it. Rounds 74-76 were the MOPAC
+**Since the sweep** (rounds 74-81, to 2026-08-22): **A1 is done** (round 80)
+and **A5 is decided** (round 81, on a branch); nothing else on this list was
+closed, and nothing was added to it. Rounds 74-76 were the MOPAC
 frequency reader, computed layers (`core/attachments.py`) and Christian's
 MOPAC batch; rounds 77-79 reworked the player - one duration per strip, a
 frame range that stays put, wall-clock playback, and a pane you can zoom and
@@ -47,11 +48,14 @@ get to later". First step is written down: reproduce on
 `cod_1547149_solid_solution.cif`, check whether `site_occupancy`/`site_of`
 survives `packing.pack`'s rebuild.
 
-**A5. `4-ABA-oxime.cif` floats 36 unbonded hydrogens.** The disordered methyl's
-surplus H are drawn with no bonds, because dropping the BOND does not drop the
-ATOM. Resolving undeclared disorder geometrically would fix it, but on that
-carbon only two of four H pairs overlap, so a naive sweep leaves a 2-hydrogen
-methyl. **Needs a decision, not a patch.**
+~~**A5. `4-ABA-oxime.cif` floats 36 unbonded hydrogens.**~~ **DECIDED and done,
+round 81** (branch `crystal-overvalence`, awaiting Christian's testing). The
+decision was his and it dissolves the item: a CIF viewer draws the FILE, so
+over-valence is drawn and nothing is dropped — which means nothing is left
+floating. The geometric disorder sweep this entry proposed was the wrong
+instrument anyway; an idealised staggered methyl puts its closest H pair at
+0.943 A, outside `DISORDER_RADIUS` (0.8). Impossibly short contacts are still
+refused, and `periodic_pairs` still caps for the fragment walks.
 
 **A6. The desktop-only selection flicker was fixed by inference, not by
 reproduction.** Overlays got their own buffers (round 35), which is right

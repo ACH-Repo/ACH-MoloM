@@ -140,6 +140,11 @@ def _removal_order(symbols, pairs, distances):
     So a bond that is some atom's LAST link to the heavy-atom skeleton goes
     last. Nothing else changes: a spurious long C...C on a carbon that has
     other heavy neighbours is not a last link, and is still dropped first.
+
+    Round 81 note: this ordering no longer applies to a drawn CRYSTAL at all,
+    because the cap is not applied there - a CIF's over-valence is the file's
+    statement and is drawn as-is. It still governs MOLECULES, where the cap is
+    the draw tool's own chemistry, and it still governs the fragment walks.
     """
     count = len(pairs)
     if not count:
@@ -231,8 +236,9 @@ def covalent_radii(symbols):
     return r
 
 def perceive_bonds(symbols, coords, tolerance=TOLERANCE,
-                   min_distance=MIN_DISTANCE, sanity=True, report=None):
-    # type: (List[str], np.ndarray, float, float, bool, Optional[dict]) -> List[Tuple[int, int, int]]
+                   min_distance=MIN_DISTANCE, sanity=True, report=None,
+                   valence=True, cap_hydrogens=True):
+    # type: (List[str], np.ndarray, float, float, bool, Optional[dict], bool, bool) -> List[Tuple[int, int, int]]
     """Perceive bonds from geometry. Returns [(i, j, 1), ...] with i < j.
 
     Vectorised numpy over all unique pairs, processed in blocks so a large
@@ -242,6 +248,9 @@ def perceive_bonds(symbols, coords, tolerance=TOLERANCE,
 
     `sanity` applies the chemistry on top of the distance rule (see the module
     docstring): impossibly short contacts and over-valence bonds are dropped.
+    `valence` and `cap_hydrogens` split that apart, because the two halves
+    answer different questions - see `prune_pairs` and round 81. A CRYSTAL
+    passes both False: what is drawn there is what the file records.
     Pass a dict as `report` to be told what went, and why — `dropped_bonds`
     explains each refusal, and `refused` is the same set as a drawable pair
     list, for the round-43 visualisation override (see `_refused_display`).
@@ -273,7 +282,7 @@ def perceive_bonds(symbols, coords, tolerance=TOLERANCE,
             dists.append(float(d))
     if sanity and bonds:
         keep, dropped = prune_pairs(symbols, [(i, j) for i, j, _o in bonds],
-                                    np.asarray(dists))
+                                    np.asarray(dists), valence=valence)
         kept = [bonds[k] for k in keep]
         if report is not None:
             report.setdefault("dropped_bonds", []).extend(dropped)
@@ -281,7 +290,7 @@ def perceive_bonds(symbols, coords, tolerance=TOLERANCE,
                 report["refused"] = _refused_display(bonds, kept, xyz,
                                                      hydrogen)
         bonds = kept
-    return _cap_hydrogens(bonds, xyz, hydrogen)
+    return _cap_hydrogens(bonds, xyz, hydrogen) if cap_hydrogens else bonds
 
 
 def _refused_display(candidates, kept, xyz, hydrogen):

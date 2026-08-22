@@ -1133,6 +1133,33 @@ def display_bonds(symbols, coords, cell, n_content, slack=0.45, existing=None,
     and the graph only ADDS to them. Anything that is not a lattice translate
     of the content — a hand-drawn or edited atom — falls back to ordinary
     perception, so this degrades to the old behaviour rather than dropping it.
+
+    **OVER-VALENCE IS DRAWN** (round 81). Christian's rule, and it is about
+    what a CIF viewer is for: "We are visualising information that is recorded
+    in a cif file, not the physical reality. If someone made a shit refinement,
+    then the cif is flawed and the visualiser should reflect that... We should
+    not be silently glossing over bad refinements."
+
+    So the drawn bonds of a crystal are what the distance test says, and the
+    valence cap is not applied here at all. A carbon with six hydrogens is
+    what a methyl disordered over two orientations at full occupancy looks
+    like, and drawing it that way is informative twice over: it is either a
+    real physical limitation of the model or a bad refinement, and either way
+    the picture should say so rather than quietly choosing a subset.
+
+    That also dissolves the round-41 defect rather than patching it. Capping
+    forced a choice about WHICH bond to sacrifice, the answer was wrong for
+    crystals (every real C-C is longer than every real C-H, so "longest first"
+    sacrificed the skeleton to keep duplicate hydrogens), and the atoms whose
+    bonds were dropped were left floating unbonded because dropping a BOND
+    does not drop an ATOM. Nothing is dropped now, so nothing floats.
+
+    What is NOT relaxed: an impossibly short contact is still refused. That is
+    not a valence judgement — no chemistry puts two nuclei at 0.5 of their
+    covalent radii — and round 43's tick already exists for looking at those.
+    `periodic_pairs` keeps the cap too, because it answers a different
+    question: what belongs TOGETHER, for the fragment walks and the boundary
+    completion. Round 42d's rule, from the other side.
     """
     from . import bondgraph, bonding
     n = len(symbols)
@@ -1142,14 +1169,16 @@ def display_bonds(symbols, coords, cell, n_content, slack=0.45, existing=None,
     xyz = np.asarray(coords, dtype=float).reshape(n, 3)
     frac = cell.to_fractional(xyz)
     graph = bondgraph.build(list(symbols)[:n_content], frac[:n_content], cell,
-                            slack=slack, report=report)
+                            slack=slack, report=report,
+                            valence=False, cap_hydrogens=False)
     labels = bondgraph.label_instances(frac, cell, n_content)
     bonds = [(int(i), int(j), 1) for i, j, _o in graph.instantiate(labels)]
     loose = [k for k, entry in enumerate(labels) if entry is None]
     if loose:
         # Atoms the graph cannot account for: perceive their bonds the
         # ordinary way rather than leaving them unbonded.
-        extra = bonding.perceive_bonds(list(symbols), xyz)
+        extra = bonding.perceive_bonds(list(symbols), xyz,
+                                       valence=False, cap_hydrogens=False)
         seen = {(i, j) for i, j, _o in bonds}
         loose_set = set(loose)
         bonds.extend((i, j, o) for i, j, o in extra
@@ -1160,10 +1189,13 @@ def display_bonds(symbols, coords, cell, n_content, slack=0.45, existing=None,
                 for i, j, _o in bonds}
         # The graph is AUTHORITATIVE for the atoms it can label: a bond it
         # does not have is a bond that does not exist. Taking the union with
-        # a separately perceived list instead is the round-43 trap one level
-        # up — both lists are valence-capped, but capped independently, so
-        # their union is not (a disordered ZIF methyl came out with five
-        # bonds on a carbon the graph had correctly capped at four).
+        # a separately perceived list instead was the round-43 trap one level
+        # up — the two lists were valence-capped INDEPENDENTLY, so their union
+        # was not (a disordered ZIF methyl came out with five bonds on a
+        # carbon the graph had capped at four). Round 81 removed the cap from
+        # both sides, so that particular disagreement is gone; the rule stays
+        # because the graph is still the only thing that knows the periodic
+        # answer, and a straight-line perception cannot see across a face.
         #
         # Only atoms the graph cannot account for keep their perceived bonds.
         loose_set = set(loose)
