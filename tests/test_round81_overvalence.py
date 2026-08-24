@@ -167,3 +167,61 @@ def test_an_ordinary_crystal_is_unchanged():
                             valence=False, cap_hydrogens=False)
     assert len(symbols) == 42
     assert len(capped.edges) == len(loose.edges) == 60
+
+
+# ------------------------------------------- round 82: an ABSOLUTE floor too
+def test_the_relative_floor_alone_was_loosest_where_hydrogen_is():
+    """Christian's observation, as the measurement that motivates the fix.
+    `0.65 x radii` gives C-H a floor of 0.696 A - so a badly refined C-H at
+    0.70 sailed through - while giving C-C 0.975. That is backwards: hydrogen
+    has the fewest electrons to place it with and had the loosest guard."""
+    relative = {}
+    for a, b in (("C", "H"), ("O", "H"), ("C", "C")):
+        r = bonding.covalent_radii([a, b])
+        relative[a + b] = bonding.IMPOSSIBLE_FACTOR * (r[0] + r[1])
+    assert relative["CH"] == pytest.approx(0.696, abs=5e-3)
+    assert relative["OH"] == pytest.approx(0.617, abs=5e-3)
+    assert relative["CC"] == pytest.approx(0.975, abs=5e-3)
+    assert relative["CH"] < bonding.SHORTEST_REAL_BOND      # raised
+    assert relative["CC"] > bonding.SHORTEST_REAL_BOND      # unchanged
+
+
+def test_the_floor_sits_in_the_gap_real_chemistry_leaves():
+    """Above HeH+ (0.772) and H2 (0.741) - neither of which MoloM bonds at
+    all - and below the shortest hydrogen an X-ray refinement really produces
+    (0.88 in `4-ABA-oxime.cif` itself). A floor at 0.90 would delete those."""
+    assert 0.772 < bonding.SHORTEST_REAL_BOND < 0.88
+
+
+def test_a_badly_refined_hydrogen_is_now_refused():
+    xyz = np.array([[0.0, 0.0, 0.0], [0.70, 0.0, 0.0]])
+    report = {}
+    assert bonding.perceive_bonds(["C", "H"], xyz, report=report) == []
+    assert report["dropped_bonds"][0][3] == "impossibly short"
+
+
+def test_a_real_X_ray_hydrogen_still_bonds():
+    """0.88 A is short but real - `4-ABA-oxime.cif`'s own hydrogens run
+    0.88-1.04. Refusing them would trade one bug for a worse one."""
+    for d in (0.88, 0.93, 0.96, 1.09):
+        xyz = np.array([[0.0, 0.0, 0.0], [d, 0.0, 0.0]])
+        assert bonding.perceive_bonds(["C", "H"], xyz) == [(0, 1, 1)], d
+
+
+def test_the_heavy_end_is_untouched():
+    """The relative rule is stricter there and stays in charge."""
+    for a, b, d in (("C", "C", 1.54), ("N", "N", 1.10), ("Zn", "O", 1.95)):
+        xyz = np.array([[0.0, 0.0, 0.0], [d, 0.0, 0.0]])
+        assert bonding.perceive_bonds([a, b], xyz) == [(0, 1, 1)], (a, b, d)
+
+
+def test_the_crystal_path_gets_it_too():
+    """`prune_pairs` is shared, so the molecular and crystal paths cannot
+    disagree about what is physically possible (round 38's rule)."""
+    cell = cif_mod.Cell(12.0, 12.0, 12.0, 90.0, 90.0, 90.0)
+    cart = np.array([[3.0, 3.0, 3.0], [3.70, 3.0, 3.0]])
+    report = {}
+    graph = bondgraph.build(["C", "H"], cell.to_fractional(cart), cell,
+                            report=report, valence=False, cap_hydrogens=False)
+    assert not graph.edges
+    assert report["dropped_bonds"][0][3] == "impossibly short"

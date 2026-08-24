@@ -198,6 +198,46 @@ other side, and the two export fixes are verified in `tools/smoke_gui.py`
 instead, which now measures the crop and counts ink with and without the cell
 box. 1310 tests.
 
+Round 82 (2026-08-24, an ABSOLUTE floor under a bond length - Christian's
+chemistry, and the measurement that says how far it goes):
+**His observation is right and the current rule was worst exactly where you
+would expect.** "The only molecules that have 0.75 A or shorter bonds are H2
+or exotic stuff like HeH+. After that, the next shortest bond length is HF,
+meaning that there is a no-mans-land... that cleanly separates these molecular
+fragments." Measured: H2 0.741, HeH+ 0.772, then **nothing until HF at
+0.917** - and MoloM bonds neither of the first two (H-H is refused by
+Avogadro's own rule, He is a noble gas), so under ~0.9 A nothing it would
+draw is real. Nothing heavy-heavy exists below N#N at 1.098 at all.
+**`IMPOSSIBLE_FACTOR` is RELATIVE, which makes it loosest precisely where
+hydrogen is**: `0.65 x (r_C + r_H)` is **0.696 A** and `0.65 x (r_O + r_H)` is
+**0.617**, so a badly refined C-H at 0.70 sailed straight through, while C-C
+got 0.975. That is backwards - hydrogen has the fewest electrons to place it
+with and had the loosest guard. `SHORTEST_REAL_BOND = 0.80` is taken as a
+`max` with the relative floor: the light end is raised (C-H, O-H, N-H all to
+0.80) and the heavy end is untouched (C-C 0.975, Zn-O 1.177).
+**0.80 and not 0.90, and the reason is X-ray refinements.** A riding hydrogen
+is routinely placed at 0.88-0.98 - `4-ABA-oxime.cif`'s own run 0.88-1.04 - so
+0.90 would delete legitimate hydrogens and trade one bug for a worse one. The
+usable window is 0.772 (HeH+) to 0.88 (the shortest real refined H), which is
+narrower than the gas-phase gap suggests.
+**WHAT IT DOES NOT DO, measured rather than assumed: it does not let
+`periodic_pairs` drop its valence cap.** The reason I had given for keeping
+that cap was HpPyBz's 0.75 A C...C fusing molecules, and Christian rightly
+objected that the file is hand-made and unphysical. So the situation was
+rebuilt - two molecules interpenetrating with a 0.75 A contact - and the
+answer is that **the 0.75 contact is refused correctly and the molecules are
+fused anyway, by four C-H contacts at 1.027 A**. That is an ordinary C-H bond
+length; no distance rule, absolute or relative, can refuse it. Only a valence
+argument can say those carbons cannot have six bonds. The short contact is a
+SYMPTOM; the fusion is carried by ordinary-length bonds to atoms that are in
+the wrong place. So the round-81 split stands and is now justified by
+measurement rather than by an unphysical fixture: **draw what the file says,
+group by what chemistry allows.**
+Both vendored crystals are byte-identical before and after (ferrocene
+210/300, the solid solution 21/23), because the floor only bites where a bond
+is impossibly short.
+1654 tests.
+
 Round 81 (2026-08-22, open item A5 - a CIF viewer draws the FILE, on branch
 `crystal-overvalence`):
 **Christian settled this with an argument, not a preference, and the argument
@@ -3606,7 +3646,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1648 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1654 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -4784,6 +4824,19 @@ independent cross-check inside a single fixture.
   FULL RUN — passing alone, which is the signature of shared state and the
   same shape as the round-37 circuit breaker and the round-46 module cache.
   `tests/conftest.py::_fresh_settings` clears it after every test.
+- **A RELATIVE BOND FLOOR IS LOOSEST WHERE HYDROGEN IS** (round 82).
+  `0.65 x (r_i + r_j)` gives C-H 0.696 A and O-H 0.617, so a badly refined
+  hydrogen - the atom most likely to be misplaced, having the fewest electrons
+  to place it with - had the loosest guard of anything. `SHORTEST_REAL_BOND`
+  (0.80) is taken as a `max` with it. The number is bounded on BOTH sides by
+  real chemistry: above HeH+ (0.772, and MoloM bonds neither it nor H2), below
+  the shortest hydrogen an X-ray refinement really produces (0.88).
+- **A SHORT CONTACT IS A SYMPTOM, NOT THE FUSION** (round 82). Two molecules
+  interpenetrating with an impossible 0.75 A contact are still fused after it
+  is refused - by ordinary 1.027 A C-H contacts to atoms that are simply in
+  the wrong place. No distance rule can refuse those, which is why the
+  fragment walk still needs the valence cap even though the drawn picture no
+  longer uses one.
 - **A CIF VIEWER DRAWS THE FILE, NOT THE CHEMISTRY IT WISHES IT HAD**
   (round 81). Over-valence is DRAWN in a crystal - `cif.display_bonds` passes
   `valence=False, cap_hydrogens=False` - because a carbon with six hydrogens is

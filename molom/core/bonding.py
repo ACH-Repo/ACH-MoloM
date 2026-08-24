@@ -29,6 +29,14 @@ what" can be robust. Two pieces of chemistry are added here, and a third
   possible coordination number are dropped LONGEST FIRST, and bonds far
   shorter than any real one are dropped outright. Both apply to the covalent
   bonds only: a chloride bridging three metals is perfectly ordinary.
+
+**Round 81/82 split the two apart, because they answer different questions.**
+The over-valence cap is not applied to what a CRYSTAL DRAWS at all - a CIF
+records a refinement and the viewer's job is to show it, over-valence included
+(`cif.display_bonds`). It still governs molecules, where it is the draw tool's
+own chemistry, and the fragment walk, which has to decide what one molecule IS
+before anything can be completed at a cell boundary. The impossibly-short rule
+applies everywhere and gained an ABSOLUTE floor - see `SHORTEST_REAL_BOND`.
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -118,6 +126,25 @@ MAX_COVALENT = {
 #: 0.75 A C...C, ratio 0.50. 0.65 sits in the gap with room on both sides.
 IMPOSSIBLE_FACTOR = 0.65
 
+#: An ABSOLUTE floor, in Angstrom, under which nothing MoloM would ever draw
+#: is a real bond. Round 82, Christian's observation: the only bonds shorter
+#: than this are H-H (0.741) and HeH+ (0.772), and MoloM bonds neither - H-H
+#: is refused by Avogadro's own rule and He is a noble gas. The next shortest
+#: real bond is H-F at 0.917, and nothing heavy-heavy exists below N#N at
+#: 1.098. That leaves a no-man's-land no physical structure occupies.
+#:
+#: 0.80 rather than 0.90, and the difference is X-ray refinements: a riding
+#: hydrogen is routinely placed at 0.88-0.98 (`4-ABA-oxime.cif`'s are
+#: 0.88-1.04), so a floor at 0.90 would delete legitimate hydrogens. 0.80
+#: sits in the window - above HeH+, below any real refined H.
+#:
+#: It matters because `IMPOSSIBLE_FACTOR` alone is at its LOOSEST exactly
+#: where hydrogen is: 0.65 x (r_C + r_H) is 0.696 A and 0.65 x (r_O + r_H) is
+#: 0.617, so a badly refined C-H at 0.70 sailed through. That is backwards -
+#: hydrogen is the atom most likely to be misplaced in a refinement, having
+#: the fewest electrons to place it with, and it had the loosest guard.
+SHORTEST_REAL_BOND = 0.80
+
 
 def _removal_order(symbols, pairs, distances):
     # type: (List[str], List[tuple], np.ndarray) -> List[int]
@@ -187,7 +214,11 @@ def prune_pairs(symbols, pairs, distances, impossible=True, valence=True):
             if not (0 <= i < n and 0 <= j < n):
                 alive[k] = False
                 continue
-            floor = IMPOSSIBLE_FACTOR * (radii[i] + radii[j])
+            # The stricter of the two: the RELATIVE floor governs the heavy
+            # end (C-C at 0.975 A), the ABSOLUTE one the light end, where the
+            # relative rule is far too generous to be a guard at all.
+            floor = max(SHORTEST_REAL_BOND,
+                        IMPOSSIBLE_FACTOR * (radii[i] + radii[j]))
             if float(distances[k]) < floor:
                 alive[k] = False
                 dropped.append((int(i), int(j), float(distances[k]),
