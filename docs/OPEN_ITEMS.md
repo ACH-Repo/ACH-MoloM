@@ -6,9 +6,10 @@ Struck-through items in CLAUDE.md are omitted; this is only what is left.
 
 Nothing here is urgent. It is an inventory, not a plan.
 
-**Since the sweep** (rounds 74-81, to 2026-08-22): **A1 is done** (round 80)
-and **A5 is decided** (round 81, on a branch); nothing else on this list was
-closed, and nothing was added to it. Rounds 74-76 were the MOPAC
+**Since the sweep** (rounds 74-83, to 2026-08-24): **A1 is done** (round 80),
+**A5 is decided** (round 81) and **A4 is mostly done** (round 83) - the last
+two on the `crystal-overvalence` branch. Nothing else here was closed, and
+nothing was added to it. Rounds 74-76 were the MOPAC
 frequency reader, computed layers (`core/attachments.py`) and Christian's
 MOPAC batch; rounds 77-79 reworked the player - one duration per strip, a
 frame range that stays put, wall-clock playback, and a pane you can zoom and
@@ -42,11 +43,17 @@ with a message in round 50, never fixed. Edits should operate on the cell
 CONTENT and re-pack. Related: `edits.adjust_bond_lengths` is cell-unaware and
 can push an atom across a face.
 
-**A4. Occupancy pie spheres may not survive asym-unit -> full-cell.** Reported
-in passing, never reproduced. Christian: "niche case... acceptable bug we can
-get to later". First step is written down: reproduce on
-`cod_1547149_solid_solution.cif`, check whether `site_occupancy`/`site_of`
-survives `packing.pack`'s rebuild.
+**A4. Occupancy pie spheres.** **Mostly fixed, round 83.** It was not a
+survival problem: `packing.pack` always built the map correctly, and two
+callers overwrote it with one whose keys mean something else (CONTENT index
+rather than DRAWN index), so 2 of 10 Nb showed a composition. Fixed at both,
+along with `site_of` and a stale `content_of` that could make a delete take
+the wrong atoms. **What remains is the ASYMMETRIC UNIT**, which shows no pie
+because the four rows would have to be merged into one atom - and
+`sync_asymmetric_unit` writes that view's atoms back into metadata, so a
+merged view would destroy the solid solution on the first edit. Needs the
+write-back taught about shared sites; three options are laid out in the
+round-83 note. **Christian's decision.**
 
 ~~**A5. `4-ABA-oxime.cif` floats 36 unbonded hydrogens.**~~ **DECIDED and done,
 round 81** (branch `crystal-overvalence`, awaiting Christian's testing). The

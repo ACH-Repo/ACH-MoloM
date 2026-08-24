@@ -2131,8 +2131,20 @@ def build_view(cell, asym_symbols, asym_frac, symops, mode="cell",
             report.update(packed_meta)
             # The cell CONTENT is a different question from what is drawn,
             # and the crystal page's count and the density both need it.
+            #
+            # Into a SEPARATE report, and only the scalars are taken across
+            # (round 83). Passing `report` straight in let this call overwrite
+            # the packing's per-atom maps with its own - which are keyed by
+            # CONTENT index while the drawn structure is the packing's, so it
+            # did not merely lose the copies, it changed what the keys mean.
+            # `1547149.cif` came back with 2 of its 10 Nb carrying a
+            # composition and `site_of` holding 6 entries for 21 atoms.
+            content_report = {}
             expand(data, whole_molecules=False, boundary=False,
-                   disorder=disorder, tol=tol, report=report)
+                   disorder=disorder, tol=tol, report=content_report)
+            for key in ("n_content", "disorder", "dropped_bonds", "refused"):
+                if content_report.get(key) is not None:
+                    report[key] = content_report[key]
     if mode != "packing":
         return symbols, coords
     offsets = supercell_offsets(cell, na, nb, nc)

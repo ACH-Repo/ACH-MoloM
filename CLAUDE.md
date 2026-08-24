@@ -198,6 +198,38 @@ other side, and the two export fixes are verified in `tools/smoke_gui.py`
 instead, which now measures the crop and counts ink with and without the cell
 box. 1310 tests.
 
+Round 83 (2026-08-24, the occupancy pie spheres - open item A4, and it was
+ONE bug wearing a disguise):
+Christian: "Pie occupation spheres still only work for certain sites. They are
+completely omitted in the asymmetric unit for cif: 1547149.cif."
+**The composition map is keyed by DRAWN atom index and `packing.pack` has
+always built it correctly** - all ten of `1547149.cif`'s Nb, every time. Two
+callers then overwrote it with the map from `expand(boundary=False)`, whose
+keys are CONTENT indices: `io.py` at import and `cif.build_view` on every
+rebuild. That does not merely lose the boundary copies, **it changes what the
+keys MEAN** - and because a content atom is its own first image, the two maps
+AGREE on the first atoms of the cell. Hence 2 of 10 Nb drawn with a
+composition and 8 plain, with no visible pattern, which is exactly what "only
+works for certain sites" looks like from the outside.
+**The same overwrite left `site_of` holding 6 entries for 21 atoms**, and left
+`content_of` stale across a view switch. That one is the dangerous member of
+the family: `images_of` reads it to decide which atoms are copies of the site
+you picked, and `on_delete_selected` deletes every image - so a stale
+`content_of` deletes the WRONG ATOMS. The rebuild now drops and re-sets every
+per-atom map together, which is round 80's lesson in the one place that
+regenerates the atom list wholesale instead of editing it.
+**THE ASYMMETRIC UNIT IS STILL OPEN, DELIBERATELY, and the reason is a data-
+loss hazard rather than a difficulty.** Showing a pie there means merging the
+four rows (Nb/Ti/Ni/Co at one position) into one atom, as the cell does. But
+`sync_asymmetric_unit` writes the asym view's atoms straight back into
+metadata on any edit, and resets the parallel columns whenever the count
+changes - so a merged view would, on the first edit, write `asym_symbols =
+['Nb', 'O']` and `asym_occupancy = [1.0, 1.0]` and **permanently destroy the
+solid solution**, reducing it to the pure NbO2 that round 42 existed to stop
+MoloM drawing. It needs the write-back taught about shared sites first.
+Christian has the decision.
+1659 tests.
+
 Round 82 (2026-08-24, an ABSOLUTE floor under a bond length - Christian's
 chemistry, and the measurement that says how far it goes):
 **His observation is right and the current rule was worst exactly where you
@@ -3646,7 +3678,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1654 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1659 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -4824,6 +4856,14 @@ independent cross-check inside a single fixture.
   FULL RUN — passing alone, which is the signature of shared state and the
   same shape as the round-37 circuit breaker and the round-46 module cache.
   `tests/conftest.py::_fresh_settings` clears it after every test.
+- **A MAP KEYED BY INDEX CAN BE OVERWRITTEN BY ONE THAT MEANS SOMETHING ELSE**
+  (round 83). `packing.pack`'s `site_occupancy` is keyed by DRAWN index;
+  `expand(boundary=False)`'s is keyed by CONTENT index. Two callers assigned
+  the second over the first, and because a content atom is its own first
+  image the two AGREE on the opening atoms - so the damage looked like a
+  feature that worked on some sites and not others rather than like a bug.
+  When two producers fill the same metadata key, check what the KEYS mean, not
+  just whether the value is present.
 - **A RELATIVE BOND FLOOR IS LOOSEST WHERE HYDROGEN IS** (round 82).
   `0.65 x (r_i + r_j)` gives C-H 0.696 A and O-H 0.617, so a badly refined
   hydrogen - the atom most likely to be misplaced, having the fewest electrons

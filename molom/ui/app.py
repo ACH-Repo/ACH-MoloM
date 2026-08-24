@@ -6550,8 +6550,6 @@ class MainWindow(QMainWindow):
             # the graph's answer rather than re-perceiving straight lines.
             meta["packed_bonds"] = report["packed_bonds"]
             meta["packed"] = True
-        if report.get("site_occupancy"):
-            meta["site_occupancy"] = dict(report["site_occupancy"])
         if report.get("n_content"):
             meta["cell_content"] = int(report["n_content"])
             # A boundary modifier already on the stack holds the OLD count,
@@ -6560,12 +6558,25 @@ class MainWindow(QMainWindow):
             existing = self._boundary_modifier(obj)
             if existing is not None:
                 existing.content = int(report["n_content"])
-        # Rebuilt views renumber the atoms, so the shared-site map has to be
-        # replaced (or cleared) with them — a stale one would paint the pie
-        # slices onto whichever atom happens to hold that index now.
-        meta.pop("site_occupancy", None)
-        if report.get("site_occupancy"):
-            meta["site_occupancy"] = dict(report["site_occupancy"])
+        # A rebuilt view renumbers the atoms, so EVERY per-atom map has to be
+        # replaced with them or dropped — a stale one stays perfectly valid
+        # and quietly describes different atoms, which is round 80's lesson in
+        # the one place that regenerates the atom list wholesale rather than
+        # editing it.
+        #
+        # `site_occupancy` was already handled here; `site_of` and
+        # `content_of` were not, and `content_of` is the dangerous one: it is
+        # what `images_of` reads to decide which atoms are copies of the same
+        # site, and `on_delete_selected` deletes every image of what you
+        # picked. A stale one therefore deletes the wrong atoms. The
+        # asymmetric-unit mode produces neither, so there they are simply
+        # dropped rather than left describing the full cell.
+        for key in ("site_occupancy", "site_of", "content_of"):
+            meta.pop(key, None)
+            if report.get(key) is not None:
+                meta[key] = (dict(report[key])
+                             if isinstance(report[key], dict)
+                             else list(report[key]))
         if not symbols:
             self.statusBar().showMessage("That view produced no atoms", 4000)
             return

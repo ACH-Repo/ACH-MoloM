@@ -889,9 +889,19 @@ def _read_cif(path, disorder=None):
         "pack_copies": False,
     }
     meta.update(packed_meta)
-    if report.get("site_occupancy"):
-        # {drawn atom index (as a STRING, so it survives the JSON savepoint):
-        #  [(element, occupancy), ...]} for sites shared by several species.
+    # {drawn atom index (as a STRING, so it survives the JSON savepoint):
+    #  [(element, occupancy), ...]} for sites shared by several species.
+    #
+    # **The PACKING's table wins, and this used to be the wrong way round**
+    # (round 83). `report` comes from `expand(boundary=False)` above - the
+    # cell CONTENT - so its keys are CONTENT indices, while the drawn
+    # structure is the packing's and its keys are DRAWN indices. Overwriting
+    # one with the other did not merely lose the copies, it silently changed
+    # what the keys MEAN. The two agree on the first few atoms, because a
+    # content atom is its own first image, which is why it looked like the
+    # pie spheres worked on some sites and not others: `1547149.cif` drew 2
+    # of its 10 Nb with a composition and the other 8 plain.
+    if not meta.get("site_occupancy") and report.get("site_occupancy"):
         meta["site_occupancy"] = dict(report["site_occupancy"])
     if data.info:
         # Descriptive tags (names, formulae, temperature, R factors ...) for
