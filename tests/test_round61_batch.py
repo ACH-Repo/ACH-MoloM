@@ -242,3 +242,31 @@ def test_make_text_selectable_leaves_buddy_labels_alone(win):
     make_text_selectable(holder)
     assert not (buddy.textInteractionFlags() & Qt.TextSelectableByMouse)
     assert plain.textInteractionFlags() & Qt.TextSelectableByMouse
+
+
+def test_rdkit_and_openbabel_are_REQUIRED_not_optional():
+    """They were the `chem` extra, on ORCA Workbench's graceful-tiering model.
+    That is the wrong trade for a desktop GUI, and it was measured rather than
+    argued: a base install read **2 of the 13 formats the Open dialog lists**
+    (xyz and cif/mmcif have native readers; pdb, mol, mol2, sdf, cml, gro,
+    hin, gzmat, pdbqt and mdl all failed while still being offered in the file
+    filter), had no SMILES at all, and had no working Optimize panel.
+
+    The cost is 43.5 MB against the 665 MB of PySide6 that is already
+    mandatory, and both publish wheels for every mainstream platform - so
+    neither the size nor the portability argument survives contact with the
+    numbers.
+    """
+    text = open(os.path.join(ROOT, "pyproject.toml"), encoding="utf-8").read()
+    required = re.search(r"(?s)^dependencies = \[(.*?)\n\]", text, re.M).group(1)
+    assert '"rdkit"' in required
+    assert '"openbabel-wheel"' in required
+
+
+def test_the_chem_extra_still_resolves():
+    """Anyone with `pip install molom[chem]` in a script or a README should not
+    get a warning about an extra that no longer exists."""
+    text = open(os.path.join(ROOT, "pyproject.toml"), encoding="utf-8").read()
+    optional = re.search(r"(?s)\[project\.optional-dependencies\](.*?)(?=\n\[)",
+                         text).group(1)
+    assert re.search(r"^chem = \[", optional, re.M)

@@ -149,11 +149,16 @@ representable and silently becomes a stutter.
 ## Install
 
 ```bash
-pip install molom              # core: numpy, PySide6, PyOpenGL, spglib
-pip install "molom[chem]"      # + rdkit, openbabel-wheel (SMILES and non-xyz formats)
-pip install "molom[video]"     # + imageio-ffmpeg (MP4/GIF export; PNG needs nothing)
-pip install "molom[all]"       # everything
+pip install molom              # everything except video export
+pip install "molom[video]"     # + imageio-ffmpeg (MP4/GIF; a PNG sequence needs nothing)
 ```
+
+The base install carries numpy, PySide6, PyOpenGL, spglib, rdkit and
+openbabel. The last two used to be a `chem` extra; they are core now, because
+without them MoloM reads only 2 of the 13 formats its Open dialog offers, and
+loses SMILES and geometry optimisation entirely. They add ~43 MB to an install
+that already needs 665 MB of Qt. `molom[chem]` still resolves, and installs
+nothing further.
 
 ```bash
 molom                          # opens with cubane, ready to edit

@@ -40,21 +40,42 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Physics",
     "Topic :: Scientific/Engineering :: Visualization",
 ]
-# Core runtime. rdkit/openbabel are OPTIONAL (SMILES + non-xyz formats degrade
-# gracefully without them, mirroring ORCA Workbench's tiering).
+# Core runtime.
 dependencies = [
     "numpy",
     "PySide6",
     "PyOpenGL",
     # Space-group symbol -> symmetry operations, for the CIFs that name their
-    # group and leave the operator loop out. NOT optional like rdkit and
-    # openbabel: those degrade to "cannot read this format", which is visible,
-    # while this one degrades to a structure a QUARTER of its true size. It is
-    # a small wheel and pymatgen (already approved) depends on it anyway.
+    # group and leave the operator loop out. It degrades to a structure a
+    # QUARTER of its true size, which is invisible, so it has never been
+    # optional. Small wheel, and pymatgen depends on it anyway.
     "spglib",
+    # rdkit and openbabel WERE optional (the `chem` extra), on ORCA
+    # Workbench's graceful-tiering model. That was the wrong trade for a
+    # desktop GUI, and the numbers are one-sided.
+    #
+    # What a base install lost, measured: **2 of the 13 formats the Open
+    # dialog advertises**. Only xyz and cif/mmcif have native readers - pdb,
+    # mol, mol2, sdf, cml, gro, hin, gzmat, pdbqt and mdl all failed outright,
+    # while still being listed in the file filter, so the user picked "PDB"
+    # and got an error. It also lost SMILES entirely (paste, Ctrl+N and
+    # import-by-name), the whole Optimize panel (every force-field tier), and
+    # it made `resolve.classify` fall back to "assume any single word is a
+    # SMILES", so Ctrl+Shift+N on "ethanol" never reached OPSIN.
+    #
+    # What they cost: rdkit 26.7 MB + openbabel 16.8 MB = **43.5 MB**, against
+    # the 665 MB of PySide6 that is already mandatory - about 6%. Wheel
+    # coverage was the one real argument against and it does not hold either:
+    # both publish for Linux x86_64/aarch64, Windows and macOS arm64 across
+    # cp310-cp314 (openbabel also Intel macOS and cp38/cp39).
+    "rdkit",
+    "openbabel-wheel",
 ]
 
 [project.optional-dependencies]
+# Kept so `pip install molom[chem]` keeps working for anyone who has it in a
+# script or a README; both are core dependencies now, so it installs nothing
+# extra.
 chem = ["rdkit", "openbabel-wheel"]
 # VIDEO export only. `imageio-ffmpeg` ships a ~25 MB static ffmpeg binary, and
 # making every install carry it to serve the minority who export MP4 or GIF is
@@ -63,6 +84,7 @@ chem = ["rdkit", "openbabel-wheel"]
 # anyway (see `core.animation.ffmpeg_candidates`), so most people who want
 # video already have what they need.
 video = ["imageio-ffmpeg"]
+# `all` is now just the video extra, kept for the same reason as `chem`.
 all = ["rdkit", "openbabel-wheel", "imageio-ffmpeg"]
 
 [project.urls]

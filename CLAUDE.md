@@ -329,8 +329,27 @@ dialog, and Python is then free to collect a QThread mid-run, which is round
 teardown and from `__main__` before the process exits, because a thread
 outliving the DIALOG is correct while one outliving the PROCESS is the same
 crash from the other end.
+**(7) rdkit AND openbabel ARE BASE DEPENDENCIES NOW**, which came out of
+Christian asking why they were an extra at all. Measured rather than argued,
+and the numbers are one-sided: a base install read **2 of the 13 formats the
+Open dialog advertises** — xyz and cif/mmcif have native readers, while pdb,
+mol, mol2, sdf, cml, gro, hin, gzmat, pdbqt and mdl all failed outright *and
+were still listed in the file filter*, so the user picked "PDB" and got an
+error. It also had no SMILES anywhere (paste, Ctrl+N, import-by-name), no
+working Optimize panel, and `resolve.classify` fell back to "assume any
+single word is a SMILES", so Ctrl+Shift+N on "ethanol" never reached OPSIN.
+Against that: **43.5 MB** (rdkit 26.7 + openbabel 16.8) on top of the
+**665 MB** of PySide6 that is already mandatory, i.e. about 6%. The one real
+counter-argument was wheel coverage, and it does not hold: both publish for
+Linux x86_64/aarch64, Windows and macOS arm64 across cp310-cp314, openbabel
+also for Intel macOS and cp38/cp39. The `chem` extra is kept as an alias so
+existing install commands do not warn. **A measurement worth not repeating
+wrong**: blocking the imports in-process is NOT a base install, because
+`_obabel_worker` is a SUBPROCESS and imports OpenBabel itself — the first
+sweep reported pdb and mol reading fine when OpenBabel had simply read them
+in a child. Patch `io._read_with_openbabel` instead.
 **`python -m pytest tests/` is 1732 passed, 4 skipped in ~110 s again.**
-1736 tests.
+1738 tests.
 
 Round 85 (2026-08-25, the search finds the PURE compound - Christian's first
 real use of it):
@@ -3925,7 +3944,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1736 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1738 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -5420,15 +5439,21 @@ independent cross-check inside a single fixture.
   Python 3.10, precision trackpad) and the **desktop PC** (Windows, Python
   3.13, wheel mouse — `C:\Users\chris\Documents\GitHub\ACH-MoloM`). Assume
   input code must work on both; `pytest` had to be pip-installed on the PC.
-- Deps: numpy, PySide6, PyOpenGL (+ rdkit, openbabel-wheel installed and
-  optional at runtime — graceful degradation mirrors OWB's tiering).
+- Deps: numpy, PySide6, PyOpenGL, spglib, **rdkit and openbabel-wheel** —
+  all REQUIRED as of 2026-08-25. The last two were the `chem` extra on OWB's
+  graceful-tiering model; measured, a base install read **2 of the 13 formats
+  the Open dialog offers** and had no SMILES and no Optimize panel at all, for
+  43.5 MB against the 665 MB of Qt already mandatory. The runtime code still
+  degrades gracefully if an import fails — that costs nothing and is what
+  makes the tiers testable — but nobody should be running without them.
+  `imageio-ffmpeg` remains the one real extra (`molom[video]`).
 - NOT a cluster tool. No SLURM/ssh anywhere. The LiDO gateway has no
   PySide6/GPU — MoloM is for local machines; the gateway keeps molden.
 - It IS a git repo now (single "Initial commit", 2026-08-01), so behavioural
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 1732 offline tests, 4 skipped, ~110 s.
+1. `python -m pytest tests/ -q` — 1734 offline tests, 4 skipped, ~90 s.
    `tests/conftest.py` sandboxes QSettings, so a GUI test can drive a real
    control without writing into your own MoloM configuration; it also
    **destroys the windows a test created** (round 86), without which the suite
