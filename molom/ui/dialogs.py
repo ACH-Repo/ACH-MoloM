@@ -1164,6 +1164,64 @@ class OperatorSearchDialog(QDialog):
         super().keyPressEvent(ev)
 
 
+#: Worker threads still running, held here and nowhere else.
+#:
+#: **A QThread parented to the dialog is destroyed with the dialog**, and
+#: destroying a running QThread is undefined behaviour - in practice an
+#: access violation that takes the whole process down with no Python
+#: traceback. It is reachable from the GUI: start a lookup that has to wait
+#: out the 12 s web timeout, press Cancel, and the dialog goes while the
+#: thread is still in `run()`.
+#:
+#: Un-parenting alone is not enough, and this is round 76's trap exactly: the
+#: only remaining reference would be `self._worker` on the dialog, which dies
+#: with it, and Python is then free to collect a QThread mid-run. So the set
+#: outlives both, and a worker leaves it when it finishes.
+#:
+#: Nothing here needs cancelling. The resolver and the crystal search both
+#: carry their own timeouts, and a result arriving after the dialog has gone
+#: is delivered to nobody - Qt drops a connection when its receiver is
+#: destroyed.
+_LIVE_WORKERS = set()
+
+
+def _own_worker(worker):
+    """Keep `worker` alive until its thread really finishes."""
+    _LIVE_WORKERS.add(worker)
+    worker.finished.connect(lambda: _LIVE_WORKERS.discard(worker))
+    worker.finished.connect(worker.deleteLater)
+    return worker
+
+
+def wait_for_workers(msecs=15000):
+    """Block until every in-flight lookup thread has finished.
+
+    The other half of not parenting them. A worker that outlives its dialog is
+    correct; a worker that outlives the PROCESS is not - Python tearing down
+    the interpreter under a running QThread is the same access violation from
+    the other end, and it happens after everything has apparently succeeded,
+    which makes it look like a shutdown problem rather than a threading one.
+
+    Call it before quitting, and from a test teardown. Bounded, because both
+    workers carry their own network timeouts and hanging on exit would be a
+    worse bug than the one being fixed.
+    """
+    for worker in list(_LIVE_WORKERS):
+        try:
+            if worker.isRunning():
+                worker.wait(int(msecs))
+            # Discarded HERE rather than left to the `finished` signal, which
+            # is queued: `wait()` returns as soon as the thread has ended, and
+            # the connection that would drop it from the set has not run yet.
+            # Relying on the signal made this report "still running" for a
+            # thread that had plainly finished.
+            if not worker.isRunning():
+                _LIVE_WORKERS.discard(worker)
+        except RuntimeError:              # already deleted; nothing to wait on
+            _LIVE_WORKERS.discard(worker)
+    return not _LIVE_WORKERS
+
+
 class _ResolveWorker(QThread):
     done = Signal(object)
 
@@ -1232,9 +1290,9 @@ class ResolveNameDialog(QDialog):
             return
         self.resolve_btn.setEnabled(False)
         self.info.setText("Resolving {!r}...".format(q))
-        self._worker = _ResolveWorker(q, self)
+        # NO parent: see `_LIVE_WORKERS`.
+        self._worker = _own_worker(_ResolveWorker(q))
         self._worker.done.connect(self._resolved)
-        self._worker.finished.connect(self._worker.deleteLater)
         self._worker.start()
 
     def _resolved(self, res):
@@ -1583,6 +1641,36 @@ class AnimationExportDialog(QDialog):
                 "increment": self.increment.isChecked()}
 
 
+def _age_phrase(when):
+    # type: (float) -> str
+    """How long ago, in words, or "" when it was a moment ago.
+
+    Coarse on purpose: the number is there to say whether the list can still
+    be trusted, and "3 minutes ago" answers that as well as a timestamp while
+    reading as a remark rather than as data.
+    """
+    import time
+    if not when:
+        return ""
+    seconds = max(0.0, time.time() - float(when))
+    if seconds < 90:
+        return ""
+    minutes = seconds / 60.0
+    if minutes < 60:
+        return ", {:.0f} minutes ago".format(minutes)
+    hours = minutes / 60.0
+    if hours < 24:
+        return ", {:.0f} hour{} ago".format(hours, "" if hours < 1.5 else "s")
+    days = hours / 24.0
+    return ", {:.0f} day{} ago".format(days, "" if days < 1.5 else "s")
+
+
+def _result_line(hits, query):
+    # type: (list, str) -> str
+    return "{} structure{} for {!r}".format(
+        len(hits), "" if len(hits) == 1 else "s", query or "")
+
+
 class _CifSearchWorker(QThread):
     """One search, off the GUI thread.
 
@@ -1593,7 +1681,7 @@ class _CifSearchWorker(QThread):
 
     done = Signal(object)
 
-    def __init__(self, query, roots, parent=None):
+    def __init__(self, query, roots=(), parent=None):
         super().__init__(parent)
         self._query = query
         self._roots = list(roots or [])
@@ -1625,13 +1713,31 @@ class CifSearchDialog(QDialog):
     COLUMNS = ("Formula", "Name / mineral", "Space group", "T / K", "Year",
                "Source")
 
-    def __init__(self, parent, roots=()):
+    #: Which columns hold a NUMBER, and therefore must not be compared as
+    #: text. `QTableWidgetItem` sorts lexically, so "100" sorts before "98"
+    #: and a run of empty cells sorts among the digits - which on COD, where
+    #: temperature and year are null constantly, would make the two columns
+    #: worth sorting by the two that lie. Each cell carries its sort value in
+    #: `Qt.EditRole`, which Qt compares numerically.
+    NUMERIC_COLUMNS = {3: "temperature", 4: "year"}
+
+    #: Where a blank sorts. A missing temperature is not 0 K and a missing
+    #: year is not year zero, so unknowns are pinned BELOW everything either
+    #: way up rather than being given a number that ranks them.
+    UNKNOWN = float("inf")
+
+    def __init__(self, parent, roots=(), remembered=None):
         super().__init__(parent)
         self.setWindowTitle("Find a crystal structure")
         self.hits = []            # type: list
         self.chosen = []          # type: list
         self._roots = list(roots or [])
         self._worker = None
+        self._sort_column = None
+        self._sort_desc = False
+        #: The hits AS DRAWN. `self.hits` keeps the search ranking; sorting
+        #: reorders only this, so "which structure is row 4?" has one answer.
+        self._shown = []
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel("Formula, mineral or chemical name:"))
         self.edit = QLineEdit(self)
@@ -1647,6 +1753,16 @@ class CifSearchDialog(QDialog):
         self.table.verticalHeader().setVisible(False)
         self.table.itemSelectionChanged.connect(self._selection_changed)
         self.table.doubleClicked.connect(self._take_one)
+        # Sorting is driven by hand rather than by `setSortingEnabled(True)`,
+        # because the rows have a MEANINGFUL default order - the ranking is
+        # the one thing the search itself is for - and Qt's built-in sorting
+        # has no way back to it. Clicking the same header a third time
+        # restores the ranking.
+        head = self.table.horizontalHeader()
+        head.setSectionsClickable(True)
+        head.sectionClicked.connect(self._sort_by)
+        head.setToolTip("Click to sort; click again to reverse, and a third "
+                        "time to go back to the search ranking")
         lay.addWidget(self.table, 1)
 
         self.info = QLabel("")
@@ -1669,8 +1785,40 @@ class CifSearchDialog(QDialog):
         cancel.clicked.connect(self.reject)
         make_text_selectable(self)
         self.resize(780, 470)
+        self.restore(remembered)
 
     # ------------------------------------------------------------ searching
+    def restore(self, remembered):
+        """Put the last search back, without re-running it.
+
+        Christian: "it really needs to remember the results of the last
+        search". Re-running would be worse than useless - it costs three
+        network round trips to redisplay something already on the screen a
+        moment ago, and it would silently change under you if a provider
+        answered differently.
+
+        The age is SAID rather than hidden. A stale list that looks live is
+        worse than an empty one: COD entries get superseded, and a result you
+        ran yesterday is a different claim from one you ran just now.
+        """
+        if not remembered:
+            return
+        query, hits, when = remembered
+        self.edit.setText(query or "")
+        self.edit.selectAll()
+        self.hits = list(hits or [])
+        self._fill()
+        age = _age_phrase(when)
+        self.info.setText(
+            "{} - from your last search{}. Press Enter to run it again."
+            .format(_result_line(self.hits, query), age))
+
+    def remembered(self):
+        # type: () -> tuple
+        """`(query, hits, when)` for the next time the dialog opens."""
+        import time
+        return (self.edit.text().strip(), list(self.hits), time.time())
+
     def _start(self):
         query = self.edit.text().strip()
         if not query or self._worker is not None:
@@ -1678,9 +1826,11 @@ class CifSearchDialog(QDialog):
         self.search_btn.setEnabled(False)
         self.info.setText("Searching {!r}...".format(query))
         self.table.setRowCount(0)
-        self._worker = _CifSearchWorker(query, self._roots, self)
+        # NO parent: see `_LIVE_WORKERS`. A crystal search is three providers
+        # with an 8 s budget each, so closing the dialog while one is in
+        # flight is an ordinary thing to do rather than a corner case.
+        self._worker = _own_worker(_CifSearchWorker(query, self._roots))
         self._worker.done.connect(self._finished)
-        self._worker.finished.connect(self._worker.deleteLater)
         self._worker.start()
 
     def _finished(self, result):
@@ -1695,20 +1845,83 @@ class CifSearchDialog(QDialog):
             text += "\n" + "; ".join(result.trouble[:3])
         self.info.setText(text)
 
+    def _sort_by(self, column):
+        """Cycle this column: ascending, descending, then back to the
+        ranking. The ranking is a real answer, not an accident of insertion
+        order, so there has to be a way back to it."""
+        if column != self._sort_column:
+            self._sort_column, self._sort_desc = column, False
+        elif not self._sort_desc:
+            self._sort_desc = True
+        else:
+            self._sort_column, self._sort_desc = None, False
+        self._fill()
+
+    def _sort_value(self, hit, column):
+        """What a hit is compared BY in one column.
+
+        Text columns fold case, or `Quartz` and `quartz` end up in different
+        halves of the list. Numeric columns hand back a real number, and an
+        unknown gets `UNKNOWN` so it sinks to the bottom whichever way the
+        column is pointing - see the class docstring for why that is not 0.
+        """
+        field = self.NUMERIC_COLUMNS.get(column)
+        if field is not None:
+            value = getattr(hit, field, None)
+            try:
+                return (0, float(value))
+            except (TypeError, ValueError):
+                return (1, self.UNKNOWN)
+        return (0, self._cells(hit)[column].lower())
+
+    def _ordered_hits(self):
+        if self._sort_column is None:
+            return list(self.hits)          # the search ranking
+        column = self._sort_column
+        rows = sorted(self.hits,
+                      key=lambda h: self._sort_value(h, column),
+                      reverse=self._sort_desc)
+        if self._sort_desc:
+            # `reverse` would also flip the unknowns to the TOP, which is the
+            # one thing they must never do - an unknown temperature is not
+            # the highest one. They are lifted out and re-appended instead.
+            known = [h for h in rows
+                     if self._sort_value(h, column)[0] == 0]
+            unknown = [h for h in self.hits
+                       if self._sort_value(h, column)[0] != 0]
+            rows = known + unknown
+        return rows
+
+    def _cells(self, hit):
+        source = ("on disk" if hit.source == cifsearch.SOURCE_LOCAL
+                  else (hit.note.split()[0] if hit.note else hit.source))
+        return (hit.formula,
+                hit.mineral or hit.name,
+                hit.spacegroup,
+                "" if hit.temperature is None
+                else "{:g}".format(float(hit.temperature)),
+                "" if not hit.year else str(hit.year),
+                source + (" (calc)" if hit.computed else ""))
+
     def _fill(self):
-        self.table.setRowCount(len(self.hits))
-        for row, hit in enumerate(self.hits):
-            source = ("on disk" if hit.source == cifsearch.SOURCE_LOCAL
-                      else (hit.note.split()[0] if hit.note else hit.source))
-            cells = (hit.formula,
-                     hit.mineral or hit.name,
-                     hit.spacegroup,
-                     "" if hit.temperature is None
-                     else "{:g}".format(float(hit.temperature)),
-                     "" if not hit.year else str(hit.year),
-                     source + (" (calc)" if hit.computed else ""))
+        # `self.hits` stays in RANK order; only the VIEW is sorted, and
+        # `_shown` maps a table row back to the hit it draws so selecting one
+        # still returns the right structure.
+        self._shown = self._ordered_hits()
+        self.table.setRowCount(len(self._shown))
+        for row, hit in enumerate(self._shown):
+            cells = self._cells(hit)
             for column, value in enumerate(cells):
                 item = QTableWidgetItem(str(value))
+                field = self.NUMERIC_COLUMNS.get(column)
+                if field is not None:
+                    number = getattr(hit, field, None)
+                    try:
+                        # The DISPLAY stays the string; this is what Qt
+                        # compares, so 100 K no longer sorts before 98 K.
+                        item.setData(Qt.EditRole, float(number))
+                    except (TypeError, ValueError):
+                        pass
                 if hit.computed:
                     # A DFT-relaxed cell is not a measurement, and which kind
                     # you are looking at must be visible at a glance.
@@ -1724,12 +1937,14 @@ class CifSearchDialog(QDialog):
         return sorted({i.row() for i in self.table.selectedIndexes()})
 
     def _selection_changed(self):
-        self.chosen = [self.hits[r] for r in self._selected_rows()
-                       if 0 <= r < len(self.hits)]
+        shown = getattr(self, "_shown", self.hits)
+        self.chosen = [shown[r] for r in self._selected_rows()
+                       if 0 <= r < len(shown)]
         self.ok_btn.setEnabled(bool(self.chosen))
 
     def _take_one(self, index):
+        shown = getattr(self, "_shown", self.hits)
         row = index.row()
-        if 0 <= row < len(self.hits):
-            self.chosen = [self.hits[row]]
+        if 0 <= row < len(shown):
+            self.chosen = [shown[row]]
             self.accept()

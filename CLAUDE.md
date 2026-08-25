@@ -198,6 +198,140 @@ other side, and the two export fixes are verified in `tools/smoke_gui.py`
 instead, which now measures the crop and counts ink with and without the cell
 box. 1310 tests.
 
+Round 86 (2026-08-25, the outliner learns what a SITE is, the search
+remembers, and the cell box stops lying about what is in front):
+Christian's batch, four things, and the outliner one is a crystallographic
+argument rather than a convenience.
+**(1) AN ELEMENT IS NOT A TYPE.** "The outliner does not allow to toggle
+equivalent atoms as a group. Right now the hierarchy is just mol > element >
+individual atoms... Let's say I want to hide all oxygen atoms of a specific
+type. I can't do that efficiently." He is right, and the missing tier already
+had its data: a cell draws one asymmetric-unit SITE over and over, and
+`packing.pack` has recorded which site each drawn atom is an image of since
+round 42 (`site_of`). So `occupancy.site_groups` turns that map into a
+partition and the tree grows **mol > element > site > atom**, the site named
+by the file's own `_atom_site_label`. Ferrocene's hundred carbons are five
+rows of twenty - `C(11)` .. `C(15)` - and hiding one kind of oxygen is one
+click. **The tier appears only where there is more than one site**: one site
+is not a grouping, it is the same list one click deeper, and a molecule has
+no sites at all, so both fall through to the flat tree that was there before.
+Atoms added by an EDIT are images of nothing and are grouped separately as
+"(added since)" rather than filed under a site they have no relation to.
+**(2) THE ROWS WERE BUILT ONCE AND NEVER GIVEN BACK**, which is the whole of
+"expanding element lists with lots of entries takes a lot of time" - and his
+guess at the mechanism was half right. Measured before anything was changed:
+opening a 300-atom element group took **473 ms**, and it left 300 live
+`RowControls` behind forever, because collapsing removed nothing.
+`refresh_row_controls` walks every live control on every colour, label or
+visibility change, so ONE look inside that group went on costing **190 ms per
+click for the rest of the session**, on rows nobody could see. Two fixes.
+Collapsing now frees the rows (and puts the placeholder child back - a
+QTreeWidget draws no expander arrow on an item with no children, so an emptied
+group would look like a leaf and could never be reopened). And **`RowControls`
+is ONE painted widget instead of five QToolButtons**: the squares were never
+anything but fixed rectangles with a letter in them, and hit-testing five
+rectangles is the one line that replaces seven widgets a row. Measured, 300
+atoms: expand **473 -> 73 ms**, refresh **190 -> 4.2 ms**, and after a collapse
+**0.4 ms**. With the site tier the same 300 atoms over 12 sites open in
+**4.5 ms**. The floor is one widget per row - 300 rows carrying a single bare
+QWidget cost 14.5 ms - so what is left is the widget, not the buttons.
+**(3) THE TREE AND THE VIEWPORT DISAGREED ABOUT WHAT WAS SELECTED.** The
+outliner emitted ONE atom on a click and nothing at all for a Ctrl or Shift
+range, so six rows could be highlighted in the tree while the viewport showed
+one atom - two selections, with the one you were looking at being the wrong
+one. `atoms_selected` carries the lot now, and a row means the atoms below it
+at every depth, so selecting the `C(12)` row selects all twenty of its images
+and selecting `C` selects all hundred. The click handler had to be taught the
+same lesson the OBJECT branch learned in round 24: Qt changes the selection on
+PRESS and emits `itemClicked` on RELEASE, so emitting one atom there ran LAST
+and collapsed the range back to the row clicked.
+**(4) THE CELL BOX IS NOT ALWAYS IN FRONT.** "The unit cell axes are always
+rendered on top in normal image exports and in the viewport. I think it
+shouldn't be. At least never in png exports." An overlay has no depth, so
+every edge is painted over whatever it crosses; on a packed cell the a, b and
+c vectors cut visibly across every molecule they pass behind. Two F3
+operators, **disambiguated as (Viewport) and (Image export)** because the
+choice is genuinely made twice - on screen the box is partly a navigation aid
+and an edge vanishing into the framework is a real loss, while an export has
+to be true. **The viewport keeps the overlay and the export defaults to
+depth**, which is what he asked for. The depth form is `core/cellbox.py`: one
+thin ROD per edge, drawn in the ordinary opaque pass, so the occlusion is what
+a depth buffer does for free. Rods rather than GL lines because `glLineWidth`
+> 1 is invalid in a core profile (round 48), and rods are what VESTA and the
+Blender export already draw - the radius is 0.4% of the cell's mean edge, so
+it reads the same on a 3 A cell and a 200 A framework, and a 10 A cell lands
+on exactly the 0.04 the Blender export already defaulted to.
+**THE INSTANCE COLOUR IS RGBA AND I UPLOADED RGB**, which is worth recording
+because of how it presented. The instance attribute layout is 16 matrix floats
+plus a vec4 (`istride = 20 * 4`), so a three-float colour shifts every instance
+after the first by one float and the whole buffer is read as garbage. It does
+not draw as a wrong-coloured cell box; it draws as **enormous white triangles
+across the entire frame** - Christian saw the screenshot before I did and said
+"my god the image is completely screwed". Nothing raised, and every offline
+test passed.
+**AND THE VERIFICATION WAS WRONG TWICE BEFORE IT WAS RIGHT**, which is the
+more useful lesson. The claim is OCCLUSION, and the first check counted
+"axis-coloured pixels" in the two modes - that measures the rod's THICKNESS
+(a rod is fatter than a 1.2 px pen, so depth mode had MORE of them) and, worse,
+counted the floor grid's own red and green axis lines. The second counted
+axis-coloured pixels lying on the structure - which counts the red oxygens and
+the green occupancy wedges, because a red rod and a red oxygen are the same
+pixel. The right measurement is COLOUR-AGNOSTIC and needs three frames: no
+box, box on top, box in depth. A pixel where the overlay differs from the
+no-box frame is one the box painted; if the depth frame AGREES with the no-box
+frame there, the depth test refused to paint it. **54.5% of the box is behind
+the structure** on the vendored solid solution, and the rest still draws. That
+check is in `tools/smoke_gui.py`, because `render_image` builds an FBO and
+cannot be reached from pytest at all (round 60).
+**(5) THE CRYSTAL SEARCH REMEMBERS AND SORTS** - `docs/OPEN_ITEMS.md` section
+I, which was his own list after round 85. The query and its hits are restored
+when the dialog reopens **without re-running the search** (three network round
+trips to redisplay what was on the screen a moment ago, and it could answer
+differently), and a result older than a minute or two **says how old it is**,
+because a stale list that looks live is worse than an empty one. Sorting is
+driven by hand rather than by `setSortingEnabled(True)`, and the trap the open
+item warned about was real: `QTableWidgetItem` compares LEXICALLY, so
+temperature and year carry their value in `Qt.EditRole` for Qt to compare as
+numbers, blanks sink to the bottom whichever way the column points (an unknown
+temperature is not 0 K, and a plain `reverse=True` floats them to the top),
+and a **third click returns to the search ranking** - which Qt's own sorting
+has no way back to, and the ranking is the one thing the search itself is for.
+The memory lives on `MainWindow`, not in a module global, so a second window
+cannot inherit it.
+**(6) THE SUITE COULD NOT BE RUN AS ONE PROCESS, and fixing it turned up a
+real bug in the app.** `python -m pytest tests/` crawled from ~75% and never
+finished, appearing to HANG in a different test each time - the most
+misleading shape a problem can take - and it was NOT round 86's doing
+(verified by stashing every change and reproducing it). Two causes.
+**(a) Nothing tore the windows down**: each `MainWindow` leaves 17 top-level
+widgets and 413 widgets, +340 / +8260 over twenty, until the process is
+thrashing at 2.8 GB. **The obvious fix looks like it does nothing** -
+`close()` + `deleteLater()` + `processEvents()` frees exactly as much as no
+teardown at all, which sends you hunting a leak that is not there. The reason
+is one line of Qt: **`processEvents()` does not dispatch DeferredDelete.**
+`sendPostedEvents(None, QEvent.DeferredDelete)` does, and then the ordinary
+idiom frees all of it - **+0 and +0 over 40 shown windows**. (`shiboken6.
+delete` also frees it and must NOT be used: a QMenu is a top-level widget, its
+parent's destruction has already freed it, `isValid` still reports it live,
+and touching one is an access violation.)
+**(b) A worker QThread was a CHILD of the dialog that started it**, so
+destroying the dialog destroyed a RUNNING thread. That is the app's bug rather
+than the suite's - start a name lookup that has to wait out the web timeout
+and press Cancel - and it is why the suite then died silently at exit 127,
+with no Python traceback and nothing from `PYTHONFAULTHANDLER`, in
+`test_round29_fixes.py`: its did-you-mean test clicks a suggestion, which
+kicks off a resolve, which was still in flight when the window was destroyed.
+Found by bisecting to the ONE test that crashed alone, then to one line of it.
+Workers are unparented now and held in `dialogs._LIVE_WORKERS` - un-parenting
+alone would leave `self._worker` as the only reference, which dies with the
+dialog, and Python is then free to collect a QThread mid-run, which is round
+76's trap from the other side. `wait_for_workers()` runs from the test
+teardown and from `__main__` before the process exits, because a thread
+outliving the DIALOG is correct while one outliving the PROCESS is the same
+crash from the other end.
+**`python -m pytest tests/` is 1732 passed, 4 skipped in ~110 s again.**
+1736 tests.
+
 Round 85 (2026-08-25, the search finds the PURE compound - Christian's first
 real use of it):
 "Searching for the typical acids I use (benzoic acid, nicotinic acid,
@@ -3791,7 +3925,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1700 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1736 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -4026,6 +4160,15 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
 - `core/selection2d.py` — project_points + rect/polygon containment (box &
   lasso). `core/grid.py` — grid colour constants + fade distance (the grid
   itself is a shader in viewport.py since round 3).
+- `core/cellbox.py` — the unit-cell box as drawable GEOMETRY, and where it
+  sits in the picture. `OVERLAY` is the painted form MoloM has always had
+  (always visible, which is what you want while navigating); `DEPTH` is one
+  thin rod per edge drawn in the opaque pass, so it is occluded by what is in
+  front of it - which is what a published still needs, and what the viewport's
+  overlay silently lies about. Chosen separately for the viewport and for an
+  image export (`viewport.cell_zorder` / `cell_zorder_export`). The rule for
+  which edge is the a axis lives here so the screen, the export and
+  `blender_export.cell_edges` cannot part company.
 - `core/cifsearch.py` — finding a CRYSTAL by formula, mineral or name, and
   importing it (Ctrl+Shift+Alt+N). Three tiers - a local folder, COD, and
   OPTIMADE's computed providers - run CONCURRENTLY, because unlike a molecule
@@ -4978,6 +5121,52 @@ independent cross-check inside a single fixture.
   FULL RUN — passing alone, which is the signature of shared state and the
   same shape as the round-37 circuit breaker and the round-46 module cache.
   `tests/conftest.py::_fresh_settings` clears it after every test.
+- **AN INSTANCE COLOUR IS RGBA, AND THE FAILURE LOOKS NOTHING LIKE A COLOUR
+  BUG** (round 86). `_InstancedMesh`'s attribute layout is `istride = 20 * 4`
+  - sixteen matrix floats plus a **vec4** - so uploading a three-float colour
+  shifts every instance after the first by one float and the buffer is read as
+  garbage. It draws as enormous white triangles across the whole frame, raises
+  nothing, and every offline test passes. Any new instanced pass must upload
+  RGBA.
+- **A NEW DRAW PASS HAS TO BE VERIFIED BY THE CLAIM IT MAKES, NOT BY COUNTING
+  COLOURED PIXELS** (round 86). Checking that a depth-ordered cell box is
+  occluded by counting "axis-coloured" pixels measures the ROD'S THICKNESS in
+  one mode against a pen width in the other, and counts the floor grid's red
+  and green axes and the molecule's own red oxygens into the bargain - it said
+  the feature worked when it did not, and then that it did not when it did.
+  The colour-agnostic form is three frames (no box / box on top / box in
+  depth) and a pixel-by-pixel comparison: a pixel the overlay paints, where
+  the depth frame still equals the no-box frame, is a pixel the depth test
+  refused. Same shape as round 53's A/B differencing.
+- **A QTreeWidget DRAWS NO EXPANDER ARROW ON AN ITEM WITH NO CHILDREN**
+  (round 86), so a group emptied on collapse becomes a leaf and can never be
+  opened again. The placeholder child is not a nicety; it is what keeps a
+  lazily-filled group openable. And the guard around a lazy fill must be
+  SAVED AND RESTORED rather than forced back to False, because `sync` holds
+  the same guard down for the whole rebuild.
+- **A ROW WIDGET IS THE COST OF AN OUTLINER, NOT WHAT IS IN IT** (round 86).
+  Measured: 300 tree rows carrying one bare `QWidget` each cost 14.5 ms; the
+  same rows carrying five QToolButtons and a layout cost 473 ms. If a row
+  control is a few fixed rectangles with a letter in them, paint them - and
+  free them when the group closes, or `refresh_row_controls` goes on walking
+  them for the rest of the session.
+- **`processEvents()` DOES NOT DISPATCH DeferredDelete** (round 86), so
+  `close()` + `deleteLater()` frees NOTHING and looks like a leak somewhere
+  else entirely - measured as identical to no teardown at all over 20 windows.
+  `QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)` is the
+  missing line, and with it the ordinary idiom frees everything. Reaching for
+  `shiboken6.delete` instead also works, right up until it destroys a window
+  whose QMenu is separately in `topLevelWidgets()` - `isValid` still says that
+  menu is live, and touching it is an access violation.
+- **A WORKER QThread MUST NOT BE A CHILD OF THE WIDGET THAT STARTED IT**
+  (round 86). Destroying the widget destroys a running thread, which is an
+  access violation with no Python traceback - it presents as the process
+  vanishing at exit 127 long after the code that caused it. Un-parenting alone
+  is not the fix either: `self._worker` is then the only reference and dies
+  with the dialog, so Python may collect the thread mid-run (round 76).
+  `dialogs._own_worker` holds it in a module-level set until `finished`, and
+  `wait_for_workers()` runs before the process exits, because a thread
+  outliving its dialog is correct while one outliving the process is not.
 - **A DATABASE'S NAMES ARE NOT A SEARCH INDEX** (round 85). COD returns 2617
   rows for "benzoic acid" and exactly ONE is named that; the pure compound's
   own entries are spelled "benzioc acid" with no chemname. Search a NAME by
@@ -5239,9 +5428,14 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 1265 offline tests. `tests/conftest.py`
-   sandboxes QSettings, so a GUI test can drive a real control without
-   writing into your own MoloM configuration.
+1. `python -m pytest tests/ -q` — 1732 offline tests, 4 skipped, ~110 s.
+   `tests/conftest.py` sandboxes QSettings, so a GUI test can drive a real
+   control without writing into your own MoloM configuration; it also
+   **destroys the windows a test created** (round 86), without which the suite
+   accumulates ~413 widgets per test and stops finishing at all. Two
+   consequences worth knowing: a module- or session-scoped WIDGET fixture no
+   longer works, and any new worker thread must be unparented and registered
+   through `dialogs._own_worker`, or tearing its dialog down kills the run.
 2. `python -m molom --selftest` — headless core sanity.
 3. GUI smoke: `python tools/smoke_gui.py` — a REAL window (never
    offscreen), which is the only thing that can catch a paintGL

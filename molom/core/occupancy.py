@@ -20,6 +20,13 @@ occupancy; it is one row PER SPECIES at the same fractional coordinates, which
 is exactly how the files that carry them are written. `expand_shared` does
 that split for the writer.
 
+**It can be GROUPED BY.** `site_of` says which asymmetric-unit row each drawn
+atom is an image of, and that is the only thing in the file that answers "all
+the oxygens of THIS type" - a question about sites, not about elements.
+`site_groups` turns the map into a partition so the outliner can offer that
+tier; keeping it here rather than in the UI is what stops two readings of one
+map drifting apart.
+
 The composition rides in `Structure.metadata["site_occupancy"]` — `{drawn atom
 index as a STRING: [(element, occupancy), ...]}` — so it round-trips through
 undo snapshots and `.molom` savepoints for free, the same bargain every other
@@ -71,6 +78,77 @@ def orbit_of(meta, index, n_atoms):
         return [index]
     return [i for i in range(min(n_atoms, len(site_of)))
             if int(site_of[i]) == site]
+
+
+def site_label(meta, site):
+    # type: (dict, int) -> str
+    """What the FILE calls this site - `O3`, `C(11)`, `Nb1`.
+
+    The CIF's own `_atom_site_label`, carried through import as
+    `asym_labels` (round 50, so a round trip still calls C12A C12A). Falling
+    back to an ordinal rather than to the element symbol is deliberate: two
+    sites of the same element would otherwise be given the same name, which
+    is exactly the distinction the label exists to make.
+    """
+    labels = (meta or {}).get("asym_labels") or []
+    site = int(site)
+    if 0 <= site < len(labels):
+        text = str(labels[site]).strip()
+        if text:
+            return text
+    return "site {}".format(site + 1)
+
+
+def site_groups(meta, indices):
+    # type: (dict, Sequence[int]) -> List[Tuple[Optional[int], str, List[int]]]
+    """Partition drawn atoms by the crystallographic SITE they are images of.
+
+    A crystal draws one asymmetric-unit site many times - ferrocene's `C(11)`
+    is twenty atoms in a 2x2x1 packing, and a cubic cell can draw one site
+    ninety-six times. "All the oxygens of this type" is therefore a question
+    about SITES, not about elements, and `packing.pack` already records the
+    answer in `site_of`: which asymmetric-unit row each drawn atom came from.
+    This turns that map into a partition.
+
+    Returns `[(site index, label, [atom indices]), ...]` in the asymmetric
+    unit's own order - the order the file lists its sites in, which is the
+    order a crystallographer reads them in.
+
+    **Atoms with no site come last, under `(None, "", [...])`.** That is not
+    an error case to be hidden: an atom added by an edit is genuinely not an
+    image of any site, and pretending otherwise would put it in a group whose
+    other members it has nothing to do with. Where there is no `site_of` at
+    all - a molecule, or a crystal edited since - every atom lands there, so a
+    caller that ignores the unsited group degrades to "no site information",
+    which is the honest answer rather than a guess.
+    """
+    site_of = (meta or {}).get("site_of") or []
+    groups = {}                      # type: Dict[int, List[int]]
+    unsited = []                     # type: List[int]
+    for index in indices:
+        i = int(index)
+        site = int(site_of[i]) if 0 <= i < len(site_of) else -1
+        if site < 0:
+            unsited.append(i)
+        else:
+            groups.setdefault(site, []).append(i)
+    out = [(site, site_label(meta, site), groups[site])
+           for site in sorted(groups)]
+    if unsited:
+        out.append((None, "", unsited))
+    return out
+
+
+def has_distinct_sites(meta, indices):
+    # type: (dict, Sequence[int]) -> bool
+    """Is it worth splitting these atoms by site at all?
+
+    One site is not a grouping, it is the same list one click deeper - so the
+    tier is only worth showing when there are at least two. Kept here rather
+    than in the outliner so the rule is testable without a widget, and so
+    anything else that wants to group by site applies the same one.
+    """
+    return len(site_groups(meta, indices)) > 1
 
 
 def normalise(parts, drop_zero=True):

@@ -46,6 +46,20 @@ toggle.
 | Import molecule by name... (OPSIN → PubChem) | Ctrl+Shift+N | — |
 | **Find a crystal structure...** — COD, OPTIMADE and a folder of your own, searched at once | **Ctrl+Shift+Alt+N** | — |
 | Crystal search: set the local CIF folder... | F3 / Settings | — |
+
+**The result table remembers and sorts.** Reopening the dialog puts the last
+query and its hits straight back — *without re-running the search*, which
+would cost three network round trips to redisplay what was on the screen a
+moment ago, and could silently answer differently. If the result is more than
+a minute or two old the dialog **says how old**: a stale list that looks live
+is worse than an empty one, because a COD entry can be superseded. Enter runs
+it again.
+
+**Clicking a column header sorts by it** — ascending, then descending, then
+back to the search ranking, which is the one thing the search itself is for.
+Temperature and year sort as NUMBERS (100 K after 98 K, not before it), and a
+blank — which COD leaves constantly — sinks to the bottom whichever way the
+column points, because an unknown temperature is not 0 K.
 | New from SMILES... (dots split into separate molecules) | Ctrl+N | — |
 | Paste XYZ / SMILES | Ctrl+V | — |
 
@@ -238,11 +252,38 @@ water                    [eye] [style]
       └ C0               ■ ■ ■          <- individual atom
   └ H  (6)               ■ ■ ■
 + New molecule
+
+ferrocene                [eye] [style]        <- a CRYSTAL gets a site tier
+  └ C  (100)             ■ ■ ■
+      └ C(11)   (20)     ■ ■ ■          <- crystallographic site
+          └ C1           ■ ■ ■          <- individual atom
+      └ C(12)   (20)     ■ ■ ■
+  └ Fe (10)              ■ ■ ■          <- ONE site, so no tier
 ```
-- Everything below a molecule is **collapsed by default**; atom rows are
-  built only when a group is expanded, so a big structure costs nothing
-  until you look inside it.
-- Element groups **and** individual atoms carry the same five squares —
+- Everything below a molecule is **collapsed by default**; rows are built
+  only when a group is expanded **and thrown away again when it is
+  collapsed**, so a big structure costs nothing until you look inside it and
+  stops costing when you look away. (Before round 86 they were built once and
+  never freed, and `refresh_row_controls` walks every live control on every
+  colour, label or visibility change — so one look inside a 300-atom group
+  went on costing ~190 ms per click for the rest of the session, on rows
+  nobody could see.)
+- **A crystal gets a third tier: the crystallographic SITE.** An element is
+  not a type — a cell draws one asymmetric-unit site over and over, and
+  *that* is what the refinement calls a type, what the file labels, and what
+  somebody means by "the bridging oxygens" as against "the terminal ones".
+  Christian: *"let's say I want to hide all oxygen atoms of a specific type.
+  I can't do that efficiently."* Now it is one click on the site row.
+  - The row is named by the file's own `_atom_site_label` (`C(11)`, `O3`).
+  - It appears **only where there is more than one site** to choose between.
+    One site is not a grouping, it is the same list one click deeper, and a
+    molecule has no sites at all — both fall through to the flat tree.
+  - Atoms added by an edit are images of no site and are grouped separately
+    as **(added since)** rather than being filed under a site they have
+    nothing to do with.
+  - It is also what makes a big crystal quick to open: ferrocene's hundred
+    carbons are five rows, not a hundred.
+- Element groups, sites **and** individual atoms carry the same five squares —
   the only difference is how many atoms the click applies to:
 
   | Square | Click | Right-click |
@@ -263,6 +304,14 @@ water                    [eye] [style]
 - A row click selects that molecule **and makes it active**, so Tab edits
   what you just clicked. Picking a molecule in the viewport does the same in
   reverse — the outliner follows the viewport.
+- **Selecting atom, site or element rows selects those atoms in the
+  viewport**, Ctrl/Shift ranges included. A row stands for the atoms below
+  it, so selecting the `O3` site selects every drawn image of that site and
+  selecting the `O` group selects every oxygen. Before round 86 the outliner
+  emitted one atom on a click and nothing at all for a range, so the tree
+  could show six rows highlighted while the viewport showed one atom — two
+  selections disagreeing, with the one you were looking at being the wrong
+  one.
 - **Drag across the eye column** to paint the same visibility onto every row
   you cross (Blender's checkbox drag).
 - **Shift+click an eye** toggles between "show only this one" and "show
@@ -339,9 +388,31 @@ applied to fill the cell; copies landing on an existing atom (minimum-image,
 0.1 Å) are dropped, so atoms on special positions do not stack up. A file
 with no symmetry listed is treated as P1.
 
-The **unit cell box** draws as a viewport overlay — 12 clipped edges, with
-a/b/c from the origin corner in the axis colours (red/green/blue), the same
-convention as the compass. Toggle it from F3 ("Show unit cell box").
+The **unit cell box** carries a/b/c from the origin corner in the axis
+colours (red/green/blue), the same convention as the compass. Toggle it from
+F3 ("Show unit cell box").
+
+**Where it sits in the picture is a separate choice, made twice.**
+
+| Operator | Draws the box as | Default |
+|---|---|---|
+| **Unit cell box (Viewport): draw on top / respect depth** | painted overlay — 12 near-plane clipped edges, always visible | **on top** |
+| **Unit cell box (Image export): draw on top / respect depth** | real geometry — one thin rod per edge, occluded by whatever is in front of it | **respect depth** |
+
+The two default differently on purpose. On screen the box is partly a
+navigation aid: you want to know where the cell is even when it runs behind
+the framework, and an edge vanishing into a dense structure is a real loss.
+An **export has to be true** — an overlay has no depth, so every edge it
+crosses is drawn as though it were in front, which on a packed cell means the
+a, b and c vectors cut visibly across every molecule they pass behind.
+Christian, 2026-08-25: *"the unit cell axes are always rendered on top ... I
+think it shouldn't be. At least never in png exports."*
+
+The depth-respecting form is a rod per edge (`core/cellbox.py`), which is what
+VESTA and Diamond draw and what the Blender export has always produced — so
+the screen, the still and the `.blend` cannot disagree about which edge is the
+a axis. The radius is **proportional to the cell** (0.4% of its mean edge), so
+it reads the same on a 3 Å cell and a 200 Å framework.
 
 ### The orientation ribbon (round 35)
 Selecting a crystal — in the outliner, or any part of it **in the viewport** —

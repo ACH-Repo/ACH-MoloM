@@ -195,6 +195,42 @@ def main(paths):
         if with_box <= ink(without):
             FAILURES.append("the unit cell box is missing from render_image")
 
+        # Round 86: the box can be drawn as real geometry instead of being
+        # painted over everything, and the EXPORT defaults to that. The claim
+        # is occlusion, so the measurement is a three-way frame comparison -
+        # counting coloured pixels measures the rod's THICKNESS instead, and
+        # counting "axis-coloured" ones counts the red oxygens (both were
+        # tried, and both said the feature worked when it did not).
+        from molom.core import cellbox as cellbox_mod
+        vp = win.viewport
+        keep = vp.cell_zorder
+        vp.show_cell = False
+        plain = vp.render_image(crop_to_content=False)
+        vp.show_cell = True
+        vp.cell_zorder = cellbox_mod.OVERLAY
+        over = vp.render_image(crop_to_content=False)
+        vp.cell_zorder = cellbox_mod.DEPTH
+        deep = vp.render_image(crop_to_content=False)
+        vp.cell_zorder = keep
+        over.save(os.path.join(OUT, "99_cell_on_top.png"))
+        deep.save(os.path.join(OUT, "99_cell_depth.png"))
+        painted = hidden = 0
+        for y in range(0, plain.height(), 2):
+            for x in range(0, plain.width(), 2):
+                base = plain.pixel(x, y)
+                if over.pixel(x, y) == base:
+                    continue
+                painted += 1
+                if deep.pixel(x, y) == base:
+                    hidden += 1
+        share = (100.0 * hidden / painted) if painted else 0.0
+        print("  cell box z-order: {} painted px, {} of them behind the "
+              "structure ({:.0f}%) {}".format(
+                  painted, hidden, share,
+                  "OK" if hidden else "NOTHING OCCLUDED"))
+        if not hidden:
+            FAILURES.append("the depth-ordered cell box occluded nothing")
+
     def measure_steps():
         """Persistent measurements: several at once, one of them highlighted as
         the Delete target. `_paint_measure` is a paint path, so a raise here is

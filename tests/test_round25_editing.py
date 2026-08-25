@@ -192,12 +192,30 @@ def test_element_indices_groups_by_symbol(win):
 
 
 def test_the_row_controls_expose_show_and_size(win):
+    """Round 26's claim: an outliner row carries per-element show/hide and
+    sphere size, without which a MOF cannot be drawn properly.
+
+    This used to assert `hasattr(control, "show_btn")`, which pinned the
+    IMPLEMENTATION - five QToolButtons - rather than the claim, and duly
+    broke when the five buttons became five painted squares in one widget
+    (the buttons cost 0.9 ms a row to build, which is most of what made
+    opening a 300-atom element group take half a second). What matters is
+    that both controls are REACHABLE and that they act, so that is what is
+    pinned now.
+    """
     from molom.ui.outliner import RowControls
     win.outliner.tree.expandAll()
     controls = win.outliner.tree.findChildren(RowControls)
     assert controls
-    assert hasattr(controls[0], "show_btn")
-    assert hasattr(controls[0], "size_btn")
+    control = controls[0]
+    assert "show" in control.KEYS and "size" in control.KEYS
+    # Reachable: each square has its own hit area, and a tooltip saying what
+    # its letter means (an unlabelled square is a guess - round 26).
+    rects = [control.square_rect(k) for k in control.KEYS]
+    assert len({(r.x(), r.y()) for r in rects}) == len(control.KEYS)
+    assert all(control._key_at(r.center()) == k
+               for k, r in zip(control.KEYS, rects))
+    assert control._faces["show"][3] and control._faces["size"][3]
 
 
 def test_toggling_visibility_from_the_row_control(win):

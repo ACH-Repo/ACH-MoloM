@@ -82,13 +82,21 @@ def main(argv=None):
     if icon is not None:
         app.setWindowIcon(icon)
     apply_dark_theme(app)   # Blender-grey UI everywhere, not just the GL view
+    from .ui import dialogs
     win = MainWindow()
     win.show_startup()   # maximized by default; Settings offers windowed
     if args.file:
         win.open_path(args.file)
     else:
         win.load_default_scene()    # cubane, the way Blender opens on a cube
-    return app.exec()
+    # A name lookup or a crystal search runs in a worker thread that
+    # deliberately outlives the dialog that started it (so cancelling one
+    # cannot destroy a running QThread). It must not outlive the PROCESS:
+    # tearing the interpreter down under a live thread is the same crash from
+    # the other end, and it would land on quit, after everything worked.
+    code = app.exec()
+    dialogs.wait_for_workers()
+    return code
 
 
 if __name__ == "__main__":

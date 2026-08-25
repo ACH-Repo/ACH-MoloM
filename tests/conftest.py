@@ -45,6 +45,69 @@ def _fresh_resolver_state():
     yield
     resolve.reset_service_state()
 
+@pytest.fixture(autouse=True)
+def _delete_widgets_after_each_test():
+    """Destroy the windows a test created, so the suite can run in ONE
+    process again.
+
+    Nearly 1700 GUI tests each build a `MainWindow` and none was torn down, so
+    the process reached ~2.8 GB and crawled from about 75% - appearing to HANG
+    in a different test each time, which is the most misleading shape a
+    problem can take.
+
+    **The trap is that `close()` + `deleteLater()` looks like it frees
+    nothing**, which sends you hunting a leak that is not there. Measured over
+    20 windows: no teardown leaves +340 top-level widgets and +8260 widgets,
+    and `close()` + `deleteLater()` followed by `processEvents()` leaves
+    exactly the same - because **`processEvents()` does not dispatch
+    DeferredDelete**. `sendPostedEvents(None, QEvent.DeferredDelete)` does,
+    and with it the ordinary Qt idiom frees all of it: **+0 and +0**.
+
+    Only MoloM's own top-level widgets are touched, and only ones that
+    appeared DURING the test, compared by identity rather than by `id()`
+    (which is reused after a free).
+    """
+    try:
+        from PySide6.QtCore import QCoreApplication, QEvent
+        from PySide6.QtWidgets import QApplication
+    except ImportError:                   # PySide6 absent: core-only run
+        yield
+        return
+    app = QApplication.instance()
+    before = list(app.topLevelWidgets()) if app is not None else []
+    yield
+    app = QApplication.instance()
+    if app is None:
+        return
+    for widget in list(app.topLevelWidgets()):
+        if any(widget is kept for kept in before):
+            continue
+        # MoloM's OWN windows. A QMenu is a top-level widget in Qt, so a
+        # window's menus are in this list too - and they are CHILDREN, which
+        # Qt destroys with their parent. `shiboken6.delete` on one afterwards
+        # is an access violation that kills the whole run.
+        if not type(widget).__module__.startswith("molom."):
+            continue
+        try:
+            widget.close()
+            widget.deleteLater()
+        except RuntimeError:
+            pass                          # already gone; nothing to free
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    app.processEvents()
+    # A dialog's lookup thread deliberately OUTLIVES the dialog (see
+    # `dialogs._LIVE_WORKERS`), which is right - but it must not outlive the
+    # PROCESS, because the interpreter tearing down under a running QThread
+    # is an access violation that kills the run after every test has
+    # apparently passed. Waited for here rather than at exit so a thread is
+    # never carried from one test into the next.
+    try:
+        from molom.ui import dialogs as _dialogs
+    except ImportError:
+        return
+    _dialogs.wait_for_workers()
+
+
 try:
     from PySide6.QtCore import QSettings
 except ImportError:                       # PySide6 absent: core-only run

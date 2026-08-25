@@ -11,7 +11,11 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
-@pytest.fixture(scope="module")
+# Function-scoped: `conftest._delete_widgets_after_each_test` destroys every
+# top-level widget a test created, so a widget built once for a whole module
+# is invalid from the second test on. A bare MolViewport is cheap - it makes
+# no GL context until it is shown.
+@pytest.fixture
 def viewport():
     pytest.importorskip("PySide6")
     from PySide6.QtWidgets import QApplication

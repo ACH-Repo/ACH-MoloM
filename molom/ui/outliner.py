@@ -15,16 +15,19 @@ and looking costs nothing.
 
 from typing import Optional
 
-from PySide6.QtCore import QEvent, QPoint, QSize, Qt, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QPalette, QPen
+from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, Signal
+from PySide6.QtGui import (QAction, QBrush, QColor, QPainter, QPalette,
+                           QPen)
 from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox,
                                QHBoxLayout, QHeaderView, QInputDialog,
                                QLabel, QMenu, QStyledItemDelegate,
-                               QFrame, QToolButton, QTreeWidget,
-                               QTreeWidgetItem, QVBoxLayout, QWidget)
+                               QFrame, QToolButton, QToolTip,
+                               QTreeWidget, QTreeWidgetItem,
+                               QVBoxLayout, QWidget)
 
 from ..core import attachments as attach_mod
 from ..core import elements
+from ..core import occupancy
 from ..core import style as style_mod
 from .widgets import FlowLayout
 
@@ -48,15 +51,34 @@ def _mode_is_available(key, obj):
     except AttributeError:
         return False
 
-ROLE_KIND = Qt.UserRole          # "object" | "element" | "atom" | "add"
+ROLE_KIND = Qt.UserRole          # "object" | "element" | "site" | "atom" | ...
 ROLE_OBJ = Qt.UserRole + 1
-ROLE_ATOM = Qt.UserRole + 2
+ROLE_ATOM = Qt.UserRole + 2      # atom index, or the symbol on a group row
 ROLE_HIDDEN = Qt.UserRole + 3    # this molecule has hidden atoms
 ROLE_UNPHYSICAL = Qt.UserRole + 4  # an attachment no longer matches it
+ROLE_SITE = Qt.UserRole + 5      # asymmetric-unit row, None where unsited
+ROLE_SITE_ROWS = Qt.UserRole + 6  # the drawn atoms of that site
+
+
+def _element_brush(sym):
+    # type: (str) -> QColor
+    """An element's own colour, for a row that stands for it."""
+    c = elements.color_f(elements.atomic_number(sym))
+    return QColor(int(c[0] * 255), int(c[1] * 255), int(c[2] * 255))
 
 # Short codes for the label-type square
 _MODE_CODE = {"element": "El", "index": "#", "element_index": "E#",
               "custom": "✎"}
+
+# The four states a square can be in, as colours rather than as five copies of
+# a stylesheet string. Named for what they MEAN: idle is "nothing set here",
+# partial is "some of these atoms", on is "all of them", off is "hidden".
+_IDLE = QColor(255, 255, 255, 18)
+_PARTIAL = QColor(0x3d, 0x55, 0x6e)
+_ON = QColor(0x4a, 0x7a, 0xb0)
+_OFF = QColor(0x6b, 0x3a, 0x3a)
+_EDGE = QColor(0x1a, 0x1a, 0x1a)
+_INK = QColor(0xee, 0xee, 0xee)
 
 
 class _Divider(QFrame):
@@ -294,50 +316,205 @@ class CrystalControls(QWidget):
 
 
 class RowControls(QWidget):
-    """The three squares an element group and an atom row both carry:
-    colour, label on/off, label type.
+    """The five squares an element group, a site and an atom row all carry:
+    colour, show/hide, sphere size, label on/off, label type.
 
-    Identical at both levels on purpose — at the element level the action
-    simply applies to every atom of that element, so "colour all my oxygens"
+    Identical at every level on purpose - the action simply applies to every
+    atom the row stands for, so "colour all my oxygens", "colour the O3 site"
     and "colour this one oxygen" are the same gesture at different depths.
+
+    **ONE widget that paints five squares, not five QToolButtons**, and the
+    reason is measured rather than stylistic. A row cost about 0.9 ms to build
+    because it was seven widgets (five buttons, a layout, the container), so
+    opening an element group of 300 atoms took **512 ms** and the tree carried
+    2100 widgets afterwards. The same 300 rows carrying ONE bare widget each
+    cost 14.5 ms. Nothing about the squares needed a QWidget: they are fixed
+    rectangles with a letter in them, and hit-testing five rectangles is the
+    one line that replaces all of it.
+
+    The trade is that tooltips and the colour square's right-click menu are
+    handled here (`event`, `mousePressEvent`) rather than by Qt per button -
+    a few lines, and they were per-square behaviour that had to be described
+    somewhere anyway.
     """
 
     changed = Signal()
 
     SIZE = 17
+    GAP = 2
+    PAD = 1
+
+    #: Square order, left to right, and which method a click runs. The order
+    #: is the one Christian has been reading since round 26 - do not shuffle
+    #: it for tidiness; the letters are memorised by position.
+    KEYS = ("colour", "show", "size", "label", "mode")
 
     def __init__(self, panel, obj, indices, parent=None):
         super().__init__(parent)
         self._panel = panel
         self._obj = obj
         self._rows = list(indices)
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(1, 0, 1, 0)
-        lay.setSpacing(2)
-        self.colour_btn = self._square("Colour — click to set, right-click "
-                                       "to reset to the element colour")
-        self.colour_btn.clicked.connect(self._pick_colour)
-        self.colour_btn.customContextMenuRequested.connect(
-            lambda _p: self._reset_colour())
-        self.label_btn = self._square("Label on / off")
-        self.label_btn.clicked.connect(self._toggle_label)
-        self.mode_btn = self._square("Label type")
-        self.mode_btn.clicked.connect(self._pick_mode)
-        # Show/hide and per-element sphere size: without these a MOF cannot
-        # be drawn properly — the hydrogens bury the framework and the metal
-        # spheres burst out of their own coordination polyhedra.
-        self.show_btn = self._square(
-            "Show / hide these atoms in the viewport")
-        self.show_btn.clicked.connect(self._toggle_shown)
-        self.size_btn = self._square(
-            "Sphere size for these atoms — click for a slider")
-        self.size_btn.clicked.connect(self._pick_size)
-        for b in (self.colour_btn, self.show_btn, self.size_btn,
-                  self.label_btn, self.mode_btn):
-            lay.addWidget(b)
-        lay.addStretch(1)
+        #: key -> (text, background, foreground, tooltip), filled by refresh.
+        self._faces = {}
+        self.setFixedHeight(self.SIZE + 2 * self.PAD)
+        self.setMinimumWidth(len(self.KEYS) * self.SIZE
+                             + (len(self.KEYS) - 1) * self.GAP
+                             + 2 * self.PAD)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMouseTracking(True)
         self.refresh()
 
+    # ------------------------------------------------------------ geometry
+    def square_rect(self, key):
+        # type: (str) -> QRect
+        """Where one square sits. Public because the popups anchor on it."""
+        k = self.KEYS.index(key)
+        return QRect(self.PAD + k * (self.SIZE + self.GAP), self.PAD,
+                     self.SIZE, self.SIZE)
+
+    def _key_at(self, pos):
+        for key in self.KEYS:
+            if self.square_rect(key).contains(pos):
+                return key
+        return None
+
+    # ------------------------------------------------------------- display
+    def refresh(self):
+        obj, rows = self._obj, self._rows
+        if not rows:
+            return
+        faces = {}
+
+        cols = {obj.atom_colors.get(i) for i in rows}
+        if len(cols) == 1 and next(iter(cols)) is not None:
+            c = next(iter(cols))
+            text = ""
+        else:
+            z = elements.atomic_number(obj.structure.symbols[rows[0]])
+            c = elements.color_f(z)
+            text = "" if len(cols) == 1 else "~"      # ~ = mixed overrides
+        qc = QColor(int(c[0] * 255), int(c[1] * 255), int(c[2] * 255))
+        faces["colour"] = (text, qc,
+                           QColor("#000") if qc.lightness() > 128
+                           else QColor("#ddd"),
+                           "Colour - click to set, right-click to reset to "
+                           "the element colour")
+
+        # H = these are shown (click to Hide), S = these are hidden (click to
+        # Show). A letter, not a glyph: an unlabelled square is a guess.
+        hidden = sum(1 for i in rows if i in obj.atom_hidden)
+        vis = "none" if hidden == len(rows) else ("some" if hidden else "all")
+        faces["show"] = ({"all": "H", "some": "h", "none": "S"}[vis],
+                         {"all": _IDLE, "some": _PARTIAL,
+                          "none": _OFF}[vis],
+                         _INK,
+                         "Show these atoms again" if vis == "none"
+                         else "Hide these atoms in the viewport")
+
+        # R = radius, replaced by the multiplier once it is not 1.
+        scales = {round(obj.atom_scale_for(i), 2) for i in rows}
+        if len(scales) == 1:
+            value = next(iter(scales))
+            size_text = "R" if abs(value - 1.0) < 1e-6 else "{:g}".format(value)
+            custom = abs(value - 1.0) > 1e-6
+        else:
+            size_text, custom = "~", True
+        faces["size"] = (size_text, _PARTIAL if custom else _IDLE, _INK,
+                         "Sphere size for these atoms - click for a slider")
+
+        on = sum(1 for i in rows if i in obj.atom_labels)
+        state = "all" if on == len(rows) else ("some" if on else "none")
+        faces["label"] = ({"all": "L", "some": "l", "none": "L"}[state],
+                          {"all": _ON, "some": _PARTIAL, "none": _IDLE}[state],
+                          _INK, "Label on / off")
+
+        modes = {obj.label_mode_for(i) for i in rows}
+        code = _MODE_CODE.get(next(iter(modes)), "?") if len(modes) == 1 \
+            else "~"
+        faces["mode"] = (code, _IDLE, _INK, "Label type")
+
+        if faces != self._faces:
+            self._faces = faces
+            self.update()
+
+    def paintEvent(self, _ev):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        font = painter.font()
+        font.setPixelSize(8)
+        painter.setFont(font)
+        for key in self.KEYS:
+            face = self._faces.get(key)
+            if face is None:
+                continue
+            text, bg, fg, _tip = face
+            rect = self.square_rect(key)
+            painter.setPen(QPen(_EDGE))
+            painter.setBrush(bg)
+            painter.drawRoundedRect(rect.adjusted(0, 0, -1, -1), 2, 2)
+            if text:
+                painter.setPen(QPen(fg))
+                painter.drawText(rect, Qt.AlignCenter, text)
+        painter.end()
+
+    # ------------------------------------------------------------- input
+    def event(self, ev):
+        """Per-square tooltips.
+
+        With five child buttons Qt did this itself; with one widget the tip
+        has to follow the pointer, and a single tooltip for the whole row
+        would be no tooltip at all - the letters are exactly the thing that
+        needs explaining.
+        """
+        if ev.type() == QEvent.ToolTip:
+            key = self._key_at(ev.pos())
+            face = self._faces.get(key) if key else None
+            QToolTip.showText(ev.globalPos(), face[3] if face else "", self)
+            return True
+        return super().event(ev)
+
+    def mousePressEvent(self, ev):
+        key = self._key_at(ev.position().toPoint())
+        if key is None:
+            super().mousePressEvent(ev)
+            return
+        if ev.button() == Qt.RightButton:
+            # Only the colour square has ever had a second action, and it is
+            # the one that needs a way back: an atom painted by hand has no
+            # other route to "whatever the element says".
+            if key == "colour":
+                self._reset_colour()
+            ev.accept()
+            return
+        if ev.button() != Qt.LeftButton:
+            super().mousePressEvent(ev)
+            return
+        {"colour": self._pick_colour, "show": self._toggle_shown,
+         "size": self._pick_size, "label": self._toggle_label,
+         "mode": self._pick_mode}[key]()
+        ev.accept()
+
+    def _popup_at(self, popup, key, align_right):
+        """Put a popup under one square, kept on the screen.
+
+        Anchored on the square's RIGHT edge where it is wide: the outliner
+        lives against the right side of the window, so a popup growing
+        rightwards runs off the screen (round 27).
+        """
+        rect = self.square_rect(key)
+        corner = rect.bottomRight() if align_right else rect.bottomLeft()
+        pos = self.mapToGlobal(corner)
+        if align_right:
+            pos -= QPoint(popup.width(), 0)
+        screen = self.screen().availableGeometry() if self.screen() else None
+        if screen is not None:
+            pos.setX(max(screen.left() + 2,
+                         min(pos.x(), screen.right() - popup.width() - 2)))
+            pos.setY(max(screen.top() + 2,
+                         min(pos.y(), screen.bottom() - popup.height() - 2)))
+        popup.move(pos)
+
+    # ------------------------------------------------------------- actions
     def _toggle_shown(self):
         obj, rows = self._obj, self._rows
         hidden = sum(1 for i in rows if i in obj.atom_hidden)
@@ -351,7 +528,7 @@ class RowControls(QWidget):
         self.changed.emit()
 
     def _pick_size(self):
-        """A slider in a popup, right under the square that opened it —
+        """A slider in a popup, right under the square that opened it -
         judging a sphere size means watching the viewport while you drag."""
         from PySide6.QtWidgets import QSlider, QHBoxLayout, QFrame
         popup = QFrame(self, Qt.Popup)
@@ -386,92 +563,9 @@ class RowControls(QWidget):
         row.addWidget(slider)
         row.addWidget(readout)
         popup.adjustSize()
-        # Anchored on its RIGHT edge: the outliner lives against the right
-        # side of the window, so a popup growing rightwards runs off screen.
-        anchor = self.size_btn.mapToGlobal(self.size_btn.rect().bottomRight())
-        pos = anchor - QPoint(popup.width(), 0)
-        screen = self.screen().availableGeometry() if self.screen() else None
-        if screen is not None:
-            pos.setX(max(screen.left() + 2,
-                         min(pos.x(), screen.right() - popup.width() - 2)))
-            pos.setY(max(screen.top() + 2,
-                         min(pos.y(), screen.bottom() - popup.height() - 2)))
-        popup.move(pos)
+        self._popup_at(popup, "size", align_right=True)
         popup.show()
 
-    def _square(self, tip):
-        b = QToolButton(self)
-        b.setFixedSize(self.SIZE, self.SIZE)
-        b.setToolTip(tip)
-        b.setCursor(Qt.PointingHandCursor)
-        b.setContextMenuPolicy(Qt.CustomContextMenu)
-        return b
-
-    # ------------------------------------------------------------- display
-    def refresh(self):
-        obj, rows = self._obj, self._rows
-        cols = {obj.atom_colors.get(i) for i in rows}
-        if len(cols) == 1 and next(iter(cols)) is not None:
-            c = next(iter(cols))
-            text = ""
-        else:
-            z = elements.atomic_number(obj.structure.symbols[rows[0]])
-            c = elements.color_f(z)
-            text = "" if len(cols) == 1 else "~"      # ~ = mixed overrides
-        qc = QColor(int(c[0] * 255), int(c[1] * 255), int(c[2] * 255))
-        self.colour_btn.setText(text)
-        self.colour_btn.setStyleSheet(
-            "QToolButton {{ background: {}; border: 1px solid #1a1a1a;"
-            " border-radius: 2px; font-size: 8px; color: {}; }}".format(
-                qc.name(), "#000" if qc.lightness() > 128 else "#ddd"))
-
-        on = sum(1 for i in rows if i in obj.atom_labels)
-        state = "all" if on == len(rows) else ("some" if on else "none")
-        fill = {"all": "#4a7ab0", "some": "#3d556e", "none": "rgba(255,255,255,18)"}
-        self.label_btn.setText({"all": "L", "some": "l", "none": "L"}[state])
-        self.label_btn.setStyleSheet(
-            "QToolButton {{ background: {}; border: 1px solid #1a1a1a;"
-            " border-radius: 2px; color: #eee; font-size: 8px; }}".format(
-                fill[state]))
-
-        # H = these are shown (click to Hide), S = these are hidden (click to
-        # Show). A letter, not a glyph: an unlabelled square is a guess.
-        hidden = sum(1 for i in rows if i in obj.atom_hidden)
-        vis = "none" if hidden == len(rows) else ("some" if hidden else "all")
-        self.show_btn.setText({"all": "H", "some": "h", "none": "S"}[vis])
-        self.show_btn.setToolTip(
-            "Show these atoms again" if vis == "none"
-            else "Hide these atoms in the viewport")
-        self.show_btn.setStyleSheet(
-            "QToolButton {{ background: {}; border: 1px solid #1a1a1a;"
-            " border-radius: 2px; color: #eee; font-size: 8px; }}".format(
-                {"all": "rgba(255,255,255,18)", "some": "#3d556e",
-                 "none": "#6b3a3a"}[vis]))
-
-        # R = radius, replaced by the multiplier once it is not 1.
-        scales = {round(obj.atom_scale_for(i), 2) for i in rows}
-        if len(scales) == 1:
-            value = next(iter(scales))
-            size_text = "R" if abs(value - 1.0) < 1e-6 else "{:g}".format(value)
-            custom = abs(value - 1.0) > 1e-6
-        else:
-            size_text, custom = "~", True
-        self.size_btn.setText(size_text)
-        self.size_btn.setStyleSheet(
-            "QToolButton {{ background: {}; border: 1px solid #1a1a1a;"
-            " border-radius: 2px; color: #ddd; font-size: 8px; }}".format(
-                "#3d556e" if custom else "rgba(255,255,255,18)"))
-
-        modes = {obj.label_mode_for(i) for i in rows}
-        code = _MODE_CODE.get(next(iter(modes)), "?") if len(modes) == 1 \
-            else "~"
-        self.mode_btn.setText(code)
-        self.mode_btn.setStyleSheet(
-            "QToolButton { background: rgba(255,255,255,18); border: 1px"
-            " solid #1a1a1a; border-radius: 2px; color: #ddd;"
-            " font-size: 8px; }")
-
-    # ------------------------------------------------------------- actions
     def _pick_colour(self):
         obj, rows = self._obj, self._rows
         cur = obj.atom_colors.get(rows[0])
@@ -526,7 +620,7 @@ class RowControls(QWidget):
         act_col = QAction("Label colour...", menu)
         act_col.triggered.connect(self._pick_label_colour)
         menu.addAction(act_col)
-        menu.exec(self.mode_btn.mapToGlobal(self.mode_btn.rect().bottomLeft()))
+        menu.exec(self.mapToGlobal(self.square_rect("mode").bottomLeft()))
 
     def _set_mode(self, key):
         for i in self._rows:
@@ -566,6 +660,7 @@ class OutlinerPanel(QWidget):
     camera_add_requested = Signal()
     atom_display_changed = Signal()          # colours / labels edited
     atom_picked = Signal(int, int)           # obj_id, atom index
+    atoms_selected = Signal(list)            # [(obj_id, atom), ...]
     crystal_view_changed = Signal(int, str)  # obj_id, 'asym' | 'cell'
     crystal_box_toggled = Signal(int, bool)
     crystal_poly_toggled = Signal(int, bool)
@@ -626,6 +721,7 @@ class OutlinerPanel(QWidget):
         self.tree.itemSelectionChanged.connect(self._on_selection_changed)
         self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         self.tree.itemExpanded.connect(self._on_expanded)
+        self.tree.itemCollapsed.connect(self._on_collapsed)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._context_menu)
         self.tree.viewport().installEventFilter(self)
@@ -816,43 +912,159 @@ class OutlinerPanel(QWidget):
         self.tree.setItemWidget(row, 0, controls)
 
     def _add_element_groups(self, parent, obj):
-        """One collapsed row per element; atoms are filled in on expand so a
-        3000-atom slab does not build 3000 widgets nobody asked for."""
+        """One collapsed row per element; everything below is filled in on
+        expand so a 3000-atom slab does not build 3000 widgets nobody asked
+        for - and thrown away again on collapse, so it does not keep them."""
         counts = {}
         for i, sym in enumerate(obj.structure.symbols):
             counts.setdefault(sym, []).append(i)
+        meta = obj.structure.metadata or {}
         for sym in sorted(counts, key=lambda s: elements.atomic_number(s)):
             rows = counts[sym]
             grp = QTreeWidgetItem(["{}   ({})".format(sym, len(rows)), "", ""])
             grp.setData(0, ROLE_KIND, "element")
             grp.setData(0, ROLE_OBJ, obj.id)
             grp.setData(0, ROLE_ATOM, sym)
-            z = elements.atomic_number(sym)
-            c = elements.color_f(z)
-            grp.setForeground(0, QBrush(QColor(int(c[0] * 255),
-                                               int(c[1] * 255),
-                                               int(c[2] * 255))))
+            grp.setForeground(0, QBrush(_element_brush(sym)))
             grp.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            grp.addChild(QTreeWidgetItem(["..."]))    # expand placeholder
+            sites = occupancy.site_groups(meta, rows)
+            if len(sites) > 1:
+                grp.setToolTip(0, "{} {} atoms over {} crystallographic "
+                               "sites".format(len(rows), sym, len(sites)))
+            self._add_placeholder(grp)
             parent.addChild(grp)
             self._attach_controls(grp, obj, rows)
 
+    # ------------------------------------------------- lazy fill and free
+    def _add_placeholder(self, item):
+        """What a collapsed group carries instead of its rows.
+
+        A child rather than a flag, because a `QTreeWidget` draws no expander
+        arrow on an item with no children - so an emptied group would look
+        like a leaf and could never be opened again.
+        """
+        dummy = QTreeWidgetItem(["..."])
+        dummy.setFlags(Qt.NoItemFlags)
+        item.addChild(dummy)
+
+    def _is_placeheld(self, item):
+        return (item.childCount() == 1
+                and self._kind(item.child(0)) is None)
+
     def _on_expanded(self, item):
-        if self._kind(item) != "element" or self._loading:
+        """Build this group's children the first time it is opened."""
+        if self._loading or self._kind(item) not in ("element", "site"):
             return
         obj = self._obj(item)
-        if obj is None:
+        if obj is None or not self._is_placeheld(item):
             return
-        sym = item.data(0, ROLE_ATOM)
-        if item.childCount() == 1 and \
-                self._kind(item.child(0)) is None:
-            item.takeChildren()
-            self._loading = True
-            for i, s in enumerate(obj.structure.symbols):
-                if s != sym:
-                    continue
+        item.takeChildren()
+        # Saved and RESTORED, not forced back to False: this also runs from
+        # inside `sync`, which holds the guard down for the whole rebuild.
+        was, self._loading = self._loading, True
+        drawing = self.tree.updatesEnabled()
+        # Building a few hundred rows one at a time makes the tree re-lay
+        # itself out on each of them; the whole fill is one update instead.
+        self.tree.setUpdatesEnabled(False)
+        try:
+            if self._kind(item) == "site":
+                for i in item.data(0, ROLE_SITE_ROWS) or []:
+                    self._add_atom_row(item, obj, int(i))
+            else:
+                self._fill_element(item, obj, item.data(0, ROLE_ATOM))
+        finally:
+            self.tree.setUpdatesEnabled(drawing)
+            self._loading = was
+
+    def _fill_element(self, item, obj, sym):
+        """Atoms of this element - or, in a crystal, the SITES they belong to.
+
+        Christian's point, and it is crystallographic rather than a
+        convenience: "let's say I want to hide all oxygen atoms of a specific
+        type". An element is not a type. A cell draws one asymmetric-unit site
+        over and over - ferrocene's `C(11)` is twenty of its hundred carbons -
+        and THAT is what the refinement calls a type, what the file labels,
+        and what somebody means by "the bridging oxygens" as against "the
+        terminal ones".
+
+        The tier appears only where there is more than one site to choose
+        between. One site is not a grouping, it is the same list one click
+        deeper; a molecule has no sites at all. Both fall through to the plain
+        element -> atom tree that was here before.
+        """
+        rows = [i for i, s in enumerate(obj.structure.symbols) if s == sym]
+        meta = obj.structure.metadata or {}
+        sites = occupancy.site_groups(meta, rows)
+        if len(sites) < 2:
+            for i in rows:
                 self._add_atom_row(item, obj, i)
-            self._loading = False
+            return
+        for site, label, indices in sites:
+            # The unsited group is real and is named as such: an atom added
+            # by an edit is an image of nothing, and filing it under a site
+            # it has no relation to would be a quiet lie about the structure.
+            text = label if site is not None else "(added since)"
+            row = QTreeWidgetItem(["{}   ({})".format(text, len(indices)),
+                                   "", ""])
+            row.setData(0, ROLE_KIND, "site")
+            row.setData(0, ROLE_OBJ, obj.id)
+            row.setData(0, ROLE_ATOM, sym)
+            row.setData(0, ROLE_SITE, site)
+            row.setData(0, ROLE_SITE_ROWS, list(indices))
+            row.setForeground(0, QBrush(_element_brush(sym)))
+            row.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            row.setToolTip(0, "Crystallographic site {} - {} drawn atoms from "
+                           "one row of the asymmetric unit".format(
+                               text, len(indices)))
+            self._add_placeholder(row)
+            item.addChild(row)
+            self._attach_controls(row, obj, list(indices))
+
+    def _on_collapsed(self, item):
+        """Give the rows back.
+
+        Measured before it was written, because the number decides whether it
+        is worth doing: 300 atom rows cost 473 ms to build and left 300 live
+        `RowControls` behind - and `refresh_row_controls` walks every one of
+        them on every colour, label or visibility change, which was 190 ms of
+        work per click on rows nobody could see. Collapsing kept all of it.
+        Freeing on collapse bounds the cost to what is actually open.
+        """
+        if self._loading or self._kind(item) not in ("element", "site"):
+            return
+        if self._is_placeheld(item):
+            return
+        was, self._loading = self._loading, True
+        try:
+            self._drop_controls_under(item)
+            item.takeChildren()
+            self._add_placeholder(item)
+        finally:
+            self._loading = was
+
+    def _drop_controls_under(self, item):
+        """Unregister the row widgets of everything below `item`.
+
+        `takeChildren` destroys the items and Qt deletes the widgets that were
+        set on them - but `self._controls` would keep the dead Python
+        wrappers, and `refresh_row_controls` would then be walking a list that
+        only ever grows. It catches `RuntimeError` for exactly that reason;
+        this is what stops the list needing to be caught.
+        """
+        doomed = set()
+
+        def walk(node):
+            for k in range(node.childCount()):
+                child = node.child(k)
+                widget = self.tree.itemWidget(child, 2)
+                if widget is not None:
+                    doomed.add(id(widget))
+                walk(child)
+
+        walk(item)
+        if doomed:
+            self._controls = [c for c in self._controls
+                              if id(c) not in doomed]
 
     def _add_atom_row(self, parent, obj, index):
         row = QTreeWidgetItem(["{}{}".format(obj.structure.symbols[index],
@@ -865,8 +1077,10 @@ class OutlinerPanel(QWidget):
         self._attach_controls(row, obj, [index])
 
     def _attach_controls(self, item, obj, indices):
-        """The colour / label / label-type squares — identical for an element
-        group and for a single atom, only the index set differs."""
+        """The colour / label / label-type squares - identical for an element
+        group, a crystallographic site and a single atom, only the index set
+        differs. That is what makes "hide every oxygen of this type" the same
+        gesture as "hide this oxygen", one row up."""
         ctrl = RowControls(self, obj, indices)
         ctrl.changed.connect(self.atom_display_changed)
         self.tree.setItemWidget(item, 2, ctrl)
@@ -888,28 +1102,68 @@ class OutlinerPanel(QWidget):
                 self._mark_hidden(item, obj)
 
     # --------------------------------------------------------- expand state
+    #: What identifies a row across a `sync`, which throws every item away and
+    #: builds new ones. A PATH rather than a pair, because the site tier makes
+    #: the tree three deep and `(object, symbol)` can no longer tell an
+    #: element group from the sites inside it.
+    def _expand_key(self, item):
+        return (self._obj_id(item), self._kind(item),
+                item.data(0, ROLE_ATOM), item.data(0, ROLE_SITE))
+
     def _expanded_keys(self):
         keys = set()
+
+        def walk(node, path):
+            for k in range(node.childCount()):
+                child = node.child(k)
+                if self._kind(child) is None:
+                    continue                       # the "..." placeholder
+                here = path + (self._expand_key(child),)
+                if child.isExpanded():
+                    keys.add(here)
+                    walk(child, here)
+
         for k in range(self.tree.topLevelItemCount()):
             top = self.tree.topLevelItem(k)
+            here = (self._expand_key(top),)
             if top.isExpanded():
-                keys.add((self._obj_id(top), None))
-            for c in range(top.childCount()):
-                grp = top.child(c)
-                if grp.isExpanded():
-                    keys.add((self._obj_id(grp), grp.data(0, ROLE_ATOM)))
+                keys.add(here)
+                walk(top, here)
         return keys
 
     def _restore_expanded(self, keys):
+        """Re-open what was open, depth first.
+
+        Each level has to be FILLED before the level below it can be found,
+        so `_on_expanded` is called explicitly rather than left to the signal
+        - `sync` runs under `_loading`, which is exactly what makes the signal
+        do nothing.
+        """
+        def walk(node, path):
+            for k in range(node.childCount()):
+                child = node.child(k)
+                if self._kind(child) is None:
+                    continue
+                here = path + (self._expand_key(child),)
+                if here in keys:
+                    child.setExpanded(True)
+                    self._fill_now(child)
+                    walk(child, here)
+
         for k in range(self.tree.topLevelItemCount()):
             top = self.tree.topLevelItem(k)
-            if (self._obj_id(top), None) in keys:
+            here = (self._expand_key(top),)
+            if here in keys:
                 top.setExpanded(True)
-            for c in range(top.childCount()):
-                grp = top.child(c)
-                if (self._obj_id(grp), grp.data(0, ROLE_ATOM)) in keys:
-                    grp.setExpanded(True)
-                    self._on_expanded(grp)
+                walk(top, here)
+
+    def _fill_now(self, item):
+        """`_on_expanded` with the loading guard lifted for the one call."""
+        was, self._loading = self._loading, False
+        try:
+            self._on_expanded(item)
+        finally:
+            self._loading = was
 
     # ------------------------------------------------------------- signals
     def _sync_label_combo(self, active_id):
@@ -963,15 +1217,82 @@ class OutlinerPanel(QWidget):
                 self.objects_selected.emit(list(chosen))
             else:
                 self.activated.emit(self._obj_id(item))
-        elif kind == "atom":
-            self.atom_picked.emit(self._obj_id(item),
-                                  int(item.data(0, ROLE_ATOM)))
+        elif kind in ("atom", "site", "element"):
+            # Qt changes the selection on PRESS and emits itemClicked on
+            # RELEASE, so emitting one atom here ran LAST and collapsed a
+            # Ctrl/Shift range back to the row clicked - the same trap the
+            # object branch above already had to be fixed for. Respect what
+            # is actually selected.
+            atoms = self.selected_atoms()
+            if atoms:
+                self.atoms_selected.emit(atoms)
+            if kind == "atom" and len(atoms) == 1:
+                self.atom_picked.emit(self._obj_id(item),
+                                      int(item.data(0, ROLE_ATOM)))
+
+    def atoms_of_row(self, item):
+        # type: (object) -> list
+        """Every atom index a row STANDS FOR.
+
+        One rule for all three depths, and it is the same rule the colour and
+        visibility squares already use: an atom row is its atom, a site row is
+        the whole symmetry orbit, an element row is every atom of that
+        element. That is what makes "select this site" a gesture at all.
+        """
+        kind = self._kind(item)
+        if kind == "atom":
+            return [int(item.data(0, ROLE_ATOM))]
+        if kind == "site":
+            return [int(i) for i in (item.data(0, ROLE_SITE_ROWS) or [])]
+        if kind == "element":
+            obj = self._obj(item)
+            sym = item.data(0, ROLE_ATOM)
+            if obj is None:
+                return []
+            return [i for i, s in enumerate(obj.structure.symbols)
+                    if s == sym]
+        return []
+
+    def selected_atoms(self):
+        # type: () -> list
+        """`[(obj_id, atom), ...]` for every atom row currently selected."""
+        picks, seen = [], set()
+        for item in self.tree.selectedItems():
+            oid = self._obj_id(item)
+            if oid is None:
+                continue
+            for index in self.atoms_of_row(item):
+                key = (int(oid), int(index))
+                if key not in seen:
+                    seen.add(key)
+                    picks.append(key)
+        return picks
 
     def _on_selection_changed(self):
-        """Ctrl/Shift-selecting several molecule rows selects them ALL in the
-        viewport, so they can be grabbed and moved as a group — picking each
-        one by Shift+double-click in the 3D view was the only way before."""
+        """Take the tree's selection into the viewport.
+
+        Two kinds of row, and they mean different things. Several MOLECULE
+        rows select those molecules, so they can be grabbed and moved as a
+        group - picking each one by Shift+double-click in the 3D view was the
+        only way before (round 24).
+
+        Several ATOM rows now select those atoms, which is Christian's
+        report: "selecting multiple atoms in the outline does not highlight
+        them in the viewport, making editing multiple atoms very tiresome."
+        The outliner was emitting `atom_picked` for ONE atom on click and
+        nothing at all for a Ctrl or Shift range, so the tree could show six
+        rows highlighted while the viewport showed one atom - two selections
+        disagreeing, with the one you were looking at being the wrong one.
+
+        Atoms WIN when both kinds are selected: a mixed selection comes from
+        Ctrl-clicking down a tree, and the atoms are the specific thing;
+        replacing them with their whole molecule would quietly widen an edit.
+        """
         if self._loading:
+            return
+        atoms = self.selected_atoms()
+        if atoms:
+            self.atoms_selected.emit(atoms)
             return
         chosen = self.selected_object_ids()
         if len(chosen) > 1:

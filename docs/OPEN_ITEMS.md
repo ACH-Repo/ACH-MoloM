@@ -6,11 +6,13 @@ Struck-through items in CLAUDE.md are omitted; this is only what is left.
 
 Nothing here is urgent. It is an inventory, not a plan.
 
-**Since the sweep** (rounds 74-85, to 2026-08-25): **A1 is done** (round 80),
+**Since the sweep** (rounds 74-86, to 2026-08-25): **A1 is done** (round 80),
 **A5 is decided** (round 81) and **A4 is mostly done** (round 83); rounds
-84-85 added the crystal search, which brings **section I** below. Everything
-from round 81 on is on the `crystal-overvalence` branch, awaiting Christian's
-testing. Nothing else here was closed. Rounds 74-76 were the MOPAC
+84-85 added the crystal search, and **round 86 closed I1, I2 and J4**, added
+the outliner's crystallographic-site tier, and made the unit-cell box's
+z-order a choice (see **J** below). Everything from round 81 on is on the
+`crystal-overvalence` branch, awaiting Christian's testing. Nothing else here
+was closed. Rounds 74-76 were the MOPAC
 frequency reader, computed layers (`core/attachments.py`) and Christian's
 MOPAC batch; rounds 77-79 reworked the player - one duration per strip, a
 frame range that stays put, wall-clock playback, and a pane you can zoom and
@@ -54,7 +56,13 @@ because the four rows would have to be merged into one atom - and
 `sync_asymmetric_unit` writes that view's atoms back into metadata, so a
 merged view would destroy the solid solution on the first edit. Needs the
 write-back taught about shared sites; three options are laid out in the
-round-83 note. **Christian's decision.**
+round-83 note. **DECIDED by Christian, 2026-08-25: merge the shared rows into
+one pie atom in the asymmetric-unit view AND fix the write-back** - teach
+`sync_asymmetric_unit` that one drawn atom can stand for several metadata
+rows, which is the same one-to-many mapping `occupancy.expand_shared` already
+performs for the CIF writer. Not the cheap option (locking shared sites
+against editing) and not leaving it: nothing is taken away, and the mechanism
+already exists on the write side. **Not yet built.**
 
 ~~**A5. `4-ABA-oxime.cif` floats 36 unbonded hydrogens.**~~ **DECIDED and done,
 round 81** (branch `crystal-overvalence`, awaiting Christian's testing). The
@@ -155,6 +163,16 @@ the size of the modifier stack.
 multi-molecule arrangement helpers (align/snap — the maths is in OWB's
 `transform.py`, ready to port).
 
+**E1b. A flat element group of a few hundred atoms still costs ~70 ms to
+open** (round 86 measured 73 ms for 300 rows, down from 512 ms). That is the
+MOLECULE case only: a crystal now splits by site, so ferrocene's hundred
+carbons are five rows and 4.5 ms. The floor is one widget per row - 300 rows
+carrying a single bare `QWidget` each measured 14.5 ms - so the remaining
+cost is the five painted squares plus `setItemWidget`. Fixing it further means
+not creating a widget per row at all (a delegate that paints the squares
+directly into the tree), which is a bigger change than the one that bought the
+7x. Not worth it unless somebody hits it.
+
 **E2. Viewport:** depth-cue fog; numbered-frame outliner rows for trajectories.
 
 **E3. Input feel-check on real hardware** (roadmap 1): scroll SIGNS on both
@@ -174,26 +192,23 @@ Christian, 2026-08-25, after using it: **"search for crystals is very nice now.
 only thing it really needs is..."** — so these two are the whole list, and
 both are about the RESULTS rather than about finding them.
 
-**I1. Remember the last search.** The dialog is constructed fresh every time,
-so reopening it gives an empty table and you retype the query you just ran.
-Keep the query text and the hits, restore them on open, and re-run only when
-asked. Two decisions to make first: where the memory lives (on `MainWindow`
-rather than a module global, so tests and a second window do not share it) and
-whether a restored result says how old it is — a stale list that looks live is
-worse than an empty one, and a COD entry can be superseded.
+~~**I1. Remember the last search.**~~ **DONE, round 86.** The query and its
+hits are kept on `MainWindow` (not in a module global - a second window, or
+the next test, must not inherit someone else's results) and restored when the
+dialog reopens, *without* re-running: that would cost three network round
+trips to redisplay what was on the screen a moment ago, and could answer
+differently. Both decisions the entry asked for were made as scoped, including
+the second: a restored list older than a minute or two **says how old it is**,
+because a stale list that looks live is worse than an empty one.
 
-**I2. Sort by clicking a column header**, ascending and descending — by
-temperature and year especially, which is exactly how you choose between
-determinations of the same compound.
+~~**I2. Sort by clicking a column header.**~~ **DONE, round 86**, and the trap
+below was real - none of it uses `setSortingEnabled`. Temperature and year
+carry their sort value in `Qt.EditRole` so Qt compares them as numbers, blanks
+sink to the bottom whichever way the column points (an unknown temperature is
+not 0 K, and reversing must not float them to the top), and a **third click
+returns to the search ranking**, which Qt's own sorting has no way back to.
+Text columns fold case, or `Quartz` and `quartz` end up in different halves.
 
-*Do not just call `setSortingEnabled(True)`.* `QTableWidgetItem` compares
-LEXICALLY, so a temperature column would order 100 K before 98 K and an empty
-cell would sort with the text. The fix is to give each cell its sort value
-with `setData(Qt.EditRole, number)` — Qt then compares numerically — and to
-decide deliberately where blanks go (COD leaves temperature and year null
-constantly, so "unknown" must not silently rank as zero). The score column
-should stay the default order, since ranking is the one thing the search
-itself is for.
 
 **I3. Related, raised while building it, NOT requested.** Unnamed COD entries
 all score 0.95 and are indistinguishable in the list — five candidates for
@@ -285,3 +300,83 @@ The cheap first move, if this is ever picked up, is H1's PXRD demonstration:
 it is useful to a working crystallographer on its own merits, it needs no new
 dependency, and it would tell you whether the "explain a thing visually" mode
 is worth building out before anything is bet on it.
+
+---
+
+## The order Christian wants (decided 2026-08-25)
+
+1. ~~**J4 - make the test suite runnable again.**~~ **DONE, round 86.** His
+   pick and the right one - a verification problem outranks features - and it
+   turned up a real app bug on the way (a worker thread parented to its
+   dialog). `python -m pytest tests/` is back to ~110 s in one process.
+2. **A4 - the asymmetric-unit pie spheres**, by merging and fixing the
+   write-back (see above). **Next up.**
+
+---
+
+## J. Raised in round 86, not built
+
+**J1. The site tier is a CRYSTAL feature only.** A molecule still gets
+element -> atom, which is right (there are no sites), but there are other
+groupings a big molecule would want: by residue for a protein, by covalent
+fragment for a solvate. `occupancy.site_groups` is the shape to copy - it
+returns `[(key, label, indices), ...]` and the outliner does not care where
+the partition came from. **B9** already records that the per-object row
+pattern was designed to be reused for proteins; this is the same thought one
+level down.
+
+**J2. The viewport does not push its selection back into the outliner.**
+Round 86 made the outliner drive the viewport, which is the direction
+Christian asked for. The reverse - clicking an atom in 3D and having its row
+highlight and scroll into view - is the obvious companion and was NOT built.
+It needs a rule for what to do when the row does not exist yet, since rows are
+built on expand and freed on collapse: expanding to reveal it is the useful
+behaviour and also means a viewport click can silently build a few hundred
+widgets, which is the cost round 86 just spent effort removing.
+
+**J3. The depth-ordered cell box is a ROD, so it thickens as you zoom in.**
+That is what real geometry does and what VESTA draws, but it is a different
+feel from the constant-width painted line, and on a very large packing the
+rods can read as heavier than the bonds. A screen-space-width line would need
+its own shader (`glLineWidth` > 1 is invalid in a core profile - round 48),
+which is why it is a rod. If it ever needs tuning, `cellbox.RADIUS_FRAC` is
+the one number.
+
+~~**J4. The test suite cannot be run as one process.**~~ **FIXED, round 86.**
+`python -m pytest tests/` used to crawl from ~75% and never finish, appearing
+to HANG in a different test each time. It now runs **1732 passed, 4 skipped in
+about 110 s**, in one process, repeatedly.
+
+Two separate causes, and the second is a real product bug rather than a test
+one:
+
+**(a) Nothing tore the windows down.** Each `MainWindow` left 17 top-level
+widgets and 413 widgets behind - +340 / +8260 over 20 windows - until the
+process was thrashing at ~2.8 GB. The trap is that the obvious fix looks like
+it does nothing: `close()` + `deleteLater()` + `processEvents()` frees
+**exactly as much as no teardown at all**, because **`processEvents()` does
+not dispatch DeferredDelete**. `QCoreApplication.sendPostedEvents(None,
+QEvent.DeferredDelete)` does, and then the ordinary idiom frees all of it -
+measured **+0 and +0** over 40 shown windows.
+
+`shiboken6.delete` also frees it and must NOT be used: a QMenu is a top-level
+widget, its parent's destruction has already freed it, `isValid` still reports
+it live, and touching one is an access violation that kills the run.
+
+**(b) A worker QThread was a CHILD of the dialog that started it**, so
+destroying the dialog destroyed a running thread. That is reachable from the
+GUI - start a lookup that has to wait out the web timeout, press Cancel - and
+it is why the suite then died silently (exit 127, no traceback, nothing from
+`PYTHONFAULTHANDLER`) in `test_round29_fixes.py`, whose
+`test_did_you_mean_suggestions_are_clickable` leaves a resolve in flight.
+Workers are unparented now and held in `dialogs._LIVE_WORKERS` (un-parenting
+alone would leave `self._worker` as the only reference, which dies with the
+dialog - round 76's trap from the other side), and `wait_for_workers()` is
+called from the test teardown and from `__main__` before the process exits,
+because a thread outliving the DIALOG is correct while one outliving the
+PROCESS is the same crash from the other end.
+
+**A module- or session-scoped WIDGET fixture no longer works**, since its
+widget is "new" during the first test of the module and dies at the end of it.
+There was exactly one (`test_round17_labels.py::viewport`) and it is
+function-scoped now.

@@ -24,6 +24,7 @@ from ..core import align as align_mod
 from ..core import attachments as attach_mod
 from ..core import blender_export as blender_mod
 from ..core import build as build_mod
+from ..core import cellbox
 from ..core import modifiers as modifiers_mod
 from ..core import (bonding, edits, input_map, internal, io, measure, project,
                     rotations)
@@ -224,6 +225,10 @@ class MainWindow(QMainWindow):
             self.settings.value("render_subdiv", 2))
         self.viewport.render_crop = self.settings.value(
             "render_crop", "false") in (True, "true")
+        for attr in ("cell_zorder", "cell_zorder_export"):
+            stored = self.settings.value(attr, "")
+            if stored in cellbox.ZORDERS:
+                setattr(self.viewport, attr, stored)
         #: An explicit ffmpeg path, for when there is no system one and the
         #: optional `imageio-ffmpeg` is not installed. Same shape as the
         #: Blender path hint (round 50): a stored hint, then PATH, then the
@@ -231,6 +236,10 @@ class MainWindow(QMainWindow):
         self.ffmpeg_hint = self.settings.value("ffmpeg_path", "") or ""
         #: The last operator run from F3, pre-selected next time it opens.
         self._last_operator = None
+        #: `(query, hits, when)` from the last crystal search, restored the
+        #: next time the dialog opens. Christian, after using round 85: "it
+        #: really needs to remember the results of the last search".
+        self._last_cif_search = None
         #: What to do with partially occupied CIF sites — see
         #: `core.cif.resolve_disorder`. An import-time decision, so changing it
         #: applies to the next file opened (and to a crystal-view rebuild).
@@ -280,6 +289,7 @@ class MainWindow(QMainWindow):
                      self.outliner.refresh_row_controls()))
         self.outliner.atom_picked.connect(
             lambda oid, i: self.viewport.set_selection([(oid, i)]))
+        self.outliner.atoms_selected.connect(self._on_outliner_atoms)
         self.outliner.isolate_requested.connect(self._on_obj_isolate)
         self.outliner.style_changed.connect(self._on_obj_style)
         self.outliner.renamed.connect(self._on_obj_renamed)
@@ -810,6 +820,21 @@ class MainWindow(QMainWindow):
         r("toggle_cell", "Show unit cell box (CIF imports)",
           lambda c: c.on_toggle_cell(), category="View",
           aliases=("crystal", "lattice", "unit cell", "cif", "box"))
+        # Two operators rather than one, because the choice is genuinely made
+        # twice: a box that reads through the structure is a navigation aid on
+        # screen and a false claim in a published still. The labels name the
+        # SURFACE first, so the two sit together in the palette and neither
+        # can be mistaken for the other.
+        r("cell_zorder_view", "Unit cell box (Viewport): draw on top / "
+          "respect depth",
+          lambda c: c.on_toggle_cell_zorder(export=False), category="View",
+          aliases=("z-order", "zorder", "depth", "occlude", "in front",
+                   "behind", "overlay", "cell", "axes"))
+        r("cell_zorder_export", "Unit cell box (Image export): draw on top / "
+          "respect depth",
+          lambda c: c.on_toggle_cell_zorder(export=True), category="View",
+          aliases=("z-order", "zorder", "depth", "occlude", "png", "render",
+                   "overlay", "cell", "axes"))
         r("meta_atom", "Meta atom: set coordination geometry on the selection",
           lambda c: c.on_meta_atom(), enabled=sel, category="Edit",
           aliases=("coordination", "metal", "dummy", "constraint",
@@ -3479,6 +3504,26 @@ class MainWindow(QMainWindow):
         self._sync_all()
         self.statusBar().showMessage("Removed {}".format(obj.name), 4000)
 
+    def _on_outliner_atoms(self, picks):
+        """Outliner row selection -> viewport selection.
+
+        The list arrives as `(obj_id, atom)` pairs, which is exactly what the
+        viewport's selection already is, so there is nothing to translate.
+        The ACTIVE object follows the first pick for the same reason a
+        viewport click sets it (round 7): Tab should edit what you just
+        selected, not whatever happened to be active before.
+        """
+        picks = [(int(o), int(i)) for o, i in picks or []]
+        self.viewport.set_selection(picks)
+        if picks and picks[0][0] != self.active_id:
+            self.active_id = picks[0][0]
+            self._sync_traj_bar()
+            self._sync_transform_panel()
+            self._sync_modifier_page()
+            self._sync_crystal_ribbon()
+        self._update_counts()
+        self.viewport.update()
+
     def _on_obj_activated(self, obj_id):
         """Outliner row click: make active AND select the molecule's atoms
         (Blender: clicking an object in the outliner selects it)."""
@@ -4000,8 +4045,19 @@ class MainWindow(QMainWindow):
         """Find a crystal structure by formula, mineral or name, and import
         the ones chosen. Several at once: comparing two polymorphs is the
         commonest reason to go looking."""
-        dlg = CifSearchDialog(self, roots=self.cif_search_roots())
-        if not dlg.exec() or not dlg.chosen:
+        # The last search is remembered ON THE WINDOW, not in a module
+        # global: a second window - or the next test - must not inherit
+        # somebody else's result list, which is the shape of bug this project
+        # keeps finding in shared state (the round-37 circuit breaker, the
+        # round-46 module cache, the round-77 QSettings sandbox).
+        dlg = CifSearchDialog(self, roots=self.cif_search_roots(),
+                              remembered=self._last_cif_search)
+        accepted = dlg.exec()
+        # Kept whether or not anything was imported: closing the dialog to
+        # look at the structure you just took is the commonest way to end up
+        # reopening it, and that is exactly when retyping the query stings.
+        self._last_cif_search = dlg.remembered()
+        if not accepted or not dlg.chosen:
             return
         installed, failed = 0, []
         for hit in dlg.chosen:
@@ -6277,6 +6333,27 @@ class MainWindow(QMainWindow):
 
     def on_toggle_cell(self):
         self._set_cell_box(not self.viewport.show_cell)
+
+    def on_toggle_cell_zorder(self, export=False):
+        """Flip the cell box between painted-on-top and real geometry.
+
+        Two settings, not one. On screen the box is partly a navigation aid
+        and an edge disappearing behind the framework is a real loss; in an
+        export the picture has to be true, and an overlay says every edge it
+        crosses is in front of the structure - which on a dense cell is
+        visibly wrong, and is what Christian reported.
+        """
+        attr = "cell_zorder_export" if export else "cell_zorder"
+        now = getattr(self.viewport, attr)
+        new = (cellbox.DEPTH if now == cellbox.OVERLAY else cellbox.OVERLAY)
+        setattr(self.viewport, attr, new)
+        self.settings.setValue(attr, new)
+        self.viewport.update()
+        self.statusBar().showMessage(
+            "Unit cell box ({}): {}".format(
+                "image export" if export else "viewport",
+                "drawn on top of everything" if new == cellbox.OVERLAY
+                else "occluded by what is in front of it"), 5000)
 
     def _set_cell_box(self, on):
         self.viewport.show_cell = bool(on)

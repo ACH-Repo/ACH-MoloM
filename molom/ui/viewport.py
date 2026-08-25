@@ -49,6 +49,7 @@ from ..core import (bonding, crop as crop_mod, edits, elements, flight,
                     input_map, internal,
                     manipulate, measure, meshes, meta as meta_mod, picking,
                     cameras as cameras_mod,
+                    cellbox as cellbox_mod,
                     polyhedra as poly_mod, rotations,
                     selection2d, style as style_mod)
 from ..core.camera import Camera, quat_from_mat3, quat_mul, quat_to_mat3
@@ -787,6 +788,7 @@ class MolViewport(QOpenGLWidget):
         # frame of orange blobs, i.e. a flicker. See `_paint_selection`.
         self._hull_sphere = None
         self._hull_cylinder = None
+        self._cell_cyl = None
         self._glow_sphere = None
         self._split_sphere = None
         self._split_prog = None
@@ -836,6 +838,17 @@ class MolViewport(QOpenGLWidget):
         self._dbl_empty = False
         self.show_hbonds = False         # suspected H-bond overlay
         self.show_cell = True            # unit-cell box for CIF imports
+        #: WHERE the cell box sits in the picture, chosen separately for the
+        #: two surfaces because they are answering different questions.
+        #: On screen an always-visible box is a navigation aid - you want to
+        #: know where the cell is even when it is behind the framework - so
+        #: the viewport keeps the overlay it has always had. An EXPORT has to
+        #: be true, and an overlay claims every edge is in front of whatever
+        #: it crosses, so a still defaults to real, depth-tested geometry.
+        #: Christian: "always rendered on top ... I think it shouldn't be. At
+        #: least never in png exports."
+        self.cell_zorder = cellbox_mod.OVERLAY
+        self.cell_zorder_export = cellbox_mod.DEPTH
         #: VESTA's pie-slice spheres for sites shared by several species. On
         #: by default: a solid solution drawn as its majority element is a
         #: composition the file never claimed, and the wedges are the only
@@ -3150,6 +3163,10 @@ class MolViewport(QOpenGLWidget):
         # stops a selection forcing a whole-scene rebuild every frame.
         self._hull_sphere = _InstancedMesh(*meshes.icosphere(2))
         self._hull_cylinder = _InstancedMesh(*meshes.cylinder(24))
+        # Its OWN buffer, never the scene's: an overlay pass that borrows
+        # `_cylinder` leaves the molecule one frame behind (round 35). Twelve
+        # segments is plenty of roundness for a rod this thin.
+        self._cell_cyl = _InstancedMesh(*meshes.cylinder(12))
         self._glow_sphere = _InstancedMesh(*meshes.icosphere(2))
         self._split_prog = _program(_SPLIT_VERT, _SPLIT_FRAG)
         self._split_sphere = _SplitMesh(*meshes.icosphere(2))
@@ -3512,6 +3529,10 @@ class MolViewport(QOpenGLWidget):
             self._cylinder.draw()
             self._draw_occupancy(view, proj)
             self._draw_lines(self._wire_lines, view, proj)
+        if self.show_cell:
+            # BEFORE the polyhedra, which are translucent and depth-write off:
+            # a solid drawn first would never be tested against the box.
+            self._draw_cell_box(view, proj, self.cell_zorder)
         if not empty:
             self._draw_polyhedra(view, proj)
         if self.show_grid:
@@ -3590,6 +3611,60 @@ class MolViewport(QOpenGLWidget):
         GL.glUniform1f(GL.glGetUniformLocation(self._line_prog, "uAlpha"),
                        float(alpha))
         buf.draw(mode)
+
+    def _draw_cell_box(self, view, proj, zorder):
+        """The unit cell as real geometry, so it is occluded by what is in
+        front of it.
+
+        The alternative form of `_paint_cells`, and which one runs is
+        `zorder`. As GL rods it goes through the ordinary opaque pass with
+        depth test AND depth write on - that is the whole point, and it is
+        also why there is nothing clever here: correct occlusion is what a
+        depth buffer does for free once the box stops being paint.
+
+        Drawn even while the scene is empty, unlike every other pass: a cell
+        with no visible atoms in it is still a cell, and the box vanishing
+        because the molecule was hidden would look like a bug.
+        """
+        if self.scene is None or zorder != cellbox_mod.DEPTH:
+            return
+        starts, ends, radii, colours = [], [], [], []
+        for obj in self.scene.visible_objects():
+            cell = cell_of(obj)
+            if cell is None:
+                continue
+            corners = cell_corners_world(obj, cell)
+            if corners is None:
+                continue
+            for p0, p1, rgb, radius in cellbox_mod.rods(cell, corners):
+                starts.append(p0)
+                ends.append(p1)
+                radii.append(radius)
+                # RGBA, not RGB. The instance attribute layout is 16 matrix
+                # floats plus a vec4 (`istride = 20 * 4`), so a three-float
+                # colour shifts every instance after the first by one float
+                # and the buffer is read as garbage - which draws as enormous
+                # white triangles across the whole frame rather than as
+                # anything recognisably wrong with a cell box.
+                colours.append((rgb[0], rgb[1], rgb[2], 1.0))
+        if self._cell_cyl is None:
+            return
+        if not starts:
+            self._cell_cyl.upload(np.zeros((0, 4, 4), dtype=np.float32),
+                                  np.zeros((0, 4), dtype=np.float32))
+            return
+        mats = meshes.cylinder_transforms(np.asarray(starts, dtype=float),
+                                          np.asarray(ends, dtype=float),
+                                          np.asarray(radii, dtype=float))
+        self._cell_cyl.upload(mats, np.asarray(colours, dtype=np.float32))
+        GL.glUseProgram(self._prog)
+        GL.glUniformMatrix4fv(GL.glGetUniformLocation(self._prog, "uView"),
+                              1, GL.GL_TRUE, view)
+        GL.glUniformMatrix4fv(GL.glGetUniformLocation(self._prog, "uProj"),
+                              1, GL.GL_TRUE, proj)
+        GL.glEnable(GL.GL_DEPTH_TEST)
+        GL.glDepthMask(GL.GL_TRUE)
+        self._cell_cyl.draw()
 
     def _draw_polyhedra(self, view, proj):
         """Translucent coordination solids through each metal's donors.
@@ -3951,7 +4026,8 @@ class MolViewport(QOpenGLWidget):
             p.setRenderHint(QPainter.TextAntialiasing)
             p.scale(float(w) / max(self.width(), 1),
                     float(h) / max(self.height(), 1))
-            if self.show_cell:
+            if self.show_cell \
+                    and self.cell_zorder_export == cellbox_mod.OVERLAY:
                 self._paint_cells(p)
             self._paint_symmetry(p)
             if labels:
@@ -4026,7 +4102,7 @@ class MolViewport(QOpenGLWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.TextAntialiasing)
-        if self.show_cell:
+        if self.show_cell and self.cell_zorder == cellbox_mod.OVERLAY:
             self._paint_cells(p)
         self._paint_cameras(p)
         self._paint_symmetry(p)
@@ -6179,6 +6255,8 @@ class MolViewport(QOpenGLWidget):
             # screen (round 37's rule).
             self._draw_occupancy(view, proj)
             self._draw_lines(self._wire_lines, view, proj)
+            if self.show_cell:
+                self._draw_cell_box(view, proj, self.cell_zorder_export)
             self._draw_polyhedra(view, proj)
             # The cell box, symmetry elements and labels are QPainter
             # overlays, so they go on AFTER the GL passes and against the
