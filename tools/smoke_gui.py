@@ -15,6 +15,7 @@ step, and exits NON-ZERO if a paint path threw. The PNGs land next to the
 script's output directory so the picture can be looked at, not just asserted.
 """
 import os
+import shutil
 import sys
 import traceback
 
@@ -230,6 +231,51 @@ def main(paths):
                   "OK" if hidden else "NOTHING OCCLUDED"))
         if not hidden:
             FAILURES.append("the depth-ordered cell box occluded nothing")
+
+        # Round 88: one dialog owns every still option, and F12 repeats
+        # exactly what it decided. These three RENDER, so they cannot live in
+        # pytest - `render_image` builds an FBO and with no live GL context
+        # that is an access violation which takes the whole run down.
+        import tempfile
+        from PySide6.QtGui import QImage
+        shots = tempfile.mkdtemp(prefix="molom_smoke_still_")
+        base = os.path.join(shots, "shot.png")
+        opts = {"path": base, "increment": True, "scale": 1, "subdiv": 0,
+                "crop": False, "margin": 16, "transparent": True,
+                "labels": False, "cell_depth": True}
+        win._write_still(opts, base)
+        win._render_target[False] = {"path": base, "increment": True,
+                                     "opts": opts}
+        win.on_render_key(animation=False)
+        win.on_render_key(animation=False)
+        made = sorted(f for f in os.listdir(shots) if f.endswith(".png"))
+        sizes = {QImage(os.path.join(shots, f)).size().toTuple()
+                 for f in made}
+        print("  F12 repeats the export: {} files, {} distinct size(s) {}"
+              .format(len(made), len(sizes),
+                      "OK" if len(made) == 3 and len(sizes) == 1 else "DIFFER"))
+        if len(made) != 3 or len(sizes) != 1:
+            FAILURES.append("F12 did not repeat the export's own settings")
+
+        before = vp.cell_zorder_export
+        pair = {}
+        for want in (True, False):
+            path = os.path.join(shots, "z{}.png".format(int(want)))
+            win._write_still(dict(opts, cell_depth=want, path=path), path)
+            pair[want] = QImage(path)
+        a, b = pair[True], pair[False]
+        differing = sum(1 for y in range(0, a.height(), 4)
+                        for x in range(0, a.width(), 4)
+                        if a.pixel(x, y) != b.pixel(x, y))
+        print("  cell z-order tick reaches the file: {} px differ {}".format(
+            differing, "OK" if differing else "NO EFFECT"))
+        if not differing:
+            FAILURES.append("the export's cell z-order tick changed nothing")
+        print("  viewport z-order left alone: {}".format(
+            "OK" if vp.cell_zorder_export == before else "CHANGED"))
+        if vp.cell_zorder_export != before:
+            FAILURES.append("exporting changed the viewport's cell z-order")
+        shutil.rmtree(shots, ignore_errors=True)
 
     def measure_steps():
         """Persistent measurements: several at once, one of them highlighted as

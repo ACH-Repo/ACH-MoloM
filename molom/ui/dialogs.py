@@ -3,6 +3,7 @@
 All thin: values in, values out; persistence and side effects stay in app.py.
 """
 
+import os
 import re
 from typing import Optional
 
@@ -11,7 +12,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox,
                                QDialog,
                                QDialogButtonBox, QDoubleSpinBox, QFileDialog,
-                               QFormLayout,
+                               QFormLayout, QGroupBox,
                                QFrame, QHBoxLayout, QHeaderView, QLabel,
                                QLineEdit,
                                QListWidget, QListWidgetItem, QPushButton,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox,
                                QWidget)
 
 from ..core import blender_export as bx
+from ..core import cellbox as cellbox_mod
 from ..core import cif as cif_mod
 from ..core import cifsearch
 from ..core import flight, input_map
@@ -1434,6 +1436,215 @@ class SiteOccupancyDialog(QDialog):
         self.total.setStyleSheet("color: #e08a6a;" if over else "")
         if self._ok is not None:
             self._ok.setEnabled(not over)
+
+
+class ImageExportDialog(QDialog):
+    """Every setting a PNG export has, in ONE window.
+
+    Christian: "I am also getting confused by the re-rendering/settings
+    dialogue. I don't think it shows the entire image export settings
+    dialogue where everything can be set. Like in GIMP I mean... We need a
+    straight-forward way of setting all these rendering options for simple PNG
+    exports that do not conflict with each other."
+
+    He is describing a real mess rather than a missing convenience. Exporting
+    a still had **no dialog at all** - it was a bare file picker - while the
+    options that decide what comes out (resolution multiplier, mesh
+    subdivision, crop-to-content) lived in **App > Settings**, several tabs
+    away from the thing they affect, and the unit-cell z-order was reachable
+    only from F3. So the export asked one question and silently obeyed four
+    answers given somewhere else, one of which (the z-order) deliberately
+    differs from what the viewport is showing. That is exactly how you end up
+    unsure whether the camera or the F12 made the difference.
+
+    Everything is here now, the pixel size is computed live so the multiplier
+    is never abstract, and the same options are what F12 repeats.
+    """
+
+    #: What the file dialog offers, and what Qt will actually write.
+    FORMATS = (("png", "PNG image (*.png)"),
+               ("jpg", "JPEG image (*.jpg *.jpeg)"),
+               ("tif", "TIFF image (*.tif *.tiff)"))
+
+    def __init__(self, parent, viewport, path="", remembered=None):
+        super().__init__(parent)
+        self.setWindowTitle("Export image")
+        self._vp = viewport
+        opts = dict(remembered or {})
+        lay = QVBoxLayout(self)
+
+        # ------------------------------------------------------------ file
+        box = QGroupBox("File", self)
+        form = QFormLayout(box)
+        row = QHBoxLayout()
+        self.path_edit = QLineEdit(path or opts.get("path", ""), self)
+        browse = QPushButton("Browse...", self)
+        browse.clicked.connect(self._browse)
+        row.addWidget(self.path_edit, 1)
+        row.addWidget(browse)
+        form.addRow("Save to:", row)
+        self.increment = QCheckBox(
+            "Number each further export (shot.png, shot_001.png, ...)", self)
+        self.increment.setChecked(bool(opts.get("increment", True)))
+        self.increment.setToolTip(
+            "F12 renders again without asking, so without this the second "
+            "press would silently replace the first render.")
+        form.addRow("", self.increment)
+        lay.addWidget(box)
+
+        # -------------------------------------------------------- geometry
+        box = QGroupBox("Size", self)
+        form = QFormLayout(box)
+        self.scale = QSpinBox(self)
+        self.scale.setRange(1, 8)
+        self.scale.setValue(int(opts.get("scale", viewport.render_scale)))
+        self.scale.setSuffix("x the viewport")
+        form.addRow("Resolution:", self.scale)
+        self.size_label = QLabel("", self)
+        form.addRow("", self.size_label)
+        self.crop = QCheckBox("Crop to the structure", self)
+        self.crop.setChecked(bool(opts.get("crop", viewport.render_crop)))
+        self.crop.setToolTip(
+            "Trim the dead background. The viewport is whatever shape the "
+            "window happens to be, so an export routinely carries a third of "
+            "its pixels as nothing.")
+        form.addRow("", self.crop)
+        self.margin = QSpinBox(self)
+        self.margin.setRange(0, 400)
+        self.margin.setValue(int(opts.get("margin", 16)))
+        self.margin.setSuffix(" px of air")
+        form.addRow("Crop margin:", self.margin)
+        lay.addWidget(box)
+
+        # ----------------------------------------------------------- looks
+        box = QGroupBox("Contents", self)
+        form = QFormLayout(box)
+        self.transparent = QCheckBox("Transparent background", self)
+        self.transparent.setChecked(bool(opts.get("transparent", True)))
+        self.transparent.setToolTip(
+            "PNG and TIFF carry an alpha channel; JPEG does not, and a "
+            "transparent JPEG comes out black.")
+        form.addRow("", self.transparent)
+        self.labels = QCheckBox("Atom labels", self)
+        self.labels.setChecked(bool(opts.get("labels", False)))
+        self.labels.setToolTip(
+            "Off by default: a label is a reading aid rather than a fact "
+            "about the structure. The cell box, polyhedra, symmetry elements "
+            "and occupancy spheres are always drawn when their own toggle "
+            "is on.")
+        form.addRow("", self.labels)
+        self.cell_depth = QCheckBox(
+            "Unit cell box respects depth (drawn behind what is in front)",
+            self)
+        self.cell_depth.setChecked(
+            bool(opts.get("cell_depth",
+                          viewport.cell_zorder_export == cellbox_mod.DEPTH)))
+        self.cell_depth.setToolTip(
+            "Off draws the box over everything, which is what the viewport "
+            "does while you navigate - handy on screen, and a false claim in "
+            "a published still.")
+        form.addRow("", self.cell_depth)
+        self.subdiv = QSpinBox(self)
+        self.subdiv.setRange(0, 4)
+        self.subdiv.setValue(int(opts.get("subdiv",
+                                          viewport.render_subdiv_bonus)))
+        self.subdiv.setSuffix(" extra subdivisions")
+        self.subdiv.setToolTip(
+            "Finer spheres and cylinders than the interactive meshes, which "
+            "are deliberately cheap.")
+        form.addRow("Mesh detail:", self.subdiv)
+        lay.addWidget(box)
+
+        self.note = QLabel("", self)
+        self.note.setWordWrap(True)
+        lay.addWidget(self.note)
+
+        row = QHBoxLayout()
+        self.ok_btn = QPushButton("Export", self)
+        cancel = QPushButton("Cancel", self)
+        row.addStretch(1)
+        row.addWidget(self.ok_btn)
+        row.addWidget(cancel)
+        lay.addLayout(row)
+        self.ok_btn.clicked.connect(self._accept)
+        cancel.clicked.connect(self.reject)
+
+        for widget in (self.scale, self.margin):
+            widget.valueChanged.connect(self._refresh)
+        for widget in (self.crop, self.transparent):
+            widget.toggled.connect(self._refresh)
+        self.path_edit.textChanged.connect(self._refresh)
+        make_text_selectable(self)
+        self._refresh()
+        self.resize(560, 470)
+
+    # ------------------------------------------------------------- helpers
+    def _browse(self):
+        start = self.path_edit.text() or "molom.png"
+        path, _f = QFileDialog.getSaveFileName(
+            self, "Export image", start,
+            ";;".join(label for _e, label in self.FORMATS) + ";;All files (*)")
+        if path:
+            self.path_edit.setText(path)
+
+    def _refresh(self):
+        """Say what will actually be written.
+
+        A multiplier is abstract; a pixel count is not, and it is the one
+        thing someone checks before pressing Export.
+        """
+        width, height = self.pixel_size()
+        bits = ["{} x {} pixels".format(width, height)]
+        if self.crop.isChecked():
+            bits.append("before cropping")
+        self.size_label.setText("  ".join(bits))
+        self.margin.setEnabled(self.crop.isChecked())
+        notes = []
+        ext = os.path.splitext(self.path_edit.text())[1].lower().lstrip(".")
+        if self.transparent.isChecked() and ext in ("jpg", "jpeg"):
+            notes.append("JPEG has no alpha channel - a transparent export "
+                         "will come out with a black background. Use PNG.")
+        if self._camera_note():
+            notes.append(self._camera_note())
+        self.note.setText("\n".join(notes))
+
+    def _camera_note(self):
+        cam = self._vp.active_camera_object()
+        if cam is None:
+            return ""
+        return ("Looking through {}: the export is that camera's frame at "
+                "its own resolution x multiplier.".format(cam.name or "a camera"))
+
+    def pixel_size(self):
+        # type: () -> tuple
+        """What the file will be, before any crop."""
+        scale = int(self.scale.value())
+        cam = self._vp.active_camera_object()
+        if cam is not None:
+            width, height = cam.resolution
+            return int(width) * scale, int(height) * scale
+        return (max(int(self._vp.width()) * scale, 1),
+                max(int(self._vp.height()) * scale, 1))
+
+    def _accept(self):
+        if not self.path_edit.text().strip():
+            self._browse()
+            if not self.path_edit.text().strip():
+                return
+        self.accept()
+
+    def options(self):
+        # type: () -> dict
+        """Everything the export needs, and everything F12 repeats."""
+        return {"path": self.path_edit.text().strip(),
+                "increment": self.increment.isChecked(),
+                "scale": int(self.scale.value()),
+                "subdiv": int(self.subdiv.value()),
+                "crop": self.crop.isChecked(),
+                "margin": int(self.margin.value()),
+                "transparent": self.transparent.isChecked(),
+                "labels": self.labels.isChecked(),
+                "cell_depth": self.cell_depth.isChecked()}
 
 
 class AnimationExportDialog(QDialog):

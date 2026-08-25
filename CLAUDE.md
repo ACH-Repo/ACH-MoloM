@@ -198,6 +198,65 @@ other side, and the two export fixes are verified in `tools/smoke_gui.py`
 instead, which now measures the crop and counts ink with and without the cell
 box. 1310 tests.
 
+Round 88 (2026-08-25, one dialog owns the image export - and the focal length
+does nothing, measured):
+Christian, after using round 86's cell-box z-order: "does it matter whether I
+render from a certain camera or through repeated F12 whether or not the unit
+cell lines will be rendered on top or behind... I am also getting confused by
+the re-rendering/settings dialogue. I don't think it shows the entire image
+export settings dialogue where everything can be set. Like in GIMP I mean."
+**HIS CONFUSION WAS STRUCTURAL, NOT A MISUNDERSTANDING.** Exporting a still
+had **no dialog at all** - `on_export_image` was a bare `QFileDialog` - while
+every option that decides what comes out lived somewhere else: the resolution
+multiplier, the mesh subdivision and crop-to-content in **App > Settings**,
+several tabs from the thing they affect, and the unit-cell z-order only behind
+an F3 operator. So the export asked one question and silently obeyed four
+answers given elsewhere, one of which (the z-order) DELIBERATELY differs from
+what the viewport is showing. There is no way to use that and stay sure what
+made a difference.
+`ImageExportDialog` carries all of it - file, numbering, resolution with the
+**pixel size computed live** (a multiplier is abstract; a pixel count is what
+you check before pressing Export), crop and its margin, transparency, atom
+labels, mesh detail and the cell-box z-order - and `_write_still` is the ONE
+place a still is produced, so the first export and every later F12 cannot
+differ. Reachable exactly where he asked: **File > Export image...,
+Ctrl+Shift+E, and F3**, all of which already pointed at `on_export_image`.
+**A transparent JPEG is warned about on the spot**, because JPEG has no alpha
+and the failure is a black background you only see after opening the file.
+**AND `on_render_settings` WAS THROWING THE SETTINGS AWAY.** The one route
+whose entire purpose is "let me change something" popped the remembered target
+before reopening the dialog - and both export dialogs read that memory to open
+on your last choices (round 61). So asking for the settings reset them. It
+does not clear anything now; nothing needs clearing, since both exports always
+ask.
+**THE CAMERA-VS-F12 QUESTION HAS A MEASURED ANSWER: NO.** Rendering the
+vendored solid solution free-view and through a camera hides **60% and 61%**
+of the cell box respectively, and both still paths went through the same
+`render_image`. What differs is the VIEWPORT (overlay, by round 86's default)
+against the EXPORT (depth) - so what he saw on screen was never what the file
+had, which is exactly the kind of thing the scattered settings made impossible
+to pin down. The dialog now states it per export. **The one real way they
+could diverge is the fallback**: `except Exception -> grabFramebuffer()` hands
+back a VIEWPORT grab, which obeys `cell_zorder` and not `cell_zorder_export`.
+That is now said out loud in the status message rather than left to be
+discovered.
+**AND A THIRD THING HE FOUND, WHICH IS A REAL BUG AND IS NOT FIXED HERE: the
+focal length does nothing.** Measured on ferrocene through a camera:
+`cam.fov_y` moves correctly with the lens (84.86 deg at 24 mm to 12.52 deg at
+200 mm) and the **widget field of view stays at 43.17 deg throughout**. The
+algebra says why in one line, and it is round 58's own model taken one step
+too far. `frame_rect` is ANGULAR - half-height `Z*tan(fov_y/2)` - and
+`viewport_fov_y` then divides by that same rectangle, so
+`tan(cam_fov_y/2)` **cancels exactly** and the widget FOV depends only on
+`zoom`. Round 58 made the frame angular so that dragging a BORDER could not
+rescale the scene, which was right; the side effect is that the LENS cannot
+rescale it either. What magnification you do see is the render cropping to a
+frame that grew, and it saturates - 135 mm and 200 mm give an identical
+528 px span. Recorded as **K1**; fixing it is a redesign of the frame model,
+because "a handle drag must not rescale" and "a lens change must rescale" pull
+against each other through the aspect.
+1765 tests.
+
 Round 87 (2026-08-25, the asymmetric unit gets its pie sphere - open item A4
 closed - and favourites in the crystal search):
 **A4 WAS BLOCKED ON A DATA-LOSS HAZARD, NOT ON DIFFICULTY, and Christian's
@@ -4016,7 +4075,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1762 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1769 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -5555,7 +5614,7 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 1758 offline tests, 4 skipped, ~125 s.
+1. `python -m pytest tests/ -q` — 1765 offline tests, 4 skipped, ~90 s.
    `tests/conftest.py` sandboxes QSettings, so a GUI test can drive a real
    control without writing into your own MoloM configuration; it also
    **destroys the windows a test created** (round 86), without which the suite

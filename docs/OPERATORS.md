@@ -81,6 +81,15 @@ of bounding-sphere clearance so nothing overlaps. One undo entry per batch.
 Measured//computed **file** imports (xyz, sdf, pdb, …) are never silently
 transformed.
 | **Export geometry...** — every molecule ticked visible in the outliner goes into the file (merged into one record); a single visible trajectory still writes all its frames | **Ctrl+E** | scene not empty |
+| **Export image...** — the full still-export dialog: file and numbering, resolution multiplier with the **pixel size shown live**, crop-to-content and its margin, transparency, atom labels, mesh detail, and whether the unit-cell box respects depth | **Ctrl+Shift+E**, File menu, F3 | scene not empty |
+
+**Every option that changes the exported image is in that one dialog.** It
+used to be a bare file picker, while the resolution multiplier, the mesh
+subdivision and crop-to-content lived in App > Settings and the cell-box
+z-order only in F3 — so the export asked one question and silently obeyed four
+answers given elsewhere. `F12` then repeats **those** settings, not whatever
+Settings happens to hold, and `F3 > Render settings: still` reopens the dialog
+on your last choices.
 | **Export image...** — PNG/JPG snapshot of the viewport exactly as drawn (grid, labels and all) at its current resolution | **Ctrl+Shift+E** | scene not empty |
 | **Export to Blender...** — a **`.blend`** (or the build script alone) with materials, coordination polyhedra, saved cameras, lights and world, after a pre-configuration dialog. See below | **Ctrl+Shift+B** | scene not empty |
 | **New empty molecule** — an empty object to draw into (Tab on an empty scene does this too) | — | — |

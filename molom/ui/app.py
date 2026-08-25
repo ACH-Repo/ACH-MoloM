@@ -52,6 +52,7 @@ from .. import resources
 from ..core.undo import UndoStack
 from .choice_popup import ChoicePopup
 from .dialogs import (AnimationExportDialog, BlenderExportDialog,
+                      ImageExportDialog,
                       MetaAtomDialog,
                       SiteOccupancyDialog,
                       CifSearchDialog,
@@ -584,7 +585,8 @@ class MainWindow(QMainWindow):
         r("save_as", "Export geometry (visible molecules)...",
           lambda c: c.on_save_as(), enabled=has_obj, category="File",
           shortcut="Ctrl+E", key="Ctrl+E")
-        r("export_image", "Export image (PNG snapshot of the viewport)...",
+        r("export_image", "Export image... (resolution, crop, transparency, "
+          "labels, cell box)",
           lambda c: c.on_export_image(), enabled=has_obj, category="File",
           shortcut="Ctrl+Shift+E", key="Ctrl+Shift+E")
         r("export_blender",
@@ -2584,32 +2586,74 @@ class MainWindow(QMainWindow):
             self.viewport.set_mode(MODE_EDIT, obj_id)
 
     def on_export_image(self):
+        """Export a still, through the one dialog that owns every option.
+
+        There used to be no dialog here at all - a bare file picker - while
+        the settings that decide what comes out lived in App > Settings and
+        the cell-box z-order only in F3. So the export asked one question and
+        silently obeyed four answers given somewhere else. Christian: "we need
+        a straight-forward way of setting all these rendering options for
+        simple PNG exports that do not conflict with each other."
+        """
         start = self.settings.value("last_dir", "")
         base = (os.path.splitext(os.path.basename(self.project_path))[0]
                 if self.project_path else "molom")
-        path, _f = QFileDialog.getSaveFileName(
-            self, "Export image", os.path.join(start, base + ".png"),
-            "PNG image (*.png);;JPEG image (*.jpg);;All files (*)")
-        if not path:
+        remembered = (self._render_target.get(False) or {}).get("opts")
+        dlg = ImageExportDialog(
+            self, self.viewport,
+            path=os.path.join(start, base + ".png"),
+            remembered=remembered)
+        if not dlg.exec():
             return
+        opts = dlg.options()
+        if not self._write_still(opts, opts["path"]):
+            return
+        self.settings.setValue("last_dir", os.path.dirname(opts["path"]))
+        # F12 from here on renders straight to the next free name, with THESE
+        # options - not with whatever App > Settings happens to hold.
+        self._render_target[False] = {"path": opts["path"],
+                                      "increment": opts["increment"],
+                                      "opts": opts}
+
+    def _write_still(self, opts, path):
+        # type: (dict, str) -> bool
+        """Render and save one image. The ONE place a still is produced.
+
+        Both routes come here - the dialog and F12 - so a repeat cannot
+        quietly differ from the export that set it up, which is half of what
+        made the old behaviour confusing.
+        """
+        vp = self.viewport
+        keep = vp.cell_zorder_export
+        vp.cell_zorder_export = (cellbox.DEPTH if opts.get("cell_depth", True)
+                                 else cellbox.OVERLAY)
         try:
-            img = self.viewport.render_image(
-                crop_to_content=self.viewport.render_crop)
-        except Exception as e:      # driver without FBO support, etc.
+            image = vp.render_image(
+                scale=int(opts.get("scale", vp.render_scale)),
+                subdiv_bonus=int(opts.get("subdiv", vp.render_subdiv_bonus)),
+                transparent=bool(opts.get("transparent", True)),
+                furniture=bool(opts.get("labels", False)),
+                crop_to_content=bool(opts.get("crop", False)),
+                crop_margin=int(opts.get("margin", 16)))
+        except Exception as exc:            # driver without FBO support, etc.
+            # The fallback is a VIEWPORT grab, which obeys `cell_zorder` and
+            # not `cell_zorder_export` - so it can differ from every other
+            # export. Said out loud rather than left to be discovered.
             self.statusBar().showMessage(
-                "High-quality render failed ({}), grabbing the viewport "
-                "instead".format(e), 8000)
-            img = self.viewport.grabFramebuffer()
-        if not img.save(path):
+                "High-quality render failed ({}) - grabbed the viewport "
+                "instead, so it looks exactly like the screen".format(exc),
+                9000)
+            image = vp.grabFramebuffer()
+        finally:
+            vp.cell_zorder_export = keep
+        if not image.save(path):
             QMessageBox.critical(self, "Export failed",
                                  "Could not write {}".format(path))
-            return
-        self.settings.setValue("last_dir", os.path.dirname(path))
-        # F12 from here on renders straight to the next free name.
-        self._render_target[False] = {"path": path, "increment": True}
+            return False
         self.statusBar().showMessage(
             "Wrote {} ({}x{}) — F12 renders the next one".format(
-                os.path.basename(path), img.width(), img.height()), 8000)
+                os.path.basename(path), image.width(), image.height()), 8000)
+        return True
 
     # ------------------------------------------------------------ Blender
     #: Export options that are worth remembering between sessions. The camera
@@ -5739,38 +5783,36 @@ class MainWindow(QMainWindow):
             self._render_still_again(remembered)
 
     def on_render_settings(self, animation):
-        """Forget the remembered target so the export ASKS again, and ask now.
+        """Reopen the export dialog. F12's way back.
 
         F12's press-and-forget behaviour is right, but it left the settings
-        with no way back — the dialog only ever appeared on the first render.
-        This is the way back, and it reopens the dialog immediately rather than
-        just clearing the memory, because "ask me next time" is never what
-        someone wants when they went looking for the settings.
+        with no way back - the dialog only ever appeared on the first render.
+        This reopens it immediately rather than just clearing the memory,
+        because "ask me next time" is never what someone wants when they have
+        gone looking for the settings.
+
+        **The memory is NOT cleared first**, which it used to be. Both export
+        dialogs read the remembered options to open on your last choices
+        (round 61), so popping them first meant the one route whose whole
+        purpose is "let me change a setting" was also the one route that threw
+        the settings away and opened on the defaults. Nothing needs clearing:
+        `on_export_image` and `on_export_animation` always ask.
         """
-        self._render_target.pop(bool(animation), None)
         if animation:
             self.on_export_animation()
         else:
             self.on_export_image()
 
     def _render_still_again(self, remembered):
+        """F12 after the first export: the SAME options, the next filename.
+
+        The remembered path stays the BASE one. Storing the incremented name
+        instead compounds the suffix - three presses gave shot.png,
+        shot_001.png, shot_001_001.png.
+        """
         path = anim_mod.next_free(remembered["path"],
                                   remembered.get("increment", True))
-        try:
-            image = self.viewport.render_image(
-                crop_to_content=self.viewport.render_crop)
-        except Exception:
-            image = self.viewport.grabFramebuffer()
-        if not image.save(path):
-            self.statusBar().showMessage(
-                "Could not write {}".format(path), 8000)
-            return
-        # The remembered path stays the BASE one. Storing the incremented
-        # name instead compounds the suffix — three presses gave
-        # shot.png, shot_001.png, shot_001_001.png.
-        self.statusBar().showMessage(
-            "Rendered {} ({}x{}) — F12 again for the next".format(
-                os.path.basename(path), image.width(), image.height()), 8000)
+        self._write_still(remembered.get("opts") or {}, path)
 
     def _render_animation_again(self, remembered):
         times = anim_mod.frame_times(self.timeline,
