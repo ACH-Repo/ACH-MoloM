@@ -89,7 +89,13 @@ def delete_atoms(structure, indices, with_hydrogens=False, report=None):
 
 
 #: Metadata that is a LIST parallel to the atoms.
-_PER_ATOM_LISTS = ("content_of", "site_of")
+#:
+#: `asym_rows` (round 87) is one entry per DRAWN atom in the asymmetric-unit
+#: view, each holding the `_atom_site_` rows that atom stands for - normally
+#: one, and four for a solid solution's shared site. Remapping it here is what
+#: lets a DELETE work: the drawn atom goes, its whole group of rows goes with
+#: it, and `sync_asymmetric_unit` compacts what is left.
+_PER_ATOM_LISTS = ("content_of", "site_of", "asym_rows")
 #: Metadata that is a dict keyed by atom index (as a string — it round-trips
 #: through JSON in a savepoint, where an int key would come back as text).
 _PER_ATOM_KEYED = ("site_occupancy",)

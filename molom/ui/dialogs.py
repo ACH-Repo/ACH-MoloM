@@ -1710,8 +1710,20 @@ class CifSearchDialog(QDialog):
     polymorph, what symmetry, measured or computed, and how recent.
     """
 
-    COLUMNS = ("Formula", "Name / mineral", "Space group", "T / K", "Year",
-               "Source")
+    COLUMNS = ("\u2605", "Formula", "Name / mineral", "Space group", "T / K",
+               "Year", "Source")
+
+    #: Column indices BY NAME. Round 87 inserted the star at 0 and shifted
+    #: every other column by one, which broke six tests that had the old
+    #: numbers written into them - so the numbers live here now and the tests
+    #: ask for them by meaning.
+    STAR = 0            # a CONTROL, not data: not sortable, no text
+    COL_FORMULA = 1
+    COL_NAME = 2
+    COL_SPACEGROUP = 3
+    COL_TEMPERATURE = 4
+    COL_YEAR = 5
+    COL_SOURCE = 6
 
     #: Which columns hold a NUMBER, and therefore must not be compared as
     #: text. `QTableWidgetItem` sorts lexically, so "100" sorts before "98"
@@ -1719,14 +1731,14 @@ class CifSearchDialog(QDialog):
     #: temperature and year are null constantly, would make the two columns
     #: worth sorting by the two that lie. Each cell carries its sort value in
     #: `Qt.EditRole`, which Qt compares numerically.
-    NUMERIC_COLUMNS = {3: "temperature", 4: "year"}
+    NUMERIC_COLUMNS = {COL_TEMPERATURE: "temperature", COL_YEAR: "year"}
 
     #: Where a blank sorts. A missing temperature is not 0 K and a missing
     #: year is not year zero, so unknowns are pinned BELOW everything either
     #: way up rather than being given a number that ranks them.
     UNKNOWN = float("inf")
 
-    def __init__(self, parent, roots=(), remembered=None):
+    def __init__(self, parent, roots=(), remembered=None, favourites=None):
         super().__init__(parent)
         self.setWindowTitle("Find a crystal structure")
         self.hits = []            # type: list
@@ -1735,6 +1747,12 @@ class CifSearchDialog(QDialog):
         self._worker = None
         self._sort_column = None
         self._sort_desc = False
+        #: Bookmarked structures, `{hit.key(): Hit}`. NOT the CIFs - a
+        #: favourite is a reference, so it cannot go stale against the
+        #: provider the way a private copy would.
+        self.favourites = dict(favourites or {})
+        #: Rows that are a divider rather than a hit.
+        self._divider_rows = set()
         #: The hits AS DRAWN. `self.hits` keeps the search ranking; sorting
         #: reorders only this, so "which structure is row 4?" has one answer.
         self._shown = []
@@ -1763,6 +1781,7 @@ class CifSearchDialog(QDialog):
         head.sectionClicked.connect(self._sort_by)
         head.setToolTip("Click to sort; click again to reverse, and a third "
                         "time to go back to the search ranking")
+        self.table.itemChanged.connect(self._star_toggled)
         lay.addWidget(self.table, 1)
 
         self.info = QLabel("")
@@ -1784,8 +1803,17 @@ class CifSearchDialog(QDialog):
         self.ok_btn.clicked.connect(self.accept)
         cancel.clicked.connect(self.reject)
         make_text_selectable(self)
-        self.resize(780, 470)
+        self.resize(820, 470)
         self.restore(remembered)
+        if not self.hits and self.favourites:
+            # Christian: "show them by default when opening the search
+            # window". With nothing remembered they ARE the window's content,
+            # so there is nothing to separate them from and no rule is drawn.
+            self._fill()
+            self.info.setText(
+                "{} favourite{} - search to add more".format(
+                    len(self.favourites),
+                    "" if len(self.favourites) == 1 else "s"))
 
     # ------------------------------------------------------------ searching
     def restore(self, remembered):
@@ -1849,6 +1877,8 @@ class CifSearchDialog(QDialog):
         """Cycle this column: ascending, descending, then back to the
         ranking. The ranking is a real answer, not an accident of insertion
         order, so there has to be a way back to it."""
+        if column == self.STAR:
+            return                      # a control, not a column of data
         if column != self._sort_column:
             self._sort_column, self._sort_desc = column, False
         elif not self._sort_desc:
@@ -1895,7 +1925,8 @@ class CifSearchDialog(QDialog):
     def _cells(self, hit):
         source = ("on disk" if hit.source == cifsearch.SOURCE_LOCAL
                   else (hit.note.split()[0] if hit.note else hit.source))
-        return (hit.formula,
+        return ("",                     # the star column carries no text
+                hit.formula,
                 hit.mineral or hit.name,
                 hit.spacegroup,
                 "" if hit.temperature is None
@@ -1903,16 +1934,54 @@ class CifSearchDialog(QDialog):
                 "" if not hit.year else str(hit.year),
                 source + (" (calc)" if hit.computed else ""))
 
+    def _favourites_below(self, shown):
+        """Favourites that are not already among the results.
+
+        A favourite that the search FOUND stays in the results with its star
+        ticked - showing it twice would make the same structure look like two,
+        and the one in the results is the one carrying its rank.
+        """
+        seen = {h.key() for h in shown}
+        return [h for k, h in sorted(self.favourites.items())
+                if k not in seen]
+
     def _fill(self):
         # `self.hits` stays in RANK order; only the VIEW is sorted, and
         # `_shown` maps a table row back to the hit it draws so selecting one
-        # still returns the right structure.
-        self._shown = self._ordered_hits()
+        # still returns the right structure. Favourites are appended BELOW a
+        # divider - Christian: "when a search is performed, sort them to the
+        # very bottom separated by a horizontal line like the ones that F3
+        # search options already uses".
+        results = self._ordered_hits()
+        extra = self._favourites_below(results)
+        self._divider_rows = set()
+        self._shown = list(results)
+        divider_at = None
+        if extra:
+            if results:
+                divider_at = len(self._shown)
+                self._shown.append(None)          # placeholder for the rule
+            self._shown.extend(extra)
+        self._loading_stars = True
         self.table.setRowCount(len(self._shown))
+        if divider_at is not None:
+            self._add_divider(divider_at)
         for row, hit in enumerate(self._shown):
+            if hit is None:
+                continue
             cells = self._cells(hit)
             for column, value in enumerate(cells):
                 item = QTableWidgetItem(str(value))
+                if column == self.STAR:
+                    item.setFlags((item.flags() | Qt.ItemIsUserCheckable)
+                                  & ~Qt.ItemIsEditable)
+                    item.setCheckState(
+                        Qt.Checked if hit.key() in self.favourites
+                        else Qt.Unchecked)
+                    item.setToolTip("Keep this structure in the list - the "
+                                    "reference is remembered, not the file")
+                    self.table.setItem(row, column, item)
+                    continue
                 field = self.NUMERIC_COLUMNS.get(column)
                 if field is not None:
                     number = getattr(hit, field, None)
@@ -1928,23 +1997,62 @@ class CifSearchDialog(QDialog):
                     item.setForeground(QColor(150, 170, 210))
                 item.setToolTip(hit.note or str(hit.ref))
                 self.table.setItem(row, column, item)
+        self._loading_stars = False
         self.table.resizeColumnsToContents()
         self.table.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.Stretch)
+            2, QHeaderView.Stretch)
+        self.table.setColumnWidth(self.STAR, 26)
+
+    def _add_divider(self, row):
+        """A full-width rule, drawn the way the F3 palette draws one.
+
+        The same device and the same reason: a long list needs to say where
+        one kind of entry stops and another starts, and a heading that cannot
+        be selected is what does it.
+        """
+        item = QTableWidgetItem("\u2500\u2500  FAVOURITES  " + "\u2500" * 40)
+        item.setFlags(Qt.NoItemFlags)             # a divider, not a choice
+        item.setForeground(QColor(130, 165, 205))
+        font = item.font()
+        font.setBold(True)
+        item.setFont(font)
+        self.table.setItem(row, 0, item)
+        self.table.setSpan(row, 0, 1, len(self.COLUMNS))
+        self._divider_rows.add(row)
+
+    def _star_toggled(self, item):
+        """A star ticked or unticked. Persistence is the caller's job."""
+        if getattr(self, "_loading_stars", False):
+            return
+        if item.column() != self.STAR:
+            return
+        row = item.row()
+        shown = getattr(self, "_shown", [])
+        if row >= len(shown) or shown[row] is None:
+            return
+        hit = shown[row]
+        if item.checkState() == Qt.Checked:
+            self.favourites[hit.key()] = hit
+        else:
+            self.favourites.pop(hit.key(), None)
 
     # ------------------------------------------------------------- choosing
     def _selected_rows(self):
-        return sorted({i.row() for i in self.table.selectedIndexes()})
+        """Rows that are a HIT. The divider is selectable-looking furniture
+        and a favourites block below it is still importable, so the only
+        thing to exclude is the rule itself."""
+        return sorted({i.row() for i in self.table.selectedIndexes()
+                       if i.row() not in self._divider_rows})
 
     def _selection_changed(self):
         shown = getattr(self, "_shown", self.hits)
         self.chosen = [shown[r] for r in self._selected_rows()
-                       if 0 <= r < len(shown)]
+                       if 0 <= r < len(shown) and shown[r] is not None]
         self.ok_btn.setEnabled(bool(self.chosen))
 
     def _take_one(self, index):
         shown = getattr(self, "_shown", self.hits)
         row = index.row()
-        if 0 <= row < len(shown):
+        if 0 <= row < len(shown) and shown[row] is not None:
             self.chosen = [shown[row]]
             self.accept()

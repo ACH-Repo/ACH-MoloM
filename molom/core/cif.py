@@ -1063,6 +1063,73 @@ def site_composition(data, tol=0.1):
     return out
 
 
+def asym_view(data, tol=0.1):
+    # type: (CifData, float) -> Tuple[List[str], np.ndarray, dict, List[List[int]]]
+    """The asymmetric unit AS DRAWN: shared sites merged into one atom each.
+
+    A CIF writes a substitutional solid solution as one `_atom_site_` row per
+    species at the same coordinates - `1547149.cif` lists Nb 0.50, Ti 0.25,
+    Ni 0.15 and Co 0.10 all at (0,0,0). The FULL CELL has drawn that correctly
+    as a single pie sphere since round 42, because `expand`'s minimum-image
+    merge collapses them; the asymmetric unit listed them verbatim and so drew
+    four atoms stacked inside one another. Same structure, two pictures, and
+    the one that looked broken was the one that had not lost anything.
+
+    Only GENUINE shared sites are merged - `site_composition`'s test, i.e.
+    more than one species with fractional occupancies. Two symmetry-redundant
+    rows for the same atom (round 33's urea case) are a duplicate, not a solid
+    solution, and collapsing those would change what the asymmetric unit shows
+    for ordinary files. So the blast radius is exactly the files that have a
+    solid solution in them.
+
+    Returns `(symbols, frac, composition, rows)` where `composition` is
+    `{drawn index as a STRING: [(element, occupancy), ...]}` - the shape
+    `metadata["site_occupancy"]` already has, so the pie renders with no new
+    drawing code - and `rows` gives, for each drawn atom, the asymmetric-unit
+    rows it stands for. **`rows` is what makes the merge safe**: without it
+    the write-back sees two atoms where the metadata has five and resets the
+    occupancy column to 1.0, which is round 42's bug performed as a WRITE.
+    """
+    frac = np.asarray(data.frac, dtype=float).reshape(-1, 3)
+    shared = site_composition(data, tol=tol)
+    groups = shared_sites(data, tol=tol)
+    symbols, out_frac, composition, rows = [], [], {}, []
+    taken = set()
+    for i in range(len(frac)):
+        if i in taken:
+            continue
+        members = [i]
+        parts = None
+        if i in shared:
+            members = sorted(groups.get(i, [i]))
+            parts = shared[i]
+        taken.update(members)
+        # The row that REPRESENTS the site is the most occupied species, which
+        # is what `site_composition` already sorts by - so the merged atom is
+        # drawn in the colour of what the site mostly is, exactly as the full
+        # cell draws it.
+        lead = members[0]
+        if parts:
+            best = parts[0][0]
+            for k in members:
+                if data.symbols[k] == best:
+                    lead = k
+                    break
+        drawn = len(symbols)
+        symbols.append(data.symbols[lead])
+        out_frac.append(frac[lead])
+        # LEAD FIRST. The drawn atom carries the majority species' element, so
+        # the write-back has to know which of the rows that element belongs
+        # to - otherwise changing a pie atom's element either does nothing or
+        # is applied to whichever row happened to sort first.
+        ordered = [int(lead)] + [int(k) for k in members if int(k) != int(lead)]
+        rows.append(ordered)
+        if parts:
+            composition[str(drawn)] = [(str(s), float(o)) for s, o in parts]
+    return (symbols, np.asarray(out_frac, dtype=float).reshape(-1, 3),
+            composition, rows)
+
+
 def _is_new(f, fracs, matrix, tol, wrap):
     # type: (np.ndarray, List[np.ndarray], np.ndarray, float, bool) -> bool
     if not fracs:
@@ -2101,9 +2168,18 @@ def build_view(cell, asym_symbols, asym_frac, symops, mode="cell",
         # The asymmetric unit is BY DEFINITION the listed sites, so no
         # disorder resolution here — but say so, since "asym" is also the mode
         # someone switches to when the cell looks wrong.
+        #
+        # SHARED SITES ARE MERGED (round 87), so a solid solution draws the
+        # same pie sphere the full cell has drawn since round 42 instead of
+        # four atoms stacked inside one another. `asym_rows` records what was
+        # merged; `sync_asymmetric_unit` needs it to write an edit back
+        # without flattening the composition.
+        symbols, frac, composition, rows = asym_view(data, tol=tol)
         if report is not None:
-            report["n_content"] = len(data.symbols)
-        return list(data.symbols), data.frac @ cell.matrix()
+            report["n_content"] = len(symbols)
+            report["site_occupancy"] = composition
+            report["asym_rows"] = rows
+        return list(symbols), frac @ cell.matrix()
     # The CELL and PACKING modes go through `core.packing`, the same route an
     # import takes — otherwise opening a file gave one picture and switching
     # to "Full unit cell" gave another (NaCl 39 against 27), which is drift

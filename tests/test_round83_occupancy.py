@@ -94,13 +94,23 @@ def test_no_per_atom_map_outlives_the_atoms_it_describes(win):
             assert index < n, (mode, index, n)
 
 
-def test_the_asymmetric_unit_carries_no_stale_composition(win):
-    """It produces no composition of its own (see the round-83 note on why
-    merging the shared rows there is not safe yet), so what it must NOT do is
-    keep the full cell's - which would paint the pie onto whichever of the
-    five listed sites happened to hold that index."""
+def test_the_asymmetric_unit_carries_its_OWN_composition(win):
+    """Round 83 left this view showing five stacked atoms and no pie, because
+    merging them was unsafe until the write-back understood shared sites.
+    **Round 87 did that work**, so the asymmetric unit now shows the same
+    single pie sphere the full cell has shown since round 42.
+
+    The claim that has not changed is the one this test was written for: the
+    composition must be the view's OWN. Keeping the full cell's would paint
+    the pie onto whichever site happened to inherit that index.
+    """
     win.open_path(SOLID_SOLUTION)
     win.on_crystal_view("asym")
     obj = win._active_obj()
-    assert obj.structure.symbols == ["Nb", "Ti", "Ni", "Co", "O"]
-    assert _pies(obj) == []
+    assert obj.structure.symbols == ["Nb", "O"]
+    pies = _pies(obj)
+    assert len(pies) == 1, "the shared site, and only it, carries a pie"
+    assert obj.structure.metadata["site_occupancy"]["0"] == [
+        ("Nb", 0.5), ("Ti", 0.25), ("Ni", 0.15), ("Co", 0.1)]
+    # the map describes THIS view: two drawn atoms, not the cell's twenty-one
+    assert len(obj.structure.metadata["asym_rows"]) == obj.structure.n_atoms

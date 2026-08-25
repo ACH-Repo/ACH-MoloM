@@ -56,19 +56,19 @@ def test_temperature_sorts_numerically_not_lexically(dialog):
     `QTableWidgetItem` compares as TEXT, so a plain `setSortingEnabled(True)`
     puts 100 K before 98 K and makes the column worth sorting by a liar."""
     dlg = dialog(_hits())
-    dlg._sort_by(3)
-    values = [v for v in _column(dlg, 3) if v]
+    dlg._sort_by(dlg.COL_TEMPERATURE)
+    values = [v for v in _column(dlg, dlg.COL_TEMPERATURE) if v]
     assert values == ["9.5", "98", "100", "293"]
     assert sorted(values) != values          # i.e. text order really differs
 
 
 def test_year_sorts_numerically_both_ways(dialog):
     dlg = dialog(_hits())
-    dlg._sort_by(4)
-    assert [v for v in _column(dlg, 4) if v] == \
+    dlg._sort_by(dlg.COL_YEAR)
+    assert [v for v in _column(dlg, dlg.COL_YEAR) if v] == \
         ["1975", "1998", "2008", "2015"]
-    dlg._sort_by(4)
-    assert [v for v in _column(dlg, 4) if v] == \
+    dlg._sort_by(dlg.COL_YEAR)
+    assert [v for v in _column(dlg, dlg.COL_YEAR) if v] == \
         ["2015", "2008", "1998", "1975"]
 
 
@@ -78,8 +78,8 @@ def test_unknowns_sink_to_the_bottom_whichever_way_the_column_points(dialog):
     which is what a plain `reverse=True` would do."""
     dlg = dialog(_hits())
     for _ in range(2):                       # ascending, then descending
-        dlg._sort_by(3)
-        column = _column(dlg, 3)
+        dlg._sort_by(dlg.COL_TEMPERATURE)
+        column = _column(dlg, dlg.COL_TEMPERATURE)
         assert column[-2:] == ["", ""]
         assert all(v for v in column[:-2])
 
@@ -88,12 +88,12 @@ def test_a_third_click_goes_back_to_the_search_ranking(dialog):
     """The ranking is the one thing the search itself is for, so there has to
     be a way back to it - which `setSortingEnabled(True)` cannot give."""
     dlg = dialog(_hits())
-    ranked = _column(dlg, 3)
-    dlg._sort_by(3)
-    assert _column(dlg, 3) != ranked
-    dlg._sort_by(3)
-    dlg._sort_by(3)
-    assert _column(dlg, 3) == ranked
+    ranked = _column(dlg, dlg.COL_TEMPERATURE)
+    dlg._sort_by(dlg.COL_TEMPERATURE)
+    assert _column(dlg, dlg.COL_TEMPERATURE) != ranked
+    dlg._sort_by(dlg.COL_TEMPERATURE)
+    dlg._sort_by(dlg.COL_TEMPERATURE)
+    assert _column(dlg, dlg.COL_TEMPERATURE) == ranked
     assert dlg._sort_column is None
 
 
@@ -102,8 +102,8 @@ def test_selecting_a_row_while_sorted_returns_the_right_structure(dialog):
     mapping from a table row back to a hit has to go through `_shown`. Getting
     this wrong imports a different crystal from the one that was clicked."""
     dlg = dialog(_hits())
-    dlg._sort_by(3)
-    dlg._sort_by(3)                          # descending: 293 K first
+    dlg._sort_by(dlg.COL_TEMPERATURE)
+    dlg._sort_by(dlg.COL_TEMPERATURE)                          # descending: 293 K first
     dlg.table.selectRow(0)
     assert dlg.chosen and dlg.chosen[0].temperature == 293
 
@@ -113,8 +113,8 @@ def test_sorting_by_a_text_column_folds_case(dialog):
     hits = [Hit("cod", "1", name="quartz"), Hit("cod", "2", name="Anatase"),
             Hit("cod", "3", name="Zircon")]
     dlg = dialog(hits)
-    dlg._sort_by(1)
-    assert _column(dlg, 1) == ["Anatase", "quartz", "Zircon"]
+    dlg._sort_by(dlg.COL_NAME)
+    assert _column(dlg, dlg.COL_NAME) == ["Anatase", "quartz", "Zircon"]
 
 
 # --------------------------------------------------------------- remembering

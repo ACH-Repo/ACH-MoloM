@@ -198,6 +198,73 @@ other side, and the two export fixes are verified in `tools/smoke_gui.py`
 instead, which now measures the crop and counts ink with and without the cell
 box. 1310 tests.
 
+Round 87 (2026-08-25, the asymmetric unit gets its pie sphere - open item A4
+closed - and favourites in the crystal search):
+**A4 WAS BLOCKED ON A DATA-LOSS HAZARD, NOT ON DIFFICULTY, and Christian's
+decision was to remove the hazard rather than work around it.** The full cell
+has drawn a shared site as one pie sphere since round 42, because `expand`'s
+minimum-image merge collapses the co-located rows; the ASYMMETRIC UNIT listed
+them verbatim and drew four atoms stacked inside one another. Same structure,
+two pictures - and the one that looked broken was the one that had not lost
+anything.
+Merging for display is six lines (`cif.asym_view`). What made it dangerous is
+`sync_asymmetric_unit`: it writes the DRAWN atoms straight into
+`asym_symbols` and resets any parallel column whose length no longer matches,
+so a merged view would go from five `_atom_site_` rows to two and write
+`asym_occupancy = [1.0, 1.0]` - permanently reducing Nb/Ti/Ni/Co to the pure
+NbO2 that round 42 exists to stop MoloM drawing. He chose merge-AND-fix over
+the two cheap alternatives (lock the view, or leave it).
+**`asym_rows` is what makes it safe**: one entry per drawn atom holding the
+rows it stands for, `[[0,1,2,3],[4]]` for the solid solution. The write-back
+walks it and gives every row of a site the drawn atom's new position while
+keeping its own element and occupancy. **The lead row is stored FIRST**,
+because the drawn atom carries the majority species and the write-back has to
+know which row that element belongs to.
+**THREE THINGS THIS BROKE, and two of them were mine.**
+(1) **The reset loop measured the columns against the DRAWN ATOM COUNT.** With
+five rows behind two atoms it found 5 != 2 and reset `asym_occupancy` to
+`[1.0, 1.0]` - flattening the composition immediately after the write-back had
+rebuilt it correctly. The columns describe `_atom_site_` ROWS, so they are
+measured against `asym_symbols`; identical in the ordinary case, where one
+atom is one row.
+(2) **Every element edit in the asymmetric unit was silently discarded**,
+because the first cut restored the stored symbol unconditionally. Caught by a
+ROUND-51 test rather than by anything new - `_change_element` on an oxygen
+then switching to the full cell, and the N was gone. That is round 43e's bug
+reintroduced from a new direction. The drawn symbol now wins on the row it
+represents; on a merged site it re-labels the majority species and leaves the
+others and every occupancy alone, so nothing is lost either way.
+(3) **A float round trip moved an atom off its special position.** The
+write-back converts Cartesian back to fractional, and an atom at exactly 0
+comes back as **-9.45e-17**. The SIGN is the damage: a tiny negative fraction
+is on the far face, so the next expansion gives that site an extra boundary
+copy and the cell came back as 22 atoms instead of 21 - a structure changed by
+floating-point noise. `_snap_fractional` rounds to nine decimals (five is what
+a CIF writes; a 0.3 A drag in a 10 A cell is 0.03, seven orders above the
+snap) and the `+ 0.0` that turns -0.0 back into 0.0 is the entire point. Round
+45b hit the same `-0.0` in the symmetry operators. **Pre-existing**, and only
+visible once something did an asym -> edit -> cell round trip.
+**FAVOURITES IN THE CRYSTAL SEARCH**, Christian's side request: "do not save
+the cifs locally, just have the links to them stay persistent". So a favourite
+is `Hit.to_dict()` - provider, reference and the fields needed to draw the row
+- and never the file, which means it cannot go stale against COD the way a
+private copy would, and a hundred of them cost a few kilobytes of settings.
+Identity is `(source, ref)` and never the formula or the name, because a dozen
+determinations of quartz share both and COD leaves most entries unnamed
+(round 85). They show on their own when the window opens with nothing
+remembered, and after a search they sit BELOW a full-width rule drawn exactly
+as the F3 palette draws its category headers - `Qt.NoItemFlags`, so it cannot
+be selected or imported. **A favourite the search FOUND is not repeated**: it
+stays in the results with its star ticked, because showing it twice would make
+one structure look like two and the copy in the results is the one carrying
+its rank.
+**The star column shifted every other column by one and broke six tests** that
+had the old numbers written into them. The numbers live on the dialog now
+(`COL_FORMULA`, `COL_TEMPERATURE`, ...) and the tests ask by meaning - round
+71's lesson, that a test pinning a POSITION breaks when nothing behaved
+differently.
+1758 tests.
+
 Round 86 (2026-08-25, the outliner learns what a SITE is, the search
 remembers, and the cell box stops lying about what is in front):
 Christian's batch, four things, and the outliner one is a crystallographic
@@ -3949,7 +4016,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1740 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1762 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -5182,6 +5249,20 @@ independent cross-check inside a single fixture.
   `shiboken6.delete` instead also works, right up until it destroys a window
   whose QMenu is separately in `topLevelWidgets()` - `isValid` still says that
   menu is live, and touching it is an access violation.
+- **A CARTESIAN ROUND TRIP MOVES AN ATOM OFF A SPECIAL POSITION** (round 87).
+  Converting coordinates out to Cartesian and back leaves an atom that sits at
+  exactly 0 at about -9.45e-17, and the SIGN is what does the damage: a tiny
+  negative fraction is on the far face of the cell, so the next expansion
+  gives that site an extra boundary copy. The solid solution came back as 22
+  atoms instead of 21 - a structure changed by floating-point noise. Snap
+  fractional coordinates before storing them (`_snap_fractional`), and
+  remember `+ 0.0`, which is what turns -0.0 back into 0.0. Round 45b hit the
+  same thing in the symmetry operators.
+- **A COLUMN INDEX WRITTEN INTO A TEST IS A POSITION, NOT A CLAIM** (round
+  87). Inserting a star column at 0 shifted every other column by one and
+  broke six tests while nothing behaved differently. Name the columns on the
+  widget and have the tests ask by meaning - the same lesson round 71 learned
+  about pinning a line of source.
 - **SETTING ANYTHING ON COLUMN 0 OF A QTreeWidgetItem LOOKS LIKE A RENAME**
   (round 86, found by running the manual checklist; it predates the round).
   `setData` AND `setToolTip` both emit `itemChanged`, and `_on_item_changed`
@@ -5474,7 +5555,7 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 1736 offline tests, 4 skipped, ~105 s.
+1. `python -m pytest tests/ -q` — 1758 offline tests, 4 skipped, ~125 s.
    `tests/conftest.py` sandboxes QSettings, so a GUI test can drive a real
    control without writing into your own MoloM configuration; it also
    **destroys the windows a test created** (round 86), without which the suite

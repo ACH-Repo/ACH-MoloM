@@ -55,6 +55,15 @@ a minute or two old the dialog **says how old**: a stale list that looks live
 is worse than an empty one, because a COD entry can be superseded. Enter runs
 it again.
 
+**Star a structure to keep it.** The first column is a favourite tick. What
+is remembered is the REFERENCE - the provider and its own id - never the file,
+so a favourite cannot go stale against COD the way a private copy would, and a
+hundred of them cost a few kilobytes rather than a hundred CIFs on disk.
+Favourites show on their own when the dialog opens with nothing remembered,
+and after a search they sit **below a full-width rule**, drawn the way the F3
+palette draws its category headers. One the search itself found stays in the
+results with its star ticked rather than being listed twice.
+
 **Clicking a column header sorts by it** — ascending, then descending, then
 back to the search ranking, which is the one thing the search itself is for.
 Temperature and year sort as NUMBERS (100 K after 98 K, not before it), and a

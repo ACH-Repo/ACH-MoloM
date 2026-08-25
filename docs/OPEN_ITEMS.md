@@ -46,23 +46,17 @@ with a message in round 50, never fixed. Edits should operate on the cell
 CONTENT and re-pack. Related: `edits.adjust_bond_lengths` is cell-unaware and
 can push an atom across a face.
 
-**A4. Occupancy pie spheres.** **Mostly fixed, round 83.** It was not a
-survival problem: `packing.pack` always built the map correctly, and two
-callers overwrote it with one whose keys mean something else (CONTENT index
-rather than DRAWN index), so 2 of 10 Nb showed a composition. Fixed at both,
-along with `site_of` and a stale `content_of` that could make a delete take
-the wrong atoms. **What remains is the ASYMMETRIC UNIT**, which shows no pie
-because the four rows would have to be merged into one atom - and
-`sync_asymmetric_unit` writes that view's atoms back into metadata, so a
-merged view would destroy the solid solution on the first edit. Needs the
-write-back taught about shared sites; three options are laid out in the
-round-83 note. **DECIDED by Christian, 2026-08-25: merge the shared rows into
-one pie atom in the asymmetric-unit view AND fix the write-back** - teach
-`sync_asymmetric_unit` that one drawn atom can stand for several metadata
-rows, which is the same one-to-many mapping `occupancy.expand_shared` already
-performs for the CIF writer. Not the cheap option (locking shared sites
-against editing) and not leaving it: nothing is taken away, and the mechanism
-already exists on the write side. **Not yet built.**
+~~**A4. Occupancy pie spheres.**~~ **DONE.** Round 83 fixed the full cell (a
+map keyed by DRAWN index was being overwritten by one keyed by CONTENT index,
+so 2 of 10 Nb showed a composition). **Round 87 closed the asymmetric unit**,
+which was the half left open - and it was blocked on a data-loss hazard rather
+than on difficulty: merging the shared rows for display is easy, but
+`sync_asymmetric_unit` would then have written `asym_occupancy = [1.0, 1.0]`
+on the first edit and permanently reduced Nb/Ti/Ni/Co to pure NbO2.
+Christian chose merge-AND-fix. `cif.asym_view` merges only GENUINE shared
+sites and records `asym_rows` - which rows each drawn atom stands for - and
+the write-back expands through it, giving every row the atom's new position
+while keeping its own element and occupancy.
 
 ~~**A5. `4-ABA-oxime.cif` floats 36 unbonded hydrogens.**~~ **DECIDED and done,
 round 81** (branch `crystal-overvalence`, awaiting Christian's testing). The
@@ -214,6 +208,13 @@ returns to the search ranking**, which Qt's own sorting has no way back to.
 Text columns fold case, or `Quartz` and `quartz` end up in different halves.
 
 
+~~**I4. Favourites.**~~ **DONE, round 87** (Christian's side request).
+A favourite is a REFERENCE - `Hit.to_dict()`, keyed on `(source, ref)` - never
+the file, so it cannot go stale against COD and a hundred cost a few kilobytes
+of settings. Shown on their own when the window opens with nothing remembered;
+below a full-width rule (the F3 palette's device, `Qt.NoItemFlags`) once a
+search runs; and never repeated when the search itself found them.
+
 **I3. Related, raised while building it, NOT requested.** Unnamed COD entries
 all score 0.95 and are indistinguishable in the list — five candidates for
 nicotinic acid with nothing to choose between. Showing cell/Z/temperature more
@@ -313,8 +314,8 @@ is worth building out before anything is bet on it.
    pick and the right one - a verification problem outranks features - and it
    turned up a real app bug on the way (a worker thread parented to its
    dialog). `python -m pytest tests/` is back to ~110 s in one process.
-2. **A4 - the asymmetric-unit pie spheres**, by merging and fixing the
-   write-back (see above). **Next up.**
+2. ~~**A4 - the asymmetric-unit pie spheres**~~ **DONE, round 87**, by
+   merging and fixing the write-back exactly as decided.
 
 ---
 

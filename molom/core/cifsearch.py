@@ -132,9 +132,60 @@ class Hit(object):
         stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("_")
         return (stem or "structure")[:60]
 
+    def key(self):
+        # type: () -> tuple
+        """What makes two hits the SAME structure, for favourites and dedupe.
+
+        The provider plus its own reference - a COD id, an OPTIMADE entry url,
+        a path on disk. Never the formula or the name: a dozen determinations
+        of quartz share both, and COD leaves most entries unnamed anyway
+        (round 85).
+        """
+        return (str(self.source), str(self.ref))
+
+    def to_dict(self):
+        # type: () -> dict
+        """Everything needed to SHOW this hit again and to fetch it later.
+
+        Deliberately not the CIF itself. A favourite is a bookmark, and
+        keeping the file would mean holding a private copy that silently goes
+        stale when COD supersedes the entry - the same argument round 84 makes
+        for downloading through a temp file rather than caching.
+        """
+        return {"source": self.source, "ref": self.ref,
+                "formula": self.formula, "name": self.name,
+                "mineral": self.mineral, "spacegroup": self.spacegroup,
+                "cell": list(self.cell) if self.cell else None,
+                "temperature": self.temperature, "year": self.year,
+                "doi": self.doi, "note": self.note,
+                "computed": bool(self.computed)}
+
     def __repr__(self):
         return "Hit({}, {!r}, {:.2f})".format(self.source, self.ref,
                                               self.score)
+
+
+def hit_from_dict(data):
+    # type: (dict) -> Optional[Hit]
+    """Rebuild a saved favourite. Returns None for anything unusable, because
+    a stored preference outlives the code that wrote it and a favourites list
+    that raises on load is worse than one that has lost an entry."""
+    if not isinstance(data, dict) or not data.get("source"):
+        return None
+    try:
+        return Hit(data["source"], data.get("ref"),
+                   formula=data.get("formula") or "",
+                   name=data.get("name") or "",
+                   mineral=data.get("mineral") or "",
+                   spacegroup=data.get("spacegroup") or "",
+                   cell=data.get("cell") or None,
+                   temperature=data.get("temperature"),
+                   year=data.get("year"),
+                   doi=data.get("doi") or "",
+                   note=data.get("note") or "",
+                   computed=bool(data.get("computed")))
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 # ------------------------------------------------------------------ ranking

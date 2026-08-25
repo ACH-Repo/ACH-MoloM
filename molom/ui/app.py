@@ -105,6 +105,27 @@ def apply_dark_theme(app):
     app.setPalette(p)
 
 
+def _snap_fractional(frac, places=9):
+    """Round a fractional coordinate back onto its exact value.
+
+    A write-back converts Cartesian coordinates into the cell frame, and the
+    round trip through a pose matrix leaves an atom that sits at exactly 0 at
+    something like **-9.45e-17**. The sign is what does the damage: a tiny
+    NEGATIVE fraction is on the far face of the cell, so the next expansion
+    gives that site an extra boundary copy and the solid solution comes back
+    as 22 atoms instead of 21 - a structure changed by floating-point noise.
+    Round 45b hit the same `-0.0` in the symmetry operators.
+
+    Nine decimals is far finer than any CIF writes (five is typical) and far
+    coarser than the noise, so a real edit is untouched: dragging an atom
+    0.3 A in a 10 A cell moves it 0.03 fractional, seven orders of magnitude
+    above the snap. `+ 0.0` is not decoration - it turns -0.0 back into 0.0,
+    which is the whole point.
+    """
+    return [[float(round(float(v), places)) + 0.0 for v in row]
+            for row in np.asarray(frac, dtype=float).reshape(-1, 3)]
+
+
 class MainWindow(QMainWindow):
 
     #: What the last CIF export decided, for the status bar. On the CLASS so
@@ -1448,9 +1469,15 @@ class MainWindow(QMainWindow):
         if pose is not None:
             rot, shift = pose
             xyz = (xyz - np.asarray(shift)) @ np.asarray(rot)
-        frac = cell.to_fractional(xyz)
-        meta["asym_symbols"] = list(s.symbols)
-        meta["asym_frac"] = [[float(v) for v in row] for row in frac]
+        frac = _snap_fractional(cell.to_fractional(xyz))
+        if not self._write_back_shared(meta, s, frac):
+            meta["asym_symbols"] = list(s.symbols)
+            meta["asym_frac"] = [list(row) for row in frac]
+            # One row per atom again, so the merge map describes nothing.
+            # Leaving it is round 80's silent failure: it stays perfectly
+            # well-formed and quietly refers to rows that are no longer there
+            # - which is what deleting the last shared site does.
+            meta.pop("asym_rows", None)
         # Re-pin against the CELL-frame coordinates, so the next fit returns
         # this same pose exactly and the error cannot accumulate over a run of
         # edits. Without this the box creeps a little further with every atom
@@ -1461,7 +1488,16 @@ class MainWindow(QMainWindow):
         # describe. When atoms have been added or deleted the old values no
         # longer line up with anything, and a silently mis-indexed occupancy
         # is worse than none, so they are reset rather than guessed at.
-        n = s.n_atoms
+        #
+        # Measured against `asym_symbols`, NOT against the drawn atom count.
+        # They describe the `_atom_site_` ROWS, and once a shared site is
+        # merged for display those are no longer the same number: the solid
+        # solution is five rows behind two drawn atoms, so comparing with
+        # `s.n_atoms` found 5 != 2 and reset `asym_occupancy` to [1.0, 1.0] -
+        # flattening the composition immediately after `_write_back_shared`
+        # had just rebuilt it correctly. Identical in the ordinary case,
+        # where one atom is one row.
+        n = len(meta.get("asym_symbols") or [])
         for key, fill in (("asym_occupancy", 1.0),
                           ("asym_disorder_groups", ""),
                           ("asym_disorder_assemblies", "")):
@@ -1470,6 +1506,80 @@ class MainWindow(QMainWindow):
                 continue
             if len(values) != n:
                 meta[key] = [fill] * n
+        return True
+
+    def _write_back_shared(self, meta, s, frac):
+        # type: (dict, object, object) -> bool
+        """Expand the merged asymmetric unit back into one row per species.
+
+        A CIF writes a solid solution as one `_atom_site_` row per species at
+        the same coordinates, and round 87 MERGES those into a single drawn
+        atom so the asymmetric unit shows the same pie sphere the full cell
+        has shown since round 42. That merge is what makes this function
+        necessary: the plain write-back sets `asym_symbols` from the DRAWN
+        atoms, so `1547149.cif` would go from five rows to two, the parallel
+        columns would no longer match, and `asym_occupancy` would be reset to
+        `[1.0, 1.0]` - permanently reducing a Nb/Ti/Ni/Co solid solution to
+        the pure NbO2 that round 42 exists to stop MoloM drawing. Christian's
+        decision was to merge AND fix this, rather than lock the view or leave
+        it showing four atoms stacked inside one another.
+
+        Every row of a merged site takes the drawn atom's new position, and
+        keeps its own element and occupancy. A DELETE is handled by the same
+        walk: `asym_rows` is remapped with the atoms (see `edits.
+        _PER_ATOM_LISTS`), so a deleted drawn atom simply takes its whole
+        group of rows out of the rebuilt columns, and the indices are compacted
+        as they are rewritten.
+
+        Returns False when the map cannot be trusted - no shared sites, or a
+        length that no longer lines up - and the caller then does the ordinary
+        one-row-per-atom write.
+        """
+        rows = meta.get("asym_rows")
+        if not rows or len(rows) != s.n_atoms:
+            return False
+        old_symbols = list(meta.get("asym_symbols") or [])
+        if not old_symbols:
+            return False
+        flat = [int(r) for group in rows for r in group]
+        if len(flat) == len(rows):
+            return False              # nothing merged; the plain path is fine
+        if any(r < 0 or r >= len(old_symbols) for r in flat):
+            return False              # stale map; better none than misindexed
+        columns = {}
+        for key in ("asym_occupancy", "asym_disorder_groups",
+                    "asym_disorder_assemblies", "asym_labels"):
+            values = meta.get(key)
+            if values is not None and len(values) == len(old_symbols):
+                columns[key] = list(values)
+        symbols, out_frac, compacted, cursor = [], [], [], 0
+        for drawn, group in enumerate(rows):
+            here = []
+            drawn_symbol = str(s.symbols[drawn])
+            for position, r in enumerate(group):
+                # THE DRAWN SYMBOL WINS ON THE ROW IT REPRESENTS. A single-row
+                # atom is an ordinary site, so changing its element must reach
+                # the metadata exactly as it did before this round - the first
+                # cut restored the stored symbol unconditionally and silently
+                # discarded every element edit in the asymmetric unit, which
+                # is round 43e's bug reintroduced from a new direction.
+                #
+                # On a MERGED site the drawn atom carries the majority
+                # species (`asym_view` puts that row first), so an element
+                # change there re-labels that species and leaves the others
+                # and every occupancy untouched. Nothing is lost, which is the
+                # test a shared-site edit has to pass.
+                symbols.append(drawn_symbol if position == 0
+                               else old_symbols[int(r)])
+                out_frac.append(list(frac[drawn]))
+                here.append(cursor)
+                cursor += 1
+            compacted.append(here)
+        for key, values in columns.items():
+            meta[key] = [values[int(r)] for r in flat]
+        meta["asym_symbols"] = symbols
+        meta["asym_frac"] = out_frac
+        meta["asym_rows"] = compacted
         return True
 
     def begin_model_edit(self):
@@ -4051,8 +4161,12 @@ class MainWindow(QMainWindow):
         # keeps finding in shared state (the round-37 circuit breaker, the
         # round-46 module cache, the round-77 QSettings sandbox).
         dlg = CifSearchDialog(self, roots=self.cif_search_roots(),
-                              remembered=self._last_cif_search)
+                              remembered=self._last_cif_search,
+                              favourites=self.cif_favourites())
         accepted = dlg.exec()
+        # Saved whatever the outcome: starring something and then pressing
+        # Cancel is an ordinary way to use a bookmark list.
+        self.set_cif_favourites(dlg.favourites)
         # Kept whether or not anything was imported: closing the dialog to
         # look at the structure you just took is the commonest way to end up
         # reopening it, and that is exactly when retyping the query stings.
@@ -4094,6 +4208,35 @@ class MainWindow(QMainWindow):
             note += " - {} could not be fetched: {}".format(len(failed),
                                                             failed[0])
         self.statusBar().showMessage(note, 9000)
+
+    def cif_favourites(self):
+        # type: () -> dict
+        """Bookmarked structures, `{hit.key(): Hit}`.
+
+        REFERENCES, not files. A favourite is "fetch this again", so it stays
+        correct when COD supersedes an entry, and starring a hundred
+        structures costs a few kilobytes of settings rather than a hundred
+        CIFs on disk. Stored as JSON because QSettings round-trips a list of
+        dicts through the registry unreliably on Windows.
+        """
+        import json
+        raw = self.settings.value("cif_favourites", "") or ""
+        try:
+            entries = json.loads(raw) if raw else []
+        except ValueError:
+            return {}
+        out = {}
+        for entry in entries if isinstance(entries, list) else []:
+            hit = cifsearch.hit_from_dict(entry)
+            if hit is not None:
+                out[hit.key()] = hit
+        return out
+
+    def set_cif_favourites(self, favourites):
+        # type: (dict) -> None
+        import json
+        entries = [h.to_dict() for h in (favourites or {}).values()]
+        self.settings.setValue("cif_favourites", json.dumps(entries))
 
     def cif_search_roots(self):
         # type: () -> list
@@ -6718,7 +6861,12 @@ class MainWindow(QMainWindow):
         # picked. A stale one therefore deletes the wrong atoms. The
         # asymmetric-unit mode produces neither, so there they are simply
         # dropped rather than left describing the full cell.
-        for key in ("site_occupancy", "site_of", "content_of"):
+        # `asym_rows` rides with them: it describes the view just built, so a
+        # stale one from the previous mode would tell the write-back that two
+        # drawn atoms stand for five rows of a structure that is no longer on
+        # screen. Round 80's rule, in the one place that regenerates the atom
+        # list wholesale.
+        for key in ("site_occupancy", "site_of", "content_of", "asym_rows"):
             meta.pop(key, None)
             if report.get(key) is not None:
                 meta[key] = (dict(report[key])

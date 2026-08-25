@@ -355,8 +355,8 @@ def test_the_dialog_lists_hits_and_multi_selects(win):
         cs.Hit(cs.SOURCE_OPTIMADE, "mp/1", formula="O2Si", spacegroup="P4_132",
                computed=True)]))
     assert dlg.table.rowCount() == 2
-    assert dlg.table.item(0, 1).text() == "Quartz"
-    assert "calc" in dlg.table.item(1, 5).text()
+    assert dlg.table.item(0, dlg.COL_NAME).text() == "Quartz"
+    assert "calc" in dlg.table.item(1, dlg.COL_SOURCE).text()
     dlg.table.selectAll()
     assert len(dlg.chosen) == 2
 
