@@ -198,6 +198,52 @@ other side, and the two export fixes are verified in `tools/smoke_gui.py`
 instead, which now measures the crop and counts ink with and without the cell
 box. 1310 tests.
 
+Round 89 (2026-08-26, the focal length finally does something - K1 closed, and
+Christian designed the fix):
+He asked the question that dissolves it: "why isn't dragging the handles just
+selecting a 2D window porting of the viewport though? If I change focal
+length, then things should just transition to more perspective or more
+orthographic... blender also has an apparent zoom in/out when changing focal
+length. But that doesn't change the camera view limits. It only changes the
+way the viewport looks."
+**Round 88 measured the bug; round 89 is his model built.** `frame_rect` was
+ANGULAR (round 58, half-height `Z*tan(fov_y/2)`) and `viewport_fov_y` divides
+by that same rectangle, so `tan(fov_y/2)` cancelled and the widget field of
+view was `1/zoom` - a constant 43.17 deg from 24 mm to 200 mm.
+**THE FRAME IS THE FILM, DRAWN AT `zoom` PIXELS PER MM.** Both dimensions free,
+each following its own sensor axis. Work the projection out from there and it
+is `tan(widget_fov/2) = REFERENCE_SENSOR_MM / (2 * focal * zoom)` - **the
+sensor cancels**, so a handle cannot rescale the scene and the focal length is
+the only thing that can. Both of his requirements at once, and neither
+arranged: they fall out of drawing the film at a fixed scale. Measured
+end to end: 24 mm -> 200 mm is **8.33x** magnification with the frame pixel-
+identical, and `proj[1][1]` goes 1.64 -> 9.20 across 24-135 mm.
+**A SENSOR PER AXIS is what makes "a handle moves only its border" true.**
+With one horizontal sensor and a derived aspect, a side drag changed the
+aspect, the aspect divided the sensor to give `fov_y`, and the vertical
+framing moved with it - so round 58 could not have both properties however it
+was written. `sensor_w`/`sensor_h`, with the aspect DERIVED, is Blender's own
+model (`sensor_fit` + `sensor_width`/`sensor_height`) and the export now hands
+both over with `sensor_fit = "AUTO"`. Round 57's "the other axis holds to a
+tenth of a percent, because a resolution is whole pixels" is gone with it:
+a horizontal drag does not touch `sensor_h` at all, so it holds EXACTLY.
+**Two consequences worth knowing.** `set_resolution` exists because the shape
+now comes from the FILM - typing 500x1000 into the properties page had to
+reshape the film too, or it would have changed the pixel count of the same
+picture. And a savefile written before this round carries one horizontal
+`sensor_mm` with the aspect in the PIXELS, so `from_dict` migrates it as
+`sensor_h = sensor_mm / aspect`; pinned to 1e-12 on three cameras, because
+reading it any other way silently re-frames every saved shot.
+**AND A THIRD FAULTY MEASURING INSTRUMENT IN ONE SESSION.** The real-window
+check counted "molecule pixels" and reported a constant 876 px while the FOV
+was plainly changing - it was measuring something that fills the window and
+clips, so max-minus-min saturates. `proj[1][1]` settled it in one line, and
+two saved frames confirmed it by eye. Round 86 counted the floor grid's axes,
+round 86 again counted red oxygens as red rods, and this one counted the
+window. **A pixel counter over a whole frame is almost always measuring
+something else; measure the quantity, not the picture.**
+1781 tests.
+
 Round 88 (2026-08-25, one dialog owns the image export - and the focal length
 does nothing, measured):
 Christian, after using round 86's cell-box z-order: "does it matter whether I
@@ -4075,7 +4121,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1769 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1785 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -5308,6 +5354,14 @@ independent cross-check inside a single fixture.
   `shiboken6.delete` instead also works, right up until it destroys a window
   whose QMenu is separately in `topLevelWidgets()` - `isValid` still says that
   menu is live, and touching it is an access violation.
+- **A PIXEL COUNTER OVER A WHOLE FRAME IS USUALLY MEASURING SOMETHING ELSE**
+  (round 89, and the third instance in one session). It reported a constant
+  876 px for a molecule whose projection was demonstrably changing, because
+  the object filled the window and clipped, so max-minus-min saturated. Round
+  86's first cut counted the floor grid's red and green axis lines; its second
+  counted red oxygens as red cell-box rods. Measure the QUANTITY - a matrix
+  element, a frame-to-frame difference - and use the picture to confirm by
+  eye, not to count.
 - **A CARTESIAN ROUND TRIP MOVES AN ATOM OFF A SPECIAL POSITION** (round 87).
   Converting coordinates out to Cartesian and back leaves an atom that sits at
   exactly 0 at about -9.45e-17, and the SIGN is what does the damage: a tiny
@@ -5614,7 +5668,7 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 1765 offline tests, 4 skipped, ~90 s.
+1. `python -m pytest tests/ -q` — 1781 offline tests, 4 skipped, ~140 s.
    `tests/conftest.py` sandboxes QSettings, so a GUI test can drive a real
    control without writing into your own MoloM configuration; it also
    **destroys the windows a test created** (round 86), without which the suite

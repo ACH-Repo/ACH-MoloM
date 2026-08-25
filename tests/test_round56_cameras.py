@@ -166,10 +166,12 @@ def test_the_frame_keeps_the_cameras_aspect_inside_the_window():
 
 def test_a_tall_camera_fits_by_height():
     cam = cameras.CameraObject(1)
-    cam.width, cam.height = 500, 1000                 # aspect 0.5
-    tx, ty = cam.half_angles()
-    zoom = cameras.fit_frame_zoom(800, 600, tx, ty)
-    _x, _y, w, h = cameras.frame_rect(800, 600, tx, ty, zoom=zoom)
+    # `set_resolution`, not two assignments: the shot's SHAPE is the FILM's as
+    # of round 89, so typing a resolution reshapes the film with it.
+    cam.set_resolution(500, 1000)                     # aspect 0.5
+    zoom = cameras.fit_frame_zoom(800, 600, cam.sensor_w, cam.sensor_h)
+    _x, _y, w, h = cameras.frame_rect(800, 600, cam.sensor_w, cam.sensor_h,
+                                      zoom=zoom)
     assert h <= 600 and w / h == pytest.approx(0.5)
 
 

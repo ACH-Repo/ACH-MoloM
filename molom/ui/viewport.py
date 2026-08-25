@@ -2379,8 +2379,8 @@ class MolViewport(QOpenGLWidget):
         cam = self.active_camera_object()
         if cam is None:
             return None
-        tx, ty = cam.half_angles()
-        return cameras_mod.frame_rect(self.width(), self.height(), tx, ty,
+        return cameras_mod.frame_rect(self.width(), self.height(),
+                                      cam.sensor_w, cam.sensor_h,
                                       zoom=cam.frame_zoom)
 
     def sync_camera_lens(self):
@@ -6645,30 +6645,35 @@ class MolViewport(QOpenGLWidget):
         self._frame_drag = {"handle": handle, "rect": rect,
                             "start": (pos.x(), pos.y()),
                             "w": cam.width, "h": cam.height,
-                            "sensor": cam.sensor_mm}
+                            "sensor_w": cam.sensor_w,
+                            "sensor_h": cam.sensor_h}
         self.update()
         return True
 
     def _camera_handle_move(self, pos):
-        """Move a BORDER of the shot. Nothing on screen rescales — see
-        `cameras.frame_rect` for why that is a property of the frame being
-        angular rather than something arranged here."""
+        """Move a BORDER of the shot, on that axis only.
+
+        A handle resizes the FILM on its own axis, so a horizontal drag
+        changes `fov_x` and nothing about the vertical framing (round 89).
+        Nothing on screen rescales either - the frame's SIZE is `frame_zoom`
+        and its shape the film's, with no lens term at all; see
+        `cameras.frame_rect`.
+        """
         d = self._frame_drag
         if d is None:
             return False
         cam = self.active_camera_object()
         if cam is None:
             return False
-        sensor, w, h = cameras_mod.resize_frame(
-            d["handle"], cam.focal_mm, d["sensor"], d["w"], d["h"],
+        sensor_w, sensor_h, w, h = cameras_mod.resize_frame(
+            d["handle"], d["sensor_w"], d["sensor_h"], d["w"], d["h"],
             pos.x() - d["start"][0], pos.y() - d["start"][1], d["rect"])
         # A border may not be dragged off the screen: the handles go with it
         # and there is then nothing left to grab. Growing the shot past the
         # window is still possible — scroll out first, which is what the wheel
         # is for, and is the same order of operations Blender wants.
-        tx, ty = cameras_mod.half_angles(cam.focal_mm, sensor,
-                                         float(w) / max(float(h), 1e-6))
-        rect = cameras_mod.frame_rect(self.width(), self.height(), tx, ty,
+        rect = cameras_mod.frame_rect(self.width(), self.height(),
+                                      sensor_w, sensor_h,
                                       zoom=cam.frame_zoom)
         margin = cameras_mod.FRAME_FIT_MARGIN
         if rect[2] > self.width() * margin or rect[3] > self.height() * margin:
@@ -6676,11 +6681,12 @@ class MolViewport(QOpenGLWidget):
                 "{}: that is as wide as the frame goes here — scroll out for "
                 "more room".format(cam.name))
             return True
-        cam.sensor_mm, cam.width, cam.height = sensor, w, h
+        cam.sensor_w, cam.sensor_h = sensor_w, sensor_h
+        cam.width, cam.height = w, h
         self.sync_camera_lens()
         self.status_message.emit(
-            "{}: {} x {} ({:.3f}:1) on a {:.1f} mm film".format(
-                cam.name, w, h, cam.aspect, sensor))
+            "{}: {} x {} ({:.3f}:1) on a {:.1f} x {:.1f} mm film".format(
+                cam.name, w, h, cam.aspect, sensor_w, sensor_h))
         self.update()
         return True
 

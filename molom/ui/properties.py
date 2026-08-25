@@ -2049,8 +2049,10 @@ class CameraPage(QWidget):
         cam.projection = self.projection.currentData()
         cam.focal_mm = self.focal.value()
         cam.sensor_mm = self.sensor.value()
-        cam.width = self.width.value()
-        cam.height = self.height.value()
+        # `set_resolution`, not two assignments: the shot's SHAPE comes from
+        # the film (round 89), so typing a resolution has to reshape it or the
+        # picture keeps its old aspect while the pixel count changes.
+        cam.set_resolution(self.width.value(), self.height.value())
         cam.multiplier = self.multiplier.value()
         cam.frame_zoom = cameras.clamp_frame_zoom(
             self.frame_zoom.value() / 100.0)

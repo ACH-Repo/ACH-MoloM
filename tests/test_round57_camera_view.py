@@ -66,40 +66,45 @@ def test_dragging_a_handle_does_not_rescale_the_scene():
     just adjust the borders of the camera view." """
     cam = _cam()
     before = _content_scale(cam)
-    rect = cameras.frame_rect(800, 600, *cam.half_angles(), zoom=cam.frame_zoom)
+    rect = cameras.frame_rect(800, 600, cam.sensor_w, cam.sensor_h,
+                              zoom=cam.frame_zoom)
     for handle, dx, dy in (("se", 40.0, 25.0), ("nw", 30.0, 30.0),
                            ("e", -50.0, 0.0), ("n", 0.0, 20.0)):
-        sensor, w, h = cameras.resize_frame(handle, cam.focal_mm,
-                                            cam.sensor_mm, cam.width,
-                                            cam.height, dx, dy, rect)
-        cam.sensor_mm, cam.width, cam.height = sensor, w, h
-        assert _content_scale(cam) == pytest.approx(before, rel=1e-9)
+        sw, sh, w, h = cameras.resize_frame(handle, cam.sensor_w, cam.sensor_h,
+                                            cam.width, cam.height,
+                                            dx, dy, rect)
+        cam.sensor_w, cam.sensor_h, cam.width, cam.height = sw, sh, w, h
+        # EXACT now, not 1e-9-ish: round 89 draws the frame as the film at a
+        # fixed pixels-per-mm, so the sensor cancels out of the projection
+        # algebraically rather than nearly.
+        assert _content_scale(cam) == pytest.approx(before, rel=1e-12)
 
 
 def test_dragging_a_handle_moves_that_border():
     """It has to DO something: the shot gets wider or taller.
 
-    The other axis holds to a tenth of a percent rather than exactly, because
-    a resolution is whole pixels: `pixels_for_aspect` rounds, so the aspect —
-    and with it the vertical half-angle — is quantised. The scale of the
-    picture is not affected by that, which is why the test above can demand
-    1e-9 of it.
+    **The other axis holds EXACTLY** as of round 89. It used to hold only to
+    a tenth of a percent, because the vertical half-angle was the horizontal
+    one divided by the ASPECT and an aspect comes from whole pixels - so a
+    horizontal drag quantised the vertical framing. With a sensor per axis,
+    a horizontal drag does not touch `sensor_h` at all.
     """
     cam = _cam()
-    rect = cameras.frame_rect(800, 600, *cam.half_angles(), zoom=cam.frame_zoom)
+    rect = cameras.frame_rect(800, 600, cam.sensor_w, cam.sensor_h,
+                              zoom=cam.frame_zoom)
     tx0, ty0 = cam.half_angles()
 
-    sensor, w, h = cameras.resize_frame("e", cam.focal_mm, cam.sensor_mm,
+    sw, sh, w, h = cameras.resize_frame("e", cam.sensor_w, cam.sensor_h,
                                         cam.width, cam.height, 40.0, 0.0, rect)
-    tx, ty = cameras.half_angles(cam.focal_mm, sensor, w / h)
+    tx, ty = cameras.half_angles(cam.focal_mm, sw, sh)
     assert tx > tx0                              # wider
-    assert ty == pytest.approx(ty0, rel=2e-3)    # and no taller
+    assert ty == ty0                             # and EXACTLY no taller
 
-    sensor, w, h = cameras.resize_frame("s", cam.focal_mm, cam.sensor_mm,
+    sw, sh, w, h = cameras.resize_frame("s", cam.sensor_w, cam.sensor_h,
                                         cam.width, cam.height, 0.0, 30.0, rect)
-    tx, ty = cameras.half_angles(cam.focal_mm, sensor, w / h)
+    tx, ty = cameras.half_angles(cam.focal_mm, sw, sh)
     assert ty > ty0
-    assert tx == pytest.approx(tx0, rel=2e-3)
+    assert tx == tx0
 
 
 def test_dragging_never_inflates_the_resolution():
@@ -108,12 +113,12 @@ def test_dragging_never_inflates_the_resolution():
     ratcheted a 1x camera into a huge render."""
     cam = _cam(640, 360)
     for _ in range(40):
-        rect = cameras.frame_rect(800, 600, *cam.half_angles(),
+        rect = cameras.frame_rect(800, 600, cam.sensor_w, cam.sensor_h,
                                   zoom=cam.frame_zoom)
-        sensor, w, h = cameras.resize_frame("se", cam.focal_mm, cam.sensor_mm,
+        sw, sh, w, h = cameras.resize_frame("se", cam.sensor_w, cam.sensor_h,
                                             cam.width, cam.height,
                                             60.0, 40.0, rect)
-        cam.sensor_mm, cam.width, cam.height = sensor, w, h
+        cam.sensor_w, cam.sensor_h, cam.width, cam.height = sw, sh, w, h
     assert max(cam.width, cam.height) == 640
     assert cam.render_size() == (640, int(round(640 / cam.aspect)))
 

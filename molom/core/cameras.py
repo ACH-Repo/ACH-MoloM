@@ -57,20 +57,37 @@ MAX_FRAME_ZOOM = 20.0
 #: Room left round the frame at the default fit, for the drag handles.
 FRAME_FIT_MARGIN = 0.92
 
+#: The film size that `frame_zoom = 1` draws across the whole widget height.
+#: Only a unit for the frame's on-screen scale - it fixes what "zoom 1" means
+#: and cancels out of the projection entirely (see `frame_rect`).
+REFERENCE_SENSOR_MM = DEFAULT_SENSOR_MM
 
-def fov_y_degrees(focal_mm, sensor_mm=DEFAULT_SENSOR_MM, aspect=None):
-    """Vertical field of view for a lens on a sensor.
 
-    `sensor_mm` is the HORIZONTAL sensor size (Blender's default fit), so the
-    vertical one is scaled by the aspect ratio — otherwise a 16:9 camera and a
-    square one with the same lens would frame the same height, which is not
-    how a camera works.
+def fov_degrees(focal_mm, sensor_mm):
+    """Field of view for a lens on ONE sensor dimension.
+
+    **Per axis, with no aspect term** (round 89). The sensor used to be a
+    single HORIZONTAL number with the vertical one derived by dividing by the
+    aspect - which meant the aspect fed the vertical field of view, so
+    dragging a side handle changed how much of the scene you saw vertically.
+    Two independent sensor dimensions is what a film back actually is, and it
+    is Blender's own model (`sensor_fit` with `sensor_width`/`sensor_height`).
     """
     focal = max(float(focal_mm), 1e-6)
     sensor = max(float(sensor_mm), 1e-6)
+    return float(np.degrees(2.0 * np.arctan(0.5 * sensor / focal)))
+
+
+def fov_y_degrees(focal_mm, sensor_mm=DEFAULT_SENSOR_MM, aspect=None):
+    """Vertical field of view. Kept for the old signature.
+
+    `aspect` divides the sensor exactly as it used to, so a caller that still
+    passes a horizontal sensor and an aspect gets the same answer as before.
+    """
+    sensor = float(sensor_mm)
     if aspect and float(aspect) > 0:
         sensor = sensor / float(aspect)
-    return float(np.degrees(2.0 * np.arctan(0.5 * sensor / focal)))
+    return fov_degrees(focal_mm, sensor)
 
 
 def twist_rotation(rotation, roll):
@@ -89,6 +106,12 @@ def twist_rotation(rotation, roll):
     twist = np.array([[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]])
     return camera_mod.quat_normalize(
         camera_mod.quat_mul(camera_mod.quat_from_mat3(twist), q))
+
+
+def focal_for_fov(fov_deg, sensor_mm):
+    """The lens that gives `fov_deg` across a sensor dimension of `sensor_mm`."""
+    half = np.tan(np.radians(max(min(float(fov_deg), 179.0), 0.01)) / 2.0)
+    return float(0.5 * max(float(sensor_mm), 1e-6) / max(half, 1e-9))
 
 
 def focal_from_fov(fov_deg, sensor_mm=DEFAULT_SENSOR_MM, aspect=None):
@@ -123,7 +146,14 @@ class CameraObject(object):
         self.roll = 0.0
         self.projection = PERSPECTIVE
         self.focal_mm = DEFAULT_FOCAL_MM
-        self.sensor_mm = DEFAULT_SENSOR_MM
+        #: The film back, in mm, PER AXIS. Two numbers rather than one plus an
+        #: aspect: the aspect used to divide the sensor to get the vertical
+        #: field of view, so dragging a side handle changed the vertical
+        #: framing as well - the coupling that made K1's fix impossible to
+        #: state. Here a horizontal handle moves `sensor_w` and only `fov_x`,
+        #: which is what a wider film does.
+        self.sensor_w = DEFAULT_SENSOR_MM
+        self.sensor_h = DEFAULT_SENSOR_MM * DEFAULT_HEIGHT / float(DEFAULT_WIDTH)
         self.width = DEFAULT_WIDTH
         self.height = DEFAULT_HEIGHT
         self.multiplier = 1.0
@@ -133,12 +163,61 @@ class CameraObject(object):
     # ----------------------------------------------------------- geometry
     @property
     def aspect(self):
-        return float(self.width) / max(float(self.height), 1.0)
+        """The shot's shape, from the FILM. The pixels follow it (see
+        `set_sensor`), so the two cannot drift apart."""
+        return float(self.sensor_w) / max(float(self.sensor_h), 1e-6)
+
+    @property
+    def sensor_mm(self):
+        """The horizontal sensor size, under its old name.
+
+        The properties page and the Blender export both speak of one sensor
+        width, and that is still exactly what `sensor_w` is; setting it keeps
+        the film's SHAPE, so the old control still means what it did.
+        """
+        return float(self.sensor_w)
+
+    @sensor_mm.setter
+    def sensor_mm(self, value):
+        aspect = self.aspect
+        self.sensor_w = float(value)
+        self.sensor_h = float(value) / max(aspect, 1e-6)
+
+    def set_resolution(self, width, height):
+        """Set the pixel size AND reshape the film to match.
+
+        The shot's SHAPE comes from the film now (`aspect` is
+        `sensor_w / sensor_h`), so setting the resolution boxes alone would
+        change how many pixels the render has without changing what is in it -
+        a 500x1000 camera that still framed 16:9. Typing a resolution IS a
+        statement about the shape, so it reshapes the film; the horizontal
+        sensor is kept, exactly as `sensor_mm`'s setter does.
+        """
+        self.width = max(int(width), 1)
+        self.height = max(int(height), 1)
+        aspect = float(self.width) / float(self.height)
+        self.sensor_h = float(min(max(self.sensor_w / max(aspect, 1e-6),
+                                      MIN_SENSOR_MM), MAX_SENSOR_MM))
+        return self
+
+    def set_sensor(self, sensor_w, sensor_h):
+        """Set the film and bring the resolution to its shape."""
+        self.sensor_w = float(min(max(float(sensor_w), MIN_SENSOR_MM),
+                                  MAX_SENSOR_MM))
+        self.sensor_h = float(min(max(float(sensor_h), MIN_SENSOR_MM),
+                                  MAX_SENSOR_MM))
+        self.width, self.height = pixels_for_aspect(
+            self.width, self.height, self.aspect)
+
+    @property
+    def fov_x(self):
+        """Horizontal field of view in degrees."""
+        return fov_degrees(self.focal_mm, self.sensor_w)
 
     @property
     def fov_y(self):
         """Vertical field of view in degrees — what the projection wants."""
-        return fov_y_degrees(self.focal_mm, self.sensor_mm, self.aspect)
+        return fov_degrees(self.focal_mm, self.sensor_h)
 
     @property
     def orthographic(self):
@@ -164,14 +243,14 @@ class CameraObject(object):
 
     def half_angles(self):
         """`(tan(fov_x/2), tan(fov_y/2))` — where this shot's borders fall."""
-        return half_angles(self.focal_mm, self.sensor_mm, self.aspect)
+        return half_angles(self.focal_mm, self.sensor_w, self.sensor_h)
 
     def fit_frame(self, widget_w, widget_h, margin=FRAME_FIT_MARGIN):
         """Size the drawn frame to this viewport. Called when a camera is
         made and by "fit the frame" — never per draw, which is what made the
         frame's size depend on its own shape."""
-        tx, ty = self.half_angles()
-        self.frame_zoom = fit_frame_zoom(widget_w, widget_h, tx, ty, margin)
+        self.frame_zoom = fit_frame_zoom(widget_w, widget_h, self.sensor_w,
+                                         self.sensor_h, margin)
         return self.frame_zoom
 
     # -------------------------------------------------------- interchange
@@ -217,9 +296,14 @@ class CameraObject(object):
         self.projection = (ORTHOGRAPHIC if camera.orthographic
                            else PERSPECTIVE)
         if width and height:
+            # Capturing "place a camera here" takes the viewport's shape, so
+            # the FILM is reshaped to it before the lens is derived - the
+            # aspect comes from the film now, not from the pixels.
             self.width, self.height = int(width), int(height)
-        self.focal_mm = focal_from_fov(
-            float(getattr(camera, "FOV_Y", 40.0)), self.sensor_mm, self.aspect)
+            aspect = float(width) / max(float(height), 1e-6)
+            self.sensor_h = self.sensor_w / max(aspect, 1e-6)
+        self.focal_mm = focal_for_fov(
+            float(getattr(camera, "FOV_Y", 40.0)), self.sensor_h)
         return self
 
     # ------------------------------------------------------- persistence
@@ -232,7 +316,11 @@ class CameraObject(object):
             "rotation": [float(v) for v in self.rotation],
             "roll": float(self.roll), "projection": str(self.projection),
             "focal_mm": float(self.focal_mm),
-            "sensor_mm": float(self.sensor_mm),
+            # `sensor_mm` is still written, so a file made now still opens in
+            # an older MoloM with the same horizontal framing.
+            "sensor_mm": float(self.sensor_w),
+            "sensor_w": float(self.sensor_w),
+            "sensor_h": float(self.sensor_h),
             "width": int(self.width), "height": int(self.height),
             "multiplier": float(self.multiplier),
             "frame_zoom": float(self.frame_zoom),
@@ -252,9 +340,20 @@ class CameraObject(object):
                           if d.get("projection") in PROJECTIONS
                           else PERSPECTIVE)
         cam.focal_mm = float(d.get("focal_mm", DEFAULT_FOCAL_MM))
-        cam.sensor_mm = float(d.get("sensor_mm", DEFAULT_SENSOR_MM))
         cam.width = int(d.get("width", DEFAULT_WIDTH))
         cam.height = int(d.get("height", DEFAULT_HEIGHT))
+        # MIGRATION. A file written before round 89 has one horizontal
+        # `sensor_mm` and takes its aspect from the PIXELS, so the vertical
+        # sensor that reproduces its framing exactly is `sensor_mm / aspect`.
+        # Reading it any other way would silently re-frame every saved shot.
+        if d.get("sensor_h") is not None:
+            cam.sensor_w = float(d.get("sensor_w", DEFAULT_SENSOR_MM))
+            cam.sensor_h = float(d["sensor_h"])
+        else:
+            sensor = float(d.get("sensor_mm", DEFAULT_SENSOR_MM))
+            aspect = float(cam.width) / max(float(cam.height), 1e-6)
+            cam.sensor_w = sensor
+            cam.sensor_h = sensor / max(aspect, 1e-6)
         cam.multiplier = float(d.get("multiplier", 1.0))
         cam.frame_zoom = clamp_frame_zoom(d.get("frame_zoom", 1.0))
         return cam
@@ -279,60 +378,78 @@ def clamp_frame_zoom(value):
     return float(min(max(z, MIN_FRAME_ZOOM), MAX_FRAME_ZOOM))
 
 
-def half_angles(focal_mm, sensor_mm, aspect):
+def half_angles(focal_mm, sensor_w, sensor_h):
     """`(tan(fov_x/2), tan(fov_y/2))` for a lens on a film.
 
-    The sensor size is HORIZONTAL, so the horizontal half-angle is a property
-    of the lens and the film alone and the aspect only divides the vertical
-    one. Everything about the frame is expressed in these two numbers, because
-    they are what decides where its borders fall.
+    One term per axis and no aspect anywhere: each half-angle is that
+    dimension of the film over twice the focal length. These two numbers are
+    what the projection wants, and - since round 89 - NOT what decides how
+    big the frame is drawn (see `frame_rect`).
     """
     focal = max(float(focal_mm), 1e-6)
-    sensor = max(float(sensor_mm), 1e-6)
-    tx = 0.5 * sensor / focal
-    ty = tx / max(float(aspect), 1e-6)
+    tx = 0.5 * max(float(sensor_w), 1e-6) / focal
+    ty = 0.5 * max(float(sensor_h), 1e-6) / focal
     return float(tx), float(ty)
 
 
-def frame_rect(widget_w, widget_h, tx, ty, zoom=1.0):
+def frame_rect(widget_w, widget_h, sensor_w, sensor_h, zoom=1.0):
     """The camera's FILM back as a rectangle inside the viewport.
 
-    **The frame is ANGULAR, not fitted.** Its half-width is `Z * tx` and its
-    half-height `Z * ty`, where `Z = zoom * widget_h / 2` is a scale in pixels
-    per unit of tan-half-angle. That one decision is what round 57's first cut
-    got wrong, and everything Christian reported follows from it.
+    **THE FRAME IS A 2D WINDOW ON THE VIEWPORT.** Its height is `zoom *
+    widget_h` and its width that times the shot's `aspect`. Size is a pure
+    VIEWING choice (the wheel); shape is the film. **There is no lens term at
+    all**, and that absence is the whole of round 89.
 
-    It was fitted before — always the largest rectangle of the camera's aspect
-    that the window holds — and the projection was then widened so the
-    camera's field of view landed on it. So the moment a handle changed the
-    aspect, the fitted rectangle changed size, the field of view changed with
-    it, and the whole scene rescaled: "when I pull the corners, the camera
-    zooms out or is moved back. It shouldn't."
+    Round 57 fitted the frame to the window and widened the projection to
+    match, so a handle drag rescaled the scene - Christian's "when I pull the
+    corners, the camera zooms out". Round 58 fixed that by making the frame
+    ANGULAR, half-height `Z * tan(fov_y/2)`. That removed the handle's effect
+    on scale and removed the LENS's too: `viewport_fov_y` then divides by this
+    same rectangle, so `tan(fov_y/2)` cancelled exactly and the widget field
+    of view came out as `1/zoom` - measured at a constant 43.17 degrees from
+    24 mm to 200 mm, with the only apparent magnification being the render
+    cropping to a smaller box, which saturates.
 
-    Angular, it cannot: the on-screen scale of the scene works out to `Z /
-    distance`, with no `tx` or `ty` in it at all. Moving a border therefore
-    changes WHAT IS CAPTURED and nothing else, which is exactly "just adjust
-    the borders of the camera view", and the only thing that resizes the
-    picture is `zoom` — the wheel. Returns (x, y, w, h), centred.
+    Christian's own diagnosis is the fix: "dragging the handles [is] just
+    selecting a 2D window ... if I change focal length, then things should
+    just transition to more perspective or more orthographic ... that doesn't
+    change the camera view limits. It only changes the way the viewport
+    looks."
+
+    **So the rectangle IS THE FILM, drawn at `zoom` pixels per mm.** Both
+    dimensions are free and each follows its own sensor axis, which is what
+    makes a south drag move the bottom border rather than - as the first cut
+    of this did, with the height pinned to `zoom` and only the width following
+    the aspect - narrowing the frame instead.
+
+    Work the projection out from here and it comes to
+    `tan(widget_fov/2) = REFERENCE_SENSOR_MM / (2 * focal * zoom)`: the sensor
+    CANCELS, so a handle drag cannot rescale the scene, and the focal length
+    is the only thing that can. Both of Christian's requirements at once, and
+    neither arranged - they fall out of drawing the film at a fixed scale.
+    Returns (x, y, w, h), centred.
     """
     widget_h = max(float(widget_h), 1.0)
-    z = clamp_frame_zoom(zoom) * widget_h / 2.0
-    w = 2.0 * z * max(float(tx), 1e-6)
-    h = 2.0 * z * max(float(ty), 1e-6)
+    scale = clamp_frame_zoom(zoom) * widget_h / REFERENCE_SENSOR_MM
+    w = scale * max(float(sensor_w), 1e-6)
+    h = scale * max(float(sensor_h), 1e-6)
     return ((max(float(widget_w), 1.0) - w) / 2.0, (widget_h - h) / 2.0, w, h)
 
 
-def fit_frame_zoom(widget_w, widget_h, tx, ty, margin=FRAME_FIT_MARGIN):
+def fit_frame_zoom(widget_w, widget_h, sensor_w, sensor_h,
+                   margin=FRAME_FIT_MARGIN):
     """The zoom at which the frame just fits the widget.
 
     Used when a camera is CREATED, so a new one is framed sensibly, and by
     "fit the frame" — not on every draw, which is what made the frame's size
-    depend on its own shape.
+    depend on its own shape. Takes the FILM now: the frame's size is the film
+    at `zoom` pixels per mm, so fitting it involves no lens either.
     """
     widget_w = max(float(widget_w), 1.0)
     widget_h = max(float(widget_h), 1.0)
-    by_h = float(margin) / max(float(ty), 1e-6)
-    by_w = float(margin) * (widget_w / widget_h) / max(float(tx), 1e-6)
+    by_h = float(margin) * REFERENCE_SENSOR_MM / max(float(sensor_h), 1e-6)
+    by_w = (float(margin) * (widget_w / widget_h) * REFERENCE_SENSOR_MM
+            / max(float(sensor_w), 1e-6))
     return clamp_frame_zoom(min(by_h, by_w))
 
 
@@ -433,30 +550,31 @@ def resize_pixels(handle, width, height, dx, dy, rect):
     return pixels_for_aspect(width, height, aspect)
 
 
-def resize_frame(handle, focal_mm, sensor_mm, width, height, dx, dy, rect):
-    """New `(sensor_mm, width, height)` after dragging a frame handle.
+def resize_frame(handle, sensor_w, sensor_h, width, height, dx, dy, rect):
+    """New `(sensor_w, sensor_h, width, height)` after dragging a handle.
 
-    A handle moves a BORDER of the shot: what falls inside changes, and
-    nothing on screen rescales. Because the frame is angular (see
-    `frame_rect`), that means the drag changes the camera's half-angles —
-    horizontally by resizing the FILM, which is what the border of a film back
-    physically is, and vertically through the aspect, since the sensor size is
-    horizontal and the aspect is what divides it.
+    A handle moves a BORDER of the shot by resizing the FILM on that axis, and
+    only that axis - which is what the border of a film back physically is.
+    A horizontal drag changes `sensor_w` and therefore `fov_x` alone, so you
+    see more or less to the sides and the vertical framing does not move.
 
-    The resolution follows the aspect with the longer side pinned, so dragging
-    reshapes the shot and never inflates it. Round 57 had the handles driving
-    the pixel count directly AND a frame zoom, which is what produced both
-    "the camera zooms out" and a 6000x5000 Blender render from a camera whose
-    multiplier said 1.
+    That per-axis independence is the reason round 89 split the sensor in two.
+    With one horizontal sensor and a derived aspect, a side drag changed the
+    aspect, the aspect divided the sensor to give `fov_y`, and the vertical
+    field of view moved with it - so "the handles only move borders" could not
+    be made true at the same time as "the lens changes the magnification".
+
+    The resolution follows the film's shape with the longer side pinned, so
+    dragging reshapes the shot and never inflates it (round 58: a few corner
+    drags used to turn a 1x camera into a 6000x5000 Blender render).
     """
     scale_x, scale_y = handle_scales(handle, dx, dy, rect)
-    tx, ty = half_angles(focal_mm, sensor_mm,
-                         float(width) / max(float(height), 1e-6))
-    tx, ty = tx * scale_x, ty * scale_y
-    sensor = float(min(max(2.0 * float(focal_mm) * tx, MIN_SENSOR_MM),
-                       MAX_SENSOR_MM))
-    w, h = pixels_for_aspect(width, height, tx / max(ty, 1e-9))
-    return sensor, w, h
+    new_w = float(min(max(float(sensor_w) * scale_x, MIN_SENSOR_MM),
+                      MAX_SENSOR_MM))
+    new_h = float(min(max(float(sensor_h) * scale_y, MIN_SENSOR_MM),
+                      MAX_SENSOR_MM))
+    w, h = pixels_for_aspect(width, height, new_w / max(new_h, 1e-9))
+    return new_w, new_h, w, h
 
 
 def zoom_frame(zoom, steps, rate=1.15):
@@ -511,7 +629,7 @@ def gizmo_geometry(cam, size):
     right, up, back = rot[0], rot[1], rot[2]      # rows: the view basis
     forward = -back
     apex = np.asarray(cam.eye(), dtype=float)
-    tx, ty = half_angles(cam.focal_mm, cam.sensor_mm, cam.aspect)
+    tx, ty = cam.half_angles()
     depth = float(size)
     centre = apex + forward * depth
     hx, hy = right * (tx * depth), up * (ty * depth)

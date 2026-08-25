@@ -390,36 +390,14 @@ function-scoped now.
 
 ## K. The camera lens (round 88, measured but NOT fixed)
 
-**K1. THE FOCAL LENGTH DOES NOT CHANGE THE FOCAL LENGTH.** Christian, 2026-08-25.
-Measured on ferrocene through a camera:
+~~**K1. The focal length does not change the focal length.**~~ **FIXED, round
+89**, to Christian's own design: "dragging the handles [is] just selecting a
+2D window porting of the viewport... if I change focal length, then things
+should just transition to more perspective or more orthographic... that
+doesn't change the camera view limits."
 
-| focal | `cam.fov_y` | widget FOV | molecule span |
-|---|---|---|---|
-| 24 mm | 84.86 deg | **43.17** | 194 px |
-| 50 mm | 47.38 deg | **43.17** | 408 px |
-| 135 mm | 18.46 deg | **43.17** | 528 px |
-| 200 mm | 12.52 deg | **43.17** | 528 px |
-
-The camera's own field of view is computed correctly. The VIEWPORT's is
-constant, and the algebra says why in one line: `frame_rect` is ANGULAR - half
-height `Z*tan(fov_y/2)` - and `sync_camera_lens` then calls
-`viewport_fov_y(cam.fov_y, rect_h, widget_h)`, which divides by that same
-rectangle. **`tan(cam_fov_y/2)` cancels exactly**, leaving `1/zoom`. The
-apparent magnification is the render cropping to a frame that grew with the
-lens, and it SATURATES - 135 mm and 200 mm produce an identical 528 px span.
-It affects the OUTPUT, not just the preview.
-
-**Why it is not a two-line fix.** Round 58 made the frame angular deliberately,
-so that dragging a border could not rescale the scene (Christian's own
-report). A lens change SHOULD rescale, and the two pull against each other
-through the aspect: `fov_y` depends on both the focal length and the aspect,
-so any rule that makes the scene scale follow `fov_y` also makes a vertical
-handle drag rescale it, and any rule that makes it ignore `fov_y` makes the
-lens inert - which is where it is now.
-
-The shape of an answer: separate the two causes. The frame's on-screen SIZE
-should be a pure viewing property (`zoom`) and its SHAPE the camera's aspect;
-the widget FOV should follow the lens through a sensor-and-aspect-independent
-quantity, so that a handle drag changes the film (and therefore the framing
-and the resolution) while the lens alone changes the magnification. Worth
-deriving properly before writing, exactly as round 58 was.
+The frame is now THE FILM drawn at `zoom` pixels per mm, with a sensor per
+axis. `tan(widget_fov/2) = REFERENCE_SENSOR_MM / (2 * focal * zoom)` - the
+sensor cancels, so a handle cannot rescale the scene and the lens is the only
+thing that can. Measured: 24 mm to 200 mm is 8.33x magnification with the
+frame pixel-identical, and each handle moves its own border exactly.

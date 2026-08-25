@@ -377,7 +377,11 @@ def camera_object_setup(cam, name=""):
         "type": "ORTHO" if cam.orthographic else "PERSP",
         "angle_y": round(float(np.radians(cam.fov_y)), 8),
         "lens": round(float(cam.focal_mm), 4),
-        "sensor": round(float(cam.sensor_mm), 4),
+        # PER AXIS (round 89), and Blender takes both directly:
+        # `sensor_fit = "AUTO"` uses whichever is the larger, which is exactly
+        # what MoloM's own frame does, so the two agree with no conversion.
+        "sensor": round(float(cam.sensor_w), 4),
+        "sensor_h": round(float(cam.sensor_h), 4),
         "ortho_scale": round(float(2.0 * half_h), 6),
         "clip_start": round(max(float(cam.distance) * 0.005, 0.01), 6),
         "clip_end": round(float(cam.distance) * 20.0 + 100.0, 3),
@@ -868,8 +872,12 @@ def build_saved_cameras(coll):
         cam.matrix_world = Matrix(spec["matrix"])
         data.clip_start = spec["clip_start"]
         data.clip_end = spec["clip_end"]
-        data.sensor_fit = "HORIZONTAL"
+        # AUTO with both dimensions given: Blender then fits to the larger
+        # one, which is how MoloM's own frame is shaped, so a shot composed in
+        # the viewport arrives framed identically.
+        data.sensor_fit = "AUTO"
         data.sensor_width = spec["sensor"]
+        data.sensor_height = spec.get("sensor_h", spec["sensor"])
         if spec["type"] == "ORTHO":
             data.type = "ORTHO"
             data.ortho_scale = spec["ortho_scale"]
