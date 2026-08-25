@@ -843,21 +843,40 @@ class OutlinerPanel(QWidget):
         anything (Christian's screenshot). `_HiddenMarkDelegate` reads the
         role and overrides both palette entries instead.
         """
-        item.setData(0, ROLE_HIDDEN, True if obj.has_hidden else None)
-        # UNPHYSICAL is a separate mark from HIDDEN and they can both be on:
-        # hiding is a display choice (stripes), a stale attachment is a
-        # correctness warning (red). Round 32's reason for using a role rather
-        # than a brush applies to both - see `_HiddenMarkDelegate`.
-        stale = attach_mod.describe_stale(obj)
-        item.setData(0, ROLE_UNPHYSICAL, True if stale else None)
-        tips = []
-        if obj.has_hidden:
-            tips.append("{} of {} atoms hidden — tick the eye off and on, or "
-                        "Alt+H, to bring them back".format(
-                            len(obj.atom_hidden), obj.structure.n_atoms))
-        if stale:
-            tips.append(stale)
-        item.setToolTip(0, "\n".join(tips))
+        # THE WHOLE BODY IS GUARDED, and not for defensive tidiness. Every
+        # write here touches column 0 - two `setData` calls and a
+        # `setToolTip` - and each emits `itemChanged`, which
+        # `_on_item_changed` reads on an object row as a RENAME. So marking
+        # the hidden stripe emitted `renamed(1, 'cubane')`, the app re-synced
+        # the whole outliner in response, every QTreeWidgetItem was destroyed,
+        # and the next write in this method hit a dead one. Qt swallows that
+        # RuntimeError, so the visible symptom was not a crash:
+        # `refresh_row_controls` ABORTED partway, and with two molecules open
+        # hiding atoms in one left the other's stripe stale.
+        #
+        # Guarding only the two `setData` calls is NOT enough - `setToolTip`
+        # emits it as well, which is exactly the half the first fix missed:
+        # the exception went away (nothing writes after it) while the
+        # spurious rename and the mid-loop re-sync both remained.
+        was, self._loading = self._loading, True
+        try:
+            item.setData(0, ROLE_HIDDEN, True if obj.has_hidden else None)
+            # UNPHYSICAL is a separate mark from HIDDEN and they can both be
+            # on: hiding is a display choice (stripes), a stale attachment is
+            # a correctness warning (red). Round 32's reason for using a role
+            # rather than a brush applies to both - see `_HiddenMarkDelegate`.
+            stale = attach_mod.describe_stale(obj)
+            item.setData(0, ROLE_UNPHYSICAL, True if stale else None)
+            tips = []
+            if obj.has_hidden:
+                tips.append("{} of {} atoms hidden — tick the eye off and on, "
+                            "or Alt+H, to bring them back".format(
+                                len(obj.atom_hidden), obj.structure.n_atoms))
+            if stale:
+                tips.append(stale)
+            item.setToolTip(0, "\n".join(tips))
+        finally:
+            self._loading = was
 
     def _add_attachment_row(self, parent_item, obj):
         """The computed-layer tick boxes, ABOVE the element groups.
@@ -1098,8 +1117,12 @@ class OutlinerPanel(QWidget):
         for k in range(self.tree.topLevelItemCount()):
             item = self.tree.topLevelItem(k)
             obj = self._obj(item)
-            if obj is not None:
+            if obj is None:
+                continue
+            try:
                 self._mark_hidden(item, obj)
+            except RuntimeError:      # item destroyed by a re-sync mid-loop
+                break                 # the tree is being rebuilt; it will mark
 
     # --------------------------------------------------------- expand state
     #: What identifies a row across a `sync`, which throws every item away and

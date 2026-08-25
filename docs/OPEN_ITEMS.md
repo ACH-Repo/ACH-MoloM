@@ -163,15 +163,19 @@ the size of the modifier stack.
 multi-molecule arrangement helpers (align/snap — the maths is in OWB's
 `transform.py`, ready to port).
 
-**E1b. A flat element group of a few hundred atoms still costs ~70 ms to
-open** (round 86 measured 73 ms for 300 rows, down from 512 ms). That is the
-MOLECULE case only: a crystal now splits by site, so ferrocene's hundred
-carbons are five rows and 4.5 ms. The floor is one widget per row - 300 rows
-carrying a single bare `QWidget` each measured 14.5 ms - so the remaining
-cost is the five painted squares plus `setItemWidget`. Fixing it further means
-not creating a widget per row at all (a delegate that paints the squares
-directly into the tree), which is a bigger change than the one that bought the
-7x. Not worth it unless somebody hits it.
+**E1b. A flat element group of a few hundred atoms still costs ~1.5 s to
+open in a REAL window** (round 86: 3.0 s -> 1.5 s for 300 rows; the
+much-quoted 473 -> 73 ms was measured offscreen, where nothing paints, and
+understates it by about 20x). Refresh is the honest win at 178 -> 7 ms.
+
+That is the MOLECULE case only: a crystal now splits by site, so ferrocene's
+hundred carbons are five rows. The remaining cost is Qt laying out and
+painting a widget per row - 300 rows carrying a single bare `QWidget` each
+measured 14.5 ms offscreen, so the widget COUNT is no longer the driver;
+the painting is. Fixing it further means not creating a widget per row at all
+(a `QStyledItemDelegate` that paints the five squares straight into the tree
+and hit-tests in `editorEvent`), which is a real piece of work. Worth doing
+only if somebody actually hits it on a molecule - a crystal no longer does.
 
 **E2. Viewport:** depth-cue fog; numbered-frame outliner rows for trajectories.
 

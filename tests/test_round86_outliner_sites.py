@@ -294,3 +294,46 @@ def test_selected_atoms_never_repeats_an_atom(panel_with):
     site.child(0).setSelected(True)
     picks = panel.selected_atoms()
     assert len(picks) == len(set(picks)) == 20
+
+
+def test_marking_the_hidden_stripe_is_not_a_rename(panel_with):
+    """`setData` on column 0 emits `itemChanged`, and `_on_item_changed` reads
+    column 0 on an object row as a RENAME.
+
+    So marking the hidden stripe emitted `renamed(id, 'cubane')`, the app
+    re-synced the whole outliner in response, every QTreeWidgetItem was
+    destroyed, and the next `setData` in `_mark_hidden` hit a dead one. Qt
+    swallows that RuntimeError, so the visible symptom was not a crash but
+    `refresh_row_controls` ABORTING partway - with two molecules open, hiding
+    atoms in one left the other's stripe stale.
+
+    Predates round 86; found by running the round-86 manual checklist.
+    """
+    panel, _scene, obj = panel_with(_molecule(6))
+    renames = []
+    panel.renamed.connect(lambda oid, name: renames.append((oid, name)))
+    obj.atom_hidden.add(0)
+    panel._mark_hidden(panel.tree.topLevelItem(0), obj)
+    assert renames == [], "marking the stripe must not look like a rename"
+
+
+def test_refresh_marks_every_molecule_not_just_the_first(panel_with):
+    """The consequence of the above: the loop has to reach the end."""
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+    QApplication.instance() or QApplication([])
+    from molom.core.scene import Scene
+    from molom.ui.outliner import OutlinerPanel, ROLE_HIDDEN
+
+    scene = Scene()
+    a = scene.add(_molecule(5), name="a")
+    b = scene.add(_molecule(5), name="b")
+    panel = OutlinerPanel()
+    panel.sync(scene, a.id)
+    b.atom_hidden.add(0)
+    panel.refresh_row_controls()
+    rows = {panel._obj_id(panel.tree.topLevelItem(k)):
+            panel.tree.topLevelItem(k).data(0, ROLE_HIDDEN)
+            for k in range(panel.tree.topLevelItemCount())
+            if panel._kind(panel.tree.topLevelItem(k)) == "object"}
+    assert rows.get(b.id) is True, "the SECOND molecule's stripe was not marked"

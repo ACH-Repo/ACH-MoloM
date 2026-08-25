@@ -82,8 +82,14 @@ MOFs is a better real test.
 ## 3. Outliner — speed and the freeing
 
 - [ ] **3.1** Expand a big element group (your 300-oxygen case).
-      → Should feel immediate now. Measured 473 → 73 ms flat, and 4.5 ms when
-      it splits into sites.
+      → In a real window, **3.0 s → 1.5 s** for a flat 300-row group. Still
+      not instant: past the widget count, the cost is Qt laying out and
+      painting 300 rows, which no amount of making the row cheaper removes.
+      **The site tier is the actual answer** — a crystal splits 300 oxygens
+      into a handful of site rows, so you never build 300 at once.
+      (The 473 → 73 ms figures quoted earlier were measured OFFSCREEN, where
+      nothing paints. They understate the real cost by about 20x; the
+      *ratio* on refresh is the honest one, 178 → 7 ms.)
 
 - [ ] **3.2** Collapse it, then expand it again.
       → Must still open. **Watch for:** the expander arrow vanishing after a

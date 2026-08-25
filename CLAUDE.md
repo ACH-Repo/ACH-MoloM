@@ -230,11 +230,16 @@ QTreeWidget draws no expander arrow on an item with no children, so an emptied
 group would look like a leaf and could never be reopened). And **`RowControls`
 is ONE painted widget instead of five QToolButtons**: the squares were never
 anything but fixed rectangles with a letter in them, and hit-testing five
-rectangles is the one line that replaces seven widgets a row. Measured, 300
-atoms: expand **473 -> 73 ms**, refresh **190 -> 4.2 ms**, and after a collapse
-**0.4 ms**. With the site tier the same 300 atoms over 12 sites open in
-**4.5 ms**. The floor is one widget per row - 300 rows carrying a single bare
-QWidget cost 14.5 ms - so what is left is the widget, not the buttons.
+rectangles is the one line that replaces seven widgets a row. Measured OFFSCREEN, 300
+atoms: expand 473 -> 73 ms, refresh 190 -> 4.2 ms, and after a collapse 0.4 ms.
+**Those numbers understate the expand by about 20x and the checklist run
+caught it**: in a REAL SHOWN window the same 300 rows are **3.0 s -> 1.5 s**,
+because offscreen nothing paints. Refresh is the honest win either way,
+**178 -> 7 ms** in a real window. The remaining expand cost is Qt laying out
+and painting a widget per row rather than the widget count - a bare QWidget
+per row is 14.5 ms - so **the site tier is the real answer**, and it is a
+crystal one: ferrocene's hundred carbons are five rows, not a hundred. Lesson
+worth keeping: an offscreen timing is a fine A/B and a bad absolute.
 **(3) THE TREE AND THE VIEWPORT DISAGREED ABOUT WHAT WAS SELECTED.** The
 outliner emitted ONE atom on a click and nothing at all for a Ctrl or Shift
 range, so six rows could be highlighted in the tree while the viewport showed
@@ -349,7 +354,7 @@ wrong**: blocking the imports in-process is NOT a base install, because
 sweep reported pdb and mol reading fine when OpenBabel had simply read them
 in a child. Patch `io._read_with_openbabel` instead.
 **`python -m pytest tests/` is 1732 passed, 4 skipped in ~110 s again.**
-1738 tests.
+1740 tests.
 
 Round 85 (2026-08-25, the search finds the PURE compound - Christian's first
 real use of it):
@@ -3944,7 +3949,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1738 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1740 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -5177,6 +5182,22 @@ independent cross-check inside a single fixture.
   `shiboken6.delete` instead also works, right up until it destroys a window
   whose QMenu is separately in `topLevelWidgets()` - `isValid` still says that
   menu is live, and touching it is an access violation.
+- **SETTING ANYTHING ON COLUMN 0 OF A QTreeWidgetItem LOOKS LIKE A RENAME**
+  (round 86, found by running the manual checklist; it predates the round).
+  `setData` AND `setToolTip` both emit `itemChanged`, and `_on_item_changed`
+  reads column 0 on an object row as a rename - so `_mark_hidden` emitted
+  `renamed(1, 'cubane')`, the app re-synced the outliner, every item was
+  destroyed, and the next write in the same method hit a dead one. Qt swallows
+  that RuntimeError, so the symptom was not a crash: `refresh_row_controls`
+  ABORTED partway, and with two molecules open hiding atoms in one left the
+  other's stripe stale. Guard the WHOLE body with `_loading` - the first fix
+  covered only the two `setData` calls, which silenced the exception (nothing
+  writes after the tooltip) while leaving the spurious rename in place.
+- **AN OFFSCREEN TIMING IS A FINE A/B AND A BAD ABSOLUTE** (round 86). The
+  outliner's expand was reported as 473 -> 73 ms from an offscreen run; in a
+  real shown window the same 300 rows are 3.0 s -> 1.5 s, because offscreen
+  nothing paints. The improvement was real and the absolute was off by 20x.
+  Quote real-window numbers for anything a user waits on.
 - **A WORKER QThread MUST NOT BE A CHILD OF THE WIDGET THAT STARTED IT**
   (round 86). Destroying the widget destroys a running thread, which is an
   access violation with no Python traceback - it presents as the process
@@ -5453,7 +5474,7 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 1734 offline tests, 4 skipped, ~90 s.
+1. `python -m pytest tests/ -q` — 1736 offline tests, 4 skipped, ~105 s.
    `tests/conftest.py` sandboxes QSettings, so a GUI test can drive a real
    control without writing into your own MoloM configuration; it also
    **destroys the windows a test created** (round 86), without which the suite
