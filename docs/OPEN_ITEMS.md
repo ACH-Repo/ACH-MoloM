@@ -6,10 +6,11 @@ Struck-through items in CLAUDE.md are omitted; this is only what is left.
 
 Nothing here is urgent. It is an inventory, not a plan.
 
-**Since the sweep** (rounds 74-83, to 2026-08-24): **A1 is done** (round 80),
-**A5 is decided** (round 81) and **A4 is mostly done** (round 83) - the last
-two on the `crystal-overvalence` branch. Nothing else here was closed, and
-nothing was added to it. Rounds 74-76 were the MOPAC
+**Since the sweep** (rounds 74-85, to 2026-08-25): **A1 is done** (round 80),
+**A5 is decided** (round 81) and **A4 is mostly done** (round 83); rounds
+84-85 added the crystal search, which brings **section I** below. Everything
+from round 81 on is on the `crystal-overvalence` branch, awaiting Christian's
+testing. Nothing else here was closed. Rounds 74-76 were the MOPAC
 frequency reader, computed layers (`core/attachments.py`) and Christian's
 MOPAC batch; rounds 77-79 reworked the player - one duration per strip, a
 frame range that stays put, wall-clock playback, and a pane you can zoom and
@@ -164,6 +165,42 @@ zoom-to-cursor rather than zoom-to-centre.
 buffer updates during a grab instead of full rebuilds. Also worth re-measuring
 a real frame with a packed MOF on screen — round 50 fixed the biggest cost in
 the paint path, but it need not have been the only one.
+
+---
+
+## I. Crystal search (rounds 84-85, Ctrl+Shift+Alt+N)
+
+Christian, 2026-08-25, after using it: **"search for crystals is very nice now.
+only thing it really needs is..."** — so these two are the whole list, and
+both are about the RESULTS rather than about finding them.
+
+**I1. Remember the last search.** The dialog is constructed fresh every time,
+so reopening it gives an empty table and you retype the query you just ran.
+Keep the query text and the hits, restore them on open, and re-run only when
+asked. Two decisions to make first: where the memory lives (on `MainWindow`
+rather than a module global, so tests and a second window do not share it) and
+whether a restored result says how old it is — a stale list that looks live is
+worse than an empty one, and a COD entry can be superseded.
+
+**I2. Sort by clicking a column header**, ascending and descending — by
+temperature and year especially, which is exactly how you choose between
+determinations of the same compound.
+
+*Do not just call `setSortingEnabled(True)`.* `QTableWidgetItem` compares
+LEXICALLY, so a temperature column would order 100 K before 98 K and an empty
+cell would sort with the text. The fix is to give each cell its sort value
+with `setData(Qt.EditRole, number)` — Qt then compares numerically — and to
+decide deliberately where blanks go (COD leaves temperature and year null
+constantly, so "unknown" must not silently rank as zero). The score column
+should stay the default order, since ranking is the one thing the search
+itself is for.
+
+**I3. Related, raised while building it, NOT requested.** Unnamed COD entries
+all score 0.95 and are indistinguishable in the list — five candidates for
+nicotinic acid with nothing to choose between. Showing cell/Z/temperature more
+prominently helps a little; actually ranking them would mean fetching each and
+comparing connectivity against the resolved SMILES, which costs a download per
+candidate. Worth a decision before anyone spends that.
 
 ---
 

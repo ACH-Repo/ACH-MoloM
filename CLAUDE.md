@@ -250,6 +250,14 @@ they properly live and it is licensed with no free API.
 `dedupe` inside the COD provider, where it can collapse two differently-named
 entries that merely share a cell - and it cost the correctly-named one.
 Deduping belongs at the top level, across providers, which is where it was.
+**Christian's verdict after using it: "search for crystals is very nice now.
+only thing it really needs is to remember the results of the last search and
+sorting via clicking on the headers (like by temperature and year, ascending
+and descending)."** Both are recorded as **section I of
+`docs/OPEN_ITEMS.md`** and are the next thing to pick up. The header-sorting
+one has a trap worth reading before starting it: `QTableWidgetItem` compares
+LEXICALLY, so `setSortingEnabled(True)` alone would order 100 K before 98 K
+and sort COD's constant null temperatures and years as text.
 1700 tests.
 
 Round 84 (2026-08-24, finding a crystal without leaving MoloM -
