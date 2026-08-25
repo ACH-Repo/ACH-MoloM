@@ -1621,8 +1621,12 @@ class ImageExportDialog(QDialog):
         scale = int(self.scale.value())
         cam = self._vp.active_camera_object()
         if cam is not None:
-            width, height = cam.resolution
-            return int(width) * scale, int(height) * scale
+            # `render_size()`, not a `resolution` attribute - a CameraObject
+            # stores `width`/`height` and applies its own `multiplier`, and
+            # guessing the name is exactly how this shipped raising
+            # AttributeError the moment a camera was active.
+            width, height = cam.render_size()
+            return max(int(width) * scale, 1), max(int(height) * scale, 1)
         return (max(int(self._vp.width()) * scale, 1),
                 max(int(self._vp.height()) * scale, 1))
 

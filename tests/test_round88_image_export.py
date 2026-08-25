@@ -122,3 +122,52 @@ def test_asking_for_the_settings_again_keeps_the_last_ones(win):
     import inspect
     source = inspect.getsource(win.__class__.on_render_settings)
     assert "_render_target.pop" not in source
+
+
+# ------------------------------------------------- the camera branch
+def test_the_dialog_opens_while_looking_through_a_camera(win, tmp_path):
+    """It shipped raising `AttributeError: 'CameraObject' object has no
+    attribute 'resolution'` the moment a camera was active.
+
+    A CameraObject stores `width`/`height` and applies its own `multiplier`
+    through `render_size()`; the attribute name was GUESSED. Every test wrote
+    for this dialog drove it in the free view, so the camera branch had no
+    test at all - and it is not an exotic path, it is the one you are on
+    whenever you compose a shot. Christian hit it on the first try.
+    """
+    from molom.ui.dialogs import ImageExportDialog
+    win.on_place_camera()
+    cam = win.scene.cameras[-1]
+    win.on_activate_camera(cam.id)
+    assert win.viewport.active_camera_object() is cam
+
+    dlg = ImageExportDialog(win, win.viewport, path=str(tmp_path / "s.png"))
+    dlg.scale.setValue(1)
+    assert dlg.pixel_size() == cam.render_size()
+    assert "camera" in dlg.note.text().lower()
+
+
+def test_the_cameras_own_multiplier_is_carried(win, tmp_path):
+    """512x512 at 2x is a different statement from 1024x1024 (round 56), and
+    the export honours it - so the dialog has to show it."""
+    from molom.ui.dialogs import ImageExportDialog
+    win.on_place_camera()
+    cam = win.scene.cameras[-1]
+    win.on_activate_camera(cam.id)
+    cam.multiplier = 2.0
+    dlg = ImageExportDialog(win, win.viewport, path=str(tmp_path / "s.png"))
+    dlg.scale.setValue(1)
+    assert dlg.pixel_size() == cam.render_size() == (cam.width * 2,
+                                                     cam.height * 2)
+
+
+def test_export_image_runs_as_an_operator_with_a_camera_active(win,
+                                                               monkeypatch):
+    """The exact path from the traceback: `run_op("export_image")`."""
+    from PySide6.QtWidgets import QDialog
+    from molom.ui import dialogs
+    monkeypatch.setattr(dialogs.ImageExportDialog, "exec",
+                        lambda self: QDialog.Rejected)
+    win.on_place_camera()
+    win.on_activate_camera(win.scene.cameras[-1].id)
+    win.run_op("export_image")          # must not raise
