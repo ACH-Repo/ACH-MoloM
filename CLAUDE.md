@@ -198,6 +198,111 @@ other side, and the two export fixes are verified in `tools/smoke_gui.py`
 instead, which now measures the crop and counts ink with and without the cell
 box. 1310 tests.
 
+Round 85 (2026-08-25, the search finds the PURE compound - Christian's first
+real use of it):
+"Searching for the typical acids I use (benzoic acid, nicotinic acid,
+terephthalic acid) and even simple stuff like DMSO never show a hit for the
+pure chemical. It is always some derivative or co-crystallized stuff. Also, I
+think I never get other sources than COD."
+**(1) COD'S NAMES CANNOT FIND A PURE COMPOUND, and the numbers are stark.** A
+text search for "benzoic acid" returns **2617 rows**, of which exactly ONE has
+`chemname` equal to "benzoic acid" - and the pure compound's own entries are
+spelled **"benzioc acid"** with `chemname` null. So every hit was a derivative
+or a co-crystal whose name happened to contain the phrase, and round 84's
+parse ceiling was reading 500 of those 2617 in COD's file-id order.
+**The fix is a formula, because a formula is not a spelling and cannot be
+mistyped into invisibility.** `resolve_formula` puts the query through
+`core/resolve.py` - OPSIN, PubChem, CACTUS, the same cascade Ctrl+Shift+N uses
+- and COD is then asked by formula AND by text, because the two answer
+different questions (the formula finds the pure compound; the text index finds
+the mineral names and co-crystals a formula cannot express). "Benzoic acid"
+and "Dimethyl sulfoxide" come up first now, and "quartz" resolves to O2Si as a
+bonus.
+**(2) "DMSO" WAS A SEPARATE BUG AND A GOOD ONE.** `formula_key("DMSO")` split
+it into D, M, S, O - all of which LOOK like element symbols, two of which are
+not - so it parsed as a formula, the resolver was never consulted, and COD was
+asked for a compound of deuterium and "M". That is why "DMSO" found NOTHING
+while "dimethylsulfoxide" found co-crystals. Every token is checked against
+the element table now.
+**(3) AND A RANKING BUG THAT MADE TEREPHTHALIC AND NICOTINIC ACID UNFINDABLE
+EVEN BY FORMULA.** COD leaves many entries unnamed - 5 of its 7 C6H5NO2 rows
+have no name at all - and the scoring rewarded weak name similarity, so a
+WRONGLY named isomer ("2-pyridinecarboxylic acid", fuzzy 0.5) outranked an
+unnamed entry that was probably the compound wanted. The rule now: **a name
+that matches is evidence FOR, a name that clearly denotes something else is
+evidence AGAINST, and an ABSENT name is neither.** Unnamed sits between the
+two at 0.95.
+**Verified structurally rather than assumed**: the top unnamed C8H6O4 hit was
+fetched and its connectivity perceived - all eight carbons 3-coordinate, an
+aromatic ring plus two carboxyls, i.e. **COD 4130843 IS terephthalic acid**,
+unnamed in COD's own index and now ranked first. The bicyclic anhydride it was
+losing to would have sp3 carbons.
+**(4) "NEVER OTHER SOURCES THAN COD" HAS AN HONEST HALF AND A FIXABLE HALF.**
+The fixable half: OPTIMADE only accepts a FORMULA - the standard describes
+structures, not literature - so a NAME query never reached it at all;
+resolving names fixes that, and DMSO now returns an OQMD hit. The honest half:
+MP and OQMD are inorganic/materials DFT databases, measured at **0 hits for
+C7H6O2 and 1 for C2H6OS against 50 for SiO2 and 94 for TiO2**. For molecular
+organic crystals they have essentially nothing, and that is what they ARE
+rather than a fault. COD is the free source for organics; the CSD is where
+they properly live and it is licensed with no free API.
+**A mistake of my own, caught by a test I had already written**: round 84 put
+`dedupe` inside the COD provider, where it can collapse two differently-named
+entries that merely share a cell - and it cost the correctly-named one.
+Deduping belongs at the top level, across providers, which is where it was.
+1700 tests.
+
+Round 84 (2026-08-24, finding a crystal without leaving MoloM -
+`core/cifsearch.py`, Ctrl+Shift+Alt+N):
+Christian: "Searching the COD by hand is a pain... a tiered search algorithm
+that doesn't die or stall if a single tier doesn't work right away and that
+allows for fuzzy string matching and selection of multiple options found."
+**A CRYSTAL SEARCH IS NOT A NAME RESOLUTION, and that is the whole design.**
+`core/resolve.py` turns a molecule's name into ONE structure, so its tiers are
+a CASCADE: the first that answers wins. A crystal name maps to MANY - a dozen
+determinations of quartz, polymorphs, temperatures, redeterminations - so the
+question is not "which service knows this?" but "show me the candidates". The
+tiers therefore run CONCURRENTLY and their results are merged, deduped and
+ranked here rather than by the providers, who disagree about what matching
+means and half of whom do not fuzzy-match at all.
+**CALLING THEM FOR REAL FOUND FIVE BUGS, and not one was findable by reading.**
+This is round 37's and round 73's rule paying out again.
+(1) **COD writes its formulae as `- O2 Si -`.** The leading dash made
+`formula_key` bail, so every COD hit scored as a NAME match rather than as the
+exact chemical identity it is. (2) **Materials Project's
+`chemical_formula_descriptive` is the whole CELL's** - `O96Si48` for a silica -
+so it never canonicalised to the query, every MP hit fell below `MIN_SCORE`,
+and the tier returned nothing while saying nothing. (3) **COD's own OPTIMADE
+endpoint answers 501**, so listing it - which was the plan, and Christian's -
+would have put a guaranteed failure line in every single search. Removing it
+changes the story honestly: **OPTIMADE is the COMPUTED tier and COD is the
+EXPERIMENTAL one**, so a hit carries `computed` and the dialog says "(calc)",
+because a DFT-relaxed cell is not a measurement. (4) **A substring test scored
+"Ferrocenecarboxylic anhydride" exactly as highly as a file called
+ferrocene**, both containing the query; the discriminator is whether the query
+is a whole WORD. (5) Found by measuring rather than calling: **COD returns its
+rows in file-id order**, and parsing 60 of 247 before ranking picked the
+shortlist at random - ranking first moved "quartz" from `Quartz low` (1939) to
+an exact `Quartz` (2008).
+**OPTIMADE SERVES JSON, NOT CIF**, so without `optimade_cif` the computed tier
+could be searched and not imported - half a feature. It writes a minimal P1
+CIF (P1 because OPTIMADE gives the whole cell contents, so claiming any other
+group would be inventing symmetry - round 52), which means all three tiers
+hand MoloM the same thing and there is ONE import path. Verified by parsing
+the output with MoloM's own reader: an MP silica round-trips to 144 sites.
+**A download takes the SAME path a file on disk does** - written to a temp
+file and opened - so the packed import, the disorder policy, the symmetry
+derivation and every report ride along. A second, subtly different import path
+for downloaded structures is exactly the drift this project keeps finding. The
+temp file goes in a temp DIRECTORY with a real name in it, because the import
+names an object after its file and `mkstemp` put `molom_d2dtna96` in the
+outliner.
+**The local tier is blank by default and stays blank**: there is no sensible
+guess at where somebody keeps their CIFs and a wrong default would silently
+search the wrong tree. Settable from F3 and from App > Settings, both.
+41 tests, every one OFFLINE through an injectable `fetch` - but every payload
+in them captured from the live services rather than written from memory.
+
 Round 83 (2026-08-24, the occupancy pie spheres - open item A4, and it was
 ONE bug wearing a disguise):
 Christian: "Pie occupation spheres still only work for certain sites. They are
@@ -3678,7 +3783,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1659 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1700 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -3913,6 +4018,15 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
 - `core/selection2d.py` — project_points + rect/polygon containment (box &
   lasso). `core/grid.py` — grid colour constants + fade distance (the grid
   itself is a shader in viewport.py since round 3).
+- `core/cifsearch.py` — finding a CRYSTAL by formula, mineral or name, and
+  importing it (Ctrl+Shift+Alt+N). Three tiers - a local folder, COD, and
+  OPTIMADE's computed providers - run CONCURRENTLY, because unlike a molecule
+  name a crystal name has many right answers and every tier may hold part of
+  the set. Ranking, deduping and fuzzy matching are done here, not by the
+  providers. Read the module docstring before changing a tier: the failure
+  model (a dead tier costs a tier, never the answer) is round 37's lesson and
+  is the whole point. `optimade_cif` exists because OPTIMADE serves JSON, and
+  writing a P1 CIF keeps ONE import path for all three tiers.
 - `core/resolve.py` — vendored OWB name resolver (OPSIN → PubChem PUG-REST →
   autocomplete; injectable `get` for offline tests).
 - `ui/viewport.py` — QOpenGLWidget, GL 3.3 core, **instanced** rendering:
@@ -4856,6 +4970,31 @@ independent cross-check inside a single fixture.
   FULL RUN — passing alone, which is the signature of shared state and the
   same shape as the round-37 circuit breaker and the round-46 module cache.
   `tests/conftest.py::_fresh_settings` clears it after every test.
+- **A DATABASE'S NAMES ARE NOT A SEARCH INDEX** (round 85). COD returns 2617
+  rows for "benzoic acid" and exactly ONE is named that; the pure compound's
+  own entries are spelled "benzioc acid" with no chemname. Search a NAME by
+  resolving it to a FORMULA - a formula cannot be mistyped into invisibility -
+  and keep the text search alongside for what a formula cannot express.
+- **AN ABSENT NAME IS NOT EVIDENCE AGAINST** (round 85). Ranking rewarded weak
+  name similarity, so a wrongly-named isomer outranked an unnamed entry that
+  was the compound being looked for - and COD leaves most entries unnamed. A
+  matching name is evidence for, a clearly different one is evidence against,
+  a missing one is neither.
+- **AN ACRONYM CAN PARSE AS A FORMULA** (round 85). "DMSO" splits into D, M,
+  S, O, all of which look like element symbols. Check every token against the
+  element table, or the name resolver is silently never consulted.
+- **AN API YOU HAVE NOT CALLED IS AN API YOU HAVE GUESSED AT** (round 84).
+  Five bugs in `core/cifsearch.py` were found by calling COD, Materials
+  Project and OQMD for real, and none of them was findable by reading: COD
+  wraps its formulae in dashes, MP's descriptive formula is the whole cell,
+  COD's OPTIMADE endpoint answers 501, a substring test cannot tell
+  "ferrocene" from "Ferrocenecarboxylic anhydride", and COD returns rows in
+  file-id order so truncating before ranking picks the shortlist at random.
+  Two of those failed SILENTLY - the tier returned nothing and said nothing.
+- **A SEARCH IS NOT A RESOLUTION** (round 84). `resolve` cascades because a
+  molecule name has one answer; `cifsearch` fans out because a crystal name
+  has many, and every tier may hold part of the answer. Cascading would also
+  hide an instant local hit behind a slow remote one.
 - **A MAP KEYED BY INDEX CAN BE OVERWRITTEN BY ONE THAT MEANS SOMETHING ELSE**
   (round 83). `packing.pack`'s `site_occupancy` is keyed by DRAWN index;
   `expand(boundary=False)`'s is keyed by CONTENT index. Two callers assigned

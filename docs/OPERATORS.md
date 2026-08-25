@@ -44,6 +44,8 @@ toggle.
 | **Save project (savepoint `.molom`)** — every molecule with its name, visibility, style, object origin/frame, bond orders and trajectory frames, plus the camera and view settings | Ctrl+S | scene not empty |
 | **Save project as...** | Ctrl+Shift+P | scene not empty |
 | Import molecule by name... (OPSIN → PubChem) | Ctrl+Shift+N | — |
+| **Find a crystal structure...** — COD, OPTIMADE and a folder of your own, searched at once | **Ctrl+Shift+Alt+N** | — |
+| Crystal search: set the local CIF folder... | F3 / Settings | — |
 | New from SMILES... (dots split into separate molecules) | Ctrl+N | — |
 | Paste XYZ / SMILES | Ctrl+V | — |
 
@@ -737,6 +739,58 @@ remembered, so the next rebuild does not put it straight back.
 Setting **Duration** never re-bakes anything either — a mode's sample count is
 the vibrations page's *Frames / period*, and a playback length must not
 quietly mutate a molecule and push an undo step.
+
+## Finding a crystal structure (Ctrl+Shift+Alt+N)
+Type a formula, a mineral name or a chemical name; pick one or more results;
+import. **Multi-select is the point** — comparing two polymorphs side by side
+is the commonest reason to go looking.
+
+**Why this is a different dialog from Import-by-name.** Resolving a molecule
+NAME gives one answer, so that dialog shows a resolution and an Import button.
+A crystal name gives many — polymorphs, temperatures, redeterminations, a
+dozen determinations of quartz — so this one is a list you choose from.
+
+| Tier | Covers | Notes |
+|---|---|---|
+| **Local folder** | your own `.cif` files | blank until you set it (F3, or Settings ▸ Local CIF folder). Indexed from the header only, and sub-folders are included. A structure you already have needs no network and sorts first |
+| **COD** | experimental determinations | formula *and* a text index, so mineral and chemical names work |
+| **OPTIMADE** | Materials Project, OQMD | formula only — the standard describes structures, not literature, so there is no name to match. These are **computed** structures and are marked `(calc)`: a DFT-relaxed cell is not a measurement |
+
+The three run **at the same time**, not as a cascade, and a provider that is
+slow, down or speaks a dialect costs that provider and nothing else — the
+dialog names what did not answer, because "Materials Project did not answer"
+is something you can act on and "1 source failed" is not.
+
+**A chemical NAME is resolved to a FORMULA first**, through the same
+OPSIN → PubChem → CACTUS cascade Ctrl+Shift+N uses, and COD is then asked by
+formula *and* by text. This is what makes a search for "benzoic acid" find
+benzoic acid: COD returns 2617 rows for that text and exactly **one** is named
+it — the pure compound's own entries are spelled "benzioc acid" with no
+chemname at all, so every hit was a derivative. A formula cannot be mistyped
+into invisibility. The summary says what it searched as.
+
+It also makes OPTIMADE reachable from a name query, since the standard
+describes structures rather than literature and can only be asked for a
+formula. Be aware what is on the other end, though: **Materials Project and
+OQMD are computed inorganic databases** — 0 hits for C₇H₆O₂ against 50 for
+SiO₂ — so for molecular organics COD is effectively the only free source. The
+CSD is where those live, and it is licensed.
+
+**Ranking** is done here rather than by the providers. An exact formula
+outranks any name similarity, because a canonical formula is a chemical
+identity and not a spelling — `TiO2` and `O2Ti` are one key. Below that,
+matching a whole WORD beats matching a prefix, which is what separates
+"ferrocene" from "Ferrocenecarboxylic anhydride". Within a formula match the
+name breaks ties — C₈H₆O₄ is terephthalic acid *and* five other things — but
+only a name that really matches: **an absent name is not evidence against**,
+and COD leaves most of its entries unnamed, so a wrongly-named isomer used to
+outrank the compound you were actually looking for. The same entry served by two
+providers is collapsed (the local copy wins); a redetermination — same formula
+and space group, a cell differing in the third decimal — survives as its own
+row, because that is exactly what you are choosing between.
+
+Imports go through the ordinary file path, so the packing, the disorder policy
+and the symmetry derivation all apply exactly as they do to a file on disk.
 
 ## Measure
 The 📏 toolbar tool. Click **2** atoms for a distance, **3** for an angle

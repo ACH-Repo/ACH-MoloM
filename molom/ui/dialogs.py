@@ -8,16 +8,20 @@ from typing import Optional
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog,
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox,
+                               QDialog,
                                QDialogButtonBox, QDoubleSpinBox, QFileDialog,
                                QFormLayout,
-                               QFrame, QHBoxLayout, QLabel, QLineEdit,
+                               QFrame, QHBoxLayout, QHeaderView, QLabel,
+                               QLineEdit,
                                QListWidget, QListWidgetItem, QPushButton,
-                               QScrollArea, QSlider, QSpinBox, QVBoxLayout,
+                               QScrollArea, QSlider, QSpinBox,
+                               QTableWidget, QTableWidgetItem, QVBoxLayout,
                                QWidget)
 
 from ..core import blender_export as bx
 from ..core import cif as cif_mod
+from ..core import cifsearch
 from ..core import flight, input_map
 from ..core import style as style_mod
 from .widgets import make_text_selectable
@@ -32,6 +36,7 @@ class SettingsDialog(QDialog):
                  render_crop=False,
                  input_preset=input_map.PRESET_AUTO, label_scale=1.0,
                  disorder_policy=None, sg_convention=None,
+                 cif_search_root="",
                  on_speed_change=None, on_atom_scale_change=None,
                  on_label_scale_change=None, flight_tuning=None,
                  on_flight_change=None):
@@ -162,6 +167,30 @@ class SettingsDialog(QDialog):
             "which usually means a framework without its disordered guest. "
             "Applies to the NEXT file opened.")
         form.addRow("CIF disorder:", self.disorder_combo)
+
+        # Where the crystal search also looks. Blank by default and stays
+        # blank: there is no sensible guess at where somebody keeps their CIF
+        # collection, and a wrong default would silently search the wrong
+        # tree. The remote tiers work with nothing set.
+        self.cif_root_edit = QLineEdit(cif_search_root or "")
+        self.cif_root_edit.setPlaceholderText("(none - remote sources only)")
+        self.cif_root_edit.setToolTip(
+            "A folder of .cif files that Ctrl+Shift+Alt+N searches alongside "
+            "COD and OPTIMADE. Sub-folders are included. A structure you "
+            "already have needs no network and is listed first, so this is "
+            "worth setting even for a small collection.")
+        browse = QPushButton("Browse...")
+        browse.clicked.connect(self._pick_cif_root)
+        clear = QPushButton("Clear")
+        clear.clicked.connect(lambda _c=False: self.cif_root_edit.setText(""))
+        root_row = QHBoxLayout()
+        root_row.setContentsMargins(0, 0, 0, 0)
+        root_row.addWidget(self.cif_root_edit, 1)
+        root_row.addWidget(browse, 0)
+        root_row.addWidget(clear, 0)
+        root_holder = QWidget()
+        root_holder.setLayout(root_row)
+        form.addRow("Local CIF folder:", root_holder)
 
         from ..core import spacegroups as _sg
         self.sg_convention_combo = QComboBox()
@@ -480,6 +509,17 @@ class SettingsDialog(QDialog):
     def start_maximized(self):
         return self.maximized_check.isChecked()
 
+
+    def _pick_cif_root(self, _checked=False):
+        path = QFileDialog.getExistingDirectory(
+            self, "Folder of CIF files to search",
+            self.cif_root_edit.text().strip())
+        if path:
+            self.cif_root_edit.setText(path)
+
+    def cif_search_root(self):
+        # type: () -> str
+        return self.cif_root_edit.text().strip()
 
 class BlenderExportDialog(QDialog):
     """Pre-configure the Blender scene before writing the script.
@@ -1541,3 +1581,155 @@ class AnimationExportDialog(QDialog):
                 "transparent": (self.transparent.isChecked()
                                 and fmt != self._anim.FORMAT_MP4),
                 "increment": self.increment.isChecked()}
+
+
+class _CifSearchWorker(QThread):
+    """One search, off the GUI thread.
+
+    Three providers with an 8 s budget each cannot run on the main thread -
+    and the whole point of `cifsearch.search` is that it returns even when a
+    provider does not, so the worker only has to carry the result across.
+    """
+
+    done = Signal(object)
+
+    def __init__(self, query, roots, parent=None):
+        super().__init__(parent)
+        self._query = query
+        self._roots = list(roots or [])
+
+    def run(self):
+        try:
+            result = cifsearch.search(self._query, roots=self._roots)
+        except Exception as exc:                    # noqa: BLE001
+            result = cifsearch.Results(
+                self._query, trouble=["search failed: {}".format(exc)])
+        self.done.emit(result)
+
+
+class CifSearchDialog(QDialog):
+    """Find a crystal structure and import it (Ctrl+Shift+Alt+N).
+
+    Deliberately NOT modelled on `ResolveNameDialog`, and the difference is
+    the whole reason this is its own dialog: resolving a molecule NAME gives
+    one answer, so that dialog shows a resolution and an Import button. A
+    crystal name gives many - polymorphs, temperatures, redeterminations, a
+    dozen determinations of quartz - so this one is a LIST you choose from,
+    and it is multi-select because comparing two polymorphs side by side is
+    the commonest reason to go looking in the first place.
+
+    The columns are what a person actually chooses by: what it is, which
+    polymorph, what symmetry, measured or computed, and how recent.
+    """
+
+    COLUMNS = ("Formula", "Name / mineral", "Space group", "T / K", "Year",
+               "Source")
+
+    def __init__(self, parent, roots=()):
+        super().__init__(parent)
+        self.setWindowTitle("Find a crystal structure")
+        self.hits = []            # type: list
+        self.chosen = []          # type: list
+        self._roots = list(roots or [])
+        self._worker = None
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Formula, mineral or chemical name:"))
+        self.edit = QLineEdit(self)
+        self.edit.setPlaceholderText("SiO2    quartz    TiO2    ferrocene")
+        lay.addWidget(self.edit)
+
+        self.table = QTableWidget(0, len(self.COLUMNS), self)
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        # MULTI-select: two polymorphs side by side is the point.
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.itemSelectionChanged.connect(self._selection_changed)
+        self.table.doubleClicked.connect(self._take_one)
+        lay.addWidget(self.table, 1)
+
+        self.info = QLabel("")
+        self.info.setWordWrap(True)
+        lay.addWidget(self.info)
+
+        row = QHBoxLayout()
+        self.search_btn = QPushButton("Search")
+        self.ok_btn = QPushButton("Import selected")
+        self.ok_btn.setEnabled(False)
+        cancel = QPushButton("Cancel")
+        row.addWidget(self.search_btn)
+        row.addStretch(1)
+        row.addWidget(self.ok_btn)
+        row.addWidget(cancel)
+        lay.addLayout(row)
+        self.search_btn.clicked.connect(self._start)
+        self.edit.returnPressed.connect(self._start)
+        self.ok_btn.clicked.connect(self.accept)
+        cancel.clicked.connect(self.reject)
+        make_text_selectable(self)
+        self.resize(780, 470)
+
+    # ------------------------------------------------------------ searching
+    def _start(self):
+        query = self.edit.text().strip()
+        if not query or self._worker is not None:
+            return
+        self.search_btn.setEnabled(False)
+        self.info.setText("Searching {!r}...".format(query))
+        self.table.setRowCount(0)
+        self._worker = _CifSearchWorker(query, self._roots, self)
+        self._worker.done.connect(self._finished)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._worker.start()
+
+    def _finished(self, result):
+        self._worker = None
+        self.search_btn.setEnabled(True)
+        self.hits = list(result.hits)
+        self._fill()
+        text = result.summary()
+        if result.trouble:
+            # NAMED, not counted. "Materials Project did not answer" is
+            # something a user can act on; "1 source failed" is not.
+            text += "\n" + "; ".join(result.trouble[:3])
+        self.info.setText(text)
+
+    def _fill(self):
+        self.table.setRowCount(len(self.hits))
+        for row, hit in enumerate(self.hits):
+            source = ("on disk" if hit.source == cifsearch.SOURCE_LOCAL
+                      else (hit.note.split()[0] if hit.note else hit.source))
+            cells = (hit.formula,
+                     hit.mineral or hit.name,
+                     hit.spacegroup,
+                     "" if hit.temperature is None
+                     else "{:g}".format(float(hit.temperature)),
+                     "" if not hit.year else str(hit.year),
+                     source + (" (calc)" if hit.computed else ""))
+            for column, value in enumerate(cells):
+                item = QTableWidgetItem(str(value))
+                if hit.computed:
+                    # A DFT-relaxed cell is not a measurement, and which kind
+                    # you are looking at must be visible at a glance.
+                    item.setForeground(QColor(150, 170, 210))
+                item.setToolTip(hit.note or str(hit.ref))
+                self.table.setItem(row, column, item)
+        self.table.resizeColumnsToContents()
+        self.table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.Stretch)
+
+    # ------------------------------------------------------------- choosing
+    def _selected_rows(self):
+        return sorted({i.row() for i in self.table.selectedIndexes()})
+
+    def _selection_changed(self):
+        self.chosen = [self.hits[r] for r in self._selected_rows()
+                       if 0 <= r < len(self.hits)]
+        self.ok_btn.setEnabled(bool(self.chosen))
+
+    def _take_one(self, index):
+        row = index.row()
+        if 0 <= row < len(self.hits):
+            self.chosen = [self.hits[row]]
+            self.accept()

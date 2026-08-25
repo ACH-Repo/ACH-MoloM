@@ -39,6 +39,7 @@ from ..core import spacegroups
 from ..core import templates as tpl_mod
 from ..core import vibrations as vib_mod
 from ..core import timeline as timeline_mod
+from ..core import cifsearch
 from ..core import meta as meta_mod
 from ..core.camera import quat_from_mat3, quat_to_mat3
 from ..core import ops as ops_mod
@@ -52,6 +53,7 @@ from .choice_popup import ChoicePopup
 from .dialogs import (AnimationExportDialog, BlenderExportDialog,
                       MetaAtomDialog,
                       SiteOccupancyDialog,
+                      CifSearchDialog,
                       OperatorSearchDialog, ResolveNameDialog, SettingsDialog)
 from .crystal_ribbon import CrystalRibbon
 from .optimize_panel import OptimizeDock, OptimizeWorker, TASK_SELECTION
@@ -525,6 +527,13 @@ class MainWindow(QMainWindow):
         r("import_name", "Import molecule by name...",
           lambda c: c.on_import_by_name(), category="File",
           shortcut="Ctrl+Shift+N", key="Ctrl+Shift+N")
+        r("search_cif", "Find a crystal structure (COD / OPTIMADE)...",
+          lambda c: c.on_search_cif(), category="File",
+          shortcut="Ctrl+Shift+Alt+N", key="Ctrl+Shift+Alt+N",
+          aliases=("cif", "crystal", "cod", "optimade", "search", "download"))
+        r("set_cif_folder", "Crystal search: set the local CIF folder...",
+          lambda c: c.on_set_cif_folder(), category="File",
+          aliases=("cif", "folder", "directory", "local"))
         r("from_smiles", "Add molecule from SMILES...",
           lambda c: c.on_from_smiles(), category="File",
           shortcut="File menu / F3")
@@ -3987,6 +3996,67 @@ class MainWindow(QMainWindow):
         self._install_smiles_batch([(res.smiles, res.query)],
                                    res.source or "resolved by name")
 
+    def on_search_cif(self):
+        """Find a crystal structure by formula, mineral or name, and import
+        the ones chosen. Several at once: comparing two polymorphs is the
+        commonest reason to go looking."""
+        dlg = CifSearchDialog(self, roots=self.cif_search_roots())
+        if not dlg.exec() or not dlg.chosen:
+            return
+        installed, failed = 0, []
+        for hit in dlg.chosen:
+            try:
+                text = cifsearch.fetch_cif(hit)
+            except Exception as exc:              # noqa: BLE001
+                failed.append("{}: {}".format(hit.label(), exc))
+                continue
+            # Written to a temp file rather than parsed in memory, so the
+            # download takes the SAME path a file on disk does - the packed
+            # import, the disorder policy, the symmetry derivation and every
+            # report that goes with them. A second, subtly different import
+            # path for downloaded structures is exactly the drift this
+            # project keeps finding.
+            import shutil
+            import tempfile
+            # A temp DIRECTORY with a properly named file inside, rather than
+            # a temp file: the import names the object after the file, so
+            # `mkstemp` would put `molom_d2dtna96` in the outliner - which
+            # says nothing and is indistinguishable from the next one.
+            folder = tempfile.mkdtemp(prefix="molom_cif_")
+            path = os.path.join(folder, hit.filename() + ".cif")
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+                before = self.scene.n_objects
+                self.open_path(path)
+                installed += self.scene.n_objects - before
+            finally:
+                shutil.rmtree(folder, ignore_errors=True)
+        note = "Imported {} structure{}".format(
+            installed, "" if installed == 1 else "s")
+        if failed:
+            note += " - {} could not be fetched: {}".format(len(failed),
+                                                            failed[0])
+        self.statusBar().showMessage(note, 9000)
+
+    def cif_search_roots(self):
+        # type: () -> list
+        """Folders the local tier searches. Empty until the user names one -
+        there is no sensible default for somebody else's file collection."""
+        value = self.settings.value("cif_search_root", "")
+        return [str(value)] if value else []
+
+    def on_set_cif_folder(self):
+        """Point the local search tier at a folder of CIFs."""
+        current = self.settings.value("cif_search_root", "") or ""
+        path = QFileDialog.getExistingDirectory(
+            self, "Folder of CIF files to search", str(current))
+        if not path:
+            return
+        self.settings.setValue("cif_search_root", path)
+        self.statusBar().showMessage(
+            "Crystal search will also look in {}".format(path), 6000)
+
     def on_from_smiles(self):
         smiles, ok = QInputDialog.getText(self, "New from SMILES",
                                           "SMILES string (dots separate "
@@ -6825,6 +6895,8 @@ class MainWindow(QMainWindow):
             label_scale=self.viewport.label_scale,
             disorder_policy=self.disorder_policy,
             sg_convention=self.sg_convention,
+            cif_search_root=(self.settings.value("cif_search_root", "")
+                             or ""),
             on_speed_change=lambda v: setattr(self.viewport.camera,
                                               "rotate_speed", v),
             on_atom_scale_change=self.viewport.set_atom_scale,
@@ -6899,6 +6971,7 @@ class MainWindow(QMainWindow):
             self.settings.setValue("disorder_policy", self.disorder_policy)
             self.sg_convention = dlg.sg_convention()
             self.settings.setValue("sg_convention", self.sg_convention)
+            self.settings.setValue("cif_search_root", dlg.cif_search_root())
             self.undo.set_limit(dlg.undo_limit())
             self.viewport.set_atom_scale(dlg.atom_scale())
             self._set_label_scale(dlg.label_scale())
