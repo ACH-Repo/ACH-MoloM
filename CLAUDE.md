@@ -198,6 +198,61 @@ other side, and the two export fixes are verified in `tools/smoke_gui.py`
 instead, which now measures the crop and counts ink with and without the cell
 box. 1310 tests.
 
+Round 92b (2026-08-27, Christian's test batch - what a round trip looks like,
+and two bugs found by using it):
+**(1) NOTHING ON SCREEN SAID A SAVE WOULD OVERWRITE SOMEBODY ELSE'S FILE.**
+"There is no indication that an edit will be forwarded to OWB or that we are
+currently in a round-trip situation." Round 92 made Ctrl+S write back to the
+structure file the session was opened from - which is exactly right and is
+also a keystroke that quietly does something quite different from what it does
+in an ordinary session. `viewport.set_roundtrip` puts a banner top RIGHT
+("Round trip - Ctrl+S writes back to mol.xyz"), clear of the edit-mode header
+on the left, and only for the round-trip case: a `.molom` project is MoloM's
+own document and needs no warning that saving it saves it.
+**(2) AND THE SAVE ITSELF NOW SAYS SO WHERE THE EYE IS.** `viewport.flash`
+fades a confirmation over the viewport, because the status bar is in the far
+corner of the window and a save is precisely the moment nobody is looking
+there. It holds at full opacity for the first third and then fades - a message
+that starts fading immediately is one you read half of.
+**(3) THE DERIVED SMILES IS FORWARDED.** "Since MoloM can derive SMILES from
+struct, it should also forward the updated SMILES (if possible) to OWB so the
+skeletal structure updates." `io.structure_to_smiles` reads the GRAPH, so
+after an edit it is the edited constitution: cubane goes out as
+`C12C3C4C1C1C2C3C41` and comes back `C12C3C4C1C1C2C3N41` once one carbon is
+changed. It rides the xyz COMMENT line, the one channel an .xyz has and the
+one place every other program already looks (round 76). **Silent on anything
+it cannot honestly answer** - a crystal (a SMILES of a packed cell means
+nothing), a structure with no bonds, or a graph RDKit refuses - because a
+wrong SMILES forwarded into another program is far worse than none. Reading
+it back is OWB's side and is written into that repo's TODO.
+**(4) A PASTED CAS NUMBER WAS HANDED TO THE CHEMISTRY BACKENDS AS A SMILES.**
+Christian pasted `2591-17-5` and got a dialog carrying "RDKit could not parse
+SMILES" and "OpenBabel raised OSError" - two complaints about a question
+nobody should have asked. `on_paste` tried xyz and then assumed everything
+else was a SMILES, while `resolve.classify` has always been able to tell a
+CAS number, a name and an InChIKey apart. Those now open the molecule search
+pre-filled and run it, so pasting a CAS behaves like searching for one.
+**(5) "ASYMMETRIC UNIT ONLY" MOVED THE CRYSTAL TO THE ORIGIN, and the cause is
+a guard doing half its job.** His report: "Unit cell of RbF jumped from
+position of RbF to (0,0,0) as an anchor. Clicking full unit cell again shifted
+the full crystal back to (0,0,0)." A crystal's placement is RECOVERED from a
+sample of reference atoms (round 19), and `set_cell_reference` refuses to pin
+one below three atoms - correctly, since two points cannot fit a rotation.
+What it did not do was CLEAR the old sample, so an `F m -3 m` fluoride whose
+asymmetric unit is TWO atoms kept 24 indices into a 27-atom list that no
+longer existed: the fit then failed silently and the next rebuild regenerated
+the crystal in the cell frame, at the origin. Round 80's lesson exactly - an
+index map that survives a renumbering does not stop being wrong, it stops
+being obvious.
+Fixed at both ends: the stale reference is dropped, and the pose is RECORDED
+explicitly (`set_cell_pose` / `stored_cell_pose`, in metadata so it rides the
+savefile) for the case where no sample can exist. `cell_corners_world` and
+`_rebuild_pose` both fall back to it, which is why the box stopped jumping
+too. Measured on his own MF.molom: RbF holds x = 36.82 and its box origin
+x = 34.0 across repeated asym/cell switches, where before the first switch
+put the box at 0 and the trip back put the crystal at 2.82.
+1905 tests.
+
 Round 92 (2026-08-27, ORCA Workbench at last - roadmap F, the item that
 motivated the whole project):
 **F1 NEEDED NO CODE IN EITHER PROGRAM, and finding that out was most of the
@@ -4583,7 +4638,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1890 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1905 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -5862,6 +5917,16 @@ independent cross-check inside a single fixture.
   293.0 renders as "293", and obvious the moment a molecular weight put
   RDKit's 106.168 next to PubChem's 106.16 in one column. If the sorting is
   hand-driven, do not write EditRole at all.
+- **A REFERENCE SAMPLE MUST BE CLEARED WHEN IT CANNOT BE RE-PINNED** (round
+  92b). `set_cell_reference` refuses to pin below three atoms, which is right,
+  and used to leave the OLD sample behind - so an asymmetric unit of two atoms
+  kept 24 indices into a 27-atom list, the fit failed silently, and the
+  crystal and its box snapped to the origin. Where no sample can exist the
+  pose is recorded explicitly instead (`set_cell_pose`).
+- **NOT EVERYTHING THAT IS NOT AN XYZ BLOCK IS A SMILES** (round 92b). The
+  paste path assumed it was, so a CAS number produced two backend parse errors
+  in a dialog. `resolve.classify` separates smiles / inchi / inchikey / cas /
+  name and has done all along.
 - **A RIGID MOTION IS NOT AN EDIT TO THE STRUCTURE** (round 91). Moving or
   turning a whole crystal preserves its space group exactly, so anything that
   re-derives symmetry on an edit commit has to ask WHAT the edit was -
@@ -6242,7 +6307,7 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 1890 offline tests, 4 skipped, ~110 s.
+1. `python -m pytest tests/ -q` — 1905 offline tests, 4 skipped, ~110 s.
    `tests/conftest.py` sandboxes QSettings, so a GUI test can drive a real
    control without writing into your own MoloM configuration; it also
    **destroys the windows a test created** (round 86), without which the suite

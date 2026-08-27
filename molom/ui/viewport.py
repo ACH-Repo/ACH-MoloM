@@ -197,7 +197,19 @@ def set_cell_reference(structure, coords=None):
     """
     from ..core import cif as cif_mod
     meta = structure.metadata
-    if not meta.get("cell") or structure.n_atoms < 3:
+    if not meta.get("cell"):
+        return
+    if structure.n_atoms < 3:
+        # TOO FEW POINTS TO FIT A ROTATION - and the old reference must go
+        # with them. Leaving it behind is worse than having none: it stays
+        # perfectly VALID-looking while describing atoms that no longer
+        # exist, so the fit silently fails and the crystal (and its box) snap
+        # back to the cell frame at the origin. That is exactly what switching
+        # an `F m -3 m` fluoride to "asymmetric unit only" did - its unit is
+        # TWO atoms. Round 80's lesson: an index map that survives a
+        # renumbering does not stop being wrong, it stops being obvious.
+        meta.pop("cell_ref_idx", None)
+        meta.pop("cell_ref_xyz", None)
         return
     xyz = structure.coords if coords is None else np.asarray(coords,
                                                              dtype=float)
@@ -206,6 +218,42 @@ def set_cell_reference(structure, coords=None):
     idx = cif_mod.reference_sample(xyz)
     meta["cell_ref_idx"] = [int(i) for i in idx]
     meta["cell_ref_xyz"] = [[float(v) for v in xyz[i]] for i in idx]
+
+
+def set_cell_pose(structure, pose):
+    """Remember the rigid motion a crystal has been given, explicitly.
+
+    The pose is normally RECOVERED from a sample of reference atoms, which is
+    what lets the box track a grab live. That sample cannot exist for an
+    asymmetric unit of one or two atoms, so the placement needs somewhere else
+    to live or it is lost the moment the view is switched.
+
+    Stored as plain lists, because it rides `Structure.metadata` into the
+    savefile.
+    """
+    meta = getattr(structure, "metadata", None)
+    if meta is None:
+        return
+    if pose is None:
+        meta.pop("cell_pose_rot", None)
+        meta.pop("cell_pose_shift", None)
+        return
+    rot, shift = pose
+    meta["cell_pose_rot"] = [[float(v) for v in row] for row in np.asarray(rot)]
+    meta["cell_pose_shift"] = [float(v) for v in np.asarray(shift)]
+
+
+def stored_cell_pose(structure):
+    """The remembered pose as `(rot, shift)`, or None."""
+    meta = getattr(structure, "metadata", None) or {}
+    rot, shift = meta.get("cell_pose_rot"), meta.get("cell_pose_shift")
+    if not rot or not shift:
+        return None
+    try:
+        return (np.asarray(rot, dtype=float).reshape(3, 3),
+                np.asarray(shift, dtype=float).reshape(3))
+    except (ValueError, TypeError):
+        return None
 
 
 def cell_corners_world(obj, cell=None):
@@ -227,16 +275,26 @@ def cell_corners_world(obj, cell=None):
     idx = meta.get("cell_ref_idx")
     ref = meta.get("cell_ref_xyz")
     if not idx or not ref:
-        return corners
+        fit = stored_cell_pose(obj.structure)
+        if fit is None:
+            return corners
+        rot, trans = fit
+        return corners @ rot.T + np.asarray(trans)[None, :]
     coords = obj.structure.coords
-    if any(i >= len(coords) for i in idx):
-        return corners           # atoms were deleted; stop pretending to fit
-    fit = cif_mod.rigid_from_reference(np.asarray(ref, dtype=float),
-                                       coords[list(idx)])
+    fit = None
+    if not any(i >= len(coords) for i in idx):
+        fit = cif_mod.rigid_from_reference(np.asarray(ref, dtype=float),
+                                           coords[list(idx)])
+    if fit is None:
+        # No usable sample - an asymmetric unit too small to fit a rotation
+        # from, or atoms deleted since. Fall back to the pose the last rebuild
+        # recorded, so the box stays where the crystal is instead of snapping
+        # to the origin.
+        fit = stored_cell_pose(obj.structure)
     if fit is None:
         return corners
     rot, trans = fit
-    return corners @ rot.T + trans[None, :]
+    return corners @ rot.T + np.asarray(trans)[None, :]
 
 Pick = Tuple[int, int]   # (object id, local atom index)
 
@@ -788,6 +846,9 @@ class MolViewport(QOpenGLWidget):
         # frame of orange blobs, i.e. a flicker. See `_paint_selection`.
         self._hull_sphere = None
         self._hull_cylinder = None
+        #: Round-trip banner text, and the fading save confirmation.
+        self.roundtrip_note = ""
+        self._flash = None
         self._cell_cyl = None
         self._glow_sphere = None
         self._split_sphere = None
@@ -4115,6 +4176,101 @@ class MolViewport(QOpenGLWidget):
                    "handles move the borders, scroll resizes the frame, "
                    "Ctrl+scroll dollies, Shift+scroll or Shift+drag re-frames")
 
+    # ------------------------------------------------- round-trip indicator
+    def set_roundtrip(self, text):
+        # type: (str) -> None
+        """Say, permanently, that Ctrl+S will write back to another program.
+
+        Christian: "there is no indication that an edit will be forwarded to
+        OWB or that we are currently in a round-trip situation". Nothing on
+        screen distinguished a session opened from ORCA Workbench - where
+        Ctrl+S overwrites somebody else's file - from an ordinary one where it
+        opens a Save dialog. That is a difference worth stating before the
+        keystroke rather than after it.
+        """
+        self.roundtrip_note = str(text or "")
+        self.update()
+
+    def flash(self, text, seconds=2.2):
+        # type: (str, float) -> None
+        """A message that fades out over the viewport.
+
+        The status bar already says what happened, and a save is exactly the
+        moment nobody is looking at the bottom of the window - Christian asked
+        for "a fading out text that informs the user changes have been
+        applied".
+        """
+        import time
+        self._flash = (str(text), time.monotonic(), float(seconds))
+        self.update()
+        # Repaint while it fades. A single-shot per frame rather than a timer
+        # that has to be stopped: the paint path decides when it is over.
+        QTimer.singleShot(40, self._flash_tick)
+
+    def _flash_tick(self):
+        if not getattr(self, "_flash", None):
+            return
+        import time
+        text, started, seconds = self._flash
+        if time.monotonic() - started >= seconds:
+            self._flash = None
+            self.update()
+            return
+        self.update()
+        QTimer.singleShot(40, self._flash_tick)
+
+    def _paint_roundtrip(self, p):
+        """The banner, top RIGHT - where Christian asked for it, and clear of
+        the edit-mode header on the left."""
+        note = getattr(self, "roundtrip_note", "")
+        if not note:
+            return
+        p.save()
+        font = p.font()
+        font.setPointSizeF(max(8.0, font.pointSizeF()))
+        p.setFont(font)
+        metrics = p.fontMetrics()
+        width = metrics.horizontalAdvance(note) + 18
+        height = metrics.height() + 8
+        x = self.width() - width - 12
+        y = 8
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(40, 62, 84, 205))
+        p.drawRoundedRect(x, y, width, height, 4, 4)
+        p.setPen(QColor(150, 200, 245))
+        p.drawText(x + 9, y + metrics.ascent() + 4, note)
+        p.restore()
+
+    def _paint_flash(self, p):
+        """The fading confirmation, centred near the top."""
+        entry = getattr(self, "_flash", None)
+        if not entry:
+            return
+        import time
+        text, started, seconds = entry
+        left = seconds - (time.monotonic() - started)
+        if left <= 0:
+            return
+        # Hold at full opacity for the first third, then fade - a message that
+        # starts fading immediately is one you read half of.
+        alpha = int(235 * min(1.0, left / (seconds * 0.66)))
+        p.save()
+        font = p.font()
+        font.setPointSizeF(max(11.0, font.pointSizeF() * 1.25))
+        font.setBold(True)
+        p.setFont(font)
+        metrics = p.fontMetrics()
+        width = metrics.horizontalAdvance(text) + 26
+        height = metrics.height() + 12
+        x = (self.width() - width) // 2
+        y = 54
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(38, 74, 48, int(alpha * 0.85)))
+        p.drawRoundedRect(x, y, width, height, 5, 5)
+        p.setPen(QColor(170, 235, 180, alpha))
+        p.drawText(x + 13, y + metrics.ascent() + 6, text)
+        p.restore()
+
     def _paint_overlays(self, view, proj, empty):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
@@ -4164,6 +4320,8 @@ class MolViewport(QOpenGLWidget):
                 self._paint_origin_gizmo(p)
             self._paint_origin_dot(p)
             self._paint_edit_mode(p)
+        self._paint_roundtrip(p)
+        self._paint_flash(p)
         p.end()
 
     def _paint_aim(self, p, colour, alpha=190, hull=9):

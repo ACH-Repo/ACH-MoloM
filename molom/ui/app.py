@@ -69,7 +69,7 @@ from .outliner import OutlinerPanel
 from .periodic_table import PeriodicTablePanel
 from .transform_panel import TransformDock
 from .viewport import (MODE_EDIT, MODE_OBJECT, MolViewport, cell_of,
-                       set_cell_reference)
+                       set_cell_pose, set_cell_reference, stored_cell_pose)
 
 _MAX_RECENT = 8
 # Height reserved at the top of the viewport for the edit-mode header banner
@@ -4216,6 +4216,58 @@ class MainWindow(QMainWindow):
             return self.on_save_geometry_back()
         return self.on_save_project_as()
 
+    def _smiles_note(self):
+        # type: () -> str
+        """The visible molecules' SMILES, for the file MoloM writes back.
+
+        Christian: "since MoloM can derive SMILES from struct, it should also
+        forward the updated SMILES (if possible) to OWB so the skeletal
+        structure updates." The graph is what `io.structure_to_smiles` reads,
+        so after an edit this is the EDITED constitution rather than the one
+        the molecule arrived with.
+
+        It goes on the xyz COMMENT line, which is the one place every other
+        program already looks (round 76) and the only channel an .xyz has.
+        Reading it back is OWB's side of the job and is recorded in its TODO.
+
+        Silent on anything it cannot honestly answer - a crystal (a SMILES of
+        a packed cell means nothing), a structure with no bonds, or a graph
+        RDKit refuses. A wrong SMILES forwarded into another program is much
+        worse than none.
+        """
+        vis = [o for o in self.scene.visible_objects()
+               if o.structure.n_atoms and o.structure.bonds]
+        if not vis or any(cell_of(o) is not None for o in vis):
+            return ""
+        parts = []
+        for o in vis:
+            try:
+                smiles, _err = io.structure_to_smiles(
+                    meta_mod.resolved_symbols(o.structure) or o.structure.symbols,
+                    o.structure.bonds,
+                    charge=getattr(o.structure, "charge", 0) or 0)
+            except Exception:                           # noqa: BLE001
+                smiles = None
+            if smiles:
+                parts.append("{}={}".format(o.name, smiles) if len(vis) > 1
+                             else smiles)
+        return "SMILES: {}".format(" ".join(parts)) if parts else ""
+
+    def _sync_roundtrip_note(self):
+        """Keep the viewport banner describing where Ctrl+S will write.
+
+        Only for the ROUND-TRIP case - a `.molom` project is MoloM's own
+        document and needs no warning that saving it saves it. The banner
+        exists because a session launched from ORCA Workbench overwrites
+        somebody else's file, and nothing on screen used to say so.
+        """
+        if self.project_path or not self.source_path:
+            self.viewport.set_roundtrip("")
+            return
+        self.viewport.set_roundtrip("Round trip - Ctrl+S writes back to {}"
+                                    .format(os.path.basename(
+                                        self.source_path)))
+
     def on_save_geometry_back(self):
         """Write the visible geometry back over the file this session opened.
 
@@ -4228,7 +4280,8 @@ class MainWindow(QMainWindow):
                 "File > Export geometry", 8000)
             return
         try:
-            backend, n_obj, n_atoms = self.export_visible(self.source_path)
+            backend, n_obj, n_atoms = self.export_visible(
+                self.source_path, extra_comment=self._smiles_note())
         except Exception as exc:                        # noqa: BLE001
             QMessageBox.critical(self, "Save failed",
                                  "Could not write {}:\n{}".format(
@@ -4240,6 +4293,8 @@ class MainWindow(QMainWindow):
                 os.path.basename(self.source_path), backend,
                 "" if n_obj == 1 else
                 " - {} molecules written".format(n_obj)), 9000)
+        self.viewport.flash("Saved to {}".format(
+            os.path.basename(self.source_path)))
 
     def on_save_project(self):
         if not self.project_path:
@@ -4252,6 +4307,8 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage(
             "Saved {}".format(os.path.basename(self.project_path)), 5000)
+        self.viewport.flash("Saved {}".format(
+            os.path.basename(self.project_path)))
 
     def on_save_project_as(self):
         start = self.settings.value("last_dir", "")
@@ -4272,6 +4329,7 @@ class MainWindow(QMainWindow):
             return
         self.project_path = path
         self.source_path = None   # the project is the document now
+        self._sync_roundtrip_note()
         self.settings.setValue("last_dir", os.path.dirname(path))
         self._push_recent(path)
         self._update_title()
@@ -4319,6 +4377,7 @@ class MainWindow(QMainWindow):
             self.on_activate_camera(through)
         self.project_path = path
         self.source_path = None   # the project is the document now
+        self._sync_roundtrip_note()
         self._push_recent(path)
         self._sync_all(fit="center" not in view)
         self._update_title()
@@ -4371,6 +4430,7 @@ class MainWindow(QMainWindow):
         # most recently is how a round-trip writes the wrong file.
         if self.source_path is None and self.project_path is None:
             self.source_path = os.path.abspath(path)
+            self._sync_roundtrip_note()
         try:
             if io.is_smiles_list_file(path):
                 pairs = io.read_smiles_file(path)
@@ -4411,7 +4471,7 @@ class MainWindow(QMainWindow):
             self.settings.setValue("last_dir", os.path.dirname(path))
             self.open_path(path)
 
-    def on_import_by_name(self):
+    def on_import_by_name(self, query=""):
         """Find a molecule by name and import it (Ctrl+Shift+N).
 
         A LIST rather than a single answer since round 90, and the reason is
@@ -4421,6 +4481,11 @@ class MainWindow(QMainWindow):
         """
         dlg = MoleculeSearchDialog(self, remembered=self._last_mol_search,
                                    favourites=self.mol_favourites())
+        if query:
+            # Pasted, rather than typed: fill it in and run it, so a CAS
+            # number on the clipboard behaves like one the user searched for.
+            dlg.edit.setText(str(query))
+            dlg._start()
         accepted = dlg.exec()
         # Saved whatever the outcome: starring something and then pressing
         # Cancel is an ordinary way to use a bookmark list.
@@ -4615,14 +4680,27 @@ class MainWindow(QMainWindow):
                                          metadata=frames[0][1] or {})
             self._install_structure(s, note="pasted XYZ")
             return
+        # NOT EVERYTHING THAT IS NOT XYZ IS A SMILES. Pasting a CAS number
+        # handed `2591-17-5` to both chemistry backends and showed their
+        # complaints in a dialog - "RDKit could not parse SMILES", "OpenBabel
+        # raised OSError" - which says nothing about the real problem, that
+        # a CAS number is a NAME and wants looking up. `resolve.classify`
+        # already tells the two apart; the paste path simply never asked.
+        from ..core import resolve as resolve_mod
+        kind = resolve_mod.classify(text.strip())
+        if kind in ("name", "cas", "inchikey"):
+            self.on_import_by_name(query=text.strip())
+            return
         # SMILES paste: parse_smiles_list splits ChemDraw's dot-separated
         # multi-structure copies into one entry per molecule.
         pairs = io.parse_smiles_list(text)
         if pairs:
             self._install_smiles_batch(pairs, "pasted SMILES")
             return
-        QMessageBox.information(self, "Paste", "Clipboard text is neither an "
-                                "XYZ block nor a SMILES.")
+        QMessageBox.information(
+            self, "Paste",
+            "Clipboard text is not an XYZ block, a SMILES, an InChI, a CAS "
+            "number or a compound name.")
 
     def on_save_as(self):
         """Export geometry. The exported set is every VISIBLE molecule in the
@@ -4661,8 +4739,8 @@ class MainWindow(QMainWindow):
         except (ValueError, OSError) as e:
             QMessageBox.critical(self, "Save failed", str(e))
 
-    def export_visible(self, path):
-        # type: (str) -> tuple
+    def export_visible(self, path, extra_comment=""):
+        # type: (str, str) -> tuple
         """Write every visible molecule to `path`. Returns
         (backend, n_objects, n_atoms). Split out from the dialog so the
         export rule is testable."""
@@ -4709,6 +4787,8 @@ class MainWindow(QMainWindow):
                 if text.strip():
                     notes.append("{}: {}".format(o.name, text.strip())
                                  if len(vis) > 1 else text.strip())
+            if extra_comment:
+                notes.append(extra_comment)
             backend = io.write_structure_file(path, atoms, name=name,
                                               comment=" | ".join(notes))
             return backend, len(vis), total
@@ -5921,6 +6001,10 @@ class MainWindow(QMainWindow):
         self._perceive_fresh(s)
         # ...and re-pin the box against the CELL frame, not the posed atoms.
         set_cell_reference(s, coords)
+        # Recorded explicitly as well, because an asymmetric unit of one or
+        # two atoms cannot carry a reference sample and would otherwise lose
+        # its placement on the next rebuild.
+        set_cell_pose(s, pose)
         self.viewport.set_selection([])
 
     def on_make_coplanar(self):
@@ -6762,13 +6846,17 @@ class MainWindow(QMainWindow):
         ref = meta.get("cell_ref_xyz")
         idx = meta.get("cell_ref_idx")
         if not ref or not idx or structure.n_atoms == 0:
-            return None
+            # No sample to fit against - an asymmetric unit of one or two
+            # atoms has none. The pose the last rebuild recorded is what
+            # keeps the crystal where the user put it.
+            return stored_cell_pose(structure)
         try:
             cur = np.asarray([structure.coords[int(i)] for i in idx],
                              dtype=float)
         except (IndexError, ValueError):
-            return None
-        return cif_mod.rigid_from_reference(np.asarray(ref, dtype=float), cur)
+            return stored_cell_pose(structure)
+        fit = cif_mod.rigid_from_reference(np.asarray(ref, dtype=float), cur)
+        return fit if fit is not None else stored_cell_pose(structure)
 
     @staticmethod
     def _apply_rebuild_pose(coords, pose):
@@ -7312,6 +7400,12 @@ class MainWindow(QMainWindow):
         obj.atom_label_modes = {}
         self._perceive_fresh(s)
         set_cell_reference(s, coords)      # cell frame, not the posed atoms
+        # ...and RECORD the pose, because an asymmetric unit of one or two
+        # atoms cannot carry a reference sample: switching an `F m -3 m`
+        # fluoride (unit: 2 atoms) to "asymmetric unit only" left it with no
+        # way to recover its placement, so the crystal and its box snapped to
+        # the origin on the way back to the full cell.
+        set_cell_pose(s, pose)
         meta["cell_view"] = mode
         self.viewport.set_selection([])
         self._sync_all()
