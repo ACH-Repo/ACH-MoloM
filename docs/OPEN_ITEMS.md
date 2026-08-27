@@ -232,11 +232,24 @@ candidate. Worth a decision before anyone spends that.
 
 ## F. OWB integration (roadmap 5)
 
-**F1.** Point ORCA Workbench's `viewer_3d_path`/`editor_3d_path` at `molom`.
-**F2.** A `--select i,j,k` CLI so geomspec atom indices can be read.
-**F3.** xyz round-trip with `coords_locked` on reload.
+~~**F1.** Point ORCA Workbench's `viewer_3d_path`/`editor_3d_path` at
+`molom`.~~ **DONE, round 92** - and it needed no code in either program, only
+`molom --where` to find the launcher. See `docs/ORCA_WORKBENCH.md`.
+~~**F2.** A `--select i,j,k` CLI so geomspec atom indices can be read.~~
+**DONE, round 92**, 0-based to match ORCA.
+~~**F3.** xyz round-trip with `coords_locked` on reload.~~ **DONE, round 92**:
+Ctrl+S writes the geometry back over the opened file, which is what OWB's own
+instruction means. `coords_locked` was always OWB's half and already worked.
 
-*This is the item that motivated the whole project and is the least advanced.*
+**F4. The constraint traffic is ONE-WAY.** MoloM reads indices out of a
+`%geom` block and cannot hand a selection back as one. "Copy selection as an
+ORCA constraint" - two atoms to a `B`, three to an `A`, four to a `D` - is a
+small, obvious next step, and MoloM already knows which kind a selection
+implies because that is what the measurement readout decides.
+
+**F5. MoloM does not know about OWB's project structure**, only about the one
+file it is handed. That is all the program slots offer, so going further would
+mean a different kind of integration than launching an external viewer.
 
 ---
 

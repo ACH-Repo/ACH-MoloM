@@ -177,6 +177,11 @@ class MainWindow(QMainWindow):
         # re-perceived when they come back, not while nobody can see them.
         self._stale_bonds = set()
         self.project_path = None         # type: Optional[str]  (.molom)
+        #: The STRUCTURE file this session was opened from, where there is
+        #: one. Distinct from `project_path`, and it is what makes the ORCA
+        #: Workbench round-trip work: OWB launches `[molom, file.xyz]`, tells
+        #: the user to edit and Save, and then re-reads that same file.
+        self.source_path = None          # type: Optional[str]
         self._local_view = None          # {obj_id: visible} while isolated
         self._pending_suppress = False   # merge the next push into this one
         #: (obj_id, pose) captured when an edit STARTS. An edit is not a rigid
@@ -573,9 +578,17 @@ class MainWindow(QMainWindow):
 
         r("open", "Open structure file or project...", lambda c: c.on_open(),
           category="File", shortcut="Ctrl+O", key="Ctrl+O")
+        r("save_document", "Save",
+          lambda c: c.on_save(), enabled=has_obj, category="File",
+          shortcut="Ctrl+S", key="Ctrl+S",
+          aliases=("save project", "savepoint", "write geometry back"))
+        r("save_geometry_back", "Save geometry back to the opened file",
+          lambda c: c.on_save_geometry_back(),
+          enabled=lambda ctx: bool(getattr(ctx, "source_path", None)),
+          category="File", shortcut="Ctrl+Alt+S", key="Ctrl+Alt+S",
+          aliases=("round trip", "overwrite xyz", "orca workbench"))
         r("save_project", "Save project (savepoint)",
-          lambda c: c.on_save_project(), enabled=has_obj, category="File",
-          shortcut="Ctrl+S", key="Ctrl+S")
+          lambda c: c.on_save_project(), enabled=has_obj, category="File")
         r("save_project_as", "Save project as...",
           lambda c: c.on_save_project_as(), enabled=has_obj, category="File",
           shortcut="Ctrl+Shift+P", key="Ctrl+Shift+P")
@@ -4187,6 +4200,47 @@ class MainWindow(QMainWindow):
             return
         self.timeline = timeline_mod.Timeline.from_dict(data)
 
+    def on_save(self):
+        """Ctrl+S: save the DOCUMENT, whatever this session's document is.
+
+        A project when there is one; otherwise the structure file MoloM was
+        launched with. That second case is the ORCA Workbench round-trip:
+        OWB opens `[molom, mol.xyz]`, tells the user to "adjust the geometry,
+        then Save so it overwrites the .xyz", and re-reads that file. If
+        Ctrl+S put up a `.molom` project dialog instead, the round-trip would
+        fail SILENTLY - OWB would reload an unchanged file and report success.
+        """
+        if self.project_path:
+            return self.on_save_project()
+        if self.source_path:
+            return self.on_save_geometry_back()
+        return self.on_save_project_as()
+
+    def on_save_geometry_back(self):
+        """Write the visible geometry back over the file this session opened.
+
+        The same writer Ctrl+E uses, so a round-tripped file is exactly what
+        an ordinary export would have produced - one path, not two.
+        """
+        if not self.source_path:
+            self.statusBar().showMessage(
+                "This session was not opened from a structure file - use "
+                "File > Export geometry", 8000)
+            return
+        try:
+            backend, n_obj, n_atoms = self.export_visible(self.source_path)
+        except Exception as exc:                        # noqa: BLE001
+            QMessageBox.critical(self, "Save failed",
+                                 "Could not write {}:\n{}".format(
+                                     self.source_path, exc))
+            return
+        self.statusBar().showMessage(
+            "Saved {} atom{} to {} ({}){}".format(
+                n_atoms, "" if n_atoms == 1 else "s",
+                os.path.basename(self.source_path), backend,
+                "" if n_obj == 1 else
+                " - {} molecules written".format(n_obj)), 9000)
+
     def on_save_project(self):
         if not self.project_path:
             return self.on_save_project_as()
@@ -4217,6 +4271,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Save failed", str(e))
             return
         self.project_path = path
+        self.source_path = None   # the project is the document now
         self.settings.setValue("last_dir", os.path.dirname(path))
         self._push_recent(path)
         self._update_title()
@@ -4263,6 +4318,7 @@ class MainWindow(QMainWindow):
         if through is not None and self.scene.camera(through) is not None:
             self.on_activate_camera(through)
         self.project_path = path
+        self.source_path = None   # the project is the document now
         self._push_recent(path)
         self._sync_all(fit="center" not in view)
         self._update_title()
@@ -4272,11 +4328,49 @@ class MainWindow(QMainWindow):
                 payload.get("saved", "?")), 8000)
 
     # ---------------------------------------------------------------- opening
+    def select_atom_indices(self, indices, obj_id=None):
+        # type: (list, Optional[int]) -> tuple
+        """Select atoms by index on one molecule. Returns `(picked, missing)`.
+
+        **0-BASED, because ORCA is.** `orca_workbench/core/geomspec.py` says
+        so outright - "ORCA atom indices are 0-based" - and the whole point of
+        `--select` is to paste the numbers out of a `%geom` constraint and see
+        which atoms they are. Renumbering them here would make the feature
+        worse than useless.
+
+        Out-of-range indices are REPORTED rather than dropped: a constraint
+        that names an atom this file does not have is exactly the mistake
+        somebody would want to be told about.
+        """
+        obj = self.scene.get(obj_id) if obj_id is not None else None
+        if obj is None:
+            obj = self._active_obj()
+        if obj is None:
+            return [], list(indices)
+        n = obj.structure.n_atoms
+        picked, missing = [], []
+        for raw in indices:
+            try:
+                i = int(raw)
+            except (TypeError, ValueError):
+                missing.append(raw)
+                continue
+            (picked if 0 <= i < n else missing).append(i)
+        self.viewport.set_selection([(obj.id, i) for i in picked])
+        return picked, missing
+
     def open_path(self, path):
         # type: (str) -> None
         if project.is_project_file(path):
             self.open_project(path)
             return
+        # Remembered BEFORE the read, so it is set even for a format whose
+        # import reports something unusual. Only the first structure file of
+        # a session claims it: importing a second molecule ADDS to the scene
+        # (round 2), and silently re-pointing "Save" at whatever was opened
+        # most recently is how a round-trip writes the wrong file.
+        if self.source_path is None and self.project_path is None:
+            self.source_path = os.path.abspath(path)
         try:
             if io.is_smiles_list_file(path):
                 pairs = io.read_smiles_file(path)

@@ -198,6 +198,55 @@ other side, and the two export fixes are verified in `tools/smoke_gui.py`
 instead, which now measures the crop and counts ink with and without the cell
 box. 1310 tests.
 
+Round 92 (2026-08-27, ORCA Workbench at last - roadmap F, the item that
+motivated the whole project):
+**F1 NEEDED NO CODE IN EITHER PROGRAM, and finding that out was most of the
+work.** OWB launches an external 3D program as `[program, file.xyz]` and
+nothing else (`orca_workbench/ui/molecules_tab.py::open_xyz_3d`), so
+`molom mol.xyz` was already the whole of what `viewer_3d_path` needs - and
+`traj_viewer_path` too, since MoloM reads a multi-frame xyz as a trajectory
+and gives it the scene clock. What was missing was the two things that make
+the integration worth having, plus knowing where to point it.
+**`--where` PRINTS THE LAUNCHER PATH**, because "point OWB at molom" is only
+easy once you know where the console script landed. The first cut looked
+beside `sys.executable` and reported "not installed" for a perfectly working
+install: a per-user pip install puts the interpreter in `C:\Program FilesPython310` and the script in `%APPDATA%\Python\Python310\Scripts`.
+`shutil.which` first - which is what OWB's own `_on_path` uses to decide
+whether a program is usable.
+**THE ROUND-TRIP WAS FAILING SILENTLY, which is the worst way to fail.** OWB
+opens the file in the EDITOR slot, tells the user to "adjust the geometry,
+then Save so it overwrites the .xyz", and re-reads that file, setting
+`coords_locked` so a hand-edited geometry is not clobbered by SMILES
+regeneration. MoloM's Ctrl+S saved a `.molom` PROJECT - so the user would
+save, OWB would reload an unchanged file, and BOTH programs would report
+success. Ctrl+S now saves the DOCUMENT: the project where there is one,
+otherwise the structure file the session was opened from. `Ctrl+Alt+S` always
+means the second, so the round-trip is reachable whatever else happened.
+**Only the FIRST structure file claims it**, because imports ADD in MoloM
+(round 2) and silently re-pointing Save at whatever was opened most recently
+is how a round-trip overwrites the wrong file.
+**`--select 3,7,11` IS 0-BASED BECAUSE ORCA IS.**
+`orca_workbench/core/geomspec.py` states it outright - "ORCA atom indices are
+0-based" - and the entire point of the flag is to paste the numbers out of a
+`%geom` constraint and see which atoms they are. Renumbering them would make
+the feature worse than useless. Commas or spaces, since a `%geom` block is
+written with spaces and a shell argument is easier with commas; a token that
+is not an index is REFUSED rather than dropped, and an index the file does not
+have is reported. Two, three or four atoms also print the bond, angle or
+dihedral they define, which is exactly what the constraint means - water with
+`--select 1,0,2` reads `angle(H1-O0-H2) = 104.51 deg`.
+**VERIFIED AGAINST OWB'S OWN READER**, not against an assumption: the sibling
+repo is checked out beside MoloM, so the test writes a file with MoloM and
+reads it back with `orca_workbench.core.coords.read_xyz`. It comes back as
+three atoms in the right order, because MoloM writes a PLAIN comment line
+rather than its JSON metadata block (round 76's rule, and this is what that
+rule was for). The test skips where OWB is not checked out.
+`docs/ORCA_WORKBENCH.md` is the setup page.
+**STILL ONE-WAY**: MoloM can read indices out of a constraint and cannot hand
+a selection back as a `%geom` block. "Copy selection as an ORCA constraint" is
+the obvious next step and is recorded rather than built.
+1890 tests.
+
 Round 91b (2026-08-27, one tick, every selected crystal):
 Christian, after the P1 fix: "do the tick changes for multiple at once."
 `_crystal_targets()` is the whole of it - every SELECTED object that has a
@@ -4534,7 +4583,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1877 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1890 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -6193,7 +6242,7 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 1877 offline tests, 4 skipped, ~105 s.
+1. `python -m pytest tests/ -q` — 1890 offline tests, 4 skipped, ~110 s.
    `tests/conftest.py` sandboxes QSettings, so a GUI test can drive a real
    control without writing into your own MoloM configuration; it also
    **destroys the windows a test created** (round 86), without which the suite

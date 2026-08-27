@@ -2,9 +2,25 @@
 
 `--selftest` exercises the core (elements, IO, bonding, meshes, camera,
 picking) with no display and no GL — usable over SSH/CI to verify an install.
+
+**The other two flags exist for ORCA Workbench**, which is the reason this
+project started. OWB launches an external 3D program as `[program, file.xyz]`
+and nothing more, so `molom mol.xyz` was already the whole of what its
+`viewer_3d_path` needs. What it could not do was the two things that make the
+integration worth having:
+
+* `--select 3,7,11` picks atoms BY 0-BASED INDEX, which is ORCA's convention
+  and therefore OWB's (`orca_workbench/core/geomspec.py`: "ORCA atom indices
+  are 0-based"). Paste the indices out of a `%geom` constraint and MoloM shows
+  you which atoms they are - and, for two, three or four of them, the bond,
+  angle or dihedral they define, which is exactly what the constraint means.
+* `--where` prints the launcher path to paste into OWB's program slots, since
+  "point it at molom" is only easy once you know where the console script
+  landed.
 """
 
 import argparse
+import os
 import sys
 
 
@@ -41,6 +57,70 @@ def _selftest():
     return 0
 
 
+def parse_indices(text):
+    # type: (str) -> list
+    """`"3,7,11"` or `"3 7 11"` -> `[3, 7, 11]`.
+
+    Accepts commas or whitespace because a `%geom` block is written with
+    spaces and a shell argument is easier with commas, and there is no reason
+    to make the user care which. Raises ValueError on anything else rather
+    than silently dropping a token - a constraint quietly missing an atom is
+    worse than a refusal.
+    """
+    out = []
+    for token in str(text or "").replace(",", " ").split():
+        try:
+            out.append(int(token))
+        except ValueError:
+            raise ValueError("not an atom index: {!r}".format(token))
+    return out
+
+
+def launcher_path():
+    # type: () -> str
+    """Where the `molom` console script is, or "" if there is not one.
+
+    `shutil.which` FIRST, because that is what ORCA Workbench itself uses to
+    decide whether a program is usable (`_on_path` in its molecules tab), and
+    because a per-user pip install puts the script nowhere near
+    `sys.executable` - on this machine the interpreter is in
+    `C:\Program Files\Python310` and the launcher in
+    `%APPDATA%\Python\Python310\Scripts`. Looking only beside the
+    interpreter reported "not installed" for a perfectly working install.
+    """
+    import shutil
+    import sysconfig
+    found = shutil.which("molom")
+    if found:
+        return found
+    for key in ("scripts", "purelib"):
+        try:
+            base = sysconfig.get_path(key)
+        except Exception:                               # noqa: BLE001
+            continue
+        if not base:
+            continue
+        for name in ("molom.exe", "molom"):
+            candidate = os.path.join(base, name)
+            if os.path.isfile(candidate):
+                return candidate
+    return ""
+
+
+def _where():
+    # type: () -> int
+    """Print the path to paste into ORCA Workbench's program slots."""
+    found = launcher_path()
+    if found:
+        print(found)
+        return 0
+    print("{} -m molom".format(sys.executable))
+    print("(no `molom` console script on PATH - the line above works as a "
+          "command but ORCA Workbench wants a single program path, so "
+          "`pip install -e .` to get one)", file=sys.stderr)
+    return 0
+
+
 def main(argv=None):
     # type: (list) -> int
     parser = argparse.ArgumentParser(
@@ -48,10 +128,29 @@ def main(argv=None):
     parser.add_argument("file", nargs="?", help="structure file to open")
     parser.add_argument("--selftest", action="store_true",
                         help="run the headless core selftest and exit")
+    parser.add_argument("--select", metavar="i,j,k",
+                        help="select these atoms of the opened file. "
+                             "0-BASED, matching ORCA and so ORCA Workbench's "
+                             "%%geom constraints; two to four of them also "
+                             "report the bond, angle or dihedral")
+    parser.add_argument("--where", action="store_true",
+                        help="print the launcher path for ORCA Workbench's "
+                             "3D viewer/editor slots and exit")
     args = parser.parse_args(argv)
 
     if args.selftest:
         return _selftest()
+    if args.where:
+        return _where()
+
+    selection = []
+    if args.select:
+        try:
+            selection = parse_indices(args.select)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if not args.file:
+            parser.error("--select needs a file to select atoms in")
 
     from PySide6.QtGui import QSurfaceFormat
     from PySide6.QtWidgets import QApplication
@@ -87,6 +186,16 @@ def main(argv=None):
     win.show_startup()   # maximized by default; Settings offers windowed
     if args.file:
         win.open_path(args.file)
+        if selection:
+            picked, missing = win.select_atom_indices(selection)
+            note = "Selected atom{} {} (0-based)".format(
+                "" if len(picked) == 1 else "s",
+                ", ".join(str(i) for i in picked)) if picked else \
+                "Nothing selected"
+            if missing:
+                note += " - no atom {} in this file".format(
+                    ", ".join(str(i) for i in missing))
+            win.statusBar().showMessage(note, 15000)
     else:
         win.load_default_scene()    # cubane, the way Blender opens on a cube
     # A name lookup or a crystal search runs in a worker thread that
