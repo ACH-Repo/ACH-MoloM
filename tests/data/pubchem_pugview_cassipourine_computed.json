@@ -1,0 +1,229 @@
+{
+ "Record": {
+  "RecordType": "CID",
+  "RecordNumber": 101821144,
+  "RecordTitle": "Cassipourine",
+  "Section": [
+   {
+    "TOCHeading": "Chemical and Physical Properties",
+    "Section": [
+     {
+      "TOCHeading": "Computed Properties",
+      "Section": [
+       {
+        "TOCHeading": "Molecular Weight",
+        "Information": [
+         {
+          "ReferenceNumber": 5,
+          "Reference": [
+           "Computed by PubChem 2.2 (PubChem release 2025.04.14)"
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "346.6"
+            }
+           ],
+           "Unit": "g/mol"
+          }
+         }
+        ]
+       },
+       {
+        "TOCHeading": "XLogP3",
+        "Information": [
+         {
+          "ReferenceNumber": 5,
+          "Name": "XLogP3-AA",
+          "Reference": [
+           "Computed by XLogP3 3.0 (PubChem release 2025.04.14)"
+          ],
+          "Value": {
+           "Number": [
+            2.4
+           ]
+          }
+         }
+        ]
+       },
+       {
+        "TOCHeading": "Hydrogen Bond Donor Count",
+        "Information": [
+         {
+          "ReferenceNumber": 5,
+          "Reference": [
+           "Computed by Cactvs 3.4.8.18 (PubChem release 2025.04.14)"
+          ],
+          "Value": {
+           "Number": [
+            0
+           ]
+          }
+         }
+        ]
+       },
+       {
+        "TOCHeading": "Hydrogen Bond Acceptor Count",
+        "Information": [
+         {
+          "ReferenceNumber": 5,
+          "Reference": [
+           "Computed by Cactvs 3.4.8.18 (PubChem release 2025.04.14)"
+          ],
+          "Value": {
+           "Number": [
+            6
+           ]
+          }
+         }
+        ]
+       },
+       {
+        "TOCHeading": "Rotatable Bond Count",
+        "Information": [
+         {
+          "ReferenceNumber": 5,
+          "Reference": [
+           "Computed by Cactvs 3.4.8.18 (PubChem release 2025.04.14)"
+          ],
+          "Value": {
+           "Number": [
+            0
+           ]
+          }
+         }
+        ]
+       },
+       {
+        "TOCHeading": "Exact Mass",
+        "Information": [
+         {
+          "ReferenceNumber": 5,
+          "Reference": [
+           "Computed by PubChem 2.2 (PubChem release 2025.04.14)"
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "346.06658340"
+            }
+           ],
+           "Unit": "Da"
+          }
+         }
+        ]
+       },
+       {
+        "TOCHeading": "Monoisotopic Mass",
+        "Information": [
+         {
+          "ReferenceNumber": 5,
+          "Reference": [
+           "Computed by PubChem 2.2 (PubChem release 2025.04.14)"
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "346.06658340"
+            }
+           ],
+           "Unit": "Da"
+          }
+         }
+        ]
+       },
+       {
+        "TOCHeading": "Topological Polar Surface Area",
+        "Information": [
+         {
+          "ReferenceNumber": 5,
+          "Reference": [
+           "Computed by Cactvs 3.4.8.18 (PubChem release 2025.04.14)"
+          ],
+          "Value": {
+           "Number": [
+            108
+           ],
+           "Unit": "Å²"
+          }
+         }
+        ]
+       },
+       {
+        "TOCHeading": "Heavy Atom Count",
+        "Information": [
+         {
+          "ReferenceNumber": 5,
+          "Reference": [
+           "Computed by PubChem"
+          ],
+          "Value": {
+           "Number": [
+            20
+           ]
+          }
+         }
+        ]
+       },
+       {
+        "TOCHeading": "Formal Charge",
+        "Information": [
+         {
+          "ReferenceNumber": 5,
+          "Reference": [
+           "Computed by PubChem"
+          ],
+          "Value": {
+           "Number": [
+            0
+           ]
+          }
+         }
+        ]
+       },
+       {
+        "TOCHeading": "Complexity",
+        "Information": [
+         {
+          "ReferenceNumber": 5,
+          "Reference": [
+           "Computed by Cactvs 3.4.8.18 (PubChem release 2025.04.14)"
+          ],
+          "Value": {
+           "Number": [
+            359
+           ]
+          }
+         }
+        ]
+       },
+       {
+        "TOCHeading": "Defined Atom Stereocenter Count",
+        "Information": [
+         {
+          "ReferenceNumber": 5,
+          "Reference": [
+           "Computed by PubChem"
+          ],
+          "Value": {
+           "Number": [
+            6
+           ]
+          }
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   }
+  ],
+  "Reference": [
+   {
+    "ReferenceNumber": 5,
+    "SourceName": "PubChem",
+    "URL": "https://pubchem.ncbi.nlm.nih.gov"
+   }
+  ]
+ }
+}

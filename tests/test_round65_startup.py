@@ -105,6 +105,11 @@ def test_resolve_is_not_imported_at_module_scope():
         head = head.split("\nclass ", 1)[0]
         assert "import resolve" not in head, \
             "{} imports the resolver at module scope".format(module.__name__)
+        # `molsearch` reaches the resolver, so importing IT at module scope
+        # costs exactly the same 130 ms by a different route - which is how
+        # round 90 reintroduced this, caught by the runtime check above.
+        assert "import molsearch" not in head, (
+            "{} imports molsearch at module scope".format(module.__name__))
 
 
 # --------------------------------------- expensive widgets are built lazily

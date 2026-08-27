@@ -198,6 +198,388 @@ other side, and the two export fixes are verified in `tools/smoke_gui.py`
 instead, which now measures the crop and counts ink with and without the cell
 box. 1310 tests.
 
+Round 91 (2026-08-27, moving a crystal is not editing it - Christian's
+alkali-fluoride savefile):
+"I have a savefile called MF.molom... It contains isostructural alkali
+fluorides. I wanted to change a tick box in the cif props pane for all of them
+simultaneously => Select all, untick draw atoms outside boundary. I think it
+basically just selected the last in the list CsF and then some edit happened,
+which converted it to P1 and made the tickbox i wanted to change unresponsive."
+**Both halves confirmed, and the tick box was innocent.** His file opens with
+four fluorides still `F m -3 m` and CsF alone at `P 1` with `cell_frozen`
+already set - the damage is IN the savefile, so it happened while he was
+working and was then written out. Reproduced in one line: **a plain 0.5 A
+translation of a whole crystal demotes `F m -3 m` to `P 1`.**
+**A SPACE GROUP DESCRIBES THE STRUCTURE, NOT WHERE IT SITS IN WORLD SPACE.**
+`_reevaluate_edited_crystal` ran `demote_to_p1` on every edit commit without
+ever asking what the edit WAS, so a grab, a rotate or an anchored tumble - the
+commonest gestures in the program - destroyed the symmetry of whatever crystal
+happened to be active. And `demote_to_p1` sets `cell_frozen` (round 52, so a
+hand-edited cell is not regenerated underneath the user), which greys the ❖
+controls: that is the "tickbox unresponsive" half, an entirely correct
+response to a state the crystal should never have been put into.
+Round 43e already knew this - "an EDIT is not a rigid motion, so never measure
+a pose across one" - and captured the cell pose BEFORE an edit so the cell box
+would not creep. The same distinction simply had not been applied to the
+symmetry.
+**`_edit_was_rigid` asks the structure rather than trusting the gesture.**
+`begin_model_edit` now stashes the coordinates, the symbols and the bonds
+alongside the pose (both edit paths go through it - `begin_chemistry_edit`
+calls it), and the commit fits the two coordinate sets with Kabsch. A rigid
+motion leaves float noise, so the group is kept; anything else demotes.
+**THE COMPOSITION CHECK COMES FIRST, AND A TEST IS WHAT PUT IT THERE.** The
+first cut compared coordinates only - and an element change MOVES NOTHING, so
+`set_element` read as a rigid placement and kept a space group that no longer
+held. Caught by the test that drives a real chemistry edit rather than by
+reading the code, which is the third time this session a test earned its place
+that way.
+Deliberately still demoting: dragging SOME of a crystal's atoms, because the
+fit is over all of them and a partial move is not rigid. And the capture is
+consumed on read, so a leftover snapshot from an earlier gesture cannot make a
+later real edit look rigid.
+**WHAT IS NOT FIXED, and is a feature rather than a bug: the ❖ page acts on
+the ACTIVE object only.** `_on_packing_option` takes one `obj_id`, so
+"select all, untick" changes exactly one crystal - which is what he saw before
+the P1 damage distracted from it. Applying a per-crystal tick to every
+SELECTED crystal is a small change and a real decision (it would make one
+click rewrite several molecules' metadata), so it is recorded in
+`docs/OPEN_ITEMS.md` rather than assumed.
+1867 tests.
+
+Round 90d (2026-08-27, the molecule IS the identifier - and the properties
+page stops needing a lock):
+Christian: "I would like to be able to search for properties even on
+drawn/edited molecules. We already have a way to derive the SMILES from a
+structure. Shouldn't it be possible to just use that as an identifier for
+queries? maybe even obtain the inchikey and then do it the most reliable way?
+no need anymore to guard against edits (i think?). Also right now I cannot use
+it on the cubane the app launches with. same reason?"
+**Yes to all of it, and the last question answers itself: the app's own
+default cubane now comes back as PubChem CID 136090.** `io.structure_to_smiles`
+reads the drawn GRAPH - atoms, bonds and orders - so it is exact rather than a
+guess, and hashing it gives the same InChIKey a searched compound gets. Round
+90's identity came from the SEARCH and was therefore absent on anything drawn,
+built or opened from a file; it now comes from the structure, every time.
+**AND THE LOCK GOES, for a better reason than convenience.** Round 90 attached
+the record through `core/attachments.py` as POLICY_FRAGILE so a chemistry edit
+would mark it stale. That works, and it is the wrong instrument here: an
+overwrite lock exists to protect something expensive and irreplaceable (round
+75's twenty-minute frequency job), whereas this is a web lookup keyed on the
+structure. Once the identity can be RE-DERIVED, the question can simply be
+ASKED - `Record.describes(inchikey)` compares the stored key against the
+molecule in front of you - which is strictly better than a flag because it
+catches an edit made by ANY route rather than only one that went through the
+edit path. Measured end to end: cubane fetches as Cubane/136090, `C -> N` with
+its hydrogens re-dressed is caught as "now a different compound", and fetching
+again identifies it as **Azacubane, CID 85608268**.
+Two refusals rather than a wrong answer: a structure with a `cell` is not a
+compound (a SMILES of a packed cell means nothing) and anything over
+`MAX_IDENTIFY_ATOMS` is declined, because identification is 0.93 ms on cubane
+and 13 ms at 300 atoms and `sync` runs on every selection change. It is also
+CACHED against a cheap signature of the graph, on the page rather than in
+metadata - derived data does not belong in a savefile.
+**"ARE ALTERNATIVE NAMES SHOWN ANYWHERE?" They were not; they are now.**
+PubChem lists **264 synonyms for benzoic acid and 698 for aspirin** (6.6 kB
+and 16.5 kB), so "show the synonyms" is not an option - `MAX_SYNONYMS` keeps
+the first 8 as PubChem ranks them, which is the common name, the CAS number
+and a trade name or two. Benzoic acid reads "Also known as: benzoic acid,
+65-85-0, Dracylic acid, benzenecarboxylic acid".
+**THE FRAME ON EVERY ROW WAS ONE LINE OF CSS.** "I think properties in the
+computed section do not need frames on every row... Especially having frames
+for both key and val is overkill." Correct, and it was never intentional: **a
+stylesheet set on a widget applies to its CHILDREN too**, so
+`setStyleSheet("background: ...")` on a card painted every label inside it as
+its own little box. `QFrame#propcard { ... }` confines it to the card. One
+frame per property, one per computed group, and the producer stated once
+BELOW its table ("Have the sources also below the groups of keyvals not
+above").
+**SELECTABLE TEXT HAS TO SAY IT IS SELECTABLE.** "I do not like programs that
+do not allow me to copy paste the text that is shown in them. Even worse: You
+can, but there is no highlighting informing you that you can." Every label
+goes through `_selectable`, which sets the flags AND the I-BEAM CURSOR -
+that is the affordance every other program uses and it costs nothing.
+**A LONG CITATION IS SHORTENED TO WHAT THE SOURCE CALLS ITSELF.** Most of
+PubChem's long names carry their own acronym, so there is nothing to invent:
+"Hazardous Substances Data Bank (HSDB)" -> HSDB, "ILO-WHO International
+Chemical Safety Cards (ICSCs)" -> ICSCs. The ones without an acronym introduce
+themselves before a comma - "Haz-Map, Information on Hazardous Chemicals and
+Occupational Diseases" -> Haz-Map. A name that is already short is left alone,
+and the full name plus the URL is the tooltip.
+**AND A LAYOUT FIX THAT UNDID ITSELF.** Round 90c used
+`QLayout.SetMinimumSize` to stop cards being squashed - and that makes a card
+as wide as its widest child's minimum, so a long value pushed the card past
+the dock and the text CLIPPED instead of wrapping. Both problems are the same
+one: a word-wrapped QLabel's height depends on its width and nothing in the
+chain propagates `heightForWidth`. The fix that solves both is to let the
+label SHRINK (`setMinimumWidth(1)` plus a `Minimum` vertical policy) rather
+than to force the layout to grow: `_wrapped()`. Verified by rendering the page
+at 380 px and reading it.
+Values within a property are separated by a hairline instead of a box apiece,
+which is the "vertical dashes for separation in between them" reading that
+seemed most defensible - one card per property, and a rule between one reading
+and the next.
+1860 tests.
+
+Round 90c (2026-08-26, the page follows the molecule, the sources become
+links, and a five-round-old outline regression - Christian's second batch):
+**(1) "FETCHED DATA IS NOT PERSISTENT AND PER-MOLECULE" - and the data was
+never the problem.** It rides `Structure.metadata`, so it survives switching
+molecules AND the savefile; both are pinned by tests now. What did not follow
+was the PAGE. `page_sync_hooks` ran from `_sync_all` alone, which covers
+imports and scene changes and NOT selection - so clicking another molecule
+left the properties tab describing the previous one, and its Fetch button
+acting on the previous one, which looks exactly like data that was lost.
+**That is round 51's bug reintroduced inside the hook built to prevent round
+51's bug**, and the reason is that MoloM has FOUR paths that change the active
+object and each re-syncs its panels by hand: `_sync_all`, `_on_obj_activated`
+(outliner row), `_on_outliner_atoms` and `_on_selection_changed` (viewport
+pick). `_sync_addon_pages()` is now called from all four. His inference that
+"this probably also means the data does not ride the save file" was the one
+part that was wrong, and worth saying plainly.
+**(2) EVERY VALUE IS STORED NOW, so "+N more" EXPANDS instead of taunting.**
+He is right that knowing there is more and having no way to it is worse than
+not being told. Keeping them beats being able to re-fetch them: it works
+offline, costs no round trip, and the spread is the entire reason the
+citations exist. `MAX_VALUES` 3 -> 8 (aspirin's worst heading has seven) with
+`PREVIEW_VALUES = 3` as a DISPLAY choice, and "Show all 7 values" is a
+hover-highlighted clickable label. `extra` now means what it says - the record
+had more than we keep - and is rare rather than routine.
+**(3) A SOURCE IS A LINK.** Every PubChem reference carries a real `URL` to
+the record the value came from (the CAMEO datasheet, the HMDB entry, the NIOSH
+pocket guide), so the citation is clickable, on its own line, at 10 px.
+Stored ONCE per record as `{name: url}` rather than on every value - PubChem's
+own payload is built that way and for the same reason: a dozen sources across
+fifty values would otherwise repeat a 60-character URL fifty times. **Only
+http(s) is kept**, because these strings come from a web service and end up in
+something the user clicks.
+**(4) COMPUTED VALUES GROUP BY THE PROGRAM THAT MADE THEM.** His words: "If
+everything is basically calculated by cactvs 3... then there should be a table
+that just says something like: Simple Computed Properties (Cactvs v. ...) and
+then list all of them." So the computed half is grouped by `Property.
+producer()` and drawn as a two-column table under one citation - four groups
+on aspirin (PubChem 2.2, XLogP3 3.0, Cactvs 3.4.8.18, PubChem) instead of
+twelve rows each repeating a 50-character string. A property whose values
+DISAGREE about their source correctly reports no producer and keeps its
+per-value citations, which is what every measured property does.
+**AND THE CARDS EXPOSED TWO REAL QT TRAPS.** `_clear_rows` used
+`deleteLater()` alone, so the old rows stayed children of the page and went on
+painting at their old geometry over the new ones until the event loop got
+round to them - a ghost of the previous layout on every expand. `setParent
+(None)` first. And **a wrapped QLabel has a height that depends on its width
+while a QFrame does not propagate `heightForWidth`**, so a card full of
+wrapped labels could be handed less height than its contents need and drew
+them on top of one another - invisible until a property was expanded to seven
+values with seven citations under them. `QLayout.SetMinimumSize` on the card's
+own layout makes the frame refuse to be squashed.
+**(5) THE ORANGE OUTLINE WAS MISSING ON DOUBLE AND TRIPLE BONDS, and the
+regression is ROUND 35'S.** `_selection_hull` drew ONE cylinder on the bond
+AXIS at `bond_radius + width`. That is right only for a single bond: a double
+is drawn as two cylinders offset by +-1.0*r at radius **1.3*r**, so the pair
+overlaps the axis and swallows the hull whole; a triple's central cylinder is
+radius r and leaves the hull poking out by the outline width alone. It was
+survivable while the outline was five times fatter - and round 35 divided
+`_OUTLINE_WIDTH_FRAC` by five for a good reason (the outline was merging
+cubane's carbons into one orange blob), which is what sank the hull inside the
+bond it was outlining. Five rounds later it is fixed by the rule this project
+keeps reaching for: the hull is built from the SAME `style.bond_cylinders`
+decomposition the scene draws, each cylinder fattened by the width, so the two
+cannot drift apart again. Verified in a real window on ethene, not just in the
+arithmetic.
+1850 tests.
+
+Round 90b (2026-08-26, the properties tab said "no properties" about an entry
+full of them - Christian's report):
+He opened Cassipourine (CID 101821144), which has a PubChem page with data on
+it, and got "PubChem has no experimental properties for CID 101821144". His
+own diagnosis was right and is the fix: **"Are the displayed properties
+irrelevant to the currently picked ones? Because all of them seem to be
+computed on pubchem."**
+**A COMPOUND CAN HAVE COMPUTED PROPERTIES AND NO MEASURED ONES, and round 90
+only ever asked for the measured half.** Measured: that CID answers
+`PUGVIEW.NotFound` with a 404 for `Experimental Properties` and returns a
+full **16 kB Computed Properties section**. So the add-on asked one of the
+two questions and reported the answer as though it were both. A natural
+product with little literature behind it is the ORDINARY case here rather
+than a corner one, which is what makes this worse than it looks - the tab
+would have been empty for most of what is not a bulk chemical.
+**BOTH SECTIONS ARE FETCHED NOW, AND THEY ARE KEPT APART.** A computed logP
+and a measured melting point are different KINDS of claim, so `Property`
+carries a `kind`, the record groups measured first and computed second, and
+the page heads them separately ("COMPUTED BY PUBCHEM - derived from the
+structure, not measured"). Running them together would have been the quiet
+kind of dishonesty this page exists to avoid. Schema version 2; a version-1
+record still reads, and its properties are `KIND_MEASURED`, because
+everything in one was.
+**THE CITATION FOR A COMPUTED VALUE IS A DIFFERENT FIELD FROM THE MEASURED
+ONE.** PubChem's reference table calls every computed value "PubChem", which
+is true and useless - it would be the same word on every row. The Information
+block's own citation says **"Computed by XLogP3 3.0 (PubChem release
+2025.04.14)"**, i.e. WHICH MODEL produced the number, and for a value nobody
+measured that is the whole of what a citation is for. So `_source_for` takes
+the kind and prefers the opposite field for each: the table's short
+`SourceName` for a measurement ("CAMEO Chemicals"), the free-text citation
+for a computed value.
+**AND THAT ONE WAS FOUND BY PHOTOGRAPHING THE PAGE, NOT BY A TEST.** The
+first computed fixture was captured WITHOUT its `Reference` table, so
+`_source_for` fell through to the Information citation and the test asserting
+"Computed by" passed - on a payload the service does not actually send. The
+real page rendered `[PubChem]` twelve times. Re-captured with the table, the
+test failed exactly as it should have, and then the fix made it pass.
+**A fixture pruned of a field the code branches on is not a capture of the
+service, it is a capture of what you expected.**
+**A UNIT IS A SIBLING OF THE VALUE, ON BOTH SHAPES.** PubChem writes
+Molecular Weight as the STRING `"346.6"` with `Unit: g/mol`; round 90 read
+the unit only off the `Number` shape, so the weight would have rendered as a
+bare `346.6`. Experimental values rarely carry a `Unit` at all, which is why
+it went unnoticed.
+`MAX_PROPERTIES` is 32 rather than 24, because a compound with both halves
+now has up to 26 headings; aspirin's full record is **4.6 kB** and
+Cassipourine's **1.8 kB**, against the 1.81 MB they came from.
+1835 tests.
+
+Round 90 (2026-08-26, a name gives a LIST, and a molecule gets a properties
+tab - Christian's batch, and the join key is the whole design):
+He asked for Ctrl+Shift+N to work like the crystal search (multiple results,
+favourites, header sorting, molecular weight), to show the skeletal structure
+of the selected row, and for a properties tab on a plain molecule, as an
+add-on for now. Then he asked the question that settled the architecture:
+"if the tiered search quits after finding something on OPSIN, then the
+fundamental structure of the search algorithm has to change? ... Or are you
+using CIDs as the ground truth because they are the most reliable/universal?"
+**THE ANSWER IS THAT THE JOIN KEY IS THE STRUCTURE, AND IT IS NEITHER THE
+NAME NOR THE CID.** A CID is PubChem-local and is what you get AFTER the
+join; a SMILES is not canonical across toolkits (RDKit and OpenBabel disagree
+for the same molecule) so it cannot join two databases. An **InChIKey** is a
+hash designed for exactly this, every service indexes on it, and RDKit
+computes it offline. Which means **the cascade answering first is not a
+problem at all**: enrichment is keyed on the structure, so it does not care
+which tier found it. Nothing about `core/resolve.py` had to change.
+**AND THE 404 IS A NAME-INDEX MISS, NOT MISSING DATA - measured.**
+`/name/xylene/cids` and `/name/cresol/cids` both fail, and PubChem has both
+compounds perfectly well: hash OPSIN's answer and ask by InChIKey and o-xylene
+comes back as CID 7237 with a full record, o-cresol as CID 335, ferrocene as
+CID 7611. So a search is three operations rather than one changed one -
+**resolve** (name to one structure, a cascade, unchanged), **search** (name to
+a candidate list, a fan-out, new), **enrich** (structure to data, keyed on the
+InChIKey, new).
+**A MOLECULE NAME IS NOT A CRYSTAL NAME, and the columns follow from that.**
+A crystal name has many right answers (polymorphs, redeterminations); a
+molecule name has ONE right structure and many candidate COMPOUNDS, so this is
+a DISAMBIGUATION list. Measured: PubChem's exact-name endpoint returns exactly
+one CID for benzoic acid, ferrocene, aspirin and glucose. Formula and weight
+are on every row because RDKit computes both offline from the SMILES whatever
+found it - and for the case the whole feature exists to fix they are useless,
+since o-, m- and p-xylene share both. **That is what the picture is for.**
+`core/depict.py` draws the selected row from its SMILES; PNG through RDKit's
+Cairo backend rather than SVG, because Qt's svg imageformat plugin is a
+deployment detail we do not control (round 62) and the failure mode is a
+silently missing picture. It draws from a STRING and never from a Structure,
+deliberately: laying out a depiction runs `Compute2DCoords`, which WRITES a
+conformer, and taking a string makes flattening the molecule you were about to
+import unrepresentable.
+**THE CANDIDATE SOURCE IS AUTOCOMPLETE, AND THE OBVIOUS ALTERNATIVE IS ROUND
+85'S MISTAKE.** A word-type name search returns **1064 CIDs for xylene and
+3371 for glucose**, in database order, ignores `MaxRecords`, and asking for
+their properties is a **414 Request-URI Too Long**. Truncating an unranked
+list is exactly what COD's file-id order did to round 84. Autocomplete answers
+in about a second with M-XYLENE, P-XYLENE, O-XYLENE at the top - the list a
+chemist wants - and its own ordering is kept as each candidate's `rank_hint`.
+**A SILENT DISAMBIGUATION IS NOW REPORTED, and it is a real bug found on the
+way.** OPSIN and CACTUS both answer "xylene" with **o-xylene** and "cresol"
+with **o-cresol**, with no warning of any kind. The test is not a title
+mismatch - PubChem's preferred name for ferrocene is "Bis(eta-cyclopentadienyl)
+iron", which is a different NAME for the same thing - it is whether the query
+is a PROPER SUBSTRING of what came back, i.e. whether a locant was added.
+**PUBCHEM THROTTLES AT 5 REQUESTS A SECOND AND THE FAILURE IS SILENT.**
+Measured: a burst of twelve name lookups through an 8-worker pool finishes in
+0.64 s and the last two come back **503, "too many requests per second"** -
+after which the bulk property call that fills the list is the one refused. The
+rows then appear with no name, no formula and no weight, i.e. looking exactly
+like broken enrichment; and because it depends on how many suggestions came
+back, **"xylene" and "aspirin" failed while "cresol" worked**. `_RateLimit` is
+process-wide (three provider threads each politely under the limit still add
+up to three times it) and a 503 is retried rather than dropped.
+**THE LIST FILLS INCREMENTALLY AND NEVER REORDERS ITSELF.** Christian's own
+design. `search(progress=)` calls back per provider with that provider's
+enriched, ranked batch, and `merge_batch` folds it into what is on screen: a
+row already drawn can only be FILLED IN, never moved or removed. So PubChem
+arriving after OPSIN gives the existing row its real name and its CID instead
+of adding a second row for the same molecule, and nothing jumps under the
+hand - round 78's rule applied to a search.
+**A PASTED SMILES STILL WORKS, and now does better than before.** The old
+dialog accepted SMILES/InChI/CAS and a straight port would have broken that.
+`search_input` handles a pasted structure with no network at all, and because
+the InChIKey join then runs on it, pasting `CC(=O)Oc1ccccc1C(=O)O` now comes
+back labelled **Aspirin** - which the resolver never did.
+**`ui/search_table.py` IS THE EXTRACTION.** Rounds 86 and 87 built the numeric
+sorting, the unknowns-sink rule, the third-click-restores-ranking cycle, the
+star column and the divider for the crystal search; every bit of it was needed
+again. Two copies is the drift this project keeps finding, so both dialogs now
+subclass one `ResultTable`. The extraction was validated by the 33 existing
+crystal-search tests, which pass unchanged apart from asking `dlg.table` for
+what is now the table's business.
+**AND IT TURNED UP A BUG THAT HAD BEEN SHIPPING SINCE ROUND 86.** Those tables
+wrote each numeric cell's value into `Qt.EditRole` "so Qt compares it as a
+number" - and then never asked Qt to compare anything, because the sorting is
+driven by hand in Python off the ATTRIBUTE. That write was not merely
+redundant: **a QTableWidgetItem keeps DisplayRole and EditRole in one slot**,
+so it silently replaced the formatted text and the column was rendered by Qt
+rather than by `cells_for`. Invisible for four rounds because a temperature
+and a year are whole numbers and 293.0 renders as "293"; it showed up at once
+on molecular weights, where RDKit's 106.168 sat next to PubChem's 106.16 in
+the same column. Removed, and the display is `cells_for`'s again.
+**THE PROPERTIES TAB, AND MELTING POINT IS NOT A NUMBER.** Measured on
+PubChem: aspirin's full record is **1.81 MB**, its Experimental Properties
+section **75 kB**, and its Melting Point section alone **11 kB containing
+seven melting points in three unit conventions** - `275 F (NTP, 1992)`,
+`138-140` with no unit at all, `135 C (rapid heating)`, `135 C`. So the page
+cannot print "the melting point"; it shows up to three values, each with its
+source, and says how many more there were. That is Christian's "always cites
+the source of the info for every item", and with a spread like that the
+citation is the only way to judge which value to believe. A real record comes
+to **3.2 kB**, which is the answer to "it must not become too big": the cap is
+arithmetic (`MAX_PROPERTIES` x `MAX_VALUES` x `MAX_CHARS`), not hope.
+**THE FORMAT IS IN CORE AND THE FETCHING IS IN THE ADD-ON**, and that split is
+not tidiness: if `molom/addons/mol_properties.py` owned the storage layout,
+disabling the add-on would make saved files unreadable and no second add-on
+could cooperate with the first. `core/molprops.py` owns the metadata key, the
+schema version and the caps; every line that knows what PubChem is lives in
+the add-on. A record written by a LATER schema version is IGNORED rather than
+read optimistically - half-understanding a format is how you show somebody a
+melting point that is really a flash point.
+**WHAT REACHES AN .xyz IS PROVENANCE ONLY.** An xyz comment is ONE line that
+every other program reads, so a few hundred characters of melting points in it
+is how you break somebody else's parser. `Record.provenance()` writes name,
+formula, CID, InChIKey and the retrieval date; the measured values stay in the
+`.molom`, where there is room. The identity record is stored on EVERY
+import-by-name whether or not the add-on is enabled - it is small, it is the
+answer to "what is this and where did it come from", and it is what lets the
+add-on work on a molecule imported before it was switched on.
+**AN EDIT MARKS IT STALE RATHER THAN DROPPING IT**, through round 75's
+existing machinery: the record attaches as `POLICY_FRAGILE`, so the object
+locks, a chemistry edit flags it and an export cannot ship it silently.
+Fragile and not volatile for a second reason on top of Christian's original
+one - these numbers describe a COMPOUND IDENTITY rather than a conformer, so
+moving the molecule cannot invalidate them while changing an element makes
+them describe something else entirely.
+**AND ROUND 65'S GUARD CAUGHT ME REINTRODUCING ITS OWN BUG.** Importing
+`molsearch` at module scope in `app.py` pulls the resolver and so
+urllib/http/email into every launch - the exact ~130 ms round 65 removed. It
+is imported at its use sites now, and the source-level guard was widened to
+name `molsearch` as well as `resolve`, because the same cost arrives by that
+route and the test that pins one should pin both.
+Verified by RUNNING it, not by assertion: "xylene" returns twelve compounds
+with the three isomers first and `read 'xylene' as O-Xylene` on the ortho row;
+aspirin imports with its provenance on the comment line and the add-on then
+stores 11 cited properties in 3264 bytes. Both themes photographed - the
+depiction swaps its ink for a dark window rather than its background, since
+black-on-transparent is the same failure as no picture but harder to
+diagnose. **`ResolveNameDialog` is superseded and no longer wired to
+anything**; it is kept for now because its did-you-mean contract is pinned by
+round 29's and round 61's tests, and it is listed in `docs/OPEN_ITEMS.md` for
+deletion if nothing adopts it.
+1827 tests.
+
 Round 89 (2026-08-26, the focal length finally does something - K1 closed, and
 Christian designed the fix):
 He asked the question that dissolves it: "why isn't dragging the handles just
@@ -4121,7 +4503,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1785 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1867 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -4365,6 +4747,35 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   image export (`viewport.cell_zorder` / `cell_zorder_export`). The rule for
   which edge is the a axis lives here so the screen, the export and
   `blender_export.cell_edges` cannot part company.
+- `core/molsearch.py` — finding a MOLECULE by name, as a LIST (Ctrl+Shift+N).
+  The counterpart to `core/resolve.py`, not a replacement: that one cascades
+  to ONE structure and still does. Read the module docstring before touching
+  a tier - the whole design turns on **the join key being the InChIKey**
+  (a CID is PubChem-local, a SMILES is not canonical across toolkits), which
+  is what lets a structure found by OPSIN be looked up in PubChem and so what
+  makes a cascade answering first harmless. `merge_batch` is what keeps an
+  incrementally filled list from reordering under the user's hand;
+  `_RateLimit` is not optional, since PubChem 503s past 5 requests a second
+  and does it silently.
+- `core/depict.py` — the 2D skeletal picture, as PNG bytes. Draws from a
+  SMILES and never from a Structure, so it cannot flatten the 3D coordinates
+  it is describing.
+- `molom/addons/mol_properties.py` — the compound-properties page. Its
+  `identify()` is the piece worth knowing: a molecule's own GRAPH is its
+  identifier (`io.structure_to_smiles` -> InChIKey -> CID), so the page works
+  on anything drawn, edited or opened rather than only on what a search
+  found - and a stored record can be CHECKED against the structure instead of
+  being flagged by an edit. That is why nothing here locks an object.
+- `core/molprops.py` — the FORMAT for a compound's properties: the metadata
+  key, the schema version and the caps. In core so that disabling the add-on
+  that fills it cannot make a savefile unreadable. Carries the
+  MEASURED/COMPUTED split (`KIND_MEASURED`, `KIND_COMPUTED`), which is not
+  cosmetic - a computed logP and a measured melting point are different
+  claims and must never be shown as one list. The fetching and the page are
+  `molom/addons/mol_properties.py`.
+- `ui/search_table.py` — the results table BOTH searches use: numeric sorting
+  that is done in Python, unknowns that sink either way up, a third click that
+  restores the ranking, the star column and the favourites divider.
 - `core/cifsearch.py` — finding a CRYSTAL by formula, mineral or name, and
   importing it (Ctrl+Shift+Alt+N). Three tiers - a local folder, COD, and
   OPTIMADE's computed providers - run CONCURRENTLY, because unlike a molecule
@@ -5362,6 +5773,89 @@ independent cross-check inside a single fixture.
   counted red oxygens as red cell-box rods. Measure the QUANTITY - a matrix
   element, a frame-to-frame difference - and use the picture to confirm by
   eye, not to count.
+- **A QTableWidgetItem KEEPS DisplayRole AND EditRole IN ONE SLOT** (round
+  90). Writing a sort value into `Qt.EditRole` therefore REPLACES the text
+  the cell was built with, and the column is rendered by Qt instead of by
+  whatever formatted it. Round 86 did that so Qt could compare numerically
+  and then sorted in Python anyway, so the write was pure harm - invisible
+  for four rounds because a year and a temperature are whole numbers and
+  293.0 renders as "293", and obvious the moment a molecular weight put
+  RDKit's 106.168 next to PubChem's 106.16 in one column. If the sorting is
+  hand-driven, do not write EditRole at all.
+- **A RIGID MOTION IS NOT AN EDIT TO THE STRUCTURE** (round 91). Moving or
+  turning a whole crystal preserves its space group exactly, so anything that
+  re-derives symmetry on an edit commit has to ask WHAT the edit was -
+  `_edit_was_rigid` fits the before and after with Kabsch. Without it a plain
+  grab demoted `F m -3 m` to `P 1` and froze the cell, which then greys the ❖
+  controls and reads as an unrelated UI bug. The composition has to be
+  compared too: an element change moves no atoms at all.
+- **A STYLESHEET SET ON A WIDGET APPLIES TO ITS CHILDREN** (round 90d), so
+  `setStyleSheet("background: ...")` on a card paints every label inside it as
+  its own little box. It reads as a deliberate (and ugly) design rather than
+  as a bug. Scope it - `QFrame#propcard { ... }` with a matching
+  `setObjectName` - whenever the sheet is meant for the widget alone.
+- **A WORD-WRAPPED QLabel MUST BE ALLOWED TO SHRINK, NOT THE LAYOUT TO GROW**
+  (round 90d). `QLayout.SetMinimumSize` stops a card being squashed vertically
+  and immediately makes it as WIDE as its widest child's minimum, so a long
+  value pushes the card past its dock and clips instead of wrapping. Both are
+  the same missing `heightForWidth`; the fix that solves both is
+  `setMinimumWidth(1)` plus a `Minimum` vertical size policy on the label.
+- **SELECTABLE TEXT NEEDS THE I-BEAM CURSOR** (round 90d). Setting only
+  `TextSelectableByMouse` gives you text that can be copied with nothing on
+  screen saying so, which Christian rates as worse than not being able to
+  copy it at all.
+- **FOUR PATHS CHANGE THE ACTIVE OBJECT, AND EACH RE-SYNCS ITS PANELS BY
+  HAND** (round 90c): `_sync_all`, `_on_obj_activated` (an outliner row),
+  `_on_outliner_atoms` and `_on_selection_changed` (a viewport pick). Wiring a
+  new panel into `_sync_all` alone covers imports and scene changes and NOT
+  selection - so the panel keeps describing the molecule you clicked away
+  from, and any button on it acts on that one. Round 51's bug, and round 90
+  reintroduced it inside the hook added to prevent it. Anything per-object
+  goes through `_sync_addon_pages()` or all four call sites.
+- **A WRAPPED QLabel'S HEIGHT DEPENDS ON ITS WIDTH AND A QFrame DOES NOT
+  PROPAGATE `heightForWidth`** (round 90c), so a frame full of wrapped labels
+  can be given less height than its contents need and draws them on top of one
+  another. `QLayout.SetMinimumSize` on the frame's own layout is the fix. It
+  only shows once a card gets tall, which is why it survived until a property
+  was expanded to seven values.
+- **`deleteLater()` ALONE DOES NOT STOP A WIDGET PAINTING** (round 90c). The
+  delete is dispatched on a later pass of the event loop (and never by
+  `processEvents` - round 86), so a cleared row remains a child of its parent
+  and keeps drawing at its old geometry until then - a ghost of the previous
+  layout over the new one. `setParent(None)` first, then `deleteLater()`.
+- **THE SELECTION OUTLINE MUST BE BUILT FROM `style.bond_cylinders`**
+  (round 90c). A double bond is drawn as two cylinders offset by +-1.0*r at
+  radius 1.3*r, so a single hull cylinder on the bond AXIS is swallowed whole
+  and the bond shows no outline at all. It was hidden for five rounds because
+  round 35 thinned the outline by 5x, which was right for the atoms and is
+  what sank the hull inside the bond.
+- **A FIXTURE PRUNED OF A FIELD THE CODE BRANCHES ON IS NOT A CAPTURE OF THE
+  SERVICE** (round 90b, and it happened TWICE - the second time the pruned
+  field was `URL`, so the source-link branch had nothing to read). The computed-properties fixture was captured without
+  its `Reference` table, so the source-attribution branch that reads that
+  table was never exercised and a test asserting the RIGHT answer passed on a
+  payload PubChem does not send. The real page showed `[PubChem]` on twelve
+  rows where it should have named XLogP3 and Cactvs. When trimming a captured
+  payload, keep every field any branch reads - or capture it whole.
+- **PUBCHEM SPLITS PROPERTIES INTO TWO SECTIONS AND A COMPOUND MAY HAVE ONLY
+  ONE** (round 90b). `Experimental Properties` 404s with `PUGVIEW.NotFound`
+  for Cassipourine (CID 101821144) while `Computed Properties` returns 16 kB.
+  A 404 on one heading is an ordinary answer, not a failure, and asking for
+  only one of the two makes an entry full of data look empty.
+- **PUBCHEM ALLOWS 5 REQUESTS A SECOND AND REFUSES THE SIXTH SILENTLY**
+  (round 90). Measured: twelve name lookups through an 8-worker pool finish
+  in 0.64 s and the last two are 503 "too many requests per second" - and the
+  one that gets refused is whichever call happens to be last, which in a
+  search is the bulk property call that fills every row. The rows then draw
+  with no name and no weight, looking exactly like broken enrichment, and it
+  depends on how many suggestions came back, so it strikes one query and not
+  the next. Any new PubChem call goes through `molsearch._pubchem_json`.
+- **THE JOIN KEY BETWEEN CHEMICAL DATABASES IS THE InChIKey** (round 90) -
+  not the name, which 404s for "xylene" and "cresol" on PubChem's own index
+  while it holds both compounds; not a CID, which is PubChem-local and is
+  what you get after the join; and not a SMILES, since RDKit and OpenBabel
+  produce different canonical strings for one molecule. Anything that has to
+  ask a second service about a structure hashes it first.
 - **A CARTESIAN ROUND TRIP MOVES AN ATOM OFF A SPECIAL POSITION** (round 87).
   Converting coordinates out to Cartesian and back leaves an atom that sits at
   exactly 0 at about -9.45e-17, and the SIGN is what does the damage: a tiny
@@ -5668,7 +6162,7 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 1781 offline tests, 4 skipped, ~140 s.
+1. `python -m pytest tests/ -q` — 1867 offline tests, 4 skipped, ~100 s.
    `tests/conftest.py` sandboxes QSettings, so a GUI test can drive a real
    control without writing into your own MoloM configuration; it also
    **destroys the windows a test created** (round 86), without which the suite

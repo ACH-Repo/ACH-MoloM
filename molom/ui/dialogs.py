@@ -8,7 +8,7 @@ import re
 from typing import Optional
 
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QImage, QPalette, QPixmap
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox,
                                QDialog,
                                QDialogButtonBox, QDoubleSpinBox, QFileDialog,
@@ -24,8 +24,11 @@ from ..core import blender_export as bx
 from ..core import cellbox as cellbox_mod
 from ..core import cif as cif_mod
 from ..core import cifsearch
+from ..core import depict as depict_mod
+from ..core import molprops
 from ..core import flight, input_map
 from ..core import style as style_mod
+from .search_table import ResultTable
 from .widgets import make_text_selectable
 
 
@@ -1239,7 +1242,14 @@ class _ResolveWorker(QThread):
 
 
 class ResolveNameDialog(QDialog):
-    """Import by name (Ctrl+Shift+N): OPSIN -> PubChem -> did-you-mean.
+    """Import by name: OPSIN -> PubChem -> did-you-mean.
+
+    **SUPERSEDED by `MoleculeSearchDialog` in round 90** and no longer wired
+    to anything - Ctrl+Shift+N now opens a list. Kept because the resolver
+    cascade it drives is still the right shape for "turn this one name into
+    one structure", and because its did-you-mean behaviour is pinned by tests
+    that describe a real contract. If nothing has adopted it by the next
+    sweep, delete it and them together.
 
     Resolution runs in a worker thread (12 s web timeout must not freeze the
     GUI). On success `self.resolution` holds the core Resolution object."""
@@ -1880,10 +1890,10 @@ def _age_phrase(when):
     return ", {:.0f} day{} ago".format(days, "" if days < 1.5 else "s")
 
 
-def _result_line(hits, query):
-    # type: (list, str) -> str
-    return "{} structure{} for {!r}".format(
-        len(hits), "" if len(hits) == 1 else "s", query or "")
+def _result_line(hits, query, noun="structure"):
+    # type: (list, str, str) -> str
+    return "{} {}{} for {!r}".format(
+        len(hits), noun, "" if len(hits) == 1 else "s", query or "")
 
 
 class _CifSearchWorker(QThread):
@@ -1910,29 +1920,63 @@ class _CifSearchWorker(QThread):
         self.done.emit(result)
 
 
+class _CifResultTable(ResultTable):
+    """The crystal search's columns: what a person actually chooses by - what
+    it is, which polymorph, what symmetry, measured or computed, how recent."""
+
+    COLUMNS = ("★", "Formula", "Name / mineral", "Space group", "T / K",
+               "Year", "Source")
+    STAR = 0
+    NUMERIC_COLUMNS = {4: "temperature", 5: "year"}
+    STRETCH_COLUMN = 2
+    DIVIDER_TEXT = "FAVOURITES"
+
+    def cells_for(self, hit):
+        source = ("on disk" if hit.source == cifsearch.SOURCE_LOCAL
+                  else (hit.note.split()[0] if hit.note else hit.source))
+        return ("",                     # the star column carries no text
+                hit.formula,
+                hit.mineral or hit.name,
+                hit.spacegroup,
+                "" if hit.temperature is None
+                else "{:g}".format(float(hit.temperature)),
+                "" if not hit.year else str(hit.year),
+                source + (" (calc)" if hit.computed else ""))
+
+    def key_for(self, hit):
+        return hit.key()
+
+    def decorate(self, hit, widget_item, column):
+        if hit.computed:
+            # A DFT-relaxed cell is not a measurement, and which kind you are
+            # looking at must be visible at a glance.
+            widget_item.setForeground(QColor(150, 170, 210))
+        widget_item.setToolTip(hit.note or str(hit.ref))
+
+    def star_tooltip(self):
+        return ("Keep this structure in the list - the reference is "
+                "remembered, not the file")
+
+
 class CifSearchDialog(QDialog):
     """Find a crystal structure and import it (Ctrl+Shift+Alt+N).
 
-    Deliberately NOT modelled on `ResolveNameDialog`, and the difference is
-    the whole reason this is its own dialog: resolving a molecule NAME gives
-    one answer, so that dialog shows a resolution and an Import button. A
-    crystal name gives many - polymorphs, temperatures, redeterminations, a
-    dozen determinations of quartz - so this one is a LIST you choose from,
-    and it is multi-select because comparing two polymorphs side by side is
-    the commonest reason to go looking in the first place.
+    Deliberately NOT modelled on `ResolveNameDialog` as that dialog was: a
+    crystal name gives many answers - polymorphs, temperatures,
+    redeterminations, a dozen determinations of quartz - so this is a LIST you
+    choose from, and it is multi-select because comparing two polymorphs side
+    by side is the commonest reason to go looking in the first place.
 
-    The columns are what a person actually chooses by: what it is, which
-    polymorph, what symmetry, measured or computed, and how recent.
+    Round 90 moved the table itself into `ui/search_table.py`, because the
+    molecule search needs every bit of its sorting, starring and dividing
+    behaviour and two copies of that is how they drift apart.
     """
 
-    COLUMNS = ("\u2605", "Formula", "Name / mineral", "Space group", "T / K",
-               "Year", "Source")
-
-    #: Column indices BY NAME. Round 87 inserted the star at 0 and shifted
-    #: every other column by one, which broke six tests that had the old
-    #: numbers written into them - so the numbers live here now and the tests
-    #: ask for them by meaning.
-    STAR = 0            # a CONTROL, not data: not sortable, no text
+    #: Kept on the dialog because callers and tests ask by MEANING rather than
+    #: by position - round 87's lesson, when inserting the star column shifted
+    #: every other index by one and broke six tests that had numbers in them.
+    COLUMNS = _CifResultTable.COLUMNS
+    STAR = _CifResultTable.STAR
     COL_FORMULA = 1
     COL_NAME = 2
     COL_SPACEGROUP = 3
@@ -1940,63 +1984,21 @@ class CifSearchDialog(QDialog):
     COL_YEAR = 5
     COL_SOURCE = 6
 
-    #: Which columns hold a NUMBER, and therefore must not be compared as
-    #: text. `QTableWidgetItem` sorts lexically, so "100" sorts before "98"
-    #: and a run of empty cells sorts among the digits - which on COD, where
-    #: temperature and year are null constantly, would make the two columns
-    #: worth sorting by the two that lie. Each cell carries its sort value in
-    #: `Qt.EditRole`, which Qt compares numerically.
-    NUMERIC_COLUMNS = {COL_TEMPERATURE: "temperature", COL_YEAR: "year"}
-
-    #: Where a blank sorts. A missing temperature is not 0 K and a missing
-    #: year is not year zero, so unknowns are pinned BELOW everything either
-    #: way up rather than being given a number that ranks them.
-    UNKNOWN = float("inf")
-
     def __init__(self, parent, roots=(), remembered=None, favourites=None):
         super().__init__(parent)
         self.setWindowTitle("Find a crystal structure")
-        self.hits = []            # type: list
         self.chosen = []          # type: list
         self._roots = list(roots or [])
         self._worker = None
-        self._sort_column = None
-        self._sort_desc = False
-        #: Bookmarked structures, `{hit.key(): Hit}`. NOT the CIFs - a
-        #: favourite is a reference, so it cannot go stale against the
-        #: provider the way a private copy would.
-        self.favourites = dict(favourites or {})
-        #: Rows that are a divider rather than a hit.
-        self._divider_rows = set()
-        #: The hits AS DRAWN. `self.hits` keeps the search ranking; sorting
-        #: reorders only this, so "which structure is row 4?" has one answer.
-        self._shown = []
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel("Formula, mineral or chemical name:"))
         self.edit = QLineEdit(self)
         self.edit.setPlaceholderText("SiO2    quartz    TiO2    ferrocene")
         lay.addWidget(self.edit)
 
-        self.table = QTableWidget(0, len(self.COLUMNS), self)
-        self.table.setHorizontalHeaderLabels(self.COLUMNS)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        # MULTI-select: two polymorphs side by side is the point.
-        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.verticalHeader().setVisible(False)
-        self.table.itemSelectionChanged.connect(self._selection_changed)
-        self.table.doubleClicked.connect(self._take_one)
-        # Sorting is driven by hand rather than by `setSortingEnabled(True)`,
-        # because the rows have a MEANINGFUL default order - the ranking is
-        # the one thing the search itself is for - and Qt's built-in sorting
-        # has no way back to it. Clicking the same header a third time
-        # restores the ranking.
-        head = self.table.horizontalHeader()
-        head.setSectionsClickable(True)
-        head.sectionClicked.connect(self._sort_by)
-        head.setToolTip("Click to sort; click again to reverse, and a third "
-                        "time to go back to the search ranking")
-        self.table.itemChanged.connect(self._star_toggled)
+        self.table = _CifResultTable(self, favourites=favourites)
+        self.table.chosen_changed.connect(self._selection_changed)
+        self.table.item_activated.connect(self._take_one)
         lay.addWidget(self.table, 1)
 
         self.info = QLabel("")
@@ -2024,37 +2026,46 @@ class CifSearchDialog(QDialog):
             # Christian: "show them by default when opening the search
             # window". With nothing remembered they ARE the window's content,
             # so there is nothing to separate them from and no rule is drawn.
-            self._fill()
+            self.table.refill()
             self.info.setText(
                 "{} favourite{} - search to add more".format(
                     len(self.favourites),
                     "" if len(self.favourites) == 1 else "s"))
 
+    # ---------------------------------------------------- table pass-through
+    @property
+    def hits(self):
+        """The ranked results. Lives on the table, which owns the view."""
+        return self.table.results
+
+    @hits.setter
+    def hits(self, value):
+        self.table.set_results(value)
+
+    @property
+    def favourites(self):
+        return self.table.favourites
+
     # ------------------------------------------------------------ searching
     def restore(self, remembered):
         """Put the last search back, without re-running it.
 
-        Christian: "it really needs to remember the results of the last
-        search". Re-running would be worse than useless - it costs three
-        network round trips to redisplay something already on the screen a
-        moment ago, and it would silently change under you if a provider
-        answered differently.
+        Re-running would be worse than useless - it costs three network round
+        trips to redisplay something that was on the screen a moment ago, and
+        it would silently change under you if a provider answered differently.
 
         The age is SAID rather than hidden. A stale list that looks live is
-        worse than an empty one: COD entries get superseded, and a result you
-        ran yesterday is a different claim from one you ran just now.
+        worse than an empty one.
         """
         if not remembered:
             return
         query, hits, when = remembered
         self.edit.setText(query or "")
         self.edit.selectAll()
-        self.hits = list(hits or [])
-        self._fill()
-        age = _age_phrase(when)
+        self.table.set_results(hits or [])
         self.info.setText(
             "{} - from your last search{}. Press Enter to run it again."
-            .format(_result_line(self.hits, query), age))
+            .format(_result_line(self.hits, query), _age_phrase(when)))
 
     def remembered(self):
         # type: () -> tuple
@@ -2068,7 +2079,7 @@ class CifSearchDialog(QDialog):
             return
         self.search_btn.setEnabled(False)
         self.info.setText("Searching {!r}...".format(query))
-        self.table.setRowCount(0)
+        self.table.set_results([])
         # NO parent: see `_LIVE_WORKERS`. A crystal search is three providers
         # with an 8 s budget each, so closing the dialog while one is in
         # flight is an ordinary thing to do rather than a corner case.
@@ -2079,8 +2090,7 @@ class CifSearchDialog(QDialog):
     def _finished(self, result):
         self._worker = None
         self.search_btn.setEnabled(True)
-        self.hits = list(result.hits)
-        self._fill()
+        self.table.set_results(result.hits)
         text = result.summary()
         if result.trouble:
             # NAMED, not counted. "Materials Project did not answer" is
@@ -2088,186 +2098,303 @@ class CifSearchDialog(QDialog):
             text += "\n" + "; ".join(result.trouble[:3])
         self.info.setText(text)
 
-    def _sort_by(self, column):
-        """Cycle this column: ascending, descending, then back to the
-        ranking. The ranking is a real answer, not an accident of insertion
-        order, so there has to be a way back to it."""
-        if column == self.STAR:
-            return                      # a control, not a column of data
-        if column != self._sort_column:
-            self._sort_column, self._sort_desc = column, False
-        elif not self._sort_desc:
-            self._sort_desc = True
-        else:
-            self._sort_column, self._sort_desc = None, False
-        self._fill()
-
-    def _sort_value(self, hit, column):
-        """What a hit is compared BY in one column.
-
-        Text columns fold case, or `Quartz` and `quartz` end up in different
-        halves of the list. Numeric columns hand back a real number, and an
-        unknown gets `UNKNOWN` so it sinks to the bottom whichever way the
-        column is pointing - see the class docstring for why that is not 0.
-        """
-        field = self.NUMERIC_COLUMNS.get(column)
-        if field is not None:
-            value = getattr(hit, field, None)
-            try:
-                return (0, float(value))
-            except (TypeError, ValueError):
-                return (1, self.UNKNOWN)
-        return (0, self._cells(hit)[column].lower())
-
-    def _ordered_hits(self):
-        if self._sort_column is None:
-            return list(self.hits)          # the search ranking
-        column = self._sort_column
-        rows = sorted(self.hits,
-                      key=lambda h: self._sort_value(h, column),
-                      reverse=self._sort_desc)
-        if self._sort_desc:
-            # `reverse` would also flip the unknowns to the TOP, which is the
-            # one thing they must never do - an unknown temperature is not
-            # the highest one. They are lifted out and re-appended instead.
-            known = [h for h in rows
-                     if self._sort_value(h, column)[0] == 0]
-            unknown = [h for h in self.hits
-                       if self._sort_value(h, column)[0] != 0]
-            rows = known + unknown
-        return rows
-
-    def _cells(self, hit):
-        source = ("on disk" if hit.source == cifsearch.SOURCE_LOCAL
-                  else (hit.note.split()[0] if hit.note else hit.source))
-        return ("",                     # the star column carries no text
-                hit.formula,
-                hit.mineral or hit.name,
-                hit.spacegroup,
-                "" if hit.temperature is None
-                else "{:g}".format(float(hit.temperature)),
-                "" if not hit.year else str(hit.year),
-                source + (" (calc)" if hit.computed else ""))
-
-    def _favourites_below(self, shown):
-        """Favourites that are not already among the results.
-
-        A favourite that the search FOUND stays in the results with its star
-        ticked - showing it twice would make the same structure look like two,
-        and the one in the results is the one carrying its rank.
-        """
-        seen = {h.key() for h in shown}
-        return [h for k, h in sorted(self.favourites.items())
-                if k not in seen]
-
-    def _fill(self):
-        # `self.hits` stays in RANK order; only the VIEW is sorted, and
-        # `_shown` maps a table row back to the hit it draws so selecting one
-        # still returns the right structure. Favourites are appended BELOW a
-        # divider - Christian: "when a search is performed, sort them to the
-        # very bottom separated by a horizontal line like the ones that F3
-        # search options already uses".
-        results = self._ordered_hits()
-        extra = self._favourites_below(results)
-        self._divider_rows = set()
-        self._shown = list(results)
-        divider_at = None
-        if extra:
-            if results:
-                divider_at = len(self._shown)
-                self._shown.append(None)          # placeholder for the rule
-            self._shown.extend(extra)
-        self._loading_stars = True
-        self.table.setRowCount(len(self._shown))
-        if divider_at is not None:
-            self._add_divider(divider_at)
-        for row, hit in enumerate(self._shown):
-            if hit is None:
-                continue
-            cells = self._cells(hit)
-            for column, value in enumerate(cells):
-                item = QTableWidgetItem(str(value))
-                if column == self.STAR:
-                    item.setFlags((item.flags() | Qt.ItemIsUserCheckable)
-                                  & ~Qt.ItemIsEditable)
-                    item.setCheckState(
-                        Qt.Checked if hit.key() in self.favourites
-                        else Qt.Unchecked)
-                    item.setToolTip("Keep this structure in the list - the "
-                                    "reference is remembered, not the file")
-                    self.table.setItem(row, column, item)
-                    continue
-                field = self.NUMERIC_COLUMNS.get(column)
-                if field is not None:
-                    number = getattr(hit, field, None)
-                    try:
-                        # The DISPLAY stays the string; this is what Qt
-                        # compares, so 100 K no longer sorts before 98 K.
-                        item.setData(Qt.EditRole, float(number))
-                    except (TypeError, ValueError):
-                        pass
-                if hit.computed:
-                    # A DFT-relaxed cell is not a measurement, and which kind
-                    # you are looking at must be visible at a glance.
-                    item.setForeground(QColor(150, 170, 210))
-                item.setToolTip(hit.note or str(hit.ref))
-                self.table.setItem(row, column, item)
-        self._loading_stars = False
-        self.table.resizeColumnsToContents()
-        self.table.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.Stretch)
-        self.table.setColumnWidth(self.STAR, 26)
-
-    def _add_divider(self, row):
-        """A full-width rule, drawn the way the F3 palette draws one.
-
-        The same device and the same reason: a long list needs to say where
-        one kind of entry stops and another starts, and a heading that cannot
-        be selected is what does it.
-        """
-        item = QTableWidgetItem("\u2500\u2500  FAVOURITES  " + "\u2500" * 40)
-        item.setFlags(Qt.NoItemFlags)             # a divider, not a choice
-        item.setForeground(QColor(130, 165, 205))
-        font = item.font()
-        font.setBold(True)
-        item.setFont(font)
-        self.table.setItem(row, 0, item)
-        self.table.setSpan(row, 0, 1, len(self.COLUMNS))
-        self._divider_rows.add(row)
-
-    def _star_toggled(self, item):
-        """A star ticked or unticked. Persistence is the caller's job."""
-        if getattr(self, "_loading_stars", False):
-            return
-        if item.column() != self.STAR:
-            return
-        row = item.row()
-        shown = getattr(self, "_shown", [])
-        if row >= len(shown) or shown[row] is None:
-            return
-        hit = shown[row]
-        if item.checkState() == Qt.Checked:
-            self.favourites[hit.key()] = hit
-        else:
-            self.favourites.pop(hit.key(), None)
-
     # ------------------------------------------------------------- choosing
-    def _selected_rows(self):
-        """Rows that are a HIT. The divider is selectable-looking furniture
-        and a favourites block below it is still importable, so the only
-        thing to exclude is the rule itself."""
-        return sorted({i.row() for i in self.table.selectedIndexes()
-                       if i.row() not in self._divider_rows})
-
     def _selection_changed(self):
-        shown = getattr(self, "_shown", self.hits)
-        self.chosen = [shown[r] for r in self._selected_rows()
-                       if 0 <= r < len(shown) and shown[r] is not None]
+        self.chosen = self.table.chosen()
         self.ok_btn.setEnabled(bool(self.chosen))
 
-    def _take_one(self, index):
-        shown = getattr(self, "_shown", self.hits)
-        row = index.row()
-        if 0 <= row < len(shown) and shown[row] is not None:
-            self.chosen = [shown[row]]
-            self.accept()
+    def _take_one(self, hit):
+        self.chosen = [hit]
+        self.accept()
+
+
+# ---------------------------------------------------------- molecule search
+class _MolSearchWorker(QThread):
+    """One molecule search, off the GUI thread, reporting AS IT LANDS.
+
+    `landed` fires once per provider with that provider's enriched, ranked
+    batch, which is what lets the dialog fill incrementally instead of
+    staring at nothing for four seconds. It is emitted from the provider's
+    own thread inside `molsearch.search`; the receiving dialog lives in the
+    GUI thread, so Qt queues it, and a dialog that has since been destroyed
+    is disconnected rather than called.
+    """
+
+    landed = Signal(str, object)
+    done = Signal(object)
+
+    def __init__(self, query, parent=None):
+        super().__init__(parent)
+        self._query = query
+
+    def run(self):
+        # Imported in the WORKER: `molsearch` reaches the resolver and so the
+        # network stack, which must not be on the path that merely opens a
+        # window (round 65).
+        from ..core import molsearch
+
+        def progress(source, batch):
+            self.landed.emit(str(source), list(batch))
+        try:
+            result = molsearch.search(self._query, progress=progress)
+        except Exception as exc:                    # noqa: BLE001
+            result = molsearch.Results(
+                self._query, trouble=["search failed: {}".format(exc)])
+        self.done.emit(result)
+
+
+class _MolResultTable(ResultTable):
+    """The molecule search's columns.
+
+    Formula and weight are here because they are FREE - RDKit computes both
+    from the SMILES offline, so every row has them whichever provider found
+    it. They are also, for the case this dialog exists to fix, completely
+    useless as discriminators: o-, m- and p-xylene share both. That is what
+    the picture beside the table is for.
+    """
+
+    COLUMNS = ("★", "Name", "Formula", "M / g mol-1", "Source")
+    STAR = 0
+    NUMERIC_COLUMNS = {3: "weight"}
+    STRETCH_COLUMN = 1
+    DIVIDER_TEXT = "FAVOURITES"
+    #: SINGLE select: the panel beside the table shows ONE structure, and a
+    #: multi-selection would leave it showing an arbitrary member of the set.
+    MULTI_SELECT = False
+
+    def cells_for(self, cand):
+        return ("",
+                cand.label(),
+                cand.formula,
+                "" if cand.weight is None else "{:.2f}".format(cand.weight),
+                cand.source)
+
+    def key_for(self, cand):
+        return cand.key()
+
+    def decorate(self, cand, widget_item, column):
+        if cand.note:
+            # The interpretation note - "read 'xylene' as O-Xylene" - is the
+            # one thing on the row that nobody would otherwise be told.
+            widget_item.setForeground(QColor(230, 180, 120))
+        widget_item.setToolTip(cand.note or cand.iupac_name or cand.smiles)
+
+    def star_tooltip(self):
+        return ("Keep this compound in the list - the structure is small "
+                "enough to remember, so a favourite works offline")
+
+
+class MoleculeSearchDialog(QDialog):
+    """Find a molecule by name and import it (Ctrl+Shift+N).
+
+    Replaces the single-answer resolver dialog, and the reason is measured
+    rather than aesthetic: PubChem's exact-name endpoint 404s on "xylene" and
+    on "cresol", and OPSIN answers both with the ORTHO isomer without saying
+    so. A dialog that shows one structure has no way to tell you either of
+    those things happened.
+
+    The panel on the right is the point. Formula and weight cannot separate
+    o-, m- and p-xylene - they are identical - so the skeletal formula is the
+    only thing in the window that settles which one you are about to import.
+    """
+
+    def __init__(self, parent, remembered=None, favourites=None):
+        super().__init__(parent)
+        self.setWindowTitle("Find a molecule by name")
+        self.chosen = []          # type: list
+        self._worker = None
+        self._last = None
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Name, SMILES, InChI or CAS number:"))
+        self.edit = QLineEdit(self)
+        self.edit.setPlaceholderText(
+            "xylene    benzoic acid    ferrocene    aspirin")
+        lay.addWidget(self.edit)
+
+        middle = QHBoxLayout()
+        self.table = _MolResultTable(self, favourites=favourites)
+        self.table.chosen_changed.connect(self._selection_changed)
+        self.table.item_activated.connect(self._take_one)
+        middle.addWidget(self.table, 1)
+        middle.addWidget(self._build_preview(), 0)
+        lay.addLayout(middle, 1)
+
+        self.info = QLabel("")
+        self.info.setWordWrap(True)
+        lay.addWidget(self.info)
+
+        row = QHBoxLayout()
+        self.search_btn = QPushButton("Search")
+        self.ok_btn = QPushButton("Import")
+        self.ok_btn.setEnabled(False)
+        cancel = QPushButton("Cancel")
+        row.addWidget(self.search_btn)
+        row.addStretch(1)
+        row.addWidget(self.ok_btn)
+        row.addWidget(cancel)
+        lay.addLayout(row)
+        self.search_btn.clicked.connect(self._start)
+        self.edit.returnPressed.connect(self._start)
+        self.ok_btn.clicked.connect(self.accept)
+        cancel.clicked.connect(self.reject)
+        make_text_selectable(self)
+        self.resize(940, 500)
+        self.restore(remembered)
+        if not self.candidates and self.favourites:
+            self.table.refill()
+            self.info.setText(
+                "{} favourite{} - search to add more".format(
+                    len(self.favourites),
+                    "" if len(self.favourites) == 1 else "s"))
+
+    def _build_preview(self):
+        panel = QWidget(self)
+        panel.setFixedWidth(320)
+        box = QVBoxLayout(panel)
+        box.setContentsMargins(8, 0, 0, 0)
+        self.picture = QLabel(panel)
+        self.picture.setAlignment(Qt.AlignCenter)
+        self.picture.setMinimumHeight(depict_mod.DEFAULT_SIZE[1])
+        self.picture.setToolTip("The selected compound, drawn from its SMILES")
+        box.addWidget(self.picture)
+        self.detail = QLabel(panel)
+        self.detail.setWordWrap(True)
+        self.detail.setAlignment(Qt.AlignTop)
+        self.detail.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        box.addWidget(self.detail, 1)
+        self._clear_preview("Select a result to see its structure")
+        return panel
+
+    # ---------------------------------------------------- table pass-through
+    @property
+    def candidates(self):
+        return self.table.results
+
+    @property
+    def favourites(self):
+        return self.table.favourites
+
+    # ------------------------------------------------------------ searching
+    def restore(self, remembered):
+        """Put the last search back without re-running it - same reasoning as
+        the crystal dialog, and the same cost of getting it wrong."""
+        if not remembered:
+            return
+        query, cands, when = remembered
+        self.edit.setText(query or "")
+        self.edit.selectAll()
+        self.table.set_results(cands or [])
+        self.info.setText(
+            "{} - from your last search{}. Press Enter to run it again."
+            .format(_result_line(self.candidates, query, noun="compound"),
+                    _age_phrase(when)))
+
+    def remembered(self):
+        # type: () -> tuple
+        import time
+        return (self.edit.text().strip(), list(self.candidates), time.time())
+
+    def _start(self):
+        query = self.edit.text().strip()
+        if not query or self._worker is not None:
+            return
+        self.search_btn.setEnabled(False)
+        self.info.setText("Searching {!r}...".format(query))
+        self.table.set_results([])
+        self._clear_preview("Searching...")
+        # NO parent: see `_LIVE_WORKERS`.
+        self._worker = _own_worker(_MolSearchWorker(query))
+        self._worker.landed.connect(self._landed)
+        self._worker.done.connect(self._finished)
+        self._worker.start()
+
+    def _landed(self, source, batch):
+        """One provider's results, folded into what is already on screen.
+
+        `merge_batch` is what makes this safe: a row already drawn is never
+        moved or removed, only filled in. So PubChem arriving after OPSIN
+        gives the row that is already there its real name and its CID rather
+        than adding a second row for the same molecule - and nothing the user
+        is reading jumps under their hand, which is round 78's rule.
+        """
+        from ..core import molsearch
+        added, updated = molsearch.merge_batch(self.table.results, batch)
+        if added or updated:
+            self.table.refill()
+        self.info.setText("{} so far - still searching...".format(
+            _result_line(self.candidates, self.edit.text().strip(),
+                         noun="compound")))
+        self._refresh_preview()
+
+    def _finished(self, result):
+        self._worker = None
+        self.search_btn.setEnabled(True)
+        if not self.candidates and result.candidates:
+            # Nothing arrived incrementally (an injected search, or a
+            # provider that answered only at the end).
+            self.table.set_results(result.candidates)
+        text = result.summary() if not self.candidates else (
+            _result_line(self.candidates, result.query, noun="compound")
+            + (" - " + result.ambiguous if result.ambiguous else ""))
+        if result.trouble:
+            text += "\n" + "; ".join(result.trouble[:3])
+        self.info.setText(text)
+        self._refresh_preview()
+
+    # -------------------------------------------------------------- preview
+    def _is_dark(self):
+        return self.palette().color(QPalette.Window).lightness() < 128
+
+    def _clear_preview(self, message):
+        self.picture.clear()
+        self.picture.setText("")
+        self.detail.setText(message)
+        self._last = None
+
+    def _refresh_preview(self):
+        cand = self.table.current_item()
+        if cand is None:
+            self._clear_preview("Select a result to see its structure")
+            return
+        if self._last is not None and self._last is cand:
+            return
+        self._last = cand
+        png = depict_mod.depict(cand.smiles, dark=self._is_dark())
+        if png:
+            image = QImage()
+            image.loadFromData(png, "PNG")
+            self.picture.setPixmap(QPixmap.fromImage(image))
+        else:
+            self.picture.clear()
+            self.picture.setText("(no structure to draw yet)")
+        rows = []
+        if cand.name:
+            rows.append("<b>{}</b>".format(cand.name))
+        if cand.iupac_name and cand.iupac_name != cand.name:
+            rows.append(cand.iupac_name)
+        if cand.formula:
+            weight = ("" if cand.weight is None
+                      else "  -  {:.2f} g mol-1".format(cand.weight))
+            rows.append(cand.formula + weight)
+        if cand.note:
+            # Bright, because it is a warning that a name was interpreted.
+            rows.append("<span style='color:#e6b478'>{}</span>"
+                        .format(cand.note))
+        if cand.inchikey:
+            rows.append("<small>{}</small>".format(cand.inchikey))
+        if cand.cid() is not None:
+            rows.append("<small>PubChem CID {}</small>".format(cand.cid()))
+        if cand.smiles:
+            rows.append("<small>{}</small>".format(cand.smiles))
+        self.detail.setText("<br>".join(rows))
+
+    # ------------------------------------------------------------- choosing
+    def _selection_changed(self):
+        self.chosen = self.table.chosen()
+        self.ok_btn.setEnabled(bool(self.chosen))
+        self._refresh_preview()
+
+    def _take_one(self, cand):
+        self.chosen = [cand]
+        self.accept()

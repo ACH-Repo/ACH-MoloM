@@ -26,7 +26,7 @@ def dialog():
         dlg = CifSearchDialog(None, favourites=favourites)
         if hits:
             dlg.hits = list(hits)
-            dlg._fill()
+            dlg.table.refill()
         return dlg
     return build
 
@@ -89,7 +89,7 @@ def test_they_show_by_default_with_no_search(dialog):
     favs = {h.key(): h for h in _hits(2)}
     dlg = dialog(favourites=favs)
     assert dlg.table.rowCount() == 2
-    assert dlg._divider_rows == set()
+    assert dlg.table._divider_rows == set()
     assert "favourite" in dlg.info.text()
     assert dlg.table.item(0, dlg.STAR).checkState() == Qt.Checked
 
@@ -101,7 +101,7 @@ def test_a_search_pushes_them_below_a_full_width_rule(dialog):
     dlg = dialog([Hit("cod", "999", formula="TiO2", name="rutile")],
                  favourites=favs)
     assert dlg.table.rowCount() == 3            # result, rule, favourite
-    assert sorted(dlg._divider_rows) == [1]
+    assert sorted(dlg.table._divider_rows) == [1]
     rule = dlg.table.item(1, 0)
     assert rule.text().startswith("──")
     assert "FAVOURITES" in rule.text()
@@ -118,7 +118,7 @@ def test_a_favourite_the_search_FOUND_is_not_shown_twice(dialog):
     found = _hits(3)
     dlg = dialog(found, favourites={found[1].key(): found[1]})
     assert dlg.table.rowCount() == 3
-    assert dlg._divider_rows == set()
+    assert dlg.table._divider_rows == set()
     stars = [dlg.table.item(r, dlg.STAR).checkState() == Qt.Checked
              for r in range(3)]
     assert stars == [False, True, False]
@@ -127,7 +127,7 @@ def test_a_favourite_the_search_FOUND_is_not_shown_twice(dialog):
 def test_the_rule_is_not_selectable_and_imports_nothing(dialog):
     favs = {h.key(): h for h in _hits(1)}
     dlg = dialog([Hit("cod", "999", formula="TiO2")], favourites=favs)
-    row = sorted(dlg._divider_rows)[0]
+    row = sorted(dlg.table._divider_rows)[0]
     dlg.table.clearSelection()
     dlg.table.selectRow(row)
     assert dlg.chosen == []
@@ -139,8 +139,8 @@ def test_the_rule_is_not_selectable_and_imports_nothing(dialog):
 def test_the_star_column_does_not_sort(dialog):
     """It is a control, not data."""
     dlg = dialog(_hits(3))
-    dlg._sort_by(dlg.STAR)
-    assert dlg._sort_column is None
+    dlg.table._sort_by(dlg.STAR)
+    assert dlg.table._sort_column is None
 
 
 def test_the_numeric_columns_still_sort_numerically(dialog):
@@ -149,10 +149,10 @@ def test_the_numeric_columns_still_sort_numerically(dialog):
     dlg = dialog([Hit("cod", str(k), formula="SiO2", temperature=t, year=y)
                   for k, (t, y) in enumerate([(100, 2008), (98, 1998),
                                               (293, 1975)])])
-    dlg._sort_by(4)
+    dlg.table._sort_by(4)
     assert [dlg.table.item(r, 4).text() for r in range(3)] == \
         ["98", "100", "293"]
-    dlg._sort_by(5)
+    dlg.table._sort_by(5)
     assert [dlg.table.item(r, 5).text() for r in range(3)] == \
         ["1975", "1998", "2008"]
 

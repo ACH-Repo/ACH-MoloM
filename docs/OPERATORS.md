@@ -43,7 +43,7 @@ toggle.
 | Open structure file **or project**... | Ctrl+O | — |
 | **Save project (savepoint `.molom`)** — every molecule with its name, visibility, style, object origin/frame, bond orders and trajectory frames, plus the camera and view settings | Ctrl+S | scene not empty |
 | **Save project as...** | Ctrl+Shift+P | scene not empty |
-| Import molecule by name... (OPSIN → PubChem) | Ctrl+Shift+N | — |
+| **Find a molecule by name...** — a LIST of candidates with formula, weight and a skeletal preview | **Ctrl+Shift+N** | — |
 | **Find a crystal structure...** — COD, OPTIMADE and a folder of your own, searched at once | **Ctrl+Shift+Alt+N** | — |
 | Crystal search: set the local CIF folder... | F3 / Settings | — |
 
@@ -1548,3 +1548,35 @@ as restraints — see the roadmap in CLAUDE.md.
   restraints; meta-atom UI (assign a geometry to a selected centre).
 - Duplicate molecule, measurement overlays in-viewport, depth-cue fog,
   numbered-frame outliner rows for trajectories.
+
+
+## Finding a molecule (Ctrl+Shift+N) - round 90
+
+Replaced the single-answer resolver dialog, and the reason is measured rather
+than aesthetic: PubChem's exact-name endpoint **404s on "xylene" and on
+"cresol"**, while OPSIN answers both with the ORTHO isomer and says nothing
+about it. A dialog that shows one structure cannot tell you either happened.
+
+OPSIN, CACTUS and PubChem are asked AT ONCE and their results merged. The
+merge runs on the **InChIKey**, not on the name and not on the CID: a CID is
+PubChem-local and a SMILES is not canonical across toolkits, while an InChIKey
+is a hash every service indexes on. That is also what lets a structure OPSIN
+found be enriched with PubChem's name, formula and weight - so the cascade in
+`core/resolve.py` did not have to change at all.
+
+Rows appear as each provider lands and a row already drawn is never moved,
+only filled in. Formula and molecular weight are computed offline by RDKit, so
+every row has them; for the case this exists to fix they are identical across
+the candidates, which is why the panel on the right draws the selected
+compound. A name that was silently interpreted says so on its row.
+
+The search accepts a pasted SMILES, InChI or CAS number as well as a name.
+
+### Compound properties (add-on, F3: "Compound: fetch properties from PubChem")
+
+`molom/addons/mol_properties.py`, off by default. Adds a properties page
+showing what is known about the compound a molecule IS - melting point,
+density, solubility and the rest - each value with its source. It shows up to
+three values per heading and says how many more there were, because there is
+no such thing as "the melting point": aspirin's own record carries seven, in
+three unit conventions, one of them without a unit at all.

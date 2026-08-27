@@ -6,6 +6,12 @@ Struck-through items in CLAUDE.md are omitted; this is only what is left.
 
 Nothing here is urgent. It is an inventory, not a plan.
 
+**Round 90 (2026-08-26)** replaced Ctrl+Shift+N with a candidate LIST
+(`core/molsearch.py`), added the skeletal preview (`core/depict.py`) and the
+compound-properties add-on (`core/molprops.py` +
+`molom/addons/mol_properties.py`), and extracted the shared results table
+(`ui/search_table.py`). Its own leftovers are section **L**.
+
 **Since the sweep** (rounds 74-86, to 2026-08-25): **A1 is done** (round 80),
 **A5 is decided** (round 81) and **A4 is mostly done** (round 83); rounds
 84-85 added the crystal search, and **round 86 closed I1, I2 and J4**, added
@@ -308,14 +314,17 @@ is worth building out before anything is bet on it.
 
 ---
 
-## The order Christian wants (decided 2026-08-25)
+## The order Christian wants
 
-1. ~~**J4 - make the test suite runnable again.**~~ **DONE, round 86.** His
-   pick and the right one - a verification problem outranks features - and it
-   turned up a real app bug on the way (a worker thread parented to its
-   dialog). `python -m pytest tests/` is back to ~110 s in one process.
-2. ~~**A4 - the asymmetric-unit pie spheres**~~ **DONE, round 87**, by
-   merging and fixing the write-back exactly as decided.
+1. ~~**J4 - make the test suite runnable again.**~~ **DONE, round 86.**
+2. ~~**A4 - the asymmetric-unit pie spheres**~~ **DONE, round 87.**
+3. ~~**K1 - the focal length does nothing.**~~ **DONE, round 89.**
+4. ~~**The name search, the skeletal preview and the properties tab.**~~
+   **DONE, round 90.**
+
+**Nothing is queued.** The next thing is whichever of the sections below he
+picks; **F** (the OWB integration that motivated the whole project) and **G**
+(isosurfaces) are the two that are neither cosmetic nor already circling.
 
 ---
 
@@ -401,3 +410,85 @@ axis. `tan(widget_fov/2) = REFERENCE_SENSOR_MM / (2 * focal * zoom)` - the
 sensor cancels, so a handle cannot rescale the scene and the lens is the only
 thing that can. Measured: 24 mm to 200 mm is 8.33x magnification with the
 frame pixel-identical, and each handle moves its own border exactly.
+
+
+---
+
+## M. Raised by round 91
+
+**M1. The ❖ crystal page acts on the ACTIVE object only.** Christian selected
+five isostructural fluorides and unticked "draw atoms outside the cell
+boundary" expecting all five to follow; `_on_packing_option` takes one
+`obj_id`, so one did. Applying a per-crystal tick to every SELECTED crystal is
+a small change and a real decision - one click would rewrite several
+molecules' metadata and rebuild each of their views - so it wants saying out
+loud before it is built. The same question applies to every other tick on that
+page (polyhedra, symmetry elements, occupancy, the cell box).
+
+**M2. A savefile can carry damage done by a fixed bug.** `MF.molom` has CsF
+stored as `P 1` with `cell_frozen`, so opening it after the round-91 fix still
+shows the demoted crystal - the fix stops it happening again and cannot undo
+what is already written. `F3 > Crystal: re-derive the space group` is the
+route back for a cell whose atoms are still in their right places, but it is
+not offered automatically and a frozen cell refuses to regenerate. Worth
+deciding whether the ❖ page should offer "this cell is frozen at P1 - unfreeze
+and re-derive?".
+
+---
+
+## L. Raised or left open by round 90
+
+**L1. `ResolveNameDialog` is superseded and unwired.** Nothing opens it any
+more; it is kept only because round 29's clickable did-you-mean and round 61's
+selectable-text contracts are pinned by tests that describe real behaviour.
+Either adopt it for something or delete it and those tests together - an
+unreachable dialog is the shape of drift this project keeps finding.
+
+**L2. The molecule search has no LOCAL tier.** The crystal search can be
+pointed at a folder of CIFs; there is no equivalent for a personal library of
+structures, and there is a good case for one (a group's own compounds are
+exactly what is not in PubChem under a name anybody would type).
+
+**L3. A metallocene still arrives as two rows.** SMILES cannot express
+hapticity (round 76), so OPSIN's cyclopentadienide form and PubChem's neutral
+form hash to different InChIKeys and are correctly NOT merged. Both rows are
+valid and the picture tells them apart, but it looks like a duplicate until
+you look. No clean fix short of a connection-table format.
+
+**L4. The throttle costs about two seconds.** Holding to PubChem's 5 requests
+a second turns a 1.9 s search into 4.7 s. PubChem's POST/listkey interface
+would let the twelve name-to-CID lookups become one request; worth measuring
+before assuming it is simpler.
+
+**L5b. The computed half duplicates things MoloM could work out itself.**
+Molecular weight, heavy-atom count and formal charge are all derivable with
+RDKit, and are shown as PubChem's values with PubChem's attribution instead.
+That is deliberate - the tab reports what PubChem says about this CID - but if
+the page ever grows a "computed here" column the two must stay visibly apart,
+for the same reason measured and computed already are.
+
+**L9. `molprops.ATTACHMENT_KEY` is now unused.** Round 90d dropped the
+attachment, so the constant is dead. Left in place for one round in case the
+decision is revisited; delete it if not.
+
+**L8. The expanded/collapsed state is per PAGE, not per molecule.** Expanding
+a property and switching molecules keeps that property expanded on the next
+one. It is a viewing choice rather than data, so this is defensible, but it
+has not been thought about properly.
+
+**L5. Properties are cited VERBATIM, units and all.** One compound reports its
+melting point in Fahrenheit and Celsius, and one value ("138-140") carries no
+unit at all. Normalising would mean parsing free text and would silently
+misread the unitless ones, so nothing is converted - but the page therefore
+shows mixed units, and whether that is right is a decision rather than an
+oversight.
+
+**L6. The properties add-on is OFF by default**, like every add-on. Christian's
+own framing was that if he ends up using it a lot it should become a mainstay;
+promoting it means moving the fetch and the page out of `molom/addons/` while
+leaving `core/molprops.py` exactly where it is, since the format is already in
+core.
+
+**L7. Nothing writes properties into an export other than the xyz comment.**
+The Blender export and the CIF writer do not carry them, and probably should
+not, but the decision has not been made explicitly.

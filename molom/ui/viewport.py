@@ -3895,7 +3895,9 @@ class MolViewport(QOpenGLWidget):
 
     def _selection_hull(self):
         """Instance matrices for the outline hull: an enlarged copy of every
-        selected atom, plus every bond with BOTH ends selected.
+        selected atom, plus every CYLINDER of every bond with both ends
+        selected - the multi-bond decomposition included, which is what makes
+        a double or triple bond show an outline at all.
 
         Including the bonds is what makes a selected fragment read as one
         outlined object (Christian's Blender reference) instead of a string of
@@ -3949,15 +3951,30 @@ class MolViewport(QOpenGLWidget):
                 m[3, 3] = 1.0
                 spheres.append(m)
             if st.show_bonds and not st.wireframe:
-                for i, j, _order in s.bonds:
+                for i, j, order in s.bonds:
                     if i not in chosen or j not in chosen:
                         continue
                     if i in obj.atom_hidden or j in obj.atom_hidden:
                         continue
                     if hide is not None and (hide[i] or hide[j]):
                         continue
-                    cylinders.append((xyz[i], xyz[j],
-                                      st.bond_radius + width))
+                    # THE SAME DECOMPOSITION THE SCENE DRAWS, enlarged. This
+                    # used to be one cylinder on the bond AXIS, which is
+                    # correct only for a single bond: a double is drawn as
+                    # two cylinders offset by +-1.0*r at radius 1.3*r, so
+                    # they OVERLAP the axis and swallow an axis cylinder of
+                    # radius r + width whole. The outline was therefore
+                    # invisible on every double bond and all but invisible on
+                    # a triple (whose central cylinder is radius r), which is
+                    # exactly what round 35 made possible when it divided the
+                    # outline width by five - before that the hull was fat
+                    # enough to poke out. Going through `bond_cylinders` is
+                    # also what stops it silently diverging again the next
+                    # time the multi-bond layout changes.
+                    for a, b, r in style_mod.bond_cylinders(
+                            xyz[i], xyz[j], order, bond_radius=st.bond_radius,
+                            show_multiple=st.show_multiple_bonds):
+                        cylinders.append((a, b, r + width))
         return spheres, cylinders
 
     def _paint_selection(self, view, proj):

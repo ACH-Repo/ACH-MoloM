@@ -41,6 +41,7 @@ from ..core import templates as tpl_mod
 from ..core import vibrations as vib_mod
 from ..core import timeline as timeline_mod
 from ..core import cifsearch
+from ..core import molprops
 from ..core import meta as meta_mod
 from ..core.camera import quat_from_mat3, quat_to_mat3
 from ..core import ops as ops_mod
@@ -55,8 +56,8 @@ from .dialogs import (AnimationExportDialog, BlenderExportDialog,
                       ImageExportDialog,
                       MetaAtomDialog,
                       SiteOccupancyDialog,
-                      CifSearchDialog,
-                      OperatorSearchDialog, ResolveNameDialog, SettingsDialog)
+                      CifSearchDialog, MoleculeSearchDialog,
+                      OperatorSearchDialog, SettingsDialog)
 from .crystal_ribbon import CrystalRibbon
 from .optimize_panel import OptimizeDock, OptimizeWorker, TASK_SELECTION
 from . import properties as properties_mod
@@ -175,6 +176,8 @@ class MainWindow(QMainWindow):
         #: to the asymmetric unit. The pose before the atoms moved is the
         #: trustworthy one.
         self._pose_before_edit = None
+        #: `(obj id, coords)` captured before an edit, for the rigidity test.
+        self._coords_before_edit = None
         self._last_push_suppressed = False
         self._repeat_macro = None        # {"delta"} after D + move
         self._macro_serial = -1          # viewport transform_serial it came from
@@ -261,7 +264,17 @@ class MainWindow(QMainWindow):
         #: `(query, hits, when)` from the last crystal search, restored the
         #: next time the dialog opens. Christian, after using round 85: "it
         #: really needs to remember the results of the last search".
+        #: Callables an ADD-ON page registers to be told the active molecule
+        #: changed. Round 51's bug was a properties page that described the
+        #: PREVIOUS molecule because nothing refreshed it on the transition;
+        #: a built-in page is named in `_sync_all` by hand, and an add-on
+        #: page had no way in at all.
+        self.page_sync_hooks = []
         self._last_cif_search = None
+        #: The last MOLECULE search, same reasoning as the crystal one: on
+        #: the window rather than in a module global, so a second window (or
+        #: the next test) cannot inherit somebody else's results.
+        self._last_mol_search = None
         #: What to do with partially occupied CIF sites — see
         #: `core.cif.resolve_disorder`. An import-time decision, so changing it
         #: applies to the next file opened (and to a crystal-view rebuild).
@@ -556,7 +569,7 @@ class MainWindow(QMainWindow):
         r("save_project_as", "Save project as...",
           lambda c: c.on_save_project_as(), enabled=has_obj, category="File",
           shortcut="Ctrl+Shift+P", key="Ctrl+Shift+P")
-        r("import_name", "Import molecule by name...",
+        r("import_name", "Find a molecule by name (PubChem / OPSIN)...",
           lambda c: c.on_import_by_name(), category="File",
           shortcut="Ctrl+Shift+N", key="Ctrl+Shift+N")
         r("search_cif", "Find a crystal structure (COD / OPTIMADE)...",
@@ -1264,6 +1277,9 @@ class MainWindow(QMainWindow):
                 # ...and bring in the orientation ribbon, which is what
                 # "selected in the viewport, or any part of a cif" means.
                 self._sync_crystal_ribbon()
+                # ...and every ADD-ON page, or the properties tab keeps
+                # describing the molecule you clicked away from.
+                self._sync_addon_pages()
 
     def _on_edit_committed(self):
         # A grab that a duplicate started makes "duplicate + this offset" the
@@ -1362,11 +1378,76 @@ class MainWindow(QMainWindow):
                 # itself and the group is untouched.
                 self.sync_asymmetric_unit(obj)
                 return
+            if self._edit_was_rigid(obj):
+                # A RIGID PLACEMENT IS NOT AN EDIT TO THE STRUCTURE.
+                #
+                # Christian's report: he selected several isostructural
+                # fluorides, went to change one tick box, and CsF came back
+                # as P1 with its cell frozen and the tick dead. Reproduced
+                # from his savefile: a plain 0.5 A translation of a whole
+                # crystal demoted `F m -3 m` to `P 1`.
+                #
+                # A space group describes the STRUCTURE, not where it sits in
+                # world space, so moving or turning a crystal preserves it
+                # exactly - and `demote_to_p1` freezes the cell as a side
+                # effect (round 52), which is what made the control
+                # unresponsive afterwards. Round 43e already knew that "an
+                # EDIT is not a rigid motion" and captured the pose before one
+                # for the cell box; this is the same distinction, applied to
+                # the symmetry.
+                #
+                # Dragging SOME of a crystal's atoms still demotes, because
+                # the fit is over all of them and a partial move is not rigid.
+                return
             changed = self.demote_to_p1(obj)
         except Exception:                    # never let this break an edit
             return
         if changed:
             self._sync_crystal_page()
+
+    def _edit_was_rigid(self, obj):
+        # type: (object) -> bool
+        """Were the atoms merely MOVED, or was the structure changed?
+
+        Two questions, and the composition one comes first because an element
+        change moves nothing. Then Kabsch: fit the pre-edit coordinates onto
+        the post-edit ones and look at what is left. A rigid motion leaves nothing (float noise only), so
+        the symmetry the file declared still holds and there is nothing to
+        re-derive. Anything else - an atom dragged out of its site, an element
+        changed, an atom added or deleted - leaves a residual or changes the
+        count, and the demotion goes ahead.
+
+        False whenever there is nothing to compare, so the conservative path
+        (demote) is what happens when this cannot tell.
+        """
+        stash = self._coords_before_edit
+        self._coords_before_edit = None
+        if not stash or stash[0] != obj.id:
+            return False
+        # COMPOSITION FIRST. An element change moves no atoms at all, so a
+        # coordinate-only test would call it a rigid placement and keep a
+        # space group that no longer holds - caught by the test that drives
+        # `set_element` rather than by reading the code.
+        if (stash[2] != tuple(obj.structure.symbols)
+                or stash[3] != tuple(map(tuple, obj.structure.bonds))):
+            return False
+        before = np.asarray(stash[1], dtype=float)
+        after = np.asarray(obj.structure.coords, dtype=float)
+        if before.shape != after.shape or len(before) < 3:
+            return False
+        bc = before - before.mean(axis=0)
+        ac = after - after.mean(axis=0)
+        try:
+            u, _s, vt = np.linalg.svd(bc.T @ ac)
+        except np.linalg.LinAlgError:
+            return False
+        d = np.sign(np.linalg.det(vt.T @ u.T))
+        rot = vt.T @ np.diag([1.0, 1.0, d]) @ u.T
+        residual = bc @ rot.T - ac
+        rmsd = float(np.sqrt((residual ** 2).sum() / len(before)))
+        # A real edit moves an atom by a thousandth of an Angstrom at the very
+        # least; a rigid move leaves only float noise.
+        return rmsd < 1e-6
 
     def demote_to_p1(self, obj):
         # type: (object) -> Optional[str]
@@ -1596,6 +1677,12 @@ class MainWindow(QMainWindow):
         obj = self._edited_crystal()
         self._pose_before_edit = ((obj.id, obj.cell_pose())
                                   if obj is not None else None)
+        # ...and the COORDINATES, so the commit can tell a rigid placement
+        # from a change to the structure. See `_reevaluate_edited_crystal`.
+        self._coords_before_edit = (
+            (obj.id, np.array(obj.structure.coords, copy=True),
+             tuple(obj.structure.symbols), tuple(map(tuple, obj.structure.bonds)))
+            if obj is not None else None)
         self.push_undo()
 
     def _edit_target(self):
@@ -3324,6 +3411,29 @@ class MainWindow(QMainWindow):
         self._sync_crystal_page()
         self.camera_page.set_camera(self.scene.active_camera())
         self._sync_crystal_ribbon()
+        self._sync_addon_pages()
+
+    def _sync_addon_pages(self):
+        """Tell every add-on page which molecule is active now.
+
+        **Called from every path that changes the active object**, not only
+        from `_sync_all`. Round 90 wired it into `_sync_all` alone, which
+        covers imports and scene changes and NOT selection - so clicking a
+        different molecule left the properties page describing the previous
+        one, and its Fetch button acting on the previous one. That is round
+        51's bug exactly ("a page not refreshed on the very same transition"),
+        reintroduced in the hook built to prevent it.
+        """
+        active = self._active_obj()
+        for hook in list(self.page_sync_hooks):
+            try:
+                hook(active)
+            except Exception as exc:            # noqa: BLE001
+                # One add-on page must not take the whole scene sync with it.
+                # Reported rather than swallowed: a page that silently stops
+                # updating is round 51's bug from the other side.
+                self.statusBar().showMessage(
+                    "An add-on page failed to refresh: {}".format(exc), 8000)
 
     @staticmethod
     def _perceive_fresh(s):
@@ -3675,6 +3785,7 @@ class MainWindow(QMainWindow):
             self._sync_transform_panel()
             self._sync_modifier_page()
             self._sync_crystal_ribbon()
+            self._sync_addon_pages()
         self._update_counts()
         self.viewport.update()
 
@@ -3686,6 +3797,7 @@ class MainWindow(QMainWindow):
         self._sync_traj_bar()
         self._update_counts()
         self._sync_transform_panel()
+        self._sync_addon_pages()
         # Also refreshes the crystal page AND greys its tab for the new
         # active molecule — without this the page kept describing whichever
         # object happened to be active when the dock was last opened.
@@ -3909,8 +4021,8 @@ class MainWindow(QMainWindow):
             super().keyPressEvent(ev)
 
     # ------------------------------------------------------- SMILES batches
-    def _install_smiles_batch(self, pairs, src):
-        # type: (List, str) -> None
+    def _install_smiles_batch(self, pairs, src, extras=None):
+        # type: (List, str, Optional[List[dict]]) -> None
         """Build every (smiles, name) pair into its own scene object.
 
         SMILES geometry is GENERATED, so it may be normalised freely (unlike
@@ -3920,13 +4032,21 @@ class MainWindow(QMainWindow):
         dot-separated ChemDraw multi-copies land side by side, not on top of
         each other. One undo entry for the whole batch."""
         built, failed = [], []
-        for smiles, name in pairs:
+        extras = list(extras or [])
+        for index, (smiles, name) in enumerate(pairs):
             try:
                 atoms, method = io.smiles_to_xyz(smiles)
             except io.CoordGenError as e:
                 failed.append((smiles, str(e)))
                 continue
             meta = {"smiles": smiles, "source": method}
+            # Whatever the caller knows about this compound and the
+            # coordinates do not: the provenance line and, where a search
+            # found it, its identity record. Merged rather than assigned so
+            # `smiles` and `source` above stay authoritative about how the
+            # GEOMETRY was made.
+            if index < len(extras):
+                meta.update(extras[index] or {})
             charge, mult = io.smiles_charge_and_mult(smiles)
             if charge is not None:
                 meta["charge"] = charge
@@ -4188,12 +4308,80 @@ class MainWindow(QMainWindow):
             self.open_path(path)
 
     def on_import_by_name(self):
-        dlg = ResolveNameDialog(self)
-        if not dlg.exec() or dlg.resolution is None:
+        """Find a molecule by name and import it (Ctrl+Shift+N).
+
+        A LIST rather than a single answer since round 90, and the reason is
+        measured: PubChem's exact-name endpoint 404s on "xylene" and on
+        "cresol", while OPSIN answers both with the ortho isomer and says
+        nothing. A dialog showing one structure cannot tell you either.
+        """
+        dlg = MoleculeSearchDialog(self, remembered=self._last_mol_search,
+                                   favourites=self.mol_favourites())
+        accepted = dlg.exec()
+        # Saved whatever the outcome: starring something and then pressing
+        # Cancel is an ordinary way to use a bookmark list.
+        self.set_mol_favourites(dlg.favourites)
+        self._last_mol_search = dlg.remembered()
+        if not accepted or not dlg.chosen:
             return
-        res = dlg.resolution
-        self._install_smiles_batch([(res.smiles, res.query)],
-                                   res.source or "resolved by name")
+        import datetime
+        today = datetime.date.today().isoformat()
+        pairs, extras = [], []
+        for cand in dlg.chosen:
+            if not cand.smiles:
+                continue
+            pairs.append((cand.smiles, cand.name or cand.query or cand.label()))
+            # The IDENTITY record is stored on import whether or not the
+            # properties add-on is enabled: it is small, it is the answer to
+            # "what is this and where did it come from", and it is what lets
+            # the add-on work on a molecule imported before it was switched
+            # on. It carries no measured properties, so it creates no
+            # attachment and therefore no overwrite lock - there is nothing
+            # to lose yet.
+            record = molprops.Record(
+                name=cand.name, formula=cand.formula,
+                inchikey=cand.inchikey, cid=cand.cid(), smiles=cand.smiles,
+                iupac_name=cand.iupac_name, retrieved=today,
+                source=cand.source, note=cand.note)
+            extras.append({molprops.METADATA_KEY: record.to_dict(),
+                           "comment": record.provenance()})
+        if not pairs:
+            self.statusBar().showMessage(
+                "That result carries no structure to import", 8000)
+            return
+        self._install_smiles_batch(pairs, "found by name", extras=extras)
+
+    def mol_favourites(self):
+        # type: () -> dict
+        """Bookmarked compounds, `{candidate.key(): Candidate}`.
+
+        Unlike a CIF favourite this DOES store the structure, because a
+        molecule's structure is a short string - which costs nothing and
+        makes a starred compound importable with no network at all.
+        """
+        # Imported HERE and not at module scope: `molsearch` pulls in the
+        # resolver, which pulls urllib/http/email for about 130 ms - and most
+        # launches never look a compound up. Round 65's guard pins it.
+        import json
+
+        from ..core import molsearch
+        raw = self.settings.value("mol_favourites", "") or ""
+        try:
+            entries = json.loads(raw) if raw else []
+        except ValueError:
+            return {}
+        out = {}
+        for entry in entries if isinstance(entries, list) else []:
+            cand = molsearch.candidate_from_dict(entry)
+            if cand is not None:
+                out[cand.key()] = cand
+        return out
+
+    def set_mol_favourites(self, favourites):
+        # type: (dict) -> None
+        import json
+        entries = [c.to_dict() for c in (favourites or {}).values()]
+        self.settings.setValue("mol_favourites", json.dumps(entries))
 
     def on_search_cif(self):
         """Find a crystal structure by formula, mineral or name, and import

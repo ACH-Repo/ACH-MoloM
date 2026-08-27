@@ -1,0 +1,1053 @@
+{
+ "Record": {
+  "RecordType": "CID",
+  "RecordNumber": 2244,
+  "RecordTitle": "Aspirin",
+  "Section": [
+   {
+    "TOCHeading": "Chemical and Physical Properties",
+    "Section": [
+     {
+      "TOCHeading": "Experimental Properties",
+      "Section": [
+       {
+        "TOCHeading": "Physical Description",
+        "Information": [
+         {
+          "ReferenceNumber": 9,
+          "Reference": [
+           "National Toxicology Program, Institute of Environmental Health Sciences, National Institutes of Health (NTP). 1992. National Toxicology Program Chemical Repository Database. Research Triangle Park, North Carolina."
+          ],
+          "ExtendedReference": [
+           {
+            "Citation": "National Toxicology Program, Institute of Environmental Health Sciences, National Institutes of Health (NTP). 1992. National Toxicology Program Chemical Repository Database. Research Triangle Park, North Carolina.",
+            "Matched": {
+             "PCLID": 900163266,
+             "Citation": "National Toxicology Program, Institute of Environmental Health Sciences, National Institutes of Health (NTP). 1992. National Toxicology Program Chemical Repository Database. Research Triangle Park, North Carolina."
+            }
+           }
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "Acetylsalicylic acid appears as odorless white crystals or crystalline powder with a slightly bitter taste. (NTP, 1992)",
+             "Markup": [
+              {
+               "Start": 0,
+               "Length": 20,
+               "URL": "https://pubchem.ncbi.nlm.nih.gov/compound/Acetylsalicylic%20acid",
+               "Type": "PubChem Internal Link",
+               "Extra": "CID-2244"
+              }
+             ]
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 66,
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "Odorless, colorless to white, crystal-line powder. [aspirin] [Note: Develops the vinegar-like odor of acetic acid on contact with moisture.]",
+             "Markup": [
+              {
+               "Start": 52,
+               "Length": 7,
+               "URL": "https://pubchem.ncbi.nlm.nih.gov/compound/aspirin",
+               "Type": "PubChem Internal Link",
+               "Extra": "CID-2244"
+              },
+              {
+               "Start": 81,
+               "Length": 7,
+               "URL": "https://pubchem.ncbi.nlm.nih.gov/compound/vinegar",
+               "Type": "PubChem Internal Link",
+               "Extra": "CID-176"
+              },
+              {
+               "Start": 102,
+               "Length": 11,
+               "URL": "https://pubchem.ncbi.nlm.nih.gov/compound/acetic%20acid",
+               "Type": "PubChem Internal Link",
+               "Extra": "CID-176"
+              }
+             ]
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 68,
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "Solid"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 85,
+          "Name": "",
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "COLOURLESS-TO-WHITE CRYSTALS OR WHITE CRYSTALLINE POWDER WITH CHARACTERISTIC ODOUR."
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 173,
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "Odorless, colorless to white, crystal-line powder."
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 218,
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "Odorless, colorless to white, crystal-line powder. [aspirin] [Note: Develops the vinegar-like odor of acetic acid on contact with moisture.]",
+             "Markup": [
+              {
+               "Start": 52,
+               "Length": 7,
+               "URL": "https://pubchem.ncbi.nlm.nih.gov/compound/aspirin",
+               "Type": "PubChem Internal Link",
+               "Extra": "CID-2244"
+              },
+              {
+               "Start": 81,
+               "Length": 7,
+               "URL": "https://pubchem.ncbi.nlm.nih.gov/compound/vinegar",
+               "Type": "PubChem Internal Link",
+               "Extra": "CID-176"
+              },
+              {
+               "Start": 102,
+               "Length": 11,
+               "URL": "https://pubchem.ncbi.nlm.nih.gov/compound/acetic%20acid",
+               "Type": "PubChem Internal Link",
+               "Extra": "CID-176"
+              }
+             ]
+            }
+           ]
+          }
+         }
+        ]
+       },
+       {
+        "TOCHeading": "Color/Form",
+        "Information": [
+         {
+          "ReferenceNumber": 67,
+          "Description": "PEER REVIEWED",
+          "Reference": [
+           "O'Neil, M.J. (ed.). The Merck Index - An Encyclopedia of Chemicals, Drugs, and Biologicals. Whitehouse Station, NJ:  Merck and Co., Inc., 2006., p. 140"
+          ],
+          "ExtendedReference": [
+           {
+            "Citation": "O'Neil, M.J. (ed.). The Merck Index - An Encyclopedia of Chemicals, Drugs, and Biologicals. Whitehouse Station, NJ:  Merck and Co., Inc., 2006., p. 140",
+            "Matched": {
+             "PCLID": 900123151,
+             "Citation": "O'Neil, M.J. (ed.). The Merck Index - An Encyclopedia of Chemicals, Drugs, and Biologicals. Whitehouse Station, NJ:  Merck and Co., Inc., 2006., p. 140"
+            }
+           }
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "Monoclinic tablets or needle-like crystals"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 67,
+          "Description": "PEER REVIEWED",
+          "Reference": [
+           "NIOSH. NIOSH Pocket Guide to Chemical Hazards & Other Databases CD-ROM. Department of Health & Human Services, Centers for Disease Prevention & Control. National Institute for Occupational Safety & Health. DHHS (NIOSH) Publication No. 2005-151 (2005)"
+          ],
+          "ExtendedReference": [
+           {
+            "Citation": "NIOSH. NIOSH Pocket Guide to Chemical Hazards & Other Databases CD-ROM. Department of Health & Human Services, Centers for Disease Prevention & Control. National Institute for Occupational Safety & Health. DHHS (NIOSH) Publication No. 2005-151 (2005)",
+            "Matched": {
+             "PCLID": 900026787,
+             "Citation": "NIOSH. NIOSH Pocket Guide to Chemical Hazards & Other Databases CD-ROM. Department of Health & Human Services, Centers for Disease Prevention & Control. National Institute for Occupational Safety & Health. DHHS (NIOSH) Publication No. 2005-151 (2005)"
+            }
+           }
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "Colorless to white, crystalline powder."
+            }
+           ]
+          }
+         }
+        ]
+       },
+       {
+        "TOCHeading": "Odor",
+        "Information": [
+         {
+          "ReferenceNumber": 67,
+          "Description": "PEER REVIEWED",
+          "Reference": [
+           "O'Neil, M.J. (ed.). The Merck Index - An Encyclopedia of Chemicals, Drugs, and Biologicals. Whitehouse Station, NJ:  Merck and Co., Inc., 2006., p. 140"
+          ],
+          "ExtendedReference": [
+           {
+            "Citation": "O'Neil, M.J. (ed.). The Merck Index - An Encyclopedia of Chemicals, Drugs, and Biologicals. Whitehouse Station, NJ:  Merck and Co., Inc., 2006., p. 140",
+            "Matched": {
+             "PCLID": 900123151,
+             "Citation": "O'Neil, M.J. (ed.). The Merck Index - An Encyclopedia of Chemicals, Drugs, and Biologicals. Whitehouse Station, NJ:  Merck and Co., Inc., 2006., p. 140"
+            }
+           }
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "Odorless, but in moist air it is gradually hydrolyzed and acquires odor of acetic acid",
+             "Markup": [
+              {
+               "Start": 75,
+               "Length": 11,
+               "URL": "https://pubchem.ncbi.nlm.nih.gov/compound/acetic%20acid",
+               "Type": "PubChem Internal Link",
+               "Extra": "CID-176"
+              }
+             ]
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 67,
+          "Description": "PEER REVIEWED",
+          "Reference": [
+           "NIOSH. NIOSH Pocket Guide to Chemical Hazards & Other Databases CD-ROM. Department of Health & Human Services, Centers for Disease Prevention & Control. National Institute for Occupational Safety & Health. DHHS (NIOSH) Publication No. 2005-151 (2005)"
+          ],
+          "ExtendedReference": [
+           {
+            "Citation": "NIOSH. NIOSH Pocket Guide to Chemical Hazards & Other Databases CD-ROM. Department of Health & Human Services, Centers for Disease Prevention & Control. National Institute for Occupational Safety & Health. DHHS (NIOSH) Publication No. 2005-151 (2005)",
+            "Matched": {
+             "PCLID": 900026787,
+             "Citation": "NIOSH. NIOSH Pocket Guide to Chemical Hazards & Other Databases CD-ROM. Department of Health & Human Services, Centers for Disease Prevention & Control. National Institute for Occupational Safety & Health. DHHS (NIOSH) Publication No. 2005-151 (2005)"
+            }
+           }
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "Odorless [Note: Develops the vinegar-like odor of acetic acid on contact with moisture].",
+             "Markup": [
+              {
+               "Start": 29,
+               "Length": 7,
+               "URL": "https://pubchem.ncbi.nlm.nih.gov/compound/vinegar",
+               "Type": "PubChem Internal Link",
+               "Extra": "CID-176"
+              },
+              {
+               "Start": 50,
+               "Length": 11,
+               "URL": "https://pubchem.ncbi.nlm.nih.gov/compound/acetic%20acid",
+               "Type": "PubChem Internal Link",
+               "Extra": "CID-176"
+              }
+             ]
+            }
+           ]
+          }
+         }
+        ]
+       },
+       {
+        "TOCHeading": "Boiling Point",
+        "Information": [
+         {
+          "ReferenceNumber": 9,
+          "Reference": [
+           "National Toxicology Program, Institute of Environmental Health Sciences, National Institutes of Health (NTP). 1992. National Toxicology Program Chemical Repository Database. Research Triangle Park, North Carolina."
+          ],
+          "ExtendedReference": [
+           {
+            "Citation": "National Toxicology Program, Institute of Environmental Health Sciences, National Institutes of Health (NTP). 1992. National Toxicology Program Chemical Repository Database. Research Triangle Park, North Carolina.",
+            "Matched": {
+             "PCLID": 900163266,
+             "Citation": "National Toxicology Program, Institute of Environmental Health Sciences, National Institutes of Health (NTP). 1992. National Toxicology Program Chemical Repository Database. Research Triangle Park, North Carolina."
+            }
+           }
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "284 °F at 760 mmHg (decomposes) (NTP, 1992)"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 36,
+          "Value": {
+           "Number": [
+            140
+           ],
+           "Unit": "°C"
+          }
+         },
+         {
+          "ReferenceNumber": 173,
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "284 °F (decomposes)"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 218,
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "284 °F (Decomposes)"
+            }
+           ]
+          }
+         }
+        ]
+       },
+       {
+        "TOCHeading": "Melting Point",
+        "Information": [
+         {
+          "ReferenceNumber": 9,
+          "Reference": [
+           "National Toxicology Program, Institute of Environmental Health Sciences, National Institutes of Health (NTP). 1992. National Toxicology Program Chemical Repository Database. Research Triangle Park, North Carolina."
+          ],
+          "ExtendedReference": [
+           {
+            "Citation": "National Toxicology Program, Institute of Environmental Health Sciences, National Institutes of Health (NTP). 1992. National Toxicology Program Chemical Repository Database. Research Triangle Park, North Carolina.",
+            "Matched": {
+             "PCLID": 900163266,
+             "Citation": "National Toxicology Program, Institute of Environmental Health Sciences, National Institutes of Health (NTP). 1992. National Toxicology Program Chemical Repository Database. Research Triangle Park, North Carolina."
+            }
+           }
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "275 °F (NTP, 1992)"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 36,
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "138-140"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 67,
+          "Description": "PEER REVIEWED",
+          "Reference": [
+           "O'Neil, M.J. (ed.). The Merck Index - An Encyclopedia of Chemicals, Drugs, and Biologicals. Whitehouse Station, NJ:  Merck and Co., Inc., 2006., p. 140"
+          ],
+          "ExtendedReference": [
+           {
+            "Citation": "O'Neil, M.J. (ed.). The Merck Index - An Encyclopedia of Chemicals, Drugs, and Biologicals. Whitehouse Station, NJ:  Merck and Co., Inc., 2006., p. 140",
+            "Matched": {
+             "PCLID": 900123151,
+             "Citation": "O'Neil, M.J. (ed.). The Merck Index - An Encyclopedia of Chemicals, Drugs, and Biologicals. Whitehouse Station, NJ:  Merck and Co., Inc., 2006., p. 140"
+            }
+           }
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "135 °C (rapid heating)"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 68,
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "135 °C"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 85,
+          "Name": "",
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "135 °C"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 173,
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "275 °F"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 218,
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "275 °F"
+            }
+           ]
+          }
+         }
+        ]
+       },
+       {
+        "TOCHeading": "Flash Point",
+        "Information": [
+         {
+          "ReferenceNumber": 9,
+          "Reference": [
+           "National Toxicology Program, Institute of Environmental Health Sciences, National Institutes of Health (NTP). 1992. National Toxicology Program Chemical Repository Database. Research Triangle Park, North Carolina."
+          ],
+          "ExtendedReference": [
+           {
+            "Citation": "National Toxicology Program, Institute of Environmental Health Sciences, National Institutes of Health (NTP). 1992. National Toxicology Program Chemical Repository Database. Research Triangle Park, North Carolina.",
+            "Matched": {
+             "PCLID": 900163266,
+             "Citation": "National Toxicology Program, Institute of Environmental Health Sciences, National Institutes of Health (NTP). 1992. National Toxicology Program Chemical Repository Database. Research Triangle Park, North Carolina."
+            }
+           }
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "482 °F (NTP, 1992)"
+            }
+           ]
+          }
+         }
+        ]
+       },
+       {
+        "TOCHeading": "Solubility",
+        "Information": [
+         {
+          "ReferenceNumber": 9,
+          "Reference": [
+           "National Toxicology Program, Institute of Environmental Health Sciences, National Institutes of Health (NTP). 1992. National Toxicology Program Chemical Repository Database. Research Triangle Park, North Carolina."
+          ],
+          "ExtendedReference": [
+           {
+            "Citation": "National Toxicology Program, Institute of Environmental Health Sciences, National Institutes of Health (NTP). 1992. National Toxicology Program Chemical Repository Database. Research Triangle Park, North Carolina.",
+            "Matched": {
+             "PCLID": 900163266,
+             "Citation": "National Toxicology Program, Institute of Environmental Health Sciences, National Institutes of Health (NTP). 1992. National Toxicology Program Chemical Repository Database. Research Triangle Park, North Carolina."
+            }
+           }
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "less than 1 mg/mL at 73 °F (NTP, 1992)"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 36,
+          "Reference": [
+           "https://www.sigmaaldrich.com/catalog/product/sigma/a5376?lang=en&region=US"
+          ],
+          "ExtendedReference": [
+           {
+            "Citation": "https://www.sigmaaldrich.com/catalog/product/sigma/a5376?lang=en&region=US",
+            "Matched": {
+             "PCLID": 900289358,
+             "Citation": "https://www.sigmaaldrich.com/catalog/product/sigma/a5376?lang=en&region=US"
+            }
+           }
+          ],
+          "Value": {
+           "Number": [
+            10
+           ],
+           "Unit": "mg/mL"
+          }
+         },
+         {
+          "ReferenceNumber": 67,
+          "Description": "PEER REVIEWED",
+          "Reference": [
+           "O'Neil, M.J. (ed.). The Merck Index - An Encyclopedia of Chemicals, Drugs, and Biologicals. Whitehouse Station, NJ:  Merck and Co., Inc., 2006., p. 140"
+          ],
+          "ExtendedReference": [
+           {
+            "Citation": "O'Neil, M.J. (ed.). The Merck Index - An Encyclopedia of Chemicals, Drugs, and Biologicals. Whitehouse Station, NJ:  Merck and Co., Inc., 2006., p. 140",
+            "Matched": {
+             "PCLID": 900123151,
+             "Citation": "O'Neil, M.J. (ed.). The Merck Index - An Encyclopedia of Chemicals, Drugs, and Biologicals. Whitehouse Station, NJ:  Merck and Co., Inc., 2006., p. 140"
+            }
+           }
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "1 g sol in: 300 mL water at 25 °C, 100 mL water at 37 °C, 5 mL alcohol, 17 mL chloroform, 10-15 mL ether; less sol in anhydrous ether",
+             "Markup": [
+              {
+               "Start": 19,
+               "Length": 5,
+               "URL": "https://pubchem.ncbi.nlm.nih.gov/compound/water",
+               "Type": "PubChem Internal Link",
+               "Extra": "CID-962"
+              },
+              {
+               "Start": 42,
+               "Length": 5,
+               "URL": "https://pubchem.ncbi.nlm.nih.gov/compound/water",
+               "Type": "PubChem Internal Link",
+               "Extra": "CID-962"
+              },
+              {
+               "Start": 78,
+               "Length": 10,
+               "URL": "https://pubchem.ncbi.nlm.nih.gov/compound/chloroform",
+               "Type": "PubChem Internal Link",
+               "Extra": "CID-6212"
+              }
+             ]
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 67,
+          "Description": "PEER REVIEWED",
+          "Reference": [
+           "Yalkowsky SH, Dannenfelser RM; Aquasol Database of Aqueous Solubility. Version 5. College of Pharmacy, University of Arizona - Tucson, AZ (1992)"
+          ],
+          "ExtendedReference": [
+           {
+            "Citation": "Yalkowsky SH, Dannenfelser RM; Aquasol Database of Aqueous Solubility. Version 5. College of Pharmacy, University of Arizona - Tucson, AZ (1992)",
+            "Matched": {
+             "PCLID": 900021980,
+             "Citation": "Yalkowsky SH, Dannenfelser RM; Aquasol Database of Aqueous Solubility. Version 5. College of Pharmacy, University of Arizona - Tucson, AZ (1992)"
+            }
+           }
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "In water, 4,600 mg/L at 25 °C",
+             "Markup": [
+              {
+               "Start": 3,
+               "Length": 5,
+               "URL": "https://pubchem.ncbi.nlm.nih.gov/compound/water",
+               "Type": "PubChem Internal Link",
+               "Extra": "CID-962"
+              }
+             ]
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 85,
+          "Name": "",
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "Solubility in water, g/100ml at 15 °C: 0.25 (poor)",
+             "Markup": [
+              {
+               "Start": 14,
+               "Length": 5,
+               "URL": "https://pubchem.ncbi.nlm.nih.gov/compound/water",
+               "Type": "PubChem Internal Link",
+               "Extra": "CID-962"
+              }
+             ]
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 218,
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "(77 °F): 0.3%"
+            }
+           ]
+          }
+         }
+        ]
+       },
+       {
+        "TOCHeading": "Density",
+        "Information": [
+         {
+          "ReferenceNumber": 9,
+          "Reference": [
+           "National Toxicology Program, Institute of Environmental Health Sciences, National Institutes of Health (NTP). 1992. National Toxicology Program Chemical Repository Database. Research Triangle Park, North Carolina."
+          ],
+          "ExtendedReference": [
+           {
+            "Citation": "National Toxicology Program, Institute of Environmental Health Sciences, National Institutes of Health (NTP). 1992. National Toxicology Program Chemical Repository Database. Research Triangle Park, North Carolina.",
+            "Matched": {
+             "PCLID": 900163266,
+             "Citation": "National Toxicology Program, Institute of Environmental Health Sciences, National Institutes of Health (NTP). 1992. National Toxicology Program Chemical Repository Database. Research Triangle Park, North Carolina."
+            }
+           }
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "1.4 (NTP, 1992) - Denser than water; will sink",
+             "Markup": [
+              {
+               "Start": 30,
+               "Length": 5,
+               "URL": "https://pubchem.ncbi.nlm.nih.gov/compound/water",
+               "Type": "PubChem Internal Link",
+               "Extra": "CID-962"
+              }
+             ]
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 67,
+          "Description": "PEER REVIEWED",
+          "Reference": [
+           "O'Neil, M.J. (ed.). The Merck Index - An Encyclopedia of Chemicals, Drugs, and Biologicals. Whitehouse Station, NJ:  Merck and Co., Inc., 2006., p. 140"
+          ],
+          "ExtendedReference": [
+           {
+            "Citation": "O'Neil, M.J. (ed.). The Merck Index - An Encyclopedia of Chemicals, Drugs, and Biologicals. Whitehouse Station, NJ:  Merck and Co., Inc., 2006., p. 140",
+            "Matched": {
+             "PCLID": 900123151,
+             "Citation": "O'Neil, M.J. (ed.). The Merck Index - An Encyclopedia of Chemicals, Drugs, and Biologicals. Whitehouse Station, NJ:  Merck and Co., Inc., 2006., p. 140"
+            }
+           }
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "1.40"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 85,
+          "Name": "",
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "1.4 g/cm³"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 173,
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "1.35"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 218,
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "1.35"
+            }
+           ]
+          }
+         }
+        ]
+       },
+       {
+        "TOCHeading": "Vapor Pressure",
+        "Information": [
+         {
+          "ReferenceNumber": 9,
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "0 mmHg (approx) (NIOSH, 2024)"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 67,
+          "Description": "PEER REVIEWED",
+          "Reference": [
+           "Eisenreich SJ et al; Environ Sci Technol 15: 30-8 (1981)"
+          ],
+          "ExtendedReference": [
+           {
+            "Citation": "Eisenreich SJ et al; Environ Sci Technol 15: 30-8 (1981)",
+            "Matched": {
+             "PCLID": 678341301,
+             "Citation": "Eisenreich SJ, Looney BB, Thornton JD. Airborne organic contaminants in the Great Lakes ecosystem. Environ. Sci. Technol. 1981 Jan 01;15(1):30–8. doi: 10.1021/es00083a002.",
+             "DOI": "10.1021/es00083a002"
+            }
+           }
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "2.52X10-5 mm Hg at 25 °C (calc)"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 85,
+          "Name": "",
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "Vapor pressure, Pa at 25 °C: ~ 0.004"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 173,
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "0 mmHg (approx)"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 218,
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "0 mmHg (approx)"
+            }
+           ]
+          }
+         }
+        ]
+       },
+       {
+        "TOCHeading": "LogP",
+        "Information": [
+         {
+          "ReferenceNumber": 36,
+          "Reference": [
+           "https://www.fip.org/files/fip/BPS/BCS/Monographs/AcetylsalicylicAcid.pdf"
+          ],
+          "ExtendedReference": [
+           {
+            "Citation": "https://www.fip.org/files/fip/BPS/BCS/Monographs/AcetylsalicylicAcid.pdf",
+            "Matched": {
+             "PCLID": 900289255,
+             "Citation": "https://www.fip.org/files/fip/BPS/BCS/Monographs/AcetylsalicylicAcid.pdf"
+            }
+           }
+          ],
+          "Value": {
+           "Number": [
+            1.18
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 67,
+          "Description": "PEER REVIEWED",
+          "Reference": [
+           "Hansch, C., Leo, A., D. Hoekman. Exploring QSAR - Hydrophobic, Electronic, and Steric Constants. Washington, DC: American Chemical Society., 1995., p. 54"
+          ],
+          "ExtendedReference": [
+           {
+            "Citation": "Hansch, C., Leo, A., D. Hoekman. Exploring QSAR - Hydrophobic, Electronic, and Steric Constants. Washington, DC: American Chemical Society., 1995., p. 54",
+            "Matched": {
+             "PCLID": 906279669,
+             "Citation": "Hansch, C., Leo, A., D. Hoekman. Exploring QSAR - Hydrophobic, Electronic, and Steric Constants. Washington, DC: American Chemical Society., 1995., p. 54"
+            }
+           }
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "log Kow = 1.19"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 68,
+          "Reference": [
+           "HANSCH,C ET AL. (1995)"
+          ],
+          "ExtendedReference": [
+           {
+            "Citation": "HANSCH,C ET AL. (1995)",
+            "Matched": {
+             "PCLID": 906299842,
+             "Citation": "HANSCH,C ET AL. (1995)"
+            }
+           }
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "1.19"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 85,
+          "Name": "",
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "1.19"
+            }
+           ]
+          }
+         }
+        ]
+       },
+       {
+        "TOCHeading": "Dissociation Constants",
+        "Information": [
+         {
+          "ReferenceNumber": 14,
+          "Name": "Acidic pKa",
+          "ExtendedReference": [
+           {
+            "Citation": "Tested as SID 103164874 in AID 781325: https://pubchem.ncbi.nlm.nih.gov/bioassay/781325#sid=103164874",
+            "Matched": {
+             "PCLID": 900287980,
+             "Citation": "Tested as SID 103164874 in AID 781325: https://pubchem.ncbi.nlm.nih.gov/bioassay/781325#sid=103164874"
+            }
+           },
+           {
+            "Citation": "Comparison of the accuracy of experimental and predicted pKa values of basic and acidic compounds. Pharm Res. 2014; 31(4):1082-95. DOI:10.1007/s11095-013-1232-z. PMID:24249037",
+            "PMID": 24249037,
+            "DOI": "10.1007/s11095-013-1232-z",
+            "PublicationTitle": "Comparison of the accuracy of experimental and predicted pKa values of basic and acidic compounds",
+            "PublicationAuthor": [
+             "Settimo L, Bellman K, Knegtel RM"
+            ],
+            "PublicationName": "Pharm Res",
+            "PublicationVolume": "31",
+            "PublicationIssue": "4",
+            "PublicationPage": "1082-95",
+            "PublicationDate": {
+             "Year": 2014
+            },
+            "Matched": {
+             "PCLID": 30306634,
+             "Citation": "Settimo L, Bellman K, Knegtel RMA. Comparison of the Accuracy of Experimental and Predicted pKa Values of Basic and Acidic Compounds. Pharmaceutical Research. 2013 Nov 19;31(4):1082–95. doi: 10.1007/s11095-013-1232-z.",
+             "PMID": 24249037,
+             "DOI": "10.1007/s11095-013-1232-z"
+            }
+           }
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "3.47"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 14,
+          "Name": "Acidic pKa",
+          "ExtendedReference": [
+           {
+            "Citation": "Tested as SID 103164874 in AID 781326: https://pubchem.ncbi.nlm.nih.gov/bioassay/781326#sid=103164874",
+            "Matched": {
+             "PCLID": 900288248,
+             "Citation": "Tested as SID 103164874 in AID 781326: https://pubchem.ncbi.nlm.nih.gov/bioassay/781326#sid=103164874"
+            }
+           },
+           {
+            "Citation": "Comparison of the accuracy of experimental and predicted pKa values of basic and acidic compounds. Pharm Res. 2014; 31(4):1082-95. DOI:10.1007/s11095-013-1232-z. PMID:24249037",
+            "PMID": 24249037,
+            "DOI": "10.1007/s11095-013-1232-z",
+            "PublicationTitle": "Comparison of the accuracy of experimental and predicted pKa values of basic and acidic compounds",
+            "PublicationAuthor": [
+             "Settimo L, Bellman K, Knegtel RM"
+            ],
+            "PublicationName": "Pharm Res",
+            "PublicationVolume": "31",
+            "PublicationIssue": "4",
+            "PublicationPage": "1082-95",
+            "PublicationDate": {
+             "Year": 2014
+            },
+            "Matched": {
+             "PCLID": 30306634,
+             "Citation": "Settimo L, Bellman K, Knegtel RMA. Comparison of the Accuracy of Experimental and Predicted pKa Values of Basic and Acidic Compounds. Pharmaceutical Research. 2013 Nov 19;31(4):1082–95. doi: 10.1007/s11095-013-1232-z.",
+             "PMID": 24249037,
+             "DOI": "10.1007/s11095-013-1232-z"
+            }
+           }
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "3.5"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 36,
+          "Name": "pKa",
+          "Reference": [
+           "https://www.fip.org/files/fip/BPS/BCS/Monographs/AcetylsalicylicAcid.pdf"
+          ],
+          "ExtendedReference": [
+           {
+            "Citation": "https://www.fip.org/files/fip/BPS/BCS/Monographs/AcetylsalicylicAcid.pdf",
+            "Matched": {
+             "PCLID": 900289255,
+             "Citation": "https://www.fip.org/files/fip/BPS/BCS/Monographs/AcetylsalicylicAcid.pdf"
+            }
+           }
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "3.5"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 67,
+          "Description": "PEER REVIEWED",
+          "Reference": [
+           "O'Neil, M.J. (ed.). The Merck Index - An Encyclopedia of Chemicals, Drugs, and Biologicals. Whitehouse Station, NJ:  Merck and Co., Inc., 2006., p. 140"
+          ],
+          "ExtendedReference": [
+           {
+            "Citation": "O'Neil, M.J. (ed.). The Merck Index - An Encyclopedia of Chemicals, Drugs, and Biologicals. Whitehouse Station, NJ:  Merck and Co., Inc., 2006., p. 140",
+            "Matched": {
+             "PCLID": 900123151,
+             "Citation": "O'Neil, M.J. (ed.). The Merck Index - An Encyclopedia of Chemicals, Drugs, and Biologicals. Whitehouse Station, NJ:  Merck and Co., Inc., 2006., p. 140"
+            }
+           }
+          ],
+          "Value": {
+           "StringWithMarkup": [
+            {
+             "String": "pKa = 3.49 at 25 °C"
+            }
+           ]
+          }
+         },
+         {
+          "ReferenceNumber": 86,
+          "Value": {
+           "ExternalTableName": "iupacpka"
+          }
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   }
+  ],
+  "Reference": [
+   {
+    "ReferenceNumber": 9,
+    "SourceName": "CAMEO Chemicals",
+    "URL": "https://cameochemicals.noaa.gov/chemical/19712"
+   },
+   {
+    "ReferenceNumber": 66,
+    "SourceName": "Haz-Map, Information on Hazardous Chemicals and Occupational Diseases",
+    "URL": "https://haz-map.com/Agents/212"
+   },
+   {
+    "ReferenceNumber": 68,
+    "SourceName": "Human Metabolome Database (HMDB)",
+    "URL": "http://www.hmdb.ca/metabolites/HMDB0001879"
+   },
+   {
+    "ReferenceNumber": 85,
+    "SourceName": "ILO-WHO International Chemical Safety Cards (ICSCs)",
+    "URL": "https://chemicalsafety.ilo.org/dyn/icsc/showcard.display?p_card_id=0822"
+   },
+   {
+    "ReferenceNumber": 173,
+    "SourceName": "Occupational Safety and Health Administration (OSHA)",
+    "URL": "https://www.osha.gov/chemicaldata/384"
+   },
+   {
+    "ReferenceNumber": 218,
+    "SourceName": "The National Institute for Occupational Safety and Health (NIOSH)",
+    "URL": "https://www.cdc.gov/niosh/npg/npgd0010.html"
+   },
+   {
+    "ReferenceNumber": 36,
+    "SourceName": "DrugBank",
+    "URL": "https://go.drugbank.com/drugs/DB00945"
+   },
+   {
+    "ReferenceNumber": 67,
+    "SourceName": "Hazardous Substances Data Bank (HSDB)",
+    "URL": "https://pubchem.ncbi.nlm.nih.gov/source/hsdb/652"
+   },
+   {
+    "ReferenceNumber": 14,
+    "SourceName": "ChEMBL",
+    "URL": "https://www.ebi.ac.uk/chembl/explore/compound/CHEMBL25"
+   },
+   {
+    "ReferenceNumber": 86,
+    "SourceName": "IUPAC Digitized pKa Dataset",
+    "URL": "https://github.com/IUPAC/Dissociation-Constants"
+   }
+  ]
+ }
+}
