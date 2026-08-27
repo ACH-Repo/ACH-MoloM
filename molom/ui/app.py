@@ -128,6 +128,16 @@ def _snap_fractional(frac, places=9):
             for row in np.asarray(frac, dtype=float).reshape(-1, 3)]
 
 
+#: What each per-crystal display flag is CALLED in a status message. Without
+#: it a multi-object report reads "4 crystals: show_refused_bonds on".
+_FLAG_LABELS = {
+    "polyhedra": "coordination polyhedra",
+    "show_refused_bonds": "refused bonds",
+    "show_symmetry": "symmetry elements",
+    "show_ghosts": "symmetry ghosts",
+}
+
+
 class MainWindow(QMainWindow):
 
     #: What the last CIF export decided, for the status bar. On the CLASS so
@@ -5563,24 +5573,79 @@ class MainWindow(QMainWindow):
             self.outliner.highlight(obj_id)
         self.on_crystal_view(mode)
 
+    def _crystal_targets(self):
+        # type: () -> List
+        """Which crystals a ❖ control acts on: every SELECTED one.
+
+        Christian, with five isostructural alkali fluorides open: "I wanted to
+        change a tick box in the cif props pane for all of them simultaneously
+        => Select all, untick draw atoms outside boundary." Before round 91b
+        every control on this page took one `obj_id` and that was the ACTIVE
+        object, so exactly one crystal changed and the other four silently did
+        not.
+
+        **Crystals only**, meaning objects that have a cell. The page is the
+        crystal page and its ticks are about crystallographic display, so a
+        molecule caught in a select-all is passed over rather than being
+        given `show_symmetry` it can do nothing with.
+
+        The ACTIVE object is always included even when the selection does not
+        reach it, because the tick the user just clicked shows ITS state - it
+        would be strange for the one the page is describing to be the one left
+        behind. With nothing selected that is the whole list, which is exactly
+        the old behaviour.
+        """
+        ids = {int(oid) for oid, _atom in (self.viewport.selection or [])}
+        active = self._active_obj()
+        if active is not None:
+            ids.add(active.id)
+        order = {o.id: i for i, o in enumerate(self.scene.objects)}
+        targets = [o for o in (self.scene.get(i) for i in ids)
+                   if o is not None and cell_of(o) is not None]
+        targets.sort(key=lambda o: order.get(o.id, 0))
+        return targets
+
+    def _report_crystal_change(self, targets, what):
+        # type: (List, str) -> None
+        """Say how many crystals a click reached.
+
+        A control that quietly acts on four objects needs to say so as much as
+        one that acts on a single object the user was not looking at.
+        """
+        if not targets:
+            return
+        if len(targets) == 1:
+            self.statusBar().showMessage(
+                "{}: {}".format(targets[0].name, what), 6000)
+        else:
+            self.statusBar().showMessage(
+                "{} crystals: {}".format(len(targets), what), 6000)
+
     def _set_obj_flag(self, key, on):
         """Per-object display flags live in metadata, so they ride undo
-        snapshots and savepoints without extra plumbing."""
-        obj = self._active_obj()
-        if obj is None:
+        snapshots and savepoints without extra plumbing.
+
+        Applied to every SELECTED crystal - see `_crystal_targets`.
+        """
+        targets = self._crystal_targets()
+        if not targets:
             return
-        if on:
-            obj.structure.metadata[key] = True
-        else:
-            obj.structure.metadata.pop(key, None)
+        for obj in targets:
+            if on:
+                obj.structure.metadata[key] = True
+            else:
+                obj.structure.metadata.pop(key, None)
         self.viewport.refresh_geometry()
         self.viewport.update()
+        self._report_crystal_change(
+            targets, "{} {}".format(_FLAG_LABELS.get(key, key),
+                                    "on" if on else "off"))
 
     def _sync_symmetry_kinds(self):
-        obj = self._active_obj()
-        if obj is None:
-            return
-        obj.structure.metadata["symmetry_kinds"] =             self.crystal_page.enabled_kinds()
+        """The symmetry-element kind filters, on every selected crystal."""
+        kinds = self.crystal_page.enabled_kinds()
+        for obj in self._crystal_targets():
+            obj.structure.metadata["symmetry_kinds"] = kinds
         self.viewport.update()
 
     def _on_crystal_poly(self, obj_id, on):
@@ -5606,12 +5671,45 @@ class MainWindow(QMainWindow):
         pipeline no longer uses, so the control had quietly stopped doing
         anything.
         """
-        obj = self.scene.get(obj_id) if obj_id is not None else None
-        if obj is None or cell_of(obj) is None:
+        # WHICH crystals: the page's own ticks pass the ACTIVE id, and that
+        # is what "act on the selection" looks like from here. An outliner
+        # row's control names a specific object instead and must act on that
+        # one alone - membership in the selection is the wrong test, because
+        # a row control for a crystal that happens to be selected would then
+        # broadcast to all of them.
+        if obj_id is None or obj_id == self.active_id:
+            targets = self._crystal_targets()
+        else:
+            obj = self.scene.get(obj_id)
+            targets = ([obj] if obj is not None and cell_of(obj) is not None
+                       else [])
+        if not targets:
             return
         key = "pack_outside" if which == "outside" else "pack_copies"
-        obj.structure.metadata[key] = bool(on)
-        self.on_crystal_view(obj.structure.metadata.get("cell_view", "cell"))
+        active = self.active_id
+        for obj in targets:
+            obj.structure.metadata[key] = bool(on)
+            # `on_crystal_view` rebuilds THE ACTIVE crystal, so each target
+            # takes its turn at being active. Restored afterwards, or a click
+            # on a tick would quietly move the selection.
+            self.active_id = obj.id
+            self.on_crystal_view(obj.structure.metadata.get("cell_view",
+                                                            "cell"))
+        self.active_id = active
+        if len(targets) > 1:
+            # Rebuilding a crystal's view regenerates its atom list, so the
+            # selection - which names atoms by index - is dropped. Without
+            # putting it back, the FIRST tick would reach all five crystals
+            # and the SECOND would quietly reach one, which is the very
+            # surprise this change exists to remove. Whole molecules, because
+            # that is what "these are the ones I am working on" means and the
+            # old indices no longer refer to anything.
+            self.viewport.select_whole_molecules([o.id for o in targets])
+        self._sync_crystal_page()
+        self._report_crystal_change(
+            targets, "atoms outside the cell {}".format(
+                "shown" if on else "hidden") if which == "outside"
+            else "boundary copies {}".format("completed" if on else "left"))
 
     def _on_crystal_exterior(self, obj_id, on):
         """VESTA's boundary search, per crystal.

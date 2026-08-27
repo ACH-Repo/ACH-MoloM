@@ -198,6 +198,37 @@ other side, and the two export fixes are verified in `tools/smoke_gui.py`
 instead, which now measures the crop and counts ink with and without the cell
 box. 1310 tests.
 
+Round 91b (2026-08-27, one tick, every selected crystal):
+Christian, after the P1 fix: "do the tick changes for multiple at once."
+`_crystal_targets()` is the whole of it - every SELECTED object that has a
+cell, with the ACTIVE one always included (the tick shows its state, so it
+would be strange for that to be the one left behind), falling back to the
+active object alone when nothing is selected, which is the old behaviour and
+the common case. It drives the two packing options, the four display flags
+(polyhedra, refused bonds, symmetry elements, ghosts) and the symmetry-kind
+filters. `_set_cell_box` is deliberately untouched: `viewport.show_cell` is
+one flag for the whole viewport rather than a per-object one.
+**A MOLECULE CAUGHT IN A SELECT-ALL IS PASSED OVER.** The page is the crystal
+page and its ticks are crystallographic, so cubane swept up by Ctrl+A is not
+given a `show_symmetry` it can do nothing with.
+**THE SELECTION HAS TO BE PUT BACK, and missing that would have shipped the
+same surprise one click later.** A packing change calls `on_crystal_view`,
+which regenerates the atom list - so the selection, which names atoms BY
+INDEX, is dropped. Measured: five selected objects before the click, zero
+after. The first tick would have reached five crystals and the second exactly
+one. `select_whole_molecules` restores them, and whole molecules is the right
+unit because the old indices no longer refer to anything.
+Two of my own logic errors, both caught by tests rather than by reading.
+`on_crystal_view` rebuilds THE ACTIVE crystal, so each target takes its turn
+at being active and the original has to be restored, or clicking a tick
+quietly changes which molecule the rest of the UI describes. And the escape
+hatch for the outliner's own row control was first written as "an object that
+is not in the selection acts alone", which is the wrong test - a row control
+for a crystal that happens to be selected would broadcast to all of them. The
+discriminator is whether the caller passed the ACTIVE id, because that is what
+the page's own ticks pass.
+1877 tests.
+
 Round 91 (2026-08-27, moving a crystal is not editing it - Christian's
 alkali-fluoride savefile):
 "I have a savefile called MF.molom... It contains isostructural alkali
@@ -4503,7 +4534,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1867 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1877 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -6162,7 +6193,7 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 1867 offline tests, 4 skipped, ~100 s.
+1. `python -m pytest tests/ -q` — 1877 offline tests, 4 skipped, ~105 s.
    `tests/conftest.py` sandboxes QSettings, so a GUI test can drive a real
    control without writing into your own MoloM configuration; it also
    **destroys the windows a test created** (round 86), without which the suite

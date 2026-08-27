@@ -416,7 +416,14 @@ frame pixel-identical, and each handle moves its own border exactly.
 
 ## M. Raised by round 91
 
-**M1. The ❖ crystal page acts on the ACTIVE object only.** Christian selected
+~~**M1. The ❖ crystal page acts on the ACTIVE object only.**~~ **DONE, round
+91b.** Every tick on it now acts on every SELECTED crystal, with the active
+one always included and a molecule caught in a select-all passed over. The
+part that needed thought was putting the SELECTION back after a rebuild, since
+`on_crystal_view` regenerates the atom list and the selection names atoms by
+index - without that the first tick reached five crystals and the second one.
+
+**M1b (was M1). The original wording, for the record.** Christian selected
 five isostructural fluorides and unticked "draw atoms outside the cell
 boundary" expecting all five to follow; `_on_packing_option` takes one
 `obj_id`, so one did. Applying a per-crystal tick to every SELECTED crystal is
