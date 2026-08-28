@@ -5,6 +5,8 @@
 2. Switching an `F m -3 m` fluoride to "asymmetric unit only" moved the
    crystal, and its cell box, to the origin.
 """
+import os
+
 import numpy as np
 import pytest
 
@@ -247,3 +249,47 @@ def test_a_molecule_with_no_bonds_forwards_nothing(win):
     obj = win.scene.add(Structure.from_atoms([("C", 0.0, 0.0, 0.0)], name="x"))
     win.active_id = obj.id
     assert win._smiles_note() == ""
+
+
+# ------------------------------------- a .cif that is not a crystal says so
+def test_a_cif_with_no_cell_is_announced(win, tmp_path):
+    """Christian opened a `ZIF-8.cif` and got a molecule with a dead crystal
+    page and no explanation.
+
+    The file was the problem - OpenBabel had written it with no
+    `_cell_length_a` at all, and ASE refuses the same file ("0 lattice
+    vectors") - so MoloM was right and merely silent about it. A `.cif` that
+    opens with no cell now says why.
+    """
+    from molom.core import build as build_mod
+    obj = win.scene.add(build_mod.cubane())        # no cell of any kind
+    assert win.cif_fallback_note(obj, str(tmp_path / "x.cif"))
+    # ...and only for a .cif: an .xyz has no crystallography to lose.
+    assert win.cif_fallback_note(obj, str(tmp_path / "x.xyz")) is None
+    assert win.cif_fallback_note(obj, None) is None
+
+
+def test_a_real_crystal_says_nothing(win):
+    obj = _fluoride(win)
+    assert win.cif_fallback_note(obj, "whatever.cif") is None
+
+
+# --------------------------------- the round trip survives a project SaveAs
+def test_saving_a_project_does_not_end_the_round_trip(win, tmp_path):
+    """ORCA Workbench is still waiting for that .xyz. Clearing `source_path`
+    disabled Ctrl+Alt+S in the one situation it exists for - which is why the
+    two shortcuts looked identical."""
+    from molom.core import project
+    path, _obj = _roundtrip(win, tmp_path)
+    win.project_path = str(tmp_path / "scene.molom")
+    project.save_project(win.project_path, win.scene)
+    win._sync_roundtrip_note()
+    assert win.source_path == os.path.abspath(path)
+    # ...and the banner names the key that now writes back.
+    assert "Ctrl+Alt+S" in win.viewport.roundtrip_note
+
+
+def test_without_a_project_the_banner_names_Ctrl_S(win, tmp_path):
+    _path, _obj = _roundtrip(win, tmp_path)
+    note = win.viewport.roundtrip_note
+    assert "Ctrl+S" in note and "Ctrl+Alt+S" not in note

@@ -838,7 +838,17 @@ def _read_cif(path, disorder=None):
         content, _content_xyz = cif_mod.expand(
             data, whole_molecules=False, boundary=False, disorder=disorder,
             report=report)
-    except (cif_mod.CifError, ValueError, OSError):
+    except (cif_mod.CifError, ValueError, OSError) as exc:
+        # SAY WHY, rather than falling through in silence. A `.cif` that the
+        # crystallographic reader refuses still opens - OpenBabel reads the
+        # atoms - but it opens as a plain MOLECULE with no cell, no space
+        # group and a dead crystal page, and nothing on screen used to explain
+        # the difference. Christian hit it with a ZIF-8.cif that OpenBabel had
+        # written with no `_cell_length_a` at all (ASE refuses the same file:
+        # "0 lattice vectors"), and reasonably read it as MoloM being odd
+        # about crystals.
+        if report is not None:
+            report["cif_fallback"] = str(exc)
         return None
     if not symbols:
         return None

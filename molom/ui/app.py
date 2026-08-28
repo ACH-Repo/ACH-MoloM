@@ -3538,11 +3538,35 @@ class MainWindow(QMainWindow):
                 "atoms, drawn only)".format(
                     s.metadata.get("boundary_bonds", 0),
                     s.metadata.get("boundary_atoms", 0))) if n])
-        note = ", ".join([n for n in (note, self.symmetry_note(s), chem)
+        note = ", ".join([n for n in (note, self.symmetry_note(s), chem,
+                                      self.cif_fallback_note(obj, path))
                           if n]) or None
         self.statusBar().showMessage(
             "Added {}{}".format(obj.name,
                                 " ({})".format(note) if note else ""), 6000)
+
+    @staticmethod
+    def cif_fallback_note(obj, path=None):
+        # type: (object, Optional[str]) -> Optional[str]
+        """Say when a `.cif` opened as a plain molecule.
+
+        A file the crystallographic reader refuses still OPENS - OpenBabel
+        reads the atoms - but it opens with no cell, no space group and a dead
+        crystal page, and nothing on screen used to explain the difference.
+        Christian hit it with a `ZIF-8.cif` that OpenBabel had written with no
+        `_cell_length_a` at all; ASE refuses the same file ("0 lattice
+        vectors"), so MoloM was right and merely silent about it.
+        """
+        # The FILE's extension, because a fallback import loses every
+        # other trace that this was meant to be a crystal: OpenBabel's
+        # reader sets no `source: cif` and the object is named after the
+        # stem, so neither of those can be asked.
+        if not str(path or "").lower().endswith((".cif", ".mmcif")):
+            return None
+        if cell_of(obj) is not None:
+            return None
+        return ("no unit cell in the file, so it opened as a plain molecule "
+                "- the crystal page stays greyed")
 
     @staticmethod
     def chemistry_note(structure):
@@ -4261,12 +4285,14 @@ class MainWindow(QMainWindow):
         exists because a session launched from ORCA Workbench overwrites
         somebody else's file, and nothing on screen used to say so.
         """
-        if self.project_path or not self.source_path:
+        if not self.source_path:
             self.viewport.set_roundtrip("")
             return
-        self.viewport.set_roundtrip("Round trip - Ctrl+S writes back to {}"
-                                    .format(os.path.basename(
-                                        self.source_path)))
+        # WHICH key writes back depends on whether a project has taken over as
+        # the document. Naming the wrong one is worse than naming none.
+        key = "Ctrl+Alt+S" if self.project_path else "Ctrl+S"
+        self.viewport.set_roundtrip("Round trip - {} writes back to {}".format(
+            key, os.path.basename(self.source_path)))
 
     def on_save_geometry_back(self):
         """Write the visible geometry back over the file this session opened.
@@ -4328,7 +4354,12 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Save failed", str(e))
             return
         self.project_path = path
-        self.source_path = None   # the project is the document now
+        # `source_path` is KEPT. Saving a project makes the project the
+        # document Ctrl+S writes, but it does not end the round trip - ORCA
+        # Workbench is still waiting for that .xyz. Clearing it here disabled
+        # `Ctrl+Alt+S` in the one situation it exists for, which is why the
+        # two shortcuts looked identical: they can only differ once BOTH a
+        # project and a source file are open at once.
         self._sync_roundtrip_note()
         self.settings.setValue("last_dir", os.path.dirname(path))
         self._push_recent(path)
@@ -4376,7 +4407,12 @@ class MainWindow(QMainWindow):
         if through is not None and self.scene.camera(through) is not None:
             self.on_activate_camera(through)
         self.project_path = path
-        self.source_path = None   # the project is the document now
+        # `source_path` is KEPT. Saving a project makes the project the
+        # document Ctrl+S writes, but it does not end the round trip - ORCA
+        # Workbench is still waiting for that .xyz. Clearing it here disabled
+        # `Ctrl+Alt+S` in the one situation it exists for, which is why the
+        # two shortcuts looked identical: they can only differ once BOTH a
+        # project and a source file are open at once.
         self._sync_roundtrip_note()
         self._push_recent(path)
         self._sync_all(fit="center" not in view)
