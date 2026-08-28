@@ -161,3 +161,88 @@ def test_an_outliner_row_control_still_acts_on_its_OWN_object(bench):
     assert crystals[0].structure.metadata.get("pack_outside") is True
     assert all(c.structure.metadata.get("pack_outside") is not True
                for c in crystals[1:])
+
+
+# ------------------------------------------------- round 93: the rest of it
+def test_the_page_stays_live_when_a_MOLECULE_is_active(bench):
+    """Christian: "Having benzene in the selection greys out all controls of
+    crystal properties tab."
+
+    Picking atoms makes the last one ACTIVE, so sweeping up a solvent killed
+    the page - while its controls would have worked perfectly well, since
+    `_crystal_targets` filters non-crystals out anyway.
+    """
+    win, crystals, molecule = bench
+    _select_everything(win)
+    win.active_id = molecule.id          # the molecule was picked last
+    assert win._crystal_subject() in crystals
+    win._sync_crystal_page()
+    assert win.crystal_page._has_cell, "the controls must stay usable"
+
+
+def test_with_no_crystal_anywhere_the_page_still_greys(bench):
+    win, crystals, molecule = bench
+    for c in crystals:
+        win.scene.remove(c.id)
+    win.active_id = molecule.id
+    win.viewport.set_selection([(molecule.id, 0)])
+    win._sync_crystal_page()
+    assert not win.crystal_page._has_cell
+
+
+def test_the_view_radio_reaches_every_selected_crystal(bench):
+    """Christian: "Switch to asymmetric unit view only works on the active
+    crystal when all except CsF are selected." Round 91b made the TICKS act on
+    the selection and left the radio behind."""
+    win, crystals, _mol = bench
+    _select_everything(win)
+    win._on_crystal_view_chosen("asym")
+    assert all(c.structure.metadata.get("cell_view") == "asym"
+               for c in crystals)
+
+
+def test_the_view_radio_puts_the_active_object_back(bench):
+    win, crystals, _mol = bench
+    _select_everything(win)
+    before = win.active_id
+    win._on_crystal_view_chosen("asym")
+    assert win.active_id == before
+
+
+def test_the_cell_box_tick_is_PER_CRYSTAL(bench):
+    """Christian: "Show unit cell box is applied to every crystal structure,
+    even not selected ones... Is it not a crystal's own internal coordinate
+    system that should be displayable?" """
+    from molom.ui.viewport import cell_shown
+    win, crystals, _mol = bench
+    win.viewport.set_selection([(crystals[0].id, 0)])
+    win.active_id = crystals[0].id
+    win._on_cell_box_toggled(False)
+    assert not cell_shown(crystals[0])
+    assert all(cell_shown(c) for c in crystals[1:]), "the others keep theirs"
+
+
+def test_a_crystal_with_no_flag_still_shows_its_box(bench):
+    """Absent means SHOWN, so every file imported before this draws as it
+    always did."""
+    from molom.ui.viewport import cell_shown
+    _win, crystals, _mol = bench
+    assert "show_cell" not in (crystals[0].structure.metadata or {})
+    assert cell_shown(crystals[0])
+
+
+def test_switching_view_drops_a_stale_packed_bond_list(bench):
+    """A PRE-EXISTING crash, found while testing the above: `packed_bonds` is
+    keyed by DRAWN atom index, an asymmetric unit produces none, and the old
+    FULL CELL list was left in metadata for `_perceive_fresh` to apply to two
+    atoms - an IndexError. It only bit a crystal that had actually been
+    packed, which is why four of Christian's five fluorides switched happily
+    and the fifth threw."""
+    win, crystals, _mol = bench
+    obj = crystals[0]
+    win.viewport.set_selection([])
+    win.active_id = obj.id
+    obj.structure.metadata["packed_bonds"] = [[0, 26, 1]]   # a full-cell list
+    obj.structure.metadata["packed"] = True
+    win.on_crystal_view("asym")            # must not raise
+    assert "packed_bonds" not in obj.structure.metadata

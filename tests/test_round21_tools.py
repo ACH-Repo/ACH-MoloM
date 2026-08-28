@@ -145,10 +145,17 @@ def test_crystal_page_switches_the_view(tmp_path, win):
     assert win._active_obj().structure.n_atoms == 65
 
 
-def test_cell_box_checkbox_drives_the_viewport(win):
-    win.crystal_page.box_check.setChecked(False)
+def test_the_cell_box_master_switch_drives_the_viewport(win):
+    """The VIEW menu's toggle is the master: "show me no boxes at all" is a
+    different request from "not this crystal's".
+
+    Round 93 made the ❖ page's own tick PER CRYSTAL - Christian: "Show unit
+    cell box is applied to every crystal structure, even not selected ones" -
+    so that tick is covered by `test_round91_multi_crystal.py` instead.
+    """
+    win.on_toggle_cell()
     assert not win.viewport.show_cell
-    win.crystal_page.box_check.setChecked(True)
+    win.on_toggle_cell()
     assert win.viewport.show_cell
 
 

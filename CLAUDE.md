@@ -198,6 +198,51 @@ other side, and the two export fixes are verified in `tools/smoke_gui.py`
 instead, which now measures the crop and counts ink with and without the cell
 box. 1310 tests.
 
+Round 93 (2026-08-27, the rest of Christian's checklist - and a crash that had
+been waiting for the right crystal):
+**(1) "HAVING BENZENE IN THE SELECTION GREYS OUT ALL CONTROLS OF CRYSTAL
+PROPERTIES TAB."** Picking atoms makes the last one ACTIVE, so sweeping up a
+solvent molecule with Ctrl+A killed the whole ❖ page - while its controls
+would have worked perfectly well, since `_crystal_targets` filters
+non-crystals out anyway. The page was the only thing that had not been told.
+`_crystal_subject()` is the fix: the active object when it IS a crystal,
+otherwise the first selected one. With no crystal anywhere the page greys as
+before.
+**(2) THE VIEW RADIO WAS LEFT BEHIND BY ROUND 91b**, which is the worse half
+to leave: "Switch to asymmetric unit view only works on the active crystal
+when all except CsF are selected." A view mode is exactly the control you want
+to apply to a row of isostructural crystals at once. `_on_crystal_view_chosen`
+fans out over `_crystal_targets()`; `on_crystal_view` itself stays
+single-object, because F3, the outliner row and `_on_packing_option` all call
+it and a fan-out inside would recurse.
+**(3) THE CELL BOX IS PER CRYSTAL NOW**, and Christian's argument is the right
+one: "Show unit cell box is applied to every crystal structure, even not
+selected ones... Is it not a crystal's own internal coordinate system that
+should be displayable relative to the viewport's absolute euclidian space?" A
+cell belongs to ONE crystal and with several open you want one box and not the
+other. `viewport.show_cell` stays as the MASTER behind the View menu - "show
+me no boxes at all" is a different request from "not this crystal's" - and
+`cell_shown(obj)` is the per-object refinement, ABSENT MEANING SHOWN so every
+file from before this draws as it always did. Two round-21/23 tests pinned the
+old global contract and moved with the code (round 71's rule).
+**(4) SORTING RESIZED THE COLUMNS.** "Sorting also rescales hspace of column
+which should only happen on double click of border between two columns."
+`refill` runs on every sort and called `resizeColumnsToContents` each time, so
+asking for an ORDER rearranged the LAYOUT. It now fits the columns only when
+the row set itself changes, and `sectionHandleDoubleClicked` gives Excel's
+gesture - the column to the LEFT of the handle, which is the index Qt reports.
+**(5) AND A PRE-EXISTING CRASH, found by driving the above.** Switching
+`Griceite_9008667` to the asymmetric unit threw `IndexError: index 5 is out of
+bounds for axis 0 with size 2`, while its four siblings switched happily.
+`packed_bonds` is a bond list keyed by DRAWN atom index; an asymmetric unit
+produces none, so `on_crystal_view` - which set the key only `if
+report.get("packed_bonds") is not None` - left the previous FULL CELL's list
+in metadata for `_perceive_fresh` to apply to two atoms. It only bit a crystal
+that had actually been packed, which is why one of five threw. Dropped and
+re-set TOGETHER now, which is round 83's rule in the one place that
+regenerates the atom list wholesale.
+1916 tests.
+
 Round 92c (2026-08-27, Christian's round-trip pass - and the ZIF-8 that was
 never a crystal):
 **(1) "IT OPENS THE .cif NOT AS A CRYSTAL STRUCTURE BUT A MOLECULE" - and the
@@ -4681,7 +4726,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1909 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1916 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -5960,6 +6005,11 @@ independent cross-check inside a single fixture.
   293.0 renders as "293", and obvious the moment a molecular weight put
   RDKit's 106.168 next to PubChem's 106.16 in one column. If the sorting is
   hand-driven, do not write EditRole at all.
+- **A REBUILD DROPS AND RE-SETS EVERY PER-ATOM MAP TOGETHER** (round 93, and
+  round 83 said it first). `on_crystal_view` set `packed_bonds` only when the
+  new view produced one, so switching to an asymmetric unit left the previous
+  FULL CELL's bond list in metadata and `_perceive_fresh` applied 27-atom
+  indices to two atoms. Setting conditionally is not the same as replacing.
 - **A REFERENCE SAMPLE MUST BE CLEARED WHEN IT CANNOT BE RE-PINNED** (round
   92b). `set_cell_reference` refuses to pin below three atoms, which is right,
   and used to leave the OLD sample behind - so an asymmetric unit of two atoms
@@ -6350,7 +6400,7 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 1909 offline tests, 4 skipped, ~110 s.
+1. `python -m pytest tests/ -q` — 1916 offline tests, 4 skipped, ~110 s.
    `tests/conftest.py` sandboxes QSettings, so a GUI test can drive a real
    control without writing into your own MoloM configuration; it also
    **destroys the windows a test created** (round 86), without which the suite

@@ -92,6 +92,8 @@ class ResultTable(QTableWidget):
         self._sort_column = None
         self._sort_desc = False
         self._loading_stars = False
+        #: The row set the columns were last fitted to.
+        self._sized_for = None
         # Sorting is driven by hand rather than by `setSortingEnabled(True)`,
         # because the rows have a MEANINGFUL default order - the ranking is
         # the one thing the search itself is for - and Qt's built-in sorting
@@ -99,6 +101,10 @@ class ResultTable(QTableWidget):
         head = self.horizontalHeader()
         head.setSectionsClickable(True)
         head.sectionClicked.connect(self._sort_by)
+        # Excel's gesture: double-clicking the border between two headers
+        # fits the column on its LEFT to its contents, which is the index Qt
+        # reports. Sorting must NOT resize anything - see `refill`.
+        head.sectionHandleDoubleClicked.connect(self.resizeColumnToContents)
         head.setToolTip("Click to sort; click again to reverse, and a third "
                         "time to go back to the search ranking")
         self.itemChanged.connect(self._star_toggled)
@@ -214,7 +220,15 @@ class ResultTable(QTableWidget):
                 continue
             self._fill_row(row, entry)
         self._loading_stars = False
-        self.resizeColumnsToContents()
+        # ONLY when the CONTENT changed. `refill` also runs on every sort, and
+        # resizing there moved the columns under the hand of somebody who had
+        # asked for an order, not a layout - Christian: "sorting also rescales
+        # hspace of column which should only happen on double click of border
+        # between two columns."
+        signature = tuple(self.key_for(e) for e in self._shown if e is not None)
+        if signature != getattr(self, "_sized_for", None):
+            self._sized_for = signature
+            self.resizeColumnsToContents()
         if 0 <= self.STRETCH_COLUMN < len(self.COLUMNS):
             self.horizontalHeader().setSectionResizeMode(
                 self.STRETCH_COLUMN, QHeaderView.Stretch)

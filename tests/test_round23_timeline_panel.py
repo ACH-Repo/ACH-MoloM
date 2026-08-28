@@ -213,12 +213,22 @@ def test_the_content_checkboxes_are_exclusive(crystal_win):
     assert not ctrl.asym_check.isChecked()
 
 
-def test_show_unit_cell_checkbox_drives_the_viewport(crystal_win):
+def test_show_unit_cell_checkbox_drives_THAT_crystals_box(crystal_win):
+    """Round 93: the row names ONE object, so it sets that object's flag
+    rather than the viewport-wide master.
+
+    Christian: "Show unit cell box is applied to every crystal structure, even
+    not selected ones... Is it not a crystal's own internal coordinate system
+    that should be displayable?" The master switch is the View menu's toggle.
+    """
+    from molom.ui.viewport import cell_shown
     ctrl = _controls(crystal_win)[0]
+    obj = crystal_win.scene.get(ctrl.obj_id)
     ctrl.box_check.setChecked(False)
-    assert not crystal_win.viewport.show_cell
+    assert not cell_shown(obj)
+    assert crystal_win.viewport.show_cell, "the master switch is untouched"
     ctrl.box_check.setChecked(True)
-    assert crystal_win.viewport.show_cell
+    assert cell_shown(obj)
 
 
 def test_advanced_opens_the_page_on_that_crystal(crystal_win):

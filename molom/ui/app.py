@@ -357,8 +357,10 @@ class MainWindow(QMainWindow):
                                self._sync_all()))
         self.outliner.merge_requested.connect(self.on_merge_ids)
         self.outliner.crystal_view_changed.connect(self._on_crystal_row_view)
-        self.outliner.crystal_box_toggled.connect(
-            lambda _oid, on: self._set_cell_box(on))
+        # The ROW names one object, so it sets that object's own flag rather
+        # than the viewport-wide master (which stays behind the View menu's
+        # "Show unit cell box").
+        self.outliner.crystal_box_toggled.connect(self._on_row_cell_box)
         self.outliner.crystal_poly_toggled.connect(self._on_crystal_poly)
         self.outliner.comment_requested.connect(self.on_edit_comment)
         self.outliner.attachment_toggled.connect(
@@ -401,14 +403,14 @@ class MainWindow(QMainWindow):
         self.vibration_page.calculate_requested.connect(
             self.on_calculate_frequencies)
         self.crystal_page = CrystalPage()
-        self.crystal_page.view_changed.connect(self.on_crystal_view)
+        self.crystal_page.view_changed.connect(self._on_crystal_view_chosen)
         self.crystal_page.occupancy_toggled.connect(
             self._on_occupancy_display)
         self.crystal_page.outside_toggled.connect(
             lambda on: self._on_packing_option(self.active_id, "outside", on))
         self.crystal_page.copies_toggled.connect(
             lambda on: self._on_packing_option(self.active_id, "copies", on))
-        self.crystal_page.box_toggled.connect(self._set_cell_box)
+        self.crystal_page.box_toggled.connect(self._on_cell_box_toggled)
         self.crystal_page.cell_apply_requested.connect(self.on_apply_cell)
         self.crystal_page.cell_suggest_requested.connect(self.on_suggest_cell)
         self.crystal_page.cell_remove_requested.connect(self.on_remove_cell)
@@ -7044,6 +7046,40 @@ class MainWindow(QMainWindow):
                 "drawn on top of everything" if new == cellbox.OVERLAY
                 else "occluded by what is in front of it"), 5000)
 
+    def _on_row_cell_box(self, obj_id, on):
+        """One crystal's box, from its outliner row."""
+        obj = self.scene.get(obj_id)
+        if obj is None or cell_of(obj) is None:
+            return
+        obj.structure.metadata["show_cell"] = bool(on)
+        if on and not self.viewport.show_cell:
+            self.viewport.show_cell = True
+        self.viewport.update()
+        self._sync_crystal_page()
+
+    def _on_cell_box_toggled(self, on):
+        """The ❖ page's box tick: PER CRYSTAL, like every other tick there.
+
+        `viewport.show_cell` stays as the master switch behind the F3
+        operator - "show me no boxes at all" is a different request from "not
+        this crystal's" - but the page's own tick now says which crystals.
+        """
+        targets = self._crystal_targets()
+        if not targets:
+            return
+        for obj in targets:
+            # Written EXPLICITLY rather than popped, because absent means
+            # SHOWN (so files from before this keep their box).
+            obj.structure.metadata["show_cell"] = bool(on)
+        if on and not self.viewport.show_cell:
+            # Asking for a box while the master switch is off would otherwise
+            # do nothing visible, which is the kind of dead control this
+            # project keeps finding.
+            self.viewport.show_cell = True
+        self.viewport.update()
+        self._report_crystal_change(
+            targets, "unit cell box {}".format("on" if on else "off"))
+
     def _set_cell_box(self, on):
         self.viewport.show_cell = bool(on)
         if self.crystal_page.box_check.isChecked() != bool(on):
@@ -7168,9 +7204,59 @@ class MainWindow(QMainWindow):
     def _on_ribbon_fit(self):
         self.viewport.fit_view()
 
-    def _sync_crystal_page(self):
+    def _on_crystal_view_chosen(self, mode, na=1, nb=1, nc=1):
+        """The ❖ page's asym / cell / packing radio, on every selected crystal.
+
+        Christian: "Switch to asymmetric unit view only works on the active
+        crystal when all except CsF are selected." Round 91b made the TICKS
+        act on the selection and left the radio behind, which is the worse
+        half to leave: a view mode is the control you most want to apply to a
+        row of isostructural crystals at once.
+
+        `on_crystal_view` itself stays single-object - it is called from F3,
+        from the outliner row and from `_on_packing_option` - so the fan-out
+        lives here, at the page's own call site.
+        """
+        targets = self._crystal_targets()
+        if not targets:
+            return
+        active = self.active_id
+        for obj in targets:
+            self.active_id = obj.id
+            self.on_crystal_view(mode, na, nb, nc)
+        self.active_id = active
+        if len(targets) > 1:
+            # The rebuild regenerates the atom list, so a selection that names
+            # atoms by index is gone - put it back, or the NEXT control would
+            # quietly reach one crystal (round 91b).
+            self.viewport.select_whole_molecules([o.id for o in targets])
+            self._report_crystal_change(
+                targets, {"asym": "asymmetric unit only",
+                          "cell": "full unit cell"}.get(
+                              mode, "{}x{}x{} packing".format(na, nb, nc)))
+        self._sync_crystal_page()
+
+    def _crystal_subject(self):
+        """Which crystal the ❖ page DESCRIBES.
+
+        The active object when it is a crystal; otherwise the first selected
+        one. Christian: "Having benzene in the selection greys out all
+        controls of crystal properties tab." Picking atoms makes the last one
+        picked ACTIVE, so sweeping up a solvent molecule killed the whole page
+        - and its controls would have worked perfectly well, since
+        `_crystal_targets` filters non-crystals out anyway. The page was the
+        only thing that had not been told.
+        """
         obj = self._active_obj()
-        cell = self._active_cell()
+        if obj is not None and cell_of(obj) is not None:
+            return obj
+        for candidate in self._crystal_targets():
+            return candidate
+        return obj
+
+    def _sync_crystal_page(self):
+        obj = self._crystal_subject()
+        cell = cell_of(obj) if obj is not None else None
         # The ❖ TAB is always clickable, like ∿ (round 30's lesson: a greyed
         # tab cannot explain why it is greyed, and this one greys itself on
         # whichever molecule happens to be active — so the page you were just
@@ -7381,6 +7467,17 @@ class MainWindow(QMainWindow):
         # periodic bond graph is built on has to be replaced with it. In a
         # PACKING the content is still the first cell's — every other cell is
         # a lattice translate of it, which is exactly what the graph labels.
+        # DROPPED FIRST, ALWAYS. `packed_bonds` is a bond list keyed by DRAWN
+        # atom index, so it describes exactly the view that produced it - and
+        # an asymmetric unit produces none, which used to leave the previous
+        # FULL CELL's list in metadata for `_perceive_fresh` to apply to two
+        # atoms. That is an IndexError on the way to the asym view, and it
+        # only bit a crystal that had actually been packed, which is why four
+        # of Christian's five fluorides switched happily and the fifth threw.
+        # Round 83's rule: the rebuild drops and re-sets every per-atom map
+        # TOGETHER.
+        meta.pop("packed_bonds", None)
+        meta.pop("packed", None)
         if report.get("packed_bonds") is not None:
             # Carried the same way an import does, so `_perceive_fresh` uses
             # the graph's answer rather than re-perceiving straight lines.

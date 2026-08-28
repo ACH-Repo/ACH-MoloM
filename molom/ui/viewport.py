@@ -256,6 +256,24 @@ def stored_cell_pose(structure):
         return None
 
 
+def cell_shown(obj):
+    # type: (object) -> bool
+    """Does THIS crystal draw its box?
+
+    Christian: "Show unit cell box is applied to every crystal structure, even
+    not selected ones... Is it not a crystal's own internal coordinate system
+    that should be displayable relative to the viewport's absolute euclidian
+    space?" He is right - a cell belongs to one crystal, and with several open
+    you want one box and not the other. `viewport.show_cell` stays as the
+    master switch behind the F3 operator; this is the per-object refinement.
+
+    Absent means SHOWN, so every file imported before this existed still draws
+    its box.
+    """
+    meta = getattr(getattr(obj, "structure", None), "metadata", None) or {}
+    return bool(meta.get("show_cell", True))
+
+
 def cell_corners_world(obj, cell=None):
     """The 8 cell corners in world space, following the molecule.
 
@@ -3692,7 +3710,7 @@ class MolViewport(QOpenGLWidget):
         starts, ends, radii, colours = [], [], [], []
         for obj in self.scene.visible_objects():
             cell = cell_of(obj)
-            if cell is None:
+            if cell is None or not cell_shown(obj):
                 continue
             corners = cell_corners_world(obj, cell)
             if corners is None:
@@ -4577,7 +4595,7 @@ class MolViewport(QOpenGLWidget):
             return
         for obj in self.scene.visible_objects():
             cell = cell_of(obj)
-            if cell is None:
+            if cell is None or not cell_shown(obj):
                 continue
             corners = cell_corners_world(obj, cell)
             if corners is None:
