@@ -445,6 +445,16 @@ molecules' metadata and rebuild each of their views - so it wants saying out
 loud before it is built. The same question applies to every other tick on that
 page (polyhedra, symmetry elements, occupancy, the cell box).
 
+**M3. A packed crystal comes back with a different atom count after an
+asym/cell round trip.** Measured 2026-08-27 on `MF.molom`: `Griceite_9008667`
+is stored with 27 atoms, and asym -> cell regenerates it as 39, stably (the
+other four fluorides hold at 27). It is the only one of the five carrying
+`packed` state, so its cell view goes through the packing path and legitimately
+includes boundary copies the stored snapshot did not. Probably correct rather
+than a bug, but nobody has checked which of the two counts the file SHOULD
+have, and a count that changes when you look at a structure two different ways
+is the kind of thing that needs an answer written down.
+
 **M2. A savefile can carry damage done by a fixed bug.** `MF.molom` has CsF
 stored as `P 1` with `cell_frozen`, so opening it after the round-91 fix still
 shows the demoted crystal - the fix stops it happening again and cannot undo
