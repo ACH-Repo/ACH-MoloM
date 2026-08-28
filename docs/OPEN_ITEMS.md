@@ -466,6 +466,58 @@ and re-derive?".
 
 ---
 
+## N. Next up, and Christian's 2026-08-27 batch
+
+**N0. WORKSPACE TABS - the next thing we work on, ergonomics first.** Blender's
+top-level editor tabs (Modeling / Sculpting / UV Editing), for MoloM. Christian
+wants to describe the ergonomics he is after in a fresh chat and have the
+backend follow from that, so DO NOT design it before that conversation.
+
+Surveyed 2026-08-27, so the numbers are known going in: the central area is a
+`QWidget` + `QVBoxLayout` holding the viewport and the transport bar - six
+lines, one `setCentralWidget` - and there are only TWO docks. The expensive
+part is NOT the layout: it is the **51 window-global shortcut QActions** (of
+129 operators), which would still fire inside another workspace. `MolViewport`
+already intercepts `ShortcutOverride` while it holds the keyboard, so the
+precedent for scoping keys exists. 273 `self.viewport.` references assume one
+viewport that is on screen; most are fine, a few need an "is the 3D workspace
+active" guard.
+**The mechanism belongs in CORE and the demonstration in an add-on**, for
+`core/molprops.py`'s reason: if the workspace system itself is an add-on, two
+workspace-providing add-ons cannot coexist. `MainWindow.add_workspace(...)`
+beside `PropertiesDock.add_page`.
+**And a second viewport is a second GL context and a second set of instance
+buffers** - one `QOpenGLWidget` cannot have two parents - so a workspace that
+also shows the crystal doubles the rebuild cost per scene change.
+
+**N1. THE ROUND-TRIP BANNER APPEARS ON AN IMPORTED CRYSTAL, and it is worse
+than cosmetic.** Christian: "I was looking at a benzoic acid cif from crystal
+search... when I deleted it, suddenly the round-trip text popped up. I think it
+shows up directly after importing any crystal structure." Diagnosed: `open_path`
+claims `source_path` for the FIRST structure file opened, and the crystal search
+writes its download into a temp directory that it deletes immediately
+afterwards (round 84). So MoloM claims a round trip to a path that no longer
+exists, and Ctrl+S would try to write there. A searched or otherwise temporary
+import must not claim the document.
+
+**N2. "Rotate by the step angle" switches a crystal from orthographic to
+perspective.** The VESTA ribbon's stepped rotation goes through the ordinary
+orbit, which pops the camera back to perspective (round 3's `auto_ortho`).
+Wrong for a crystal, where the axis views are deliberately orthographic.
+
+**N3. The column-width rules must be IDENTICAL in both search windows.** Round
+93 fixed the resize-on-sort in `ui/search_table.py`, which the crystal search
+uses - and the molecule search apparently did not pick it up. Worth checking
+why, since both subclass `ResultTable`. **Standing rule from Christian: any
+control that exists in both search windows should behave the same in both.**
+Also wanted: **the CAS number as a default column** in the molecule search.
+
+**N4. A distribute operator.** F3: with several structures selected, spread
+them along x, y or z; a typed number sets the clear space between them; commit
+on click, like the other modals.
+
+---
+
 ## L. Raised or left open by round 90
 
 **L1. `ResolveNameDialog` is superseded and unwired.** Nothing opens it any
