@@ -198,6 +198,56 @@ other side, and the two export fixes are verified in `tools/smoke_gui.py`
 instead, which now measures the crop and counts ink with and without the cell
 box. 1310 tests.
 
+Round 94 (2026-08-27, the diffraction a crystal already knows how to give -
+`core/pxrd.py`, the physics only):
+Christian asked for the plot window to be designed first and then set up "what
+you can right now", so this round is the CALCULATION and none of the UI. That
+split is the point: `core/pxrd.py` returns arrays, so **matplotlib is still
+not a dependency** and the window's decision is still open.
+**IT IS CHECKED AGAINST ANOTHER PROGRAM, not against numbers written here.**
+pymatgen's `XRDCalculator` on rock salt: **all 9 peaks matched, max 2-theta
+difference 3.9e-4 deg, max intensity difference 0.0000 %.** pymatgen is not a
+MoloM dependency (it is the optional backstop for space-group symbols), so the
+cross-check skips where it is absent and the rest of the suite stands on
+textbook facts instead - the multiplicities of rock salt (111 x8, 200 x6, 220
+x12, 311 x24) and the absence of every mixed-index reflection.
+**BOTH OF THOSE COME OUT OF MERGING, NOT OUT OF A RULE.** Every `hkl` in the
+sphere is enumerated and reflections landing at the same angle are summed, so
+multiplicity accumulates and systematic absences are just `|F|^2` being zero.
+Nothing in `compute` knows what an F-centred lattice is, which is exactly what
+makes the agreement meaningful.
+**THE SCATTERING FACTORS ARE VENDORED AND THE PARAMETERISATION IS THE TRAP.**
+`tools/gen_scattering.py` generates `core/scattering.py` from pymatgen's table
+(MIT, itself International Tables Vol. C Table 6.1.1.4), the same way
+`gen_elements.py` generates the element data - a numeric table nobody should
+type from memory. The coefficients give the DIFFERENCE from Z,
+`f(s) = Z - 41.78214 s^2 sum a_i exp(-b_i s^2)`, NOT a Cromer-Mann sum with a
+constant term; using them in the wrong formula gives numbers that look
+entirely plausible. A test pins `f(0) == Z` for three elements because that is
+the cheapest way to catch it.
+**Q IS NOT A DISPLAY PREFERENCE.** 2-theta depends on the wavelength and Q
+does not, so two structures simulated at different wavelengths cannot honestly
+share a 2-theta axis - the same reflection would sit at two angles for no
+physical reason. `common_axis` is what the window will ask before drawing
+several patterns together, and a test pins that one reflection gives one Q at
+two wavelengths.
+**PER-STRUCTURE SETTINGS LIVE ON THE STRUCTURE**, in `metadata` beside
+`polyhedra` and `show_cell` - which is the round 91b/93 decision applied
+again, and it means the plot window will own no per-structure state at all:
+deleting a crystal takes its trace with it because the trace was never the
+window's. Only what DIFFERS from the defaults is written, so a savefile does
+not carry ten keys per crystal saying "as shipped".
+**AND IT SAYS WHAT IT DOES NOT KNOW.** No CIF here carries displacement
+parameters, so B = 0 and the high-angle intensities are overestimated;
+`Pattern.note` says so rather than letting a plausible curve stand
+unqualified. A species with no tabulated factor falls back to Z and says that
+too - assembled BEFORE the empty-pattern early return, because an all-`Xx`
+structure scatters nothing and the emptiness is exactly what the warning
+explains. Found by a test.
+Measured on the vendored files: the solid solution is 27 reflections, ferrocene
+335 from a 42-atom cell in 0.15 s.
+1934 tests.
+
 Round 93 (2026-08-27, the rest of Christian's checklist - and a crash that had
 been waiting for the right crystal):
 **(1) "HAVING BENZENE IN THE SELECTION GREYS OUT ALL CONTROLS OF CRYSTAL
@@ -4726,7 +4776,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1916 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 1934 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -4970,6 +5020,13 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   image export (`viewport.cell_zorder` / `cell_zorder_export`). The rule for
   which edge is the a axis lives here so the screen, the export and
   `blender_export.cell_edges` cannot part company.
+- `core/pxrd.py` — simulated powder diffraction from a crystal already open.
+  UI-free and matplotlib-free: it returns arrays. Read the module docstring
+  before touching the maths - the vendored scattering coefficients give the
+  DIFFERENCE from Z rather than a Cromer-Mann sum, and multiplicity and
+  systematic absences both fall out of MERGING coincident reflections rather
+  than out of any rule. Validated against pymatgen's `XRDCalculator`.
+  `core/scattering.py` is GENERATED by `tools/gen_scattering.py`.
 - `core/molsearch.py` — finding a MOLECULE by name, as a LIST (Ctrl+Shift+N).
   The counterpart to `core/resolve.py`, not a replacement: that one cascades
   to ONE structure and still does. Read the module docstring before touching
@@ -6400,7 +6457,7 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 1916 offline tests, 4 skipped, ~110 s.
+1. `python -m pytest tests/ -q` — 1934 offline tests, 4 skipped, ~110 s.
    `tests/conftest.py` sandboxes QSettings, so a GUI test can drive a real
    control without writing into your own MoloM configuration; it also
    **destroys the windows a test created** (round 86), without which the suite

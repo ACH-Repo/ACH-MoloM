@@ -466,6 +466,43 @@ and re-derive?".
 
 ---
 
+## P. PXRD - what round 94 built and what it did not
+
+**P0. `core/pxrd.py` EXISTS AND IS VALIDATED; THE WINDOW DOES NOT EXIST.**
+Reflections, structure factors, Lorentz-polarisation, merging (which is where
+multiplicity comes from), the Q / 2-theta conversion, three peak shapes and
+the per-structure settings are all in and cross-checked against pymatgen's
+`XRDCalculator` - all 9 rock-salt peaks matched, max 2-theta difference
+3.9e-4 deg, max intensity difference 0.0000 %. Ferrocene's 42-atom cell takes
+0.15 s. **No matplotlib is involved**: `core/pxrd.py` returns arrays, so the
+dependency decision is still open and is the window's to make.
+
+**P1. The plot window.** One window, several structures, per-structure
+wavelength / step / FWHM / shape / range / colour / offset (already stored by
+`pxrd.set_settings`), shared x-unit and stack offset. Design agreed
+2026-08-27; the pieces worth lifting from OWB's `ui/spectra.py` (which is
+tkinter, so nothing ports directly) are `_keep_view` - a redraw caused by a
+SETTING must not throw away a ZOOM - offsets as a fraction of a reference
+amplitude, bottom-trace-in-front z-ordering, and a hover tolerance that is a
+fraction of the visible range rather than a fixed number.
+
+**P2. Two traps waiting in the window.** matplotlib installs its own key
+bindings and will eat shortcuts unless disabled; and a canvas carries a
+devicePixelRatio (1.5 here) that makes pixel arithmetic land 1.5x off, which
+is round 59's screenshot bug in a new place.
+
+**P3. Ionic scattering factors are not used.** The table is keyed by element
+symbol, because that is what a structure records; ionic factors differ mostly
+at low angle. A stated limitation, not an oversight.
+
+**P4. No preferred orientation, no background, no K-alpha2.** All three are
+things a real powder pattern has and this does not. March-Dollase and a
+K-alpha1/alpha2 doublet are small additions; a background model is a
+different kind of thing and probably belongs with whatever compares a
+simulation to a measurement.
+
+---
+
 ## N. Next up, and Christian's 2026-08-27 batch
 
 **N0. WORKSPACE TABS - the next thing we work on, ergonomics first.** Blender's
