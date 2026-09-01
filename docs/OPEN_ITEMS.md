@@ -47,10 +47,21 @@ presented frame occasionally carries two integration steps or none. Cosmetic,
 third-person-only because the chase camera is a lagging filter of the ship
 while the cockpit camera is rigidly on it. Fix is to integrate on the paint.
 
-**A3. Editing a PACKED crystal desynchronises the boundary copies.** Flagged
-with a message in round 50, never fixed. Edits should operate on the cell
-CONTENT and re-pack. Related: `edits.adjust_bond_lengths` is cell-unaware and
-can push an atom across a face.
+~~**A3. Editing a PACKED crystal desynchronises the boundary copies.**~~
+**DONE, round 99** - and NOT the way this entry proposed. "Operate on the
+cell CONTENT and re-pack" cannot work: `pack` unwraps molecules, so the drawn
+content is not the canonical content and re-packing does not give the picture
+back (round 52 measured 210 atoms coming back as 168), and it renumbers
+everything. Propagating the DISPLACEMENT to every image does the same job
+exactly, because images differ by a lattice translation and a translation
+commutes with a Cartesian displacement. `edits.adjust_bond_lengths` needed
+nothing: round 52 already gates it off for crystals.
+
+What is still open from it, and is a smaller thing: **an atom moved OFF a
+face keeps its copies.** They are no longer justified by the boundary, and a
+re-pack would drop them; keeping them is the deliberate choice (round 52's
+"the atoms in front of you ARE the structure"), but nothing tells the user
+that the picture now has copies the crystallography no longer implies.
 
 ~~**A4. Occupancy pie spheres.**~~ **DONE.** Round 83 fixed the full cell (a
 map keyed by DRAWN index was being overwritten by one keyed by CONTENT index,

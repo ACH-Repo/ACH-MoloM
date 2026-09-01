@@ -140,6 +140,30 @@ def content_indices(meta, n_atoms):
     return [first[c] for c in sorted(first)] if first else list(range(n))
 
 
+def image_groups(meta, n_atoms):
+    # type: (dict, int) -> dict
+    """`{content atom: [drawn index, ...]}` - every image of every atom.
+
+    `images_of` answers "which atoms are the same as THESE"; this answers the
+    same question for all of them at once, which is what a caller needs when
+    it has to keep an edit consistent across the whole picture rather than
+    across one selection.
+
+    Empty where there is no mapping, so a caller can tell "no copies" from
+    "nothing known about copies" - the second is an unpacked structure and
+    guessing there would move atoms nobody touched.
+    """
+    mapping = (meta or {}).get("content_of") or []
+    if not mapping or len(mapping) != int(n_atoms):
+        return {}
+    groups = {}
+    for drawn, content in enumerate(mapping):
+        content = int(content)
+        if content >= 0:
+            groups.setdefault(content, []).append(drawn)
+    return groups
+
+
 def images_of(meta, indices, n_atoms):
     # type: (dict, object, int) -> list
     """Every drawn atom that is the same CELL-CONTENT atom as one of these.

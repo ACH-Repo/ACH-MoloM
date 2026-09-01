@@ -198,6 +198,54 @@ other side, and the two export fixes are verified in `tools/smoke_gui.py`
 instead, which now measures the crop and counts ink with and without the cell
 box. 1310 tests.
 
+Round 99 (2026-09-01, A3 closed - a boundary copy is the same atom, and now
+it moves like one):
+The oldest standing item on the docket, flagged in round 50 and warned about
+ever since. A crystal is DRAWN with copies - an atom on a cell face appears
+twice and one on a corner eight times, as independent entries in the atom
+list, which is correct and is what every crystallography viewer does. Round
+54 taught an ELEMENT change and a DELETE to reach every image
+(`packing.images_of`); a GEOMETRY edit never learned. Measured on ferrocene
+before anything was changed: **content atom 0 is drawn EIGHT times, and a
+0.5 A drag moved exactly one of them.**
+**THE DOCKET SAID "EDIT THE CONTENT AND RE-PACK", AND THAT IS THE ONE THING
+THAT CANNOT WORK.** `packing.pack` unwraps molecules to keep them whole, so
+the drawn content is not the canonical content and packing it again does not
+give the picture back - round 52 measured ferrocene coming back as 168 atoms
+of 210. It would also renumber everything, which invalidates every per-atom
+map (round 80).
+**PROPAGATING THE DISPLACEMENT DOES THE SAME JOB EXACTLY, and "exactly" is
+the word.** Two images of one content atom differ by a LATTICE TRANSLATION,
+and a translation commutes with a Cartesian displacement - so applying the
+same delta to every image keeps them exactly one lattice vector apart, which
+is the definition of their being the same atom. Nothing is renumbered, so
+every per-atom map stays valid. Pinned by the property rather than by which
+atoms moved: two images are one lattice vector apart to **< 1e-9 A** after a
+single-atom drag, a whole-molecule grab, and a 14 A move.
+**AN ATOM MOVED OFF A FACE KEEPS ITS COPIES, deliberately.** Re-packing would
+delete them, since it no longer sits on a boundary - but round 52's rule for
+an edited cell is that the atoms in front of you ARE the structure, and
+removing an atom the user did not touch is a worse surprise than keeping the
+picture self-consistent.
+**IT RUNS BEFORE THE RIGIDITY TEST AND CANNOT CHANGE ITS ANSWER.** A rigid
+motion has already moved every image by the same delta, so the sync is a
+no-op there and round 91's rule stands: a plain translation of a whole
+crystal still keeps `P 1 21/a 1`. A single-atom drag still demotes to P1,
+which is round 52's.
+**THE ONE CASE WITH NO RIGHT ANSWER IS SAID OUT LOUD.** If two images of one
+atom are moved DIFFERENTLY, the first move wins - averaging would be a third
+answer nobody asked for - and the status line says so, because it is the only
+outcome here where atoms end up somewhere nobody put them. Three things want
+the status bar after one edit and they are not equal: the demotion matters
+more than "eight copies came along", and the disagreement matters more than
+either, so the plain count is posted BEFORE the demotion (and harmlessly
+overwritten by it) and the disagreement after.
+**The round-50 WARNING is gone**, and its two tests moved with the code
+(round 71's rule): one of them was a promise to fix this, which is now kept.
+`edits.adjust_bond_lengths`, the other half of A3's note, needed nothing -
+round 52 already gates it off for crystals.
+2038 tests.
+
 Round 98 (2026-09-01, the plot gets its window back - and the pattern was
 right all along):
 **(0) "THE PEAK POSITIONS ARE CLEARLY WRONG" - CHECKED, AND THEY ARE NOT.**
@@ -5156,7 +5204,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 2025 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 2038 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -6457,6 +6505,17 @@ independent cross-check inside a single fixture.
   293.0 renders as "293", and obvious the moment a molecular weight put
   RDKit's 106.168 next to PubChem's 106.16 in one column. If the sorting is
   hand-driven, do not write EditRole at all.
+- **A BOUNDARY COPY IS THE SAME ATOM, SO EVERY EDIT HAS TO REACH IT**
+  (round 99). A packed crystal draws an atom on a face twice and one on a
+  corner eight times, as independent entries - `packing.image_groups` is the
+  map, `images_of` the same question for one selection. An element change and
+  a delete have gone through it since round 54; a GEOMETRY edit goes through
+  `MainWindow._sync_packed_images`, which applies the same DELTA to every
+  image. That is exact rather than approximate because images differ by a
+  lattice translation and a translation commutes with a displacement. Do NOT
+  reach for re-packing instead: `pack` unwraps molecules, so re-packing atoms
+  it has already relocated does not reproduce the picture (round 52), and it
+  renumbers everything (round 80).
 - **THE FIRST `cell_content` DRAWN ATOMS ARE NOT THE CELL CONTENT** (round
   95). `packing.pack` says so in its own comments - `complete_molecules`
   REORDERS and duplicates - so a prefix slice is a different set of atoms.
@@ -6952,7 +7011,7 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 2025 offline tests, 4 skipped, ~115 s.
+1. `python -m pytest tests/ -q` — 2038 offline tests, 4 skipped, ~100 s.
    `tests/conftest.py` sandboxes QSettings, so a GUI test can drive a real
    control without writing into your own MoloM configuration; it also
    **destroys the windows a test created** (round 86), without which the suite

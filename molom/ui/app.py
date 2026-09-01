@@ -165,7 +165,6 @@ class MainWindow(QMainWindow):
         #: Objects already warned about editing a packed crystal — the hazard
         #: is real every time, but a message on every drag drowns out
         #: everything else the status bar has to say.
-        self._packed_edit_warned = set()
         self._render_target = {}
         self.setWindowTitle("MoloM")
         # Also on the window, not only on the QApplication in `__main__`: a
@@ -1391,19 +1390,13 @@ class MainWindow(QMainWindow):
     @staticmethod
     def packed_crystal_edit(obj):
         # type: (object) -> bool
-        """Is this an edit to a PACKED crystal, where the copies won't follow?
+        """Is this a PACKED crystal, i.e. one whose picture carries copies?
 
-        A packed import's boundary copies are ordinary independent atoms in
-        the list — measured on ZIF-8, atom 0 has a copy at index 348 and
-        moving one does not move the other — so an edit desynchronises them
-        silently. The existing guards do not cover it: `begin_model_edit`
-        handles the cell-box drift (round 43e) and `sync_asymmetric_unit`
-        only fires when the base IS the asymmetric unit, which a packed
-        import's base is not.
-
-        Editing that way is unsupported until edits operate on the CONTENT and
-        re-pack. Until then the honest thing is to SAY so — a structure that
-        quietly disagrees with itself is the worst of the options.
+        An atom on a cell face is drawn twice and one on a corner eight
+        times, as independent entries in the atom list - measured on
+        ferrocene, content atom 0 is drawn eight times. That is correct and is
+        what every crystallography viewer does; what it means is that an edit
+        has to be told to reach all of them (`_sync_packed_images`).
         """
         meta = getattr(obj.structure, "metadata", None) or {}
         if not meta.get("packed"):
@@ -1411,16 +1404,106 @@ class MainWindow(QMainWindow):
         content = int(meta.get("cell_content") or 0)
         return 0 < content < obj.structure.n_atoms
 
-    def _warn_packed_edit(self, obj):
-        if not self.packed_crystal_edit(obj):
-            return
-        if obj.id in self._packed_edit_warned:
-            return
-        self._packed_edit_warned.add(obj.id)
-        self.statusBar().showMessage(
-            "Edited a PACKED crystal: the boundary copies are separate atoms "
-            "and do not follow. Switch the crystal page to \"Asymmetric unit "
-            "only\" to edit the structure itself.", 15000)
+    #: Below this a coordinate has not moved. Well under any edit somebody
+    #: makes on purpose and well over the float noise a rigid transform
+    #: leaves behind.
+    MOVED_TOLERANCE = 1e-7
+
+    def _sync_packed_images(self, obj):
+        # type: (object) -> tuple
+        """Move every boundary copy with the atom it is a copy of.
+
+        Returns `(copies moved, content atoms whose images disagreed)`.
+
+        **Why the same delta is exactly right, not an approximation.** Two
+        images of one content atom differ by a LATTICE TRANSLATION, and a
+        translation commutes with a Cartesian displacement - so applying the
+        same delta to every image keeps them exactly one lattice vector
+        apart, which is the definition of their being the same atom.
+
+        **What it deliberately does not do is re-pack.** The obvious reading
+        of "edits should operate on the content" is to edit the cell content
+        and pack it again, and that is the one thing that cannot work here:
+        `packing.pack` unwraps molecules to keep them whole, so the drawn
+        content is not the canonical content and packing it again does not
+        reproduce the picture - round 52 measured ferrocene coming back as
+        168 atoms where it had 210. It would also renumber everything, which
+        invalidates every per-atom map (round 80).
+
+        **An atom moved off a face keeps its copies.** Re-packing would
+        delete them, since it no longer sits on a boundary; but round 52's
+        rule for an edited cell is that the atoms in front of you ARE the
+        structure, and silently removing an atom the user did not touch is a
+        worse surprise than keeping the picture self-consistent.
+        """
+        s = obj.structure
+        meta = getattr(s, "metadata", None) or {}
+        groups = packing_mod.image_groups(meta, s.n_atoms)
+        if not groups:
+            return 0, 0
+        stash = self._coords_before_edit
+        if not stash or stash[0] != obj.id:
+            return 0, 0
+        before = np.asarray(stash[1], dtype=float)
+        after = np.asarray(s.coords, dtype=float)
+        if before.shape != after.shape:
+            # An atom was added or removed. A different question, and one
+            # `images_of` already answers on the delete path.
+            return 0, 0
+        delta = after - before
+        moved = np.flatnonzero(np.linalg.norm(delta, axis=1)
+                               > self.MOVED_TOLERANCE)
+        if not len(moved):
+            return 0, 0
+        mapping = meta.get("content_of") or []
+        movers = {}
+        for i in moved:
+            movers.setdefault(int(mapping[int(i)]), []).append(int(i))
+        coords = np.array(after, copy=True)
+        touched, disagreed = 0, 0
+        for content, rows in movers.items():
+            step = delta[rows[0]]
+            if len(rows) > 1 and max(
+                    float(np.linalg.norm(delta[r] - step)) for r in rows[1:]
+            ) > self.MOVED_TOLERANCE:
+                # The user has pulled two copies of one atom APART, which is
+                # the very state this exists to prevent. The first one wins
+                # and it is SAID: averaging would be a third answer nobody
+                # asked for.
+                disagreed += 1
+            for other in groups.get(content, ()):
+                if other in rows:
+                    continue
+                coords[other] = coords[other] + step
+                touched += 1
+        if touched:
+            # The CURRENT frame: the delta was measured on it, and a crystal
+            # has one.
+            s.frames[s.current_frame] = coords
+        return touched, disagreed
+
+    def _report_packed_images(self, obj, touched, disagreed, last=False):
+        """Say what happened to the copies, in priority order.
+
+        Three things can want the status bar after one edit, and they are not
+        equally important: that the crystal is now P1 matters more than that
+        eight copies came along, and that two copies were pulled APART matters
+        more than either - it is the only one of the three saying atoms are
+        somewhere the user did not put them. So the plain count goes BEFORE
+        the demotion (and is harmlessly overwritten by it) and the
+        disagreement goes after.
+        """
+        if last:
+            if disagreed:
+                self.statusBar().showMessage(
+                    "{}: {} atom(s) had two of their own boundary copies "
+                    "moved apart - the first move was applied to all of "
+                    "them, because a copy IS the same atom.".format(
+                        obj.name, disagreed), 12000)
+        elif touched and not disagreed:
+            self.statusBar().showMessage(
+                "{}: moved {} boundary copy/copies with it - a copy is the "
+                "same crystallographic atom.".format(obj.name, touched), 6000)
 
     def _reevaluate_edited_crystal(self):
         """After an edit: keep the asymmetric unit, or re-derive the cell."""
@@ -1430,7 +1513,17 @@ class MainWindow(QMainWindow):
             obj = self._active_obj()
         if obj is None or not (obj.structure.metadata or {}).get("symops"):
             return
-        self._warn_packed_edit(obj)
+        # FIRST, and before the rigidity test: a boundary copy is the same
+        # crystallographic atom, so it moves with the atom it is a copy of.
+        # Doing it first also means the rigidity test sees the FINAL
+        # structure - and it cannot change that test's answer, because a
+        # rigid motion moves every image by the same delta already and this
+        # is then a no-op.
+        try:
+            touched, disagreed = self._sync_packed_images(obj)
+        except Exception:                    # never let this break an edit
+            touched, disagreed = 0, 0
+        self._report_packed_images(obj, touched, disagreed)
         try:
             if self.base_is_asymmetric_unit(obj):
                 # NEVER re-derive here. The atoms in front of us are one
@@ -1445,6 +1538,7 @@ class MainWindow(QMainWindow):
                 # together, so the operators still map the structure onto
                 # itself and the group is untouched.
                 self.sync_asymmetric_unit(obj)
+                self._report_packed_images(obj, touched, disagreed, last=True)
                 return
             if self._edit_was_rigid(obj):
                 # A RIGID PLACEMENT IS NOT AN EDIT TO THE STRUCTURE.
@@ -1466,10 +1560,13 @@ class MainWindow(QMainWindow):
                 #
                 # Dragging SOME of a crystal's atoms still demotes, because
                 # the fit is over all of them and a partial move is not rigid.
+                self._report_packed_images(obj, touched, disagreed, last=True)
                 return
             changed = self.demote_to_p1(obj)
         except Exception:                    # never let this break an edit
+            self._report_packed_images(obj, touched, disagreed, last=True)
             return
+        self._report_packed_images(obj, touched, disagreed, last=True)
         if changed:
             self._sync_crystal_page()
 

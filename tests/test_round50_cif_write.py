@@ -361,11 +361,11 @@ def test_the_export_note_says_when_occupancies_were_dropped():
 
 
 # ----------------------------------------------- editing a packed crystal
-def test_editing_a_packed_crystal_is_flagged():
-    """The copies are ordinary independent atoms — measured on ZIF-8, atom 0
-    has a copy at index 348 and moving one does not move the other. Until
-    editing operates on the CONTENT and re-packs, the honest thing is to say
-    so rather than let the structure quietly disagree with itself."""
+def test_a_packed_crystal_is_recognised_as_one():
+    """The picture carries copies: an atom on a cell face is drawn twice and
+    one on a corner eight times. Round 50 used this to WARN that an edit
+    would desynchronise them; round 99 uses it to make the edit reach them
+    (see `test_round99_packed_edits.py`)."""
     pytest.importorskip("PySide6")
     from PySide6.QtWidgets import QApplication
     from molom.ui.app import MainWindow
@@ -376,21 +376,3 @@ def test_editing_a_packed_crystal_is_flagged():
     sc = Scene()
     plain = sc.add(build.cubane(), name="cubane")
     assert not MainWindow.packed_crystal_edit(plain)
-
-
-def test_the_packed_warning_fires_once_per_object():
-    """A message on every drag drowns out everything else the status bar has
-    to say."""
-    pytest.importorskip("PySide6")
-    from PySide6.QtWidgets import QApplication
-    from molom.ui.app import MainWindow
-    QApplication.instance() or QApplication([])
-    win = MainWindow()
-    win.open_path(FERROCENE)
-    obj = win._active_obj()
-    win.statusBar().clearMessage()
-    win._warn_packed_edit(obj)
-    assert "PACKED" in win.statusBar().currentMessage()
-    win.statusBar().clearMessage()
-    win._warn_packed_edit(obj)
-    assert win.statusBar().currentMessage() == ""
