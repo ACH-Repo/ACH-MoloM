@@ -69,7 +69,8 @@ from .outliner import OutlinerPanel
 from .periodic_table import PeriodicTablePanel
 from .transform_panel import TransformDock
 from .viewport import (MODE_EDIT, MODE_OBJECT, MolViewport, cell_of,
-                       set_cell_pose, set_cell_reference, stored_cell_pose)
+                       cell_shown, set_cell_pose, set_cell_reference,
+                       stored_cell_pose)
 
 _MAX_RECENT = 8
 # Height reserved at the top of the viewport for the edit-mode header banner
@@ -147,6 +148,12 @@ class MainWindow(QMainWindow):
 
     #: Where the free view was before we stepped into a camera.
     _view_before_camera = None
+
+    #: Which crystal the ❖ page is describing, and the PXRD window once it
+    #: has been opened. On the CLASS because `_on_selection_changed` can fire
+    #: while the window is still being built - the round-34 rule.
+    _crystal_page_subject = None
+    _pxrd_window = None
 
     #: What F12 / Ctrl+F12 render when pressed again: {animation: {...}}.
     #: On the CLASS so the keys exist before any export has happened, and
@@ -392,6 +399,14 @@ class MainWindow(QMainWindow):
         # a fresh window. Only the page is wanted; hide the husk.
         self.optimize_panel.setVisible(False)
         self._opt_worker = None
+        #: The PXRD window, built on first use and then KEPT - it holds a
+        #: zoomed view range, and a second one would disagree with the first
+        #: about which crystals are switched on.
+        self._pxrd_window = None
+        #: Which crystal the ❖ page is currently describing, so a selection
+        #: change can tell whether the page has gone stale without rebuilding
+        #: it on every mouse move of a box select.
+        self._crystal_page_subject = None
 
         # Blender's properties editor: one dock, a vertical tab strip, and a
         # page per topic. The force-field panel lives in it as a page rather
@@ -415,6 +430,7 @@ class MainWindow(QMainWindow):
         self.crystal_page.cell_suggest_requested.connect(self.on_suggest_cell)
         self.crystal_page.cell_remove_requested.connect(self.on_remove_cell)
         self.crystal_page.frac_apply_requested.connect(self.on_apply_fractional)
+        self.crystal_page.pxrd_requested.connect(self.on_pxrd)
         # Through the page's GUARDED signals, never the raw `toggled`: these
         # ticks are now written from the active object by `set_cell`, and an
         # unguarded connection reads that refresh back as the user asking for
@@ -933,6 +949,18 @@ class MainWindow(QMainWindow):
           category="Crystal", aliases=("occupancy", "solid solution",
                                        "shared site", "mixed", "doping",
                                        "substitution", "pie", "partial"))
+        # A crystal in the scene, not necessarily the ACTIVE one: the window
+        # is about every crystal open, so requiring the right one to be
+        # selected first would be a gate with nothing behind it.
+        any_cell = lambda c: any(
+            (getattr(o.structure, "metadata", None) or {}).get("cell")
+            for o in c.scene.objects)
+        r("crystal_pxrd", "Crystal: simulate the powder pattern (PXRD)...",
+          lambda c: c.on_pxrd(), enabled=any_cell, category="Crystal",
+          shortcut="Ctrl+Shift+D", key="Ctrl+Shift+D",
+          aliases=("xrd", "powder", "diffraction", "diffractogram",
+                   "pattern", "peaks", "2 theta", "two theta", "bragg",
+                   "reflections", "hkl", "cif"))
         r("export_animation", "Export the animation (PNG sequence or video)",
           lambda c: c.on_export_animation(),
           enabled=lambda c: c.timeline.duration > 0.0,
@@ -1194,6 +1222,8 @@ class MainWindow(QMainWindow):
         crystal.addSeparator()
         self._add_op(crystal, "toggle_cell", "Show unit cell &box")
         self._add_op(crystal, "cell_info", "Cell &parameters...")
+        crystal.addSeparator()
+        self._add_op(crystal, "crystal_pxrd", "Powder pattern (PX&RD)...")
         m_view.addSeparator()
         self._add_op(m_view, "local_view", "&Local view (isolate)")
         self._add_op(m_view, "toggle_outliner", "Properties / out&liner")
@@ -1305,6 +1335,19 @@ class MainWindow(QMainWindow):
                 # ...and every ADD-ON page, or the properties tab keeps
                 # describing the molecule you clicked away from.
                 self._sync_addon_pages()
+        # LAST, so it sees the active object this pick has just settled on.
+        # The ❖ page describes `_crystal_subject()`, which depends on the
+        # SELECTION and not only on the active object - so it goes stale on a
+        # selection change that leaves the active object alone, and a page
+        # naming one crystal while its controls reach another is exactly
+        # Christian's "Luciferin, when selected, still shows the crystal page
+        # for Griceite. When clicking the controls, nothing about Griceite
+        # changes though." Only when the subject really moved, because this
+        # runs on every mouse move of a box select.
+        subject = self._crystal_subject()
+        subject_id = None if subject is None else subject.id
+        if subject_id != self._crystal_page_subject:
+            self._sync_crystal_page()
 
     def _on_edit_committed(self):
         # A grab that a duplicate started makes "duplicate + this offset" the
@@ -5907,7 +5950,6 @@ class MainWindow(QMainWindow):
             self.active_id = obj.id
             self.on_crystal_view(obj.structure.metadata.get("cell_view",
                                                             "cell"))
-        self.active_id = active
         if len(targets) > 1:
             # Rebuilding a crystal's view regenerates its atom list, so the
             # selection - which names atoms by index - is dropped. Without
@@ -5917,6 +5959,13 @@ class MainWindow(QMainWindow):
             # that is what "these are the ones I am working on" means and the
             # old indices no longer refer to anything.
             self.viewport.select_whole_molecules([o.id for o in targets])
+        # AFTER the re-selection, not before. `select_whole_molecules` emits
+        # `selection_changed`, and picking moves the ACTIVE object to the last
+        # thing selected - so restoring it first let the last crystal in the
+        # list quietly become the one the page describes. The tick then read
+        # back a different crystal's state and appeared to have turned itself
+        # on again.
+        self.active_id = active
         self._sync_crystal_page()
         self._report_crystal_change(
             targets, "atoms outside the cell {}".format(
@@ -6707,6 +6756,15 @@ class MainWindow(QMainWindow):
             np.asarray(frac, dtype=float).reshape(-1, 3)[:n_content],
             expanded_s, expanded_f)
 
+    @staticmethod
+    def _content_atom_indices(obj):
+        # type: (object) -> list
+        """Which DRAWN atoms are the cell's own content - see
+        `packing.content_indices`, which is where the rule lives so the CIF
+        writer and this cannot drift apart."""
+        return packing_mod.content_indices(obj.structure.metadata or {},
+                                           obj.structure.n_atoms)
+
     def resync_derived_asymmetric_unit(self, obj, cell, frac, identity=False):
         # type: (object, object, object, bool) -> int
         """Re-derive the stored asymmetric unit to match re-derived operators.
@@ -6723,9 +6781,20 @@ class MainWindow(QMainWindow):
         """
         s = obj.structure
         meta = s.metadata
-        n = min(int(meta.get("cell_content") or 0) or s.n_atoms, s.n_atoms)
-        symbols = list(s.symbols)[:n]
-        content = np.asarray(frac, dtype=float).reshape(-1, 3)[:n]
+        # WHICH drawn atoms are the content - by the packing's own map, never
+        # by taking the first `cell_content` of them. `packing.pack` says so
+        # itself ("`complete_molecules` REORDERS and duplicates"), so the
+        # prefix is a different set: measured on ferrocene, the first 42 drawn
+        # atoms are ONE molecule plus a lattice copy of it, where the cell
+        # holds two molecules related by a screw axis. Demoting an edited
+        # ferrocene therefore wrote an asymmetric unit of 21 atoms listed
+        # twice, and `expand` merges the duplicates - so a P1 rebuild, an
+        # exported .cif and a simulated powder pattern all described half the
+        # crystal. `Z = 2` and `C10 H10 Fe` in the file's own header settle
+        # which of the two is right.
+        picks = self._content_atom_indices(obj)
+        symbols = [s.symbols[i] for i in picks]
+        content = np.asarray(frac, dtype=float).reshape(-1, 3)[picks]
         reps = None
         if not identity:
             try:
@@ -6739,7 +6808,7 @@ class MainWindow(QMainWindow):
         # `identity=True` says so up front and skips the search: asking spglib
         # and then ignoring the answer is how the two ended up disagreeing.
         if not reps:
-            reps = list(range(n))
+            reps = list(range(len(picks)))
         meta["asym_symbols"] = [symbols[i] for i in reps]
         # WRAPPED into [0,1). The drawn content is not: `packing.pack` unwraps
         # molecules to keep them whole, so 34 of ferrocene's 42 content atoms
@@ -6758,7 +6827,11 @@ class MainWindow(QMainWindow):
         # occupancy for every species on a shared site. Where the mapping is
         # absent the column goes, because a mis-indexed occupancy is worse
         # than none (round 43e).
-        columns, _missing = cif_write._site_columns(meta, reps, s.n_atoms)
+        # `_site_columns` looks its answers up by DRAWN index, so the
+        # representatives have to be translated back through `picks` - they
+        # index the content, not the picture.
+        columns, _missing = cif_write._site_columns(
+            meta, [picks[i] for i in reps], s.n_atoms)
         for key, source in (("occupancy", "asym_occupancy"),
                             ("labels", "asym_labels"),
                             ("disorder_groups", "asym_disorder_groups"),
@@ -7224,16 +7297,30 @@ class MainWindow(QMainWindow):
         for obj in targets:
             self.active_id = obj.id
             self.on_crystal_view(mode, na, nb, nc)
-        self.active_id = active
         if len(targets) > 1:
             # The rebuild regenerates the atom list, so a selection that names
             # atoms by index is gone - put it back, or the NEXT control would
             # quietly reach one crystal (round 91b).
             self.viewport.select_whole_molecules([o.id for o in targets])
+        # AFTER the re-selection - see `_on_packing_option`. Restoring it
+        # first let `selection_changed` move the active object to the last
+        # crystal in the list, so the page came back describing a structure
+        # the user had not chosen.
+        self.active_id = active
+        if len(targets) > 1:
+            # ONE message for the whole fan-out. Each frozen target posts its
+            # own "was edited in the full cell" line on the way past, and with
+            # five crystals selected the last one to speak wins - so a single
+            # edited cell made the click look as though it had done nothing
+            # but complain.
+            frozen = sum(1 for o in targets
+                         if (o.structure.metadata or {}).get("cell_frozen"))
             self._report_crystal_change(
                 targets, {"asym": "asymmetric unit only",
                           "cell": "full unit cell"}.get(
-                              mode, "{}x{}x{} packing".format(na, nb, nc)))
+                              mode, "{}x{}x{} packing".format(na, nb, nc))
+                + ("" if not frozen else
+                   " ({} edited into P1, left as it is)".format(frozen)))
         self._sync_crystal_page()
 
     def _crystal_subject(self):
@@ -7250,12 +7337,22 @@ class MainWindow(QMainWindow):
         obj = self._active_obj()
         if obj is not None and cell_of(obj) is not None:
             return obj
+        # A molecule picked ON ITS OWN already describes itself: with nothing
+        # else selected `_crystal_targets` is empty, so the fallback below
+        # finds nothing and the page greys and names it. What it could NOT do
+        # was notice that the selection had changed at all - see
+        # `_on_selection_changed`, which is where "Luciferin, when selected,
+        # still shows the crystal page for Griceite" really lived.
         for candidate in self._crystal_targets():
             return candidate
         return obj
 
     def _sync_crystal_page(self):
         obj = self._crystal_subject()
+        # Recorded here rather than at the call site, so the cache
+        # `_on_selection_changed` compares against can never describe a page
+        # that some other path has already refreshed.
+        self._crystal_page_subject = None if obj is None else obj.id
         cell = cell_of(obj) if obj is not None else None
         # The ❖ TAB is always clickable, like ∿ (round 30's lesson: a greyed
         # tab cannot explain why it is greyed, and this one greys itself on
@@ -7313,7 +7410,19 @@ class MainWindow(QMainWindow):
             symmetry_on=bool(meta.get("show_symmetry")),
             ghosts=bool(meta.get("show_ghosts")),
             occupancy=bool(self.viewport.show_occupancy),
-            frozen=bool(meta.get("cell_frozen")),
+            # The BOX tick is per crystal too (round 93) and was the one
+            # display flag never read back, so it kept whichever crystal was
+            # looked at last - round 51's bug, one control along.
+            box=cell_shown(obj),
+            # Frozen only when EVERY crystal the controls would reach is
+            # frozen. Christian: "if the P1 CsF is selected... you have to
+            # deselect it to use the controls on the other four again." One
+            # edited cell in a selection of five is not a reason to grey a
+            # switch that would work perfectly well on the other four - the
+            # frozen one is passed over and said so, which is the same rule
+            # `_crystal_targets` already applies to a molecule.
+            frozen=all(bool((o.structure.metadata or {}).get("cell_frozen"))
+                       for o in (self._crystal_targets() or [obj])),
             name=obj.name)
         self.crystal_page.set_detail(
             info, naming=naming, site_occupancy=meta.get("site_occupancy"))
@@ -7546,6 +7655,40 @@ class MainWindow(QMainWindow):
                  "packing": "{}x{}x{} packing".format(na, nb, nc)}[mode]
         self.statusBar().showMessage(
             "{}: {} — {} atoms".format(obj.name, label, s.n_atoms), 6000)
+
+    def on_pxrd(self):
+        """The simulated powder pattern, for every crystal in the scene.
+
+        ONE window, kept and re-shown rather than rebuilt: it holds a view
+        range the user has zoomed into, and a second window would compute the
+        same patterns again and disagree with the first about which crystals
+        are switched on. Re-opening it re-reads the scene, so a crystal
+        imported or deleted since is picked up.
+        """
+        from .pxrd_panel import PxrdWindow
+        if not any(cell_of(o) is not None for o in self.scene.objects):
+            # Said BEFORE anything is built: a window that is created and then
+            # never shown is one more thing to tear down and one more chance
+            # for a stale one to reappear later.
+            self.statusBar().showMessage(
+                "No crystal in the scene - a powder pattern needs a unit "
+                "cell, so import a .cif first", 6000)
+            return
+        if self._pxrd_window is None:
+            self._pxrd_window = PxrdWindow(self)
+        window = self._pxrd_window
+        # The SELECTION decides which crystals are ticked. "If I select 3
+        # structures and then launch it, only those three should be ticked and
+        # shown" - a selection is a statement about what you are working on,
+        # and a window that opens on everything makes you untick the rest by
+        # hand. An empty selection falls back to what each crystal remembers.
+        window.set_objects(
+            list(self.scene.objects),
+            selected={int(oid) for oid, _atom in (self.viewport.selection
+                                                  or [])})
+        window.show()
+        window.raise_()
+        window.activateWindow()
 
     def on_crystal_packing(self):
         na, ok = QInputDialog.getInt(self, "Packing", "Cells along a:", 2, 1, 12)

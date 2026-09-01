@@ -17,9 +17,16 @@ a signal rather than a call into settings from here.
 """
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (QAbstractItemView, QHeaderView, QTableWidget,
                                QTableWidgetItem)
+
+#: The row shading, taken from the timeline pane so the two lists in the
+#: program look like the same program. Christian: "do the alternating shades
+#: of grey to highlight bordering row contrast. I think we do that in the
+#: animation player already."
+ROW_BG = QColor(48, 48, 48)
+ROW_ALT = QColor(58, 58, 58)
 
 
 class ResultTable(QTableWidget):
@@ -104,12 +111,64 @@ class ResultTable(QTableWidget):
         # Excel's gesture: double-clicking the border between two headers
         # fits the column on its LEFT to its contents, which is the index Qt
         # reports. Sorting must NOT resize anything - see `refill`.
-        head.sectionHandleDoubleClicked.connect(self.resizeColumnToContents)
+        head.sectionHandleDoubleClicked.connect(self._fit_column)
+        # THE STRETCH COLUMN IS SET UP ONCE, HERE, AND NEVER REFITTED.
+        # `QTableView.resizeColumnsToContents` calls `resizeSections
+        # (ResizeToContents)`, which - by documented design - IGNORES the
+        # per-section resize mode. So every refill set the name column to the
+        # width of its longest entry, a delayed relayout put the Stretch back,
+        # and with results arriving one provider at a time the column visibly
+        # flipped between the two. Christian: "the width jumps back and forth
+        # between contracted and full width used... I think the name column is
+        # the culprit." A very long name is exactly when the two disagree
+        # most, which is why it looked like a name-length problem: it was.
+        if 0 <= self.STRETCH_COLUMN < len(self.COLUMNS):
+            head.setSectionResizeMode(self.STRETCH_COLUMN, QHeaderView.Stretch)
+            # The star is a 26 px control rather than a column of data, and a
+            # header's minimum is global - so it has to come down far enough
+            # for `refill`'s `setColumnWidth(STAR, 26)` to mean anything.
+            head.setMinimumSectionSize(min(head.minimumSectionSize(), 26))
+        # ...and because it can no longer grow to fit, a long name WRAPS.
+        # Eliding it would hide the half that distinguishes two entries of the
+        # same compound, which is the one thing this list exists to show.
+        self.setWordWrap(True)
+        self.setTextElideMode(Qt.ElideNone)
+        self.verticalHeader().setSectionResizeMode(
+            QHeaderView.ResizeToContents)
+        pal = self.palette()
+        pal.setColor(QPalette.Base, ROW_BG)
+        pal.setColor(QPalette.AlternateBase, ROW_ALT)
+        self.setPalette(pal)
+        self.setAlternatingRowColors(True)
         head.setToolTip("Click to sort; click again to reverse, and a third "
                         "time to go back to the search ranking")
         self.itemChanged.connect(self._star_toggled)
         self.itemSelectionChanged.connect(self.chosen_changed)
         self.doubleClicked.connect(self._activate)
+
+    # ------------------------------------------------------------- geometry
+    def _fit_column(self, column):
+        """Excel's double-click-the-border gesture, minus the one column it
+        cannot mean anything for.
+
+        The stretch column already occupies every pixel the others leave, so
+        "fit it to its contents" has nothing to do - and doing it anyway would
+        take it out of Stretch until the next relayout snapped it back, which
+        is the flicker this round removed.
+        """
+        if column == self.STRETCH_COLUMN:
+            return
+        self.resizeColumnToContents(column)
+        self.resizeRowsToContents()
+
+    def resizeEvent(self, ev):
+        """A wrapped cell's HEIGHT depends on its column's WIDTH, and nothing
+        in Qt propagates that on its own - so widening the window leaves a
+        name that now fits on one line sitting in a two-line row, and
+        narrowing it clips the second line off a name that has just grown
+        one."""
+        super().resizeEvent(ev)
+        self.resizeRowsToContents()
 
     # -------------------------------------------------------- for subclasses
     def cells_for(self, item):
@@ -228,11 +287,14 @@ class ResultTable(QTableWidget):
         signature = tuple(self.key_for(e) for e in self._shown if e is not None)
         if signature != getattr(self, "_sized_for", None):
             self._sized_for = signature
-            self.resizeColumnsToContents()
-        if 0 <= self.STRETCH_COLUMN < len(self.COLUMNS):
-            self.horizontalHeader().setSectionResizeMode(
-                self.STRETCH_COLUMN, QHeaderView.Stretch)
+            # Column BY COLUMN, skipping the stretch one: the bulk call would
+            # override its Stretch mode (see `__init__`) and start the flicker
+            # again.
+            for column in range(len(self.COLUMNS)):
+                if column != self.STRETCH_COLUMN:
+                    self.resizeColumnToContents(column)
         self.setColumnWidth(self.STAR, 26)
+        self.resizeRowsToContents()
 
     def _fill_row(self, row, entry):
         cells = self.cells_for(entry)

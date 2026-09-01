@@ -536,6 +536,7 @@ a grab or a rotation *during* the drag, not on commit.
 | Show refused bonds (visualisation override) | the ❖ page's checkbox |
 | Crystal: edit the asymmetric unit (cell follows the symmetry) | F3 |
 | Crystal: re-derive the space group from the coordinates | F3 (also automatic on every edit to a full cell) |
+| Crystal: simulate the powder pattern (PXRD)... | **Ctrl+Shift+D**, the ❖ page's button, View ▸ Crystal ▸ Powder pattern, or F3 (opens on the SELECTED crystals) |
 | Make the selected substituent coplanar with its ring | F3 |
 
 **Editing a crystal, and what happens to its symmetry.** Which of two things
@@ -569,6 +570,84 @@ the molecule's other properties.
 
 Every mode is regenerated from the stored asymmetric unit, so switching back
 and forth cannot drift.
+
+**A ❖ control acts on every SELECTED crystal** (round 91b), and two rules
+follow from that. A crystal whose cell has been edited into P1 cannot be
+regenerated, so it is **passed over and counted in the status line** rather
+than greying the control for the others - one edited cell in a selection of
+five is not a reason to disable a switch that works perfectly well on the
+other four. And the active object is restored **after** the selection is put
+back, or `select_whole_molecules` moves it to the last crystal in the list and
+the page comes back describing a structure nobody chose.
+
+### Simulated powder pattern (PXRD) - Ctrl+Shift+D
+Every crystal in the scene at once, because comparing two is the usual
+reason to look. The sum is regenerated from the **cell, the operators and the
+site occupancies** each time, never read off the drawn atoms - so the
+asymmetric-unit view, the full cell and a 3x3x3 packing give the **same**
+pattern, which is what makes it a property of the crystal rather than of the
+picture. A site shared by several species contributes one term per species.
+
+Wheel zooms about the cursor, **Home** or **Fit** frames the whole range,
+hovering names the nearest reflection (`(1 1 0) and 3 more`, with d and Q),
+and **Export...** writes both the curve and the indexed reflection list as
+CSV. Settings - radiation, range, peak width and shape - are stored **on each
+crystal**, so they ride undo and the savefile and deleting a crystal takes its
+trace with it.
+
+Two patterns computed at **different wavelengths are forced onto a Q axis**:
+2-theta depends on the wavelength and Q does not, so the same reflection would
+otherwise sit at two angles for no physical reason. No CIF here carries
+displacement parameters, so B = 0 and the high-angle intensities are
+overestimated - the window says so rather than letting a plausible curve stand
+unqualified.
+
+**The keys are ORCA Workbench's** (round 96), taken from its NMR plotter key
+for key, so the two programs navigate a spectrum the same way:
+
+| Key | What it does |
+|---|---|
+| `Z` | cycle zoom: horizontal strip, vertical strip, box, off |
+| `P` | cycle pan: horizontal, vertical, free, off |
+| `Esc` | leave the zoom/pan mode |
+| `F` / `Home` | two-stage reset: x, then y, then the intensity scale |
+| `M` | jump to the numeric limit boxes |
+| `R` / `F5` | recompute and redraw |
+| `Ctrl+S` | save the plot as an image |
+| `Ctrl+W` | close the window |
+| wheel | scale intensity about each trace's own baseline (Mestrenova's rule) |
+| `Ctrl`+wheel | zoom x about the cursor |
+| right-click | that crystal's own colour, radiation, range and width; also the axis limits |
+
+The **Pattern** tab carries only what is touched constantly - radiation, the
+2-theta range, the peak width, and a vertical offset slider beside the plot.
+Those three settings are **global overrides**: changing one writes it to every
+crystal, and any crystal can then be given its own from the right-click menu
+(colour, radiation, range, width, shape). Everything else - peak shape, the Q
+axis, the vertical margin, fit / save / export and the key map - is on the
+**Advanced** tab.
+
+The **radiation box takes text as well as a preset**: a wavelength
+(`1.5406`), an energy (`17.5 keV`, `8040 eV`), a named line (`Cu Ka1`,
+`Mo Ka2`), or a K-alpha doublet with its intensity ratio (`Cu Ka1+Ka2 2:1`,
+the standard 2:1 being a property of the atom rather than of the tube). A lab
+tube really does emit the doublet, which is why peaks past about 40 degrees
+look split - and why a doublet does **not** split on the Q axis.
+
+The curve is **sampled at the pixel columns of the view being drawn** rather
+than resampled from a stored grid (round 97), so it is about one point per
+pixel and perfectly smooth at any zoom - from the whole pattern down to a
+hundredth of a degree - and a repaint costs the same either way. Each column
+is supersampled and reduced by min/max, so a peak narrower than a pixel is
+still drawn at its full height instead of wherever a single sample happened
+to land.
+
+The **Reflections (hkl)** tab lists h k l, d, 2-theta, Q, the multiplicity,
+|F|^2, the Lorentz-polarisation factor and the relative intensity, **including
+the systematically absent reflections**, which are the reason to open it: a
+list of what is present cannot tell you why something is missing. An absence
+here is `|F|^2` coming out zero - nothing in the calculation knows what an
+F-centred lattice is.
 
 Known gaps: a CIF that names only a space group and gives **no symmetry
 loop** falls back to P1, which shows just the asymmetric unit (pymatgen is

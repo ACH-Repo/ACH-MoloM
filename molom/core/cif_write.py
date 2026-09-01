@@ -319,13 +319,19 @@ def from_object(obj, policy=None, version="", report=None):
         rotation, translation = pose
         coords = (coords - np.asarray(translation)) @ np.asarray(rotation)
 
-    # Only the CONTENT: everything past `cell_content` is a boundary copy or a
+    # Only the CONTENT: everything else drawn is a boundary copy or a
     # completion, i.e. an exact lattice translate of an atom already listed.
     # Writing those would claim a cell with every face atom in it twice.
-    n_content = int(meta.get("cell_content") or 0) or len(symbols)
-    n_content = min(n_content, len(symbols))
-    content_symbols = list(symbols[:n_content])
-    content_frac = _wrapped(cell.to_fractional(coords[:n_content]))
+    #
+    # WHICH atoms those are is `packing.content_indices`, not the first
+    # `cell_content` of them: the packing reorders and duplicates, so the
+    # prefix is a different set (ferrocene's first 42 drawn atoms are one
+    # molecule and a lattice copy of it, where the cell holds two).
+    from . import packing as packing_mod
+    picks = packing_mod.content_indices(meta, len(symbols))
+    n_content = len(picks)
+    content_symbols = [symbols[i] for i in picks]
+    content_frac = _wrapped(cell.to_fractional(coords[picks]))
     report["n_content"] = n_content
     report["n_drawn"] = len(symbols)
 

@@ -461,6 +461,7 @@ class CrystalPage(QWidget):
     cell_suggest_requested = Signal()
     cell_remove_requested = Signal()
     frac_apply_requested = Signal()
+    pxrd_requested = Signal()
 
     #: Has the ACTIVE molecule's cell been edited into P1?
     _frozen = False
@@ -812,6 +813,19 @@ class CrystalPage(QWidget):
         self.refused_check.toggled.connect(self._emit(self.refused_toggled))
         lay.insertWidget(lay.indexOf(self.occupancy_check) + 1,
                          self.refused_check)
+
+        # The powder pattern is a property OF the crystal, so it belongs
+        # beside the crystal's other properties - the same argument that put
+        # the asym/cell/packing switch on this page instead of leaving it in
+        # a menu and in F3, where nobody finds anything.
+        self.pxrd_btn = QPushButton("Simulate powder pattern (PXRD)...")
+        self.pxrd_btn.setToolTip(
+            "Open the simulated diffractogram for every crystal in the "
+            "scene, computed from the cell, the operators and the site "
+            "occupancies (Ctrl+Shift+D).")
+        self.pxrd_btn.clicked.connect(
+            lambda _c=False: self.pxrd_requested.emit())
+        lay.insertWidget(lay.indexOf(self.refused_check) + 1, self.pxrd_btn)
         dragcheck.install(self)
         self.set_cell(None)
 

@@ -611,3 +611,50 @@ core.
 **L7. Nothing writes properties into an export other than the xyz comment.**
 The Blender export and the CIF writer do not carry them, and probably should
 not, but the decision has not been made explicitly.
+
+## M. The PXRD window (rounds 95, 96)
+
+**M1. ~~The trace colour cannot be chosen.~~ DONE in round 96** - right-click
+a line or its tick box.
+
+**M5. ~~The pattern is recomputed for every control change.~~ DONE in round
+96** - cached on the structure, the source and the range, which is everything
+it depends on. Eight patterns recompute in 37 ms and redraw in 0.5 ms.
+
+**M2. No measured pattern can be loaded alongside.** The whole point of a
+simulation is to overlay it on a diffractogram somebody measured, and the
+window cannot read one. A two-column `.xy` / `.xye` reader plus a scale-and-
+offset control is a small piece of work; the honest part is deciding what to
+do about the background, which a simulation does not have. Now that the
+window has per-trace settings and its own navigation, this is the obvious
+next thing - and Christian has four other repos full of measured patterns to
+test it against (`ACH-PXRD-Quickplot`, `ACH-Diffraction-Analysis-Suite`).
+
+**M3. B = 0 everywhere, and it is stated rather than fixed.** No CIF vendored
+here carries displacement parameters, so the high-angle intensities are
+overestimated. `compute` already takes `debye_waller`, so the moment a file
+with `_atom_site_U_iso_or_equiv` turns up the reader could carry it - nothing
+downstream would change.
+
+**M4. Preferred orientation is not modelled at all.** A real powder of a
+layered or needle-like crystal does not give the intensities computed here,
+and no warning says so. March-Dollase is the standard correction and is a few
+lines, but it needs an axis the user has to state, so it is a decision rather
+than a default.
+
+**M6. The peak width is one number at all angles.** A real diffractometer's
+resolution varies with 2-theta, which is what Caglioti's `U tan^2 t + V tan t
++ W` describes and what every Rietveld program fits. The shipping single FWHM
+is right for a drawing aid and wrong for anything compared against a
+measurement, so it belongs with M2 rather than before it.
+
+**M7. The K-beta line is in the table and not offered as a preset.**
+`parse_source("Cu Kb")` works, so a user who knows to type it gets it; what is
+missing is the thing a real unfiltered tube shows, which is K-alpha plus a
+weak K-beta at a few percent. The ratio depends on the filter, so it is a
+number somebody has to state rather than one to assume.
+
+**M8. The hkl tab describes ONE crystal at a time.** A combo picks which, and
+with several isostructural crystals open the interesting comparison is
+side by side. Whether that means several tables or one table with a source
+column has not been thought about.

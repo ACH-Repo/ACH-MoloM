@@ -198,6 +198,386 @@ other side, and the two export fixes are verified in `tools/smoke_gui.py`
 instead, which now measures the crop and counts ink with and without the cell
 box. 1310 tests.
 
+Round 98 (2026-09-01, the plot gets its window back - and the pattern was
+right all along):
+**(0) "THE PEAK POSITIONS ARE CLEARLY WRONG" - CHECKED, AND THEY ARE NOT.**
+Round 94 cross-checked a synthetic rock salt; this checks the REAL files
+through the whole `cell_contents` path against pymatgen's `XRDCalculator`.
+**Ferrocene (monoclinic P2_1/c) and the solid solution: worst 2-theta
+difference 0.00000 deg, worst intensity difference 0.00 %.** And the DISPLAY
+half separately, because the fault could have been between the number and the
+pixel: every drawn peak sits within **0.02 px** of where the reflection list
+puts it, and a gridline value maps to a pixel and back with zero error.
+**What he almost certainly hit is the next item.** A typed wavelength was
+REFUSED, silently leaving the pattern at Cu K-alpha1 - which is exactly what
+"every peak in the wrong place" looks like from the outside.
+**(1) A TYPED WAVELENGTH WAS NOT ACCEPTED, and it is one Qt default.** An
+editable `QComboBox` INSERTS what you type as a new item (`InsertAtBottom`),
+and `itemData` for that row is None - so `source_text` returned the string
+`"None"`, `parse_source` refused it, and the pattern stayed where it was.
+`NoInsert`, plus reading the text whenever the item carries no spec.
+**(2) A DECIMAL COMMA IS A DECIMAL POINT.** He is on a German locale, so
+Qt's own separator is a comma and a typed `0.15` is not a number - the spin
+box keeps its old value and says nothing. `NumberBox` normalises both ways in
+`validate` and `valueFromText`, `parse_source` converts a comma BETWEEN
+DIGITS (so a comma separating two components still separates them), and the
+axis-limits dialog does the same. A plot is exactly where somebody pastes a
+number out of a paper.
+**(3) THE "STEPS" WERE NOT AN ANTIALIASING FAULT.** "The anti-aliasing seems
+to not work properly unless zoomed in very close. A lot of steps visible."
+The min/max envelope reduces to one column per **`rect.width()`**, which is
+LOGICAL - so on a 150% display every tread is one and a half REAL pixels, and
+antialiasing cannot smooth away a step it has been asked to draw. Reduced at
+`width * devicePixelRatioF()` now, which puts the treads below one device
+pixel. It only looked right zoomed in because at high zoom the sampler
+returns one point per column and the envelope is skipped entirely.
+**(4) THE PATTERN TAB KEEPS FOUR CONTROLS AND NO MORE** - radiation, the
+2-theta range, the FWHM and the offset - because those are the ones touched
+constantly and the rest was spending the plot's own height. Everything else
+is on a new **Advanced** tab (peak shape, Q axis, margin, fit, save, export,
+the key map) or on the line itself. **The offset slider is VERTICAL and
+beside the plot**, which is both what it does and free of height.
+**(5) THE GLOBALS ARE OVERRIDES, and every one of them is also per line.**
+Radiation, FWHM and the range write to EVERY crystal, ticked or not - an
+override that skipped the ones you cannot see would leave a stale wavelength
+waiting - and the right-click menu gives one line its own afterwards. The
+per-line dialog grew the FWHM and the peak shape to match.
+**(6) THE LEGEND AND THE INTENSITY NUMBERS GO.** The tick boxes are already
+coloured, so the name inside the plot said it twice; and every trace is
+normalised to its own strongest peak, so "100" means the same thing on every
+one of them and nothing about any of them. The 0 and 50 rules stay, because
+those are what the eye measures against. `_LEFT` drops from 54 px to 10.
+**(7) THE TICK LABELS ARE ABBREVIATED** to twelve characters with the full
+name on hover - a COD entry's name is a sentence, and a legend is a row.
+**(8) THE AXIS LIMITS ARE A DIALOG**, off the right-click menu, `M`, and the
+Advanced tab; they were four boxes and a button across the top of a plot that
+wanted the height, typed twice a session at most.
+**AND THE WINDOW CAN BE MADE SMALL AT LAST.** Round 97 got the minimum from
+902 x 634 to 356 x 366; the Advanced tab put it back up to 700 wide through
+a `QFormLayout` whose widest row sets the width. `AllNonFixedFieldsGrow` plus
+`WrapLongRows` and a wrapping button row: **308 x 329**.
+**A DEBUG TICK AT EVERY SAMPLED POINT** was added to the Advanced tab so the
+sampling could be LOOKED at rather than reasoned about, and removed again
+before this was committed, which is what it was for ("When we commit this, it
+will be reverted"). What it showed: one marker per DEVICE column at every
+zoom, evenly spaced, which is the claim the round makes.
+**AND THE WHEEL'S COST HAS A MEASURED ANSWER**, asked out of curiosity and
+worth keeping because the obvious explanation is the wrong one. Scaling the
+intensity up does NOT explode the point count - 990 to 1417 over a 500x
+scale, +43%, because more columns become "spiky" and emit two points instead
+of one, and that saturates at two per column by construction. What explodes
+is the **stroked path LENGTH: 3817 px to 1.53 million**, 400x, because a
+stroked antialiased polyline costs per PIXEL COVERED and a taller peak has
+more vertical pixels in it. It is self-limiting: the paint peaks at 52 ms
+around 30x and falls back to 34 ms at 500x, where most of the curve is
+off-screen and clipped cheaply. **Clamping the off-screen excursions was
+tried and REJECTED on measurement** - 0.69x the speed at 100x scale (a
+segment ending just outside the rect has to be rasterised to the boundary,
+where one entirely outside is rejected outright) and it moved 1.5% of the
+pixels. Left alone deliberately.
+2025 tests.
+
+Round 97 (2026-09-01, the window fits the screen, and the curve is sampled
+where it is drawn - Christian's two reports and one good question):
+**(1) NO MINIMISE OR MAXIMISE BUTTON.** A `QDialog` gets a close button and
+nothing else. This is a TOOL window - modeless, kept open beside the viewport,
+and a plot is the first thing anybody wants full-screen - so it asks for the
+ordinary frame (`Qt.Window` plus the two hints). OWB's spectrum windows are
+Toplevels with real WM decorations for exactly this reason.
+**(2) "THE LAUNCH SIZE IS WAY TOO BIG NOW", and the `resize` call was not the
+problem.** `resize` takes LOGICAL pixels, so at his 150% scaling a 980 x 660
+window is **1470 x 990 real ones** - taller than the working area of a 1080p
+display, which is why the controls were below the bottom edge. **And no
+`resize` could have fixed it, because the window's own minimum was 902 x 634.**
+Three causes, and the first is round 90d's trap from the other side: a
+word-wrapped QLabel reports the height it needs AT ITS MINIMUM WIDTH, so the
+note label asked for **219 px** and set the window's minimum height. Capped at
+two lines, with the full text in the tooltip. The control rows were fixed
+QHBoxLayouts summing to 816 px, and the hkl tab's own row to 870 - both are
+`FlowLayout`s now, which MoloM already had for exactly this (round 45's stage
+buttons, round 75's attachment ticks, round 21's rule that a fixed row makes
+part of a panel unreachable). Minimum **902 x 634 -> 356 x 366**, and the
+opening size is asked of the SCREEN rather than assumed.
+**(3) THE SAMPLING QUESTION, and his instinct was right on both halves.**
+"Is it possible to improve peak shapes and performance by exploiting the fact
+that any given peak type has a known FWHM? ... the only thing I am not clear
+on is: what to do at high zoom levels."
+**The half he had is right**: a peak of known FWHM contributes nothing beyond
+a few widths, so the space between peaks costs nothing - `profile`'s `reach =
+12 x FWHM` windowing has always exploited that. **The half he was missing is
+that the answer is to stop resampling a stored curve at all.** A stored grid
+has ONE sampling for every zoom level, so it is wrong at both ends: zoomed
+out it is thousands of points landing on the same pixel, and zoomed in it is
+a dozen points across the window. Measured before anything was changed:
+**at a 0.1 degree span, 12 points across 754 pixels - 68 px per straight
+segment**, which is a polygon, exactly as he predicted ("then 10 ish points
+would suddenly be too little").
+The profile is an analytic sum of peaks, so `profile_at` evaluates it **at
+the pixel columns of the view being drawn**. The point count is then bounded
+by the WIDTH of the window at every zoom level: measured **1.00 px per
+segment from a 45 degree view down to 0.02**, with the repaint cost flat at
+10-15 ms for four traces instead of growing.
+**THE TRAP HE DID NOT ASK ABOUT IS ALIASING, and it is the reason for
+supersampling.** A peak narrower than a pixel can fall between two samples
+and be drawn at a fraction of its height, or vanish. So each pixel column is
+sampled several times and reduced by MIN and MAX - which is what a waveform
+editor does and what the decimation path here already did - with the count
+from the FWHM. Measured on a peak **0.168 pixels wide**: the supersampled
+draw reaches **99.7%** of its true height where one sample per pixel finds
+**62.6%**.
+**AND THE FIRST CUT MADE IT WORSE, caught by a test.** Resampling at every
+zoom is wrong: at full zoom the per-pixel sampling is COARSER than the stored
+0.01 degree grid, so peak tops came out **4 px low**. Two corrections. The two
+paths are chosen by **which samples the profile more finely**, so the drawing
+can only ever improve; and `SAMPLES_PER_FWHM` is 8 rather than 3, which is
+what a 1% worst-case height error costs (sampling every `d` leaves the nearest
+sample `d/2` from the centre, and `exp(-0.5 (d/2 sigma)^2) >= 0.99` gives
+`d <= 0.12 FWHM`). The Gaussian is the worst case; a Lorentzian is flatter on
+top. **The test that caught it is the one comparing the drawn curve against
+the stored samples - written for the decimation, and it had no reason to
+exist until the drawing stopped using them.**
+2016 tests.
+
+Round 96 (2026-08-31, the PXRD window becomes a spectrum window - Christian's
+batch, and OWB's key map poached wholesale):
+Round 95 made the pattern reachable. It was also slow, monochromatic, and
+navigated by nothing but a horizontal wheel zoom. Nine items, and the
+navigation one is the biggest because it is not invention: **the keys, the
+modes and the two-stage reset are ORCA Workbench's NMR plotter's**, on
+Christian's instruction ("that should be the most refined"), key for key -
+`Z` cycles zoom horizontal / vertical / box, `P` cycles pan, `Esc` leaves the
+mode, `F` resets x then y then the intensity scale, `M` jumps to the limit
+boxes, `R` redraws, `Ctrl+S` saves, `Ctrl+W` closes, the wheel scales
+intensity about each trace's own baseline and `Ctrl+wheel` zooms x about the
+cursor. Two of OWB's own hard-won details came with them: a PAN is measured
+in pixels through the PRESS-TIME view (reading the live one feeds the motion
+into itself and the pan accelerates away), and the rubber band is drawn over
+a cached picture rather than by redrawing the plot.
+**(1) THE PERFORMANCE, AND IT WAS THREE SEPARATE THINGS.** "Scales poorly
+with number of PXRDs and is even not very fluid with a single one."
+**(a) The structure-factor sum was a Python loop over hkl** with an inner
+loop over the scattering parameters per atom. Vectorised and chunked over
+reflections (the (n_hkl x n_atom) phase array is what needs bounding, and the
+form factors are evaluated per ELEMENT rather than per atom - three curves
+instead of forty-two): **ferrocene to 90 degrees, 150 ms -> 10.9 ms**, and
+pymatgen still agrees peak for peak.
+**(b) It was recomputed for things it does not depend on.** A structure
+factor depends on the structure, the source and the range - not on the peak
+width, the shape, the stacking or the margin. Cached on exactly that
+signature: a full recompute of eight patterns is **37 ms**, a repeat is
+**0.2 ms**, and dragging the offset slider is **0.2 ms** instead of a second.
+**(c) The paint path rebuilt several thousand QPointF EVERY event**, so
+moving the mouse across the plot was as expensive as drawing it. Two fixes.
+Everything that does not follow the cursor is drawn ONCE into a QPixmap and
+blitted, so a hover is a blit plus two lines; and the curve is decimated to a
+min/max envelope per pixel COLUMN. Measured: 4501 samples cost 6.4 ms to
+build and 25 ms to stroke, so eight traces were a quarter of a second a
+frame. **The envelope emits ONE point for a flat column and two only where
+the column has real spread** - a diffractogram is mostly baseline - which
+takes it to about one point per pixel: **871 points from 4501, 35 ms for a
+full rebuild of eight traces and 0.48 ms for a blitted repaint.**
+**AND THE FIRST CUT OF THAT MADE IT SLOWER** (343 ms), because the flat/spiky
+selection was a Python loop over a thousand columns - more expensive than the
+points it saved. `repeat` plus a cumulative index instead.
+**A PAN BLITS TOO**, and it is the one gesture that can: the picture is
+unchanged and only its origin moved, so `paintEvent` draws the cached pixmap
+SHIFTED and the rebuild waits for the release.
+**(2) THE DEFAULT RANGE IS 50 DEGREES**, Christian's call. The sum is over a
+sphere of radius 1/d_min, so the cost grows as the CUBE of how far you ask,
+and a molecular crystal has almost nothing above 50.
+**(3) THE SELECTION DECIDES THE TICKS.** "If I select 3 structures and then
+launch it, only those three should be ticked and shown." And deliberately
+**not written back**: a selection says what this OPENING is about, so opening
+the window on one of five must not silently switch the other four off in the
+savefile. Ticking a box by hand DOES write, because that is the decision.
+**(4) A LAB TUBE EMITS A DOUBLET, and one calculation covers it.**
+`parse_source` reads a wavelength (`1.5406`), an ENERGY (`17.5 keV`,
+`8040 eV` - a synchrotron user states one and never the other), a named line
+(`Cu Ka1`, `Mo Ka2`), or a doublet with its ratio (`Cu Ka1+Ka2 2:1`). One
+parser for the presets and for anything typed, which is what lets a source
+that can be chosen also be written down.
+**The doublet costs nothing extra because `s = sin(theta)/lambda = 1/(2d)`
+has no wavelength in it**: `|F|^2` is shared and only the ANGLE and the
+Lorentz-polarisation factor differ, so `Reflection` carries `f2` and
+`peak_positions` places one peak per component. Measured on rock salt: the
+split grows from **0.069 deg at 27 deg to 0.49 deg at 119 deg**, which is the
+signature of a real K-alpha doublet, and the alpha2 comes in at **0.497** of
+alpha1 rather than exactly 0.5 - the two lines diffract at slightly different
+angles, so their LP factors differ. **On the Q axis a doublet does not split
+at all**, which is not a bug but the reason that axis exists.
+2:1 is the standard ratio and it is a property of the ATOM (the 2p level
+degeneracies), not of the instrument, so it is the same for every tube here.
+**(5) AN hkl TAB, WITH THE SYSTEMATIC ABSENCES IN IT.** The columns a
+reflection list carries: h k l, d, 2-theta, Q, multiplicity, |F|^2, the
+Lorentz-polarisation factor, the relative intensity, and whether the
+reflection is absent. **The absences are the reason the tab exists** - a list
+that shows only what is there cannot answer "is 100 allowed?". `keep_absent`
+merges them in rather than dropping them at `|F|^2 <= ABSENT_F2`, and the
+check is textbook: on rock salt every absent reflection has MIXED-parity
+indices and every present one does not, which is F-centring falling out of
+the arithmetic rather than out of a rule.
+**(6) PER-CRYSTAL SETTINGS OFF A RIGHT-CLICK**, on the line or on the tick
+box - both, as asked, and the line because "clicking the line is more
+intuitive and doesn't require tab switching". Colour, radiation and range,
+stored on the structure like everything else here. The dialog SAYS what it
+understood the source text to be, and refuses OK while it cannot read it: a
+source box that quietly falls back to Cu is how a whole pattern comes out at
+the wrong angles with nothing on screen to say so.
+**(7) AND A PRECISION BUG THAT ONLY THE CACHE MADE VISIBLE.** The source box
+showed a bare wavelength as `{:.5f}`, so Cu K-alpha1 became "1.54060" and the
+box handed that back as a DIFFERENT wavelength - which changed the cache key
+on every edit, recomputed every pattern, and moved every peak by a
+ten-thousandth of a degree. Ten significant figures round-trips.
+Found by the test asserting that a peak-width change reuses the pattern,
+which is the second time this session a cache has been the thing that made an
+invisible wrongness visible.
+**(8) A FOURTH FAULTY MEASURING INSTRUMENT.** The first check that the
+decimation keeps every peak reported SEVEN lost peaks - and it had assigned
+samples to pixel columns with `round` while the envelope uses truncation, so
+it was comparing adjacent columns. Allowing a pixel of slack in x: **worst
+peak-top error 0.000 px**, and the tallest drawn point equals the tallest
+true one. Rounds 86, 86 again, 89 and now this: **a measurement that
+disagrees with the code is as likely to be the instrument as the code.**
+Also: `QMenu.exec` runs a modal event loop, so the menus are BUILT by
+`build_trace_menu` / `build_label_menu` and shown by one line - a test that
+reaches `exec` hangs rather than fails, which is round 75's lesson.
+**(9) AND IT SHIPPED BROKEN ON HIS DISPLAY, which is ROUND 59'S OWN TRAP.**
+Christian: "something is completely screwed" - a screenshot with the plot
+drawn into the top-left two thirds of the widget, no x axis, no right-hand
+peaks, one flat blue line, and the crosshair running on past the edge of the
+picture into bare grey.
+`QPixmap(w, h)` allocates w x h DEVICE pixels; `setDevicePixelRatio(1.5)`
+then declares them to be **w/1.5 x h/1.5 LOGICAL** ones. So the blitting
+cache, made at the widget's logical size, covered exactly two thirds of a
+150% display and everything past that was clipped - while the crosshair,
+painted on the WIDGET, was drawn at full size. Both halves of the screenshot,
+from one line. **The bare grey was the unpainted widget showing through**,
+which is what makes it look like a layout catastrophe rather than a pixmap
+one.
+**And the flat line was the same bug, not a second one.** Griceite is LiF,
+whose only reflections below 50 degrees are 111 at 38.70 and 200 at 44.99 -
+both in the right-hand third, i.e. exactly the part that was clipped away.
+The visible left two thirds of an LiF pattern is a flat line, correctly.
+Round 59 met this from the other side, in `tools/screenshots.py`, and this
+file has carried the lesson since. **Pinned now rather than remembered**: a
+test shadows `devicePixelRatioF` at 1.0, 1.25, 1.5 and 2.0 and asserts the
+pixmap is allocated in DEVICE pixels and covers the widget - which is
+testable at any scale, where running the suite at 150% is not (a
+QApplication reads its scale factor once, at construction).
+2009 tests.
+
+Round 95 (2026-08-31, the powder pattern gets a window - and the active object
+stopped wandering off):
+Christian's checklist against round 93: make PXRD reachable, and three things
+that were still wrong.
+**(1) THE PXRD WINDOW, AND THE BRIDGE IS WHERE THE MISTAKES LIVE.** Round 94
+returned arrays and deliberately built no UI, so **matplotlib is still not a
+dependency**: `ui/pxrd_panel.py` PAINTS the diffractogram, the way the
+timeline pane is painted, because a pattern is a polyline against an axis and
+a plotting library would do nothing here that thirty lines of QPainter do not.
+Reachable three ways - **Ctrl+Shift+D**, a button on the crystal page, and
+View > Crystal - because a property OF the crystal belongs beside the
+crystal's other properties (round 21's rule).
+**`pxrd.cell_contents` NEVER READS THE DRAWN ATOMS**, and that is the whole
+design. A structure factor is a property of the CELL, so the picture is the
+wrong input three times over: boundary copies are the same atom drawn twice
+(an atom on a face would be counted twice), a packing is many cells, and both
+are in the VIEWPORT's frame rather than the cell's. It regenerates from the
+asymmetric unit and the operators every time, which makes the invariant
+testable and it is: **asymmetric unit, full cell and a 2x2x2 packing give an
+identical pattern**, and so does a crystal that has been dragged across the
+viewport.
+**A SHARED SITE HAD TO BE PUT BACK TOGETHER.** `expand`'s minimum-image merge
+keeps the first species of a shared position and discards the rest (round 42's
+ordering flaw), which costs a picture a pie sphere and costs a structure
+factor the actual scatterer - the solid solution would have diffracted as
+half-empty Nb. `site_composition` restores it as one term per species at one
+position, which is what the sum wants anyway. Checked against chemistry rather
+than against our own numbers: it is a rutile-type oxide and comes out with
+110, 101 and 211 as its three strongest reflections, 110 at 26.81 deg.
+**Q IS FORCED WHEN THE WAVELENGTHS DIFFER**, `common_axis` deciding rather
+than the user - two patterns at two wavelengths put the same reflection at two
+angles on a 2-theta axis, and drawing that would be a lie the window is
+perfectly able to avoid. The tick is then disabled rather than merely wrong.
+**(2) "THE ACTIVE STRUCTURE TURNED ON DRAW ATOMS OUTSIDE THE CELL BOUNDARY FOR
+SOME REASON WHEN SWITCHING BACK."** It did not - the ACTIVE OBJECT moved.
+Round 91b's fan-out restored `self.active_id` and THEN called
+`select_whole_molecules` to put the selection back, and picking moves the
+active object to the last thing selected (round 7). So after any fan-out the
+crystal page described the last crystal in the list and read ITS ticks back,
+which looks exactly like a tick turning itself on. Restored AFTER the
+re-selection now, in both fan-outs. Measured: with LiF being looked at and
+five crystals selected, a single tick used to leave CsF active.
+**(3) AND THAT IS ALSO HOW ONE EDITED CELL GREYED THE WHOLE PAGE.** "If the P1
+CsF is selected, the message that an edit has been made pops up and you have
+to deselect it to use controls on the other four again." Two causes on top of
+the drift: `frozen` was read off the SUBJECT alone, so one `cell_frozen`
+crystal disabled the contents radio for every other crystal the controls would
+have reached; and each frozen target posts its own "was edited in the full
+cell" status line on the way past, so with five selected the complaint was the
+last thing said and the click looked as though it had done nothing else.
+Frozen now means EVERY target is frozen - the same rule `_crystal_targets`
+already applies to a molecule swept up by Ctrl+A - and the fan-out reports
+once, counting them ("4 crystals: asymmetric unit only (1 edited into P1, left
+as it is)").
+**(4) THE CRYSTAL PAGE NOW FOLLOWS THE SELECTION, not only the active
+object.** "Luciferin 6'-ethyl ether sodium salt when selected still shows the
+crystal page for Griceite. When clicking the controls, nothing about Griceite
+changes though." The page describes `_crystal_subject()`, which reads the
+SELECTION, and `_sync_crystal_page` ran from four paths none of which was a
+plain selection change - so a selection that left the active object alone left
+a page naming one crystal while its controls reached another, which is
+precisely what "nothing changes" looks like. Re-synced from
+`_on_selection_changed`, and only when the SUBJECT really moved, because that
+runs on every mouse move of a box select. **And the box tick was the one
+per-crystal flag never read back**: round 93 made the cell box per crystal
+(round 51's four-place lesson) and `_sync_crystal_page` never passed `box=`,
+so it kept whichever crystal was looked at last.
+**(4b) AND SIMULATING A PATTERN BEFORE AND AFTER A DEMOTION FOUND A REAL
+PRE-EXISTING BUG.** The two must be the same crystal, and they were not - 298
+reflections became 335 with intensities up to 18% apart.
+`resync_derived_asymmetric_unit` took the FIRST `cell_content` drawn atoms as
+the content, and `packing.pack`'s own comment says why that cannot work:
+"`complete_molecules` REORDERS and duplicates". Measured on ferrocene, the
+first 42 drawn atoms are ONE molecule plus a lattice copy of it, where the
+cell holds two molecules related by a screw axis - so demoting an edited
+ferrocene wrote an asymmetric unit of 21 atoms listed TWICE, `expand` merged
+the duplicates on the way back, and the P1 cell was half the crystal. The
+file's own `Z 2` and `C10 H10 Fe` settle which of the two is right.
+`content_of` - which cell-content atom each drawn atom is an image of - is the
+map that answers it properly, and it has been recorded since round 54.
+`_content_atom_indices` takes the first drawn image of each. **Verified by the
+invariant that found it: a demotion to P1 now changes the pattern by 6.7e-16,
+i.e. not at all.** It also reached the CIF writer's re-derived path and
+`demote_to_p1`, so an exported edited crystal was carrying the same halved
+unit.
+**(5) THE SEARCH TABLE'S WIDTH, AND THE CULPRIT IS A DOCUMENTED Qt
+BEHAVIOUR.** "The width jumps back and forth between contracted and full width
+used... I think the name column is the culprit." It is, and the mechanism is
+that **`QTableView.resizeColumnsToContents` calls
+`resizeSections(ResizeToContents)`, which by design IGNORES the per-section
+resize mode** - so it fitted the STRETCH column to its longest entry too.
+Measured: a long name takes it to **1771 px inside a 796 px viewport**, and a
+relayout then snaps it back. Round 93 had already stopped it running on every
+SORT; it still ran on every batch a provider landed. The stretch column is now
+set up once in `__init__` and never refitted, and only the fixed columns are
+fitted, one by one.
+**A long name WRAPS instead**, which is Christian's own suggestion and the
+only honest option once the column cannot grow: eliding hides the half that
+tells two entries of one compound apart, which is what the list exists to
+show. `setWordWrap` plus `ElideNone` plus a `ResizeToContents` vertical
+header, and a `resizeEvent` that re-fits the rows - **a wrapped cell's height
+depends on the column's width and nothing in Qt propagates that**, so widening
+the window otherwise leaves a two-line name in a two-line row with one line in
+it. Alternating row shading uses the timeline pane's own pair, so the two
+lists in the program look like the same program.
+Double-clicking the border of the stretch column is now a NO-OP rather than a
+half-working gesture ("border clicking kind of works"): it already occupies
+every pixel the others leave, and fitting it would take it out of Stretch
+until the next relayout put it back - i.e. it would re-create the flicker on
+demand.
+1968 tests.
+
 Round 94 (2026-08-27, the diffraction a crystal already knows how to give -
 `core/pxrd.py`, the physics only):
 Christian asked for the plot window to be designed first and then set up "what
@@ -4776,7 +5156,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 1934 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 2025 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -5027,6 +5407,21 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   systematic absences both fall out of MERGING coincident reflections rather
   than out of any rule. Validated against pymatgen's `XRDCalculator`.
   `core/scattering.py` is GENERATED by `tools/gen_scattering.py`.
+  `cell_contents` / `pattern_for` (round 95) are the bridge from a
+  crystal MoloM has open: they REGENERATE the cell from the asymmetric
+  unit and the operators rather than reading the drawn atoms, which is
+  what makes the pattern identical in the asym view, the full cell and
+  a packing. `ui/pxrd_panel.py` is the window, and it is PAINTED -
+  matplotlib is still not a dependency. Round 96 added `parse_source` (a wavelength, an energy in
+  keV or eV, a named line, or a K-alpha doublet with its ratio),
+  `peak_positions` (one peak per emission line, sharing `|F|^2` because
+  `s = 1/(2d)` has no wavelength in it) and `keep_absent` for the hkl list.
+  `compute` is vectorised and chunked; read its docstring before changing the
+  loop, and see round 96 for why the paint path decimates and blits.
+  Round 97 added `profile_at` - the profile at ARBITRARY x - which is what
+  lets the plot sample at its own pixel columns at every zoom level;
+  `profile` is the regular grid an EXPORT wants and is now a thin wrapper
+  over it.
 - `core/molsearch.py` — finding a MOLECULE by name, as a LIST (Ctrl+Shift+N).
   The counterpart to `core/resolve.py`, not a replacement: that one cascades
   to ONE structure and still does. Read the module docstring before touching
@@ -6062,6 +6457,106 @@ independent cross-check inside a single fixture.
   293.0 renders as "293", and obvious the moment a molecular weight put
   RDKit's 106.168 next to PubChem's 106.16 in one column. If the sorting is
   hand-driven, do not write EditRole at all.
+- **THE FIRST `cell_content` DRAWN ATOMS ARE NOT THE CELL CONTENT** (round
+  95). `packing.pack` says so in its own comments - `complete_molecules`
+  REORDERS and duplicates - so a prefix slice is a different set of atoms.
+  Measured on ferrocene: the first 42 drawn atoms are one molecule plus a
+  lattice copy of it, where the cell holds two molecules related by a screw
+  axis. `meta["content_of"]` is the map that answers it (the first drawn image
+  of each content atom); `MainWindow._content_atom_indices` is the one place
+  that reads it. Anything writing an asymmetric unit or exporting a cell has
+  to go through it.
+- **REDUCE A CURVE AT DEVICE RESOLUTION, NOT LOGICAL** (round 98). A min/max
+  envelope built per `rect.width()` column has treads one and a half real
+  pixels wide on a 150% display, and it reads as broken antialiasing -
+  antialiasing cannot smooth a step it was told to draw. Use
+  `width * devicePixelRatioF()`.
+- **AN EDITABLE QComboBox INSERTS WHAT YOU TYPE** (round 98), as a new item
+  whose `itemData` is None. Reading the data of the current row then gives
+  `None` for exactly the typed values the box exists to accept - here, a
+  custom wavelength, which was refused and left a whole pattern at the
+  previous one. `setInsertPolicy(QComboBox.NoInsert)`, and fall back to the
+  text whenever the row carries no data.
+- **A GERMAN LOCALE'S DECIMAL SEPARATOR IS A COMMA** (round 98), so a
+  QDoubleSpinBox silently keeps its old value when "0.15" is typed and
+  `float("1,5406")` raises. Normalise both ways in `validate` /
+  `valueFromText` and wherever a number is parsed out of free text - between
+  DIGITS only, so a comma that separates two things still does.
+- **A QFormLayout'S WIDEST ROW SETS THE WINDOW'S MINIMUM WIDTH** (round 98)
+  unless it is told otherwise: `setFieldGrowthPolicy(AllNonFixedFieldsGrow)`
+  plus `setRowWrapPolicy(WrapLongRows)`. One tab nobody has open while
+  resizing had put the whole window's minimum back up by 400 px.
+- **A STORED CURVE HAS ONE SAMPLING AND A PLOT HAS MANY ZOOM LEVELS**
+  (round 97). A fixed grid is simultaneously too dense zoomed out (thousands
+  of points on one pixel) and too sparse zoomed in - measured at 12 points
+  across 754 pixels, i.e. a polygon. Where the curve is an analytic function,
+  evaluate it AT THE PIXEL COLUMNS being drawn: the count is then bounded by
+  the width of the window at every zoom. Supersample each column and reduce
+  by min/max, or a peak narrower than a pixel falls between two samples and
+  is drawn at 60% of its height. And choose between resampling and decimating
+  the stored grid by WHICH IS FINER - resampling unconditionally draws peak
+  tops low when zoomed out.
+- **`resize` TAKES LOGICAL PIXELS, AND A LAYOUT MINIMUM OVERRIDES IT ANYWAY**
+  (round 97). At 150% a 980 x 660 window is 1470 x 990 real ones, taller than
+  a 1080p working area - so half the controls were off the bottom of the
+  screen. Clamp the opening size to `screen().availableGeometry()`. And check
+  `minimumSizeHint` before blaming `resize`: a word-wrapped QLabel reports
+  the height it needs at its MINIMUM WIDTH (round 90d again), which set this
+  window's minimum height to 634 px on its own, and fixed control rows set
+  the width. Cap the label, and use `widgets.FlowLayout` for the rows.
+- **A QDialog HAS NO MINIMISE OR MAXIMISE BUTTON** (round 97). Fine for a
+  dialog; wrong for a modeless TOOL window somebody will want full-screen.
+  `Qt.Window` plus `WindowMinimizeButtonHint` / `WindowMaximizeButtonHint`.
+- **A QPixmap IS ALLOCATED IN DEVICE PIXELS AND PAINTED IN LOGICAL ONES**
+  (round 96, and round 59 in `tools/screenshots.py` before it). `QPixmap(w,
+  h)` gives w x h DEVICE pixels; `setDevicePixelRatio(1.5)` then declares
+  them to be w/1.5 x h/1.5 logical ones, so a cache made at a widget's
+  logical size covers two thirds of a 150% display. Allocate at
+  `size * devicePixelRatioF()` and set the ratio; the painter works in
+  logical coordinates either way, which is what makes everything drawn into
+  it correct as it stands. It does not look like a scaling bug - it looks
+  like the widget failed to lay out, because the part the pixmap does not
+  cover is bare unpainted widget.
+- **`QMenu.exec` RUNS A MODAL EVENT LOOP** (round 96), so a test that reaches
+  one HANGS rather than failing - round 75's worst-shape-of-problem again.
+  Build a context menu in a method that RETURNS it and show it in one line;
+  the logic is all in the building.
+- **A NUMBER SHOWN IN A BOX MUST ROUND-TRIP THROUGH IT** (round 96).
+  `{:.5f}` renders Cu K-alpha1 as "1.54060", and the box hands that back as a
+  different wavelength - which recomputed every pattern on every edit and
+  moved every peak by a ten-thousandth of a degree. `{:.10g}` round-trips.
+  Only the cache made it visible, which is an argument for caches.
+- **A PYTHON LOOP IN A PAINT PATH COSTS MORE THAN THE POINTS IT SAVES**
+  (round 96). Decimating a curve to one point per pixel column is right and
+  is worth 5x; doing the selection with a `for` over a thousand columns made
+  the window SLOWER than drawing all 4501 points. `np.repeat` plus a
+  cumulative index. Same family as round 33 and round 50.
+- **`resizeColumnsToContents` IGNORES A SECTION'S RESIZE MODE** (round 95).
+  `QTableView.resizeColumnsToContents` is `resizeSections(ResizeToContents)`,
+  which by documented design overrides the per-section mode - so it fits a
+  STRETCH column to its longest entry too. Measured on the crystal search: a
+  long name takes that column to 1771 px inside a 796 px viewport, and a
+  relayout then snaps it back, which is the width visibly flipping between
+  "contracted and full width used". Set the stretch column up once and fit the
+  other columns ONE BY ONE.
+- **A WRAPPED CELL'S HEIGHT DEPENDS ON ITS COLUMN'S WIDTH AND NOTHING
+  PROPAGATES THAT** (round 95, round 90c's `heightForWidth` trap in an item
+  view). `setWordWrap(True)` alone leaves a two-line name in a one-line row; a
+  `ResizeToContents` vertical header fixes the initial layout and a
+  `resizeEvent` calling `resizeRowsToContents` fixes it again after the window
+  is widened.
+- **RESTORE THE ACTIVE OBJECT *AFTER* PUTTING THE SELECTION BACK** (round 95).
+  Every crystal-page fan-out ends with `select_whole_molecules`, which emits
+  `selection_changed`, and picking moves the ACTIVE object to the last thing
+  selected (round 7). Restoring `active_id` first therefore does nothing: the
+  page comes back describing the last crystal in the list, its per-crystal
+  ticks read THAT crystal's state, and if it happens to be an edited P1 cell
+  the whole page greys. It reads as a tick turning itself on.
+- **A PER-OBJECT FLAG GREYS THE PAGE ONLY IF EVERY TARGET HAS IT** (round 95).
+  `cell_frozen` was read off the SUBJECT alone, so one edited cell in a
+  selection of five disabled the contents radio for the other four - which
+  would have worked perfectly well, since a frozen target is passed over the
+  same way a molecule is. Say how many were skipped instead of refusing.
 - **A REBUILD DROPS AND RE-SETS EVERY PER-ATOM MAP TOGETHER** (round 93, and
   round 83 said it first). `on_crystal_view` set `packed_bonds` only when the
   new view produced one, so switching to an asymmetric unit left the previous
@@ -6457,7 +6952,7 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 1934 offline tests, 4 skipped, ~110 s.
+1. `python -m pytest tests/ -q` — 2025 offline tests, 4 skipped, ~115 s.
    `tests/conftest.py` sandboxes QSettings, so a GUI test can drive a real
    control without writing into your own MoloM configuration; it also
    **destroys the windows a test created** (round 86), without which the suite

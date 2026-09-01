@@ -108,6 +108,38 @@ def pack(data, disorder=None, outside=True, grow_from_copies=False, tol=0.1):
     return out_symbols, out_frac @ cell.matrix(), out_bonds, meta
 
 
+def content_indices(meta, n_atoms):
+    # type: (dict, int) -> list
+    """Which DRAWN atoms are the cell's own content - one per content atom.
+
+    **The first `cell_content` atoms of the drawn list are NOT the content**,
+    and `pack` says so a few lines above: `complete_molecules` reorders and
+    duplicates. Measured on ferrocene, whose `content_of` begins
+    `[0, 2, 4, ... 40, 0, 2, 4, ... 40, ...]` - the drawn atoms run molecule
+    by molecule while `expand` emits site by site, so the first 42 are ONE
+    molecule and a lattice copy of it and the cell's second molecule does not
+    appear until index 168. Slicing the prefix therefore gave 21 atoms listed
+    twice for a cell that holds 42 distinct ones (`Z 2`, `C10 H10 Fe`), which
+    an asymmetric unit written from it then handed to `expand` to merge back
+    down to half a crystal.
+
+    `content_of` is the map that answers it properly, and the FIRST drawn
+    image of each content atom is the representative. Falls back to the
+    prefix where there is no map - the unpacked case, where the two agree.
+    """
+    n = int((meta or {}).get("cell_content") or 0) or int(n_atoms)
+    n = max(0, min(n, int(n_atoms)))
+    mapping = (meta or {}).get("content_of")
+    if not mapping or len(mapping) != int(n_atoms):
+        return list(range(n))
+    first = {}
+    for drawn, content in enumerate(mapping):
+        content = int(content)
+        if content >= 0 and content not in first:
+            first[content] = drawn
+    return [first[c] for c in sorted(first)] if first else list(range(n))
+
+
 def images_of(meta, indices, n_atoms):
     # type: (dict, object, int) -> list
     """Every drawn atom that is the same CELL-CONTENT atom as one of these.
