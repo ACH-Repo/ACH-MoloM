@@ -468,38 +468,36 @@ and re-derive?".
 
 ## P. PXRD - what round 94 built and what it did not
 
-**P0. `core/pxrd.py` EXISTS AND IS VALIDATED; THE WINDOW DOES NOT EXIST.**
-Reflections, structure factors, Lorentz-polarisation, merging (which is where
-multiplicity comes from), the Q / 2-theta conversion, three peak shapes and
-the per-structure settings are all in and cross-checked against pymatgen's
-`XRDCalculator` - all 9 rock-salt peaks matched, max 2-theta difference
-3.9e-4 deg, max intensity difference 0.0000 %. Ferrocene's 42-atom cell takes
-0.15 s. **No matplotlib is involved**: `core/pxrd.py` returns arrays, so the
-dependency decision is still open and is the window's to make.
+~~**P0. The window does not exist.**~~ **DONE, rounds 95-98.** Reachable at
+`Ctrl+Shift+D`, from the crystal page and from View > Crystal; painted rather
+than plotted, so **matplotlib is still not a dependency** and that decision
+stayed open the way round 94 wanted it to.
 
-**P1. The plot window.** One window, several structures, per-structure
-wavelength / step / FWHM / shape / range / colour / offset (already stored by
-`pxrd.set_settings`), shared x-unit and stack offset. Design agreed
-2026-08-27; the pieces worth lifting from OWB's `ui/spectra.py` (which is
-tkinter, so nothing ports directly) are `_keep_view` - a redraw caused by a
-SETTING must not throw away a ZOOM - offsets as a fraction of a reference
-amplitude, bottom-trace-in-front z-ordering, and a hover tolerance that is a
-fraction of the visible range rather than a fixed number.
+~~**P1. The plot window.**~~ **DONE.** Several structures at once,
+per-structure colour / radiation / range / width / shape off a right-click,
+a shared axis and a vertical stack offset. Of the four things worth lifting
+from OWB's `ui/spectra.py`, three are in: a redraw caused by a SETTING does
+not throw away a zoom (the pattern cache is keyed on what a pattern depends
+on, and the view is separate), offsets are a fraction of a reference
+amplitude, and the hover tolerance is a fraction of the visible range.
+**Bottom-trace-in-front z-ordering is NOT** - the traces are drawn in scene
+order, which only shows where two of them overlap.
 
-**P2. Two traps waiting in the window.** matplotlib installs its own key
-bindings and will eat shortcuts unless disabled; and a canvas carries a
-devicePixelRatio (1.5 here) that makes pixel arithmetic land 1.5x off, which
-is round 59's screenshot bug in a new place.
+~~**P2. Two traps waiting in the window.**~~ **BOTH HIT, BOTH FIXED.** There
+is no matplotlib, so its key bindings were never a problem - but the
+devicePixelRatio one landed exactly as predicted: the blitting cache was
+allocated at LOGICAL size, covered two thirds of a 150% display, and looked
+like a layout catastrophe rather than a pixmap one. A test now pins the
+allocation at 1.0, 1.25, 1.5 and 2.0.
 
 **P3. Ionic scattering factors are not used.** The table is keyed by element
 symbol, because that is what a structure records; ionic factors differ mostly
 at low angle. A stated limitation, not an oversight.
 
-**P4. No preferred orientation, no background, no K-alpha2.** All three are
-things a real powder pattern has and this does not. March-Dollase and a
-K-alpha1/alpha2 doublet are small additions; a background model is a
-different kind of thing and probably belongs with whatever compares a
-simulation to a measurement.
+**P4. No preferred orientation and no background.** ~~No K-alpha2~~ - the
+doublet is in (round 96), at the standard 2:1 and with the splitting growing
+with angle as a real one does. The other two remain, and a background model
+probably belongs with whatever compares a simulation to a measurement (Q2).
 
 ---
 
@@ -612,16 +610,16 @@ core.
 The Blender export and the CIF writer do not carry them, and probably should
 not, but the decision has not been made explicitly.
 
-## M. The PXRD window (rounds 95, 96)
+## Q. The PXRD window (rounds 95-98)
 
-**M1. ~~The trace colour cannot be chosen.~~ DONE in round 96** - right-click
+**Q1. ~~The trace colour cannot be chosen.~~ DONE in round 96** - right-click
 a line or its tick box.
 
-**M5. ~~The pattern is recomputed for every control change.~~ DONE in round
+**Q5. ~~The pattern is recomputed for every control change.~~ DONE in round
 96** - cached on the structure, the source and the range, which is everything
 it depends on. Eight patterns recompute in 37 ms and redraw in 0.5 ms.
 
-**M2. No measured pattern can be loaded alongside.** The whole point of a
+**Q2. No measured pattern can be loaded alongside.** The whole point of a
 simulation is to overlay it on a diffractogram somebody measured, and the
 window cannot read one. A two-column `.xy` / `.xye` reader plus a scale-and-
 offset control is a small piece of work; the honest part is deciding what to
@@ -630,31 +628,31 @@ window has per-trace settings and its own navigation, this is the obvious
 next thing - and Christian has four other repos full of measured patterns to
 test it against (`ACH-PXRD-Quickplot`, `ACH-Diffraction-Analysis-Suite`).
 
-**M3. B = 0 everywhere, and it is stated rather than fixed.** No CIF vendored
+**Q3. B = 0 everywhere, and it is stated rather than fixed.** No CIF vendored
 here carries displacement parameters, so the high-angle intensities are
 overestimated. `compute` already takes `debye_waller`, so the moment a file
 with `_atom_site_U_iso_or_equiv` turns up the reader could carry it - nothing
 downstream would change.
 
-**M4. Preferred orientation is not modelled at all.** A real powder of a
+**Q4. Preferred orientation is not modelled at all.** A real powder of a
 layered or needle-like crystal does not give the intensities computed here,
 and no warning says so. March-Dollase is the standard correction and is a few
 lines, but it needs an axis the user has to state, so it is a decision rather
 than a default.
 
-**M6. The peak width is one number at all angles.** A real diffractometer's
+**Q6. The peak width is one number at all angles.** A real diffractometer's
 resolution varies with 2-theta, which is what Caglioti's `U tan^2 t + V tan t
 + W` describes and what every Rietveld program fits. The shipping single FWHM
 is right for a drawing aid and wrong for anything compared against a
 measurement, so it belongs with M2 rather than before it.
 
-**M7. The K-beta line is in the table and not offered as a preset.**
+**Q7. The K-beta line is in the table and not offered as a preset.**
 `parse_source("Cu Kb")` works, so a user who knows to type it gets it; what is
 missing is the thing a real unfiltered tube shows, which is K-alpha plus a
 weak K-beta at a few percent. The ratio depends on the filter, so it is a
 number somebody has to state rather than one to assume.
 
-**M8. The hkl tab describes ONE crystal at a time.** A combo picks which, and
+**Q8. The hkl tab describes ONE crystal at a time.** A combo picks which, and
 with several isostructural crystals open the interesting comparison is
 side by side. Whether that means several tables or one table with a source
 column has not been thought about.
