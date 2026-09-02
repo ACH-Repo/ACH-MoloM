@@ -6827,7 +6827,17 @@ class MainWindow(QMainWindow):
         if cell is None or obj.structure.n_atoms == 0:
             return None
         xyz = np.asarray(obj.structure.coords, dtype=float)
-        pose = obj.cell_pose()
+        # Prefer the pose from BEFORE the edit, for round 43e's reason: an
+        # edit is not a rigid motion, so measuring the pose across one reads
+        # the moved atoms as a rotation of the whole crystal - and this is the
+        # function `demote_to_p1` writes the new asymmetric unit from, so the
+        # error would be baked into the structure rather than just drawn.
+        pose = None
+        remembered = self._pose_before_edit
+        if remembered is not None and remembered[0] == obj.id:
+            pose = remembered[1]
+        if pose is None:
+            pose = obj.cell_pose()
         if pose is not None:
             rot, shift = pose
             xyz = (xyz - np.asarray(shift)) @ np.asarray(rot)

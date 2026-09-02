@@ -135,7 +135,39 @@ MIN_RELATIVE = 1e-6
 #: CUBE of how far you ask. Christian's call, and it is 3x less work.
 DEFAULT_TWO_THETA = (5.0, 50.0)
 DEFAULT_FWHM = 0.10             # degrees 2-theta
-DEFAULT_STEP = 0.01             # degrees 2-theta
+
+#: How many stored samples span one FWHM when the step is left to derive
+#: itself. The right invariant is points PER PEAK rather than a fixed number
+#: of degrees: 0.01 deg is 10 points across a 0.1 deg peak and only 2 across
+#: a 0.02 deg one, so a fixed step is simultaneously too coarse for a sharp
+#: pattern and wasteful for a broad one.
+#:
+#: 20 rather than 10 because it costs nothing, measured: the min/max envelope
+#: reduces to about one point per pixel column whatever is stored, so paint
+#: time is FLAT in the stored density - 8 traces repaint in 44 ms at 144k
+#: points and 48 ms at 36k - and the whole cost is in building the profile,
+#: 6.2 -> 9.1 ms for those eight. What it buys is a curve that survives being
+#: enlarged, which is what an SVG figure is for.
+STORED_PER_FWHM = 20.0
+
+#: 0 means "derive it from the FWHM" - see `step_for`. A savefile that
+#: carries an explicit step still gets exactly that step.
+DEFAULT_STEP = 0.0
+
+def step_for(fwhm, step=0.0):
+    # type: (float, float) -> float
+    """The sampling step of the stored profile, in the units of the axis.
+
+    An explicit `step` wins; 0 derives one from the peak width, which is the
+    quantity that decides whether a curve looks like a curve.
+    """
+    if step:
+        return abs(float(step))
+    fwhm = abs(float(fwhm))
+    if fwhm <= 0.0:
+        return 0.01
+    return fwhm / STORED_PER_FWHM
+
 
 SHAPE_GAUSSIAN = "gaussian"
 SHAPE_LORENTZIAN = "lorentzian"
@@ -784,7 +816,7 @@ def profile(pattern, axis=AXIS_TWO_THETA, fwhm=DEFAULT_FWHM,
             lo, hi = pattern.two_theta_range
     else:
         lo, hi = (float(x_range[0]), float(x_range[1]))
-    step = abs(float(step)) or DEFAULT_STEP
+    step = step_for(fwhm, step)
     n = max(2, int(round((hi - lo) / step)) + 1)
     x = np.linspace(lo, hi, n)
     y = profile_at(pattern, x, axis=axis, fwhm=fwhm, shape=shape, eta=eta)

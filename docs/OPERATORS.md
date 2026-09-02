@@ -613,11 +613,46 @@ for key, so the two programs navigate a spectrum the same way:
 | `F` / `Home` | two-stage reset: x, then y, then the intensity scale |
 | `M` | jump to the numeric limit boxes |
 | `R` / `F5` | recompute and redraw |
-| `Ctrl+S` | save the plot as an image |
+| `Ctrl+S` | save the plot - **SVG** (vector, for a paper) or PNG/JPG |
 | `Ctrl+W` | close the window |
 | wheel | scale intensity about each trace's own baseline (Mestrenova's rule) |
 | `Ctrl`+wheel | zoom x about the cursor |
 | right-click | that crystal's own colour, radiation, range and width; also the axis limits |
+
+**`Ctrl+S` writes an SVG**, which is what a figure wants - a diffractogram
+is a polyline against an axis, so a raster grab is a picture nobody can
+rescale or restyle. It is painted through the same code as the screen, so it
+cannot disagree with the window, but two things are deliberately different:
+the curve is sampled at **32 columns per peak FWHM** rather than at the
+window's own resolution (the on-screen envelope is a per-pixel reduction and
+an SVG has no pixels - at screen resolution a peak is about two columns wide
+and comes out polygonal when the figure is enlarged), and it is written in a
+**light palette**, every trace darkened to a 2.23:1 contrast against white,
+which is the mean of matplotlib's `tab10`. The plot's dark theme is a screen
+choice and does not survive a page.
+
+**A MEASURED pattern can be laid over the simulations** (round 100): *Load
+measured...* on the Advanced tab, or the plot's right-click menu. Text
+formats (`.xy`, `.xye`, `.xys`, `.csv`, `.txt`, `.asc`, plain `.dat`) are
+read against the only thing every vendor agrees on - two or three columns of
+numbers under a header - and the vendor formats go through **vendored**
+readers from `ACH-Diffraction-Analysis-Suite`: Bruker `.raw` (RAW1.01/1.02)
+and `.brml`, and Riet7 `.dat`. Right-click the curve or its tick box for its
+**colour, height and 2 theta shift**, to **reload it from disk** (keeping all
+three - a scan gets re-integrated, and losing the alignment you just set is
+the reason not to re-open it), or to remove it.
+
+The measurement is drawn at the **top of the stack**, in a paler palette, in
+italics in the tick row - which curve is data and which is a calculation is
+the one distinction here that is not a matter of taste. Two honest refusals:
+a file is in 2 theta and carries no wavelength, so it cannot go on the **Q
+axis** without one being invented; and if it runs past where the simulation
+stops the window **says so**, because the curve simply going flat reads as
+the phase having no reflections up there. The heights are a **knob**, not a
+correction - preferred orientation, absorption and the displacement
+parameters no CIF here carries all mean the two disagree about intensity -
+while the 2 theta shift is real physics, a flat sample off the focusing
+circle moving the whole pattern by a constant.
 
 The **Pattern** tab carries only what is touched constantly - radiation, the
 2-theta range, the peak width, and a vertical offset slider beside the plot.

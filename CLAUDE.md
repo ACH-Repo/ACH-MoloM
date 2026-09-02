@@ -198,6 +198,187 @@ other side, and the two export fixes are verified in `tools/smoke_gui.py`
 instead, which now measures the crop and counts ink with and without the cell
 box. 1310 tests.
 
+Round 101 (2026-09-02, a refusal nobody can see - and the plot becomes a
+figure):
+Christian, testing round 100: "I have also loaded in multiple files and the
+checkboxes for them show up, but none are actually displayed." Plus a
+question: "is it by design that there is no svg export for the plots?"
+**(1) THE REFUSAL WAS CORRECT AND EFFECTIVELY SILENT, WHICH IS THE SAME AS A
+BUG.** Reproduced on the Q axis, where dropping a measured trace is right - a
+measurement is in 2 theta and carries no wavelength, so converting it would
+mean inventing one (round 100's own rule). What was wrong is that the
+explanation was `notes.append`ed LAST, and the note line shows `notes[:2]` -
+so with one crystal open its standing "no displacement parameters, B = 0"
+caveat took a slot and the one sentence saying where two files had gone was
+truncated away. Measured: the note read "cod_1547149...: B = 0..." and
+mentioned the measurement nowhere at all.
+**Two fixes, and the second is the one that matters.** `alerts` are now a
+separate list from `notes` and are shown FIRST - an explanation for something
+the user just asked for and cannot see must outrank a caveat that is true of
+every pattern in the window. And the TICK BOX says it itself: a suppressed
+measurement greys to #7a7a7a and its tooltip says why, because the note line
+is four seconds of attention and the box is what somebody is looking at when
+they wonder where their file went. The tooltip keeps everything, which is
+what caught a bug I introduced doing this - `load_measured` was overwriting
+the tooltip with its own summary, so the caveats stopped being said anywhere.
+**(2) SVG WAS NOT BY DESIGN, JUST NOT BUILT** - `save_image` was
+`plot.grab().save(path)`, and a QPixmap has no vector format. A
+diffractogram is a polyline against an axis, i.e. vector content all the way
+down, so a raster figure is one nobody can rescale or restyle.
+**THE OBSTACLE IS THE BLITTING CACHE** (round 96): rendering the widget into
+a `QSvgGenerator` would embed that QPixmap and produce an SVG with a bitmap
+in it, which is worthless and looks fine until somebody zooms. So `_render`
+was split - `PxrdPlot.paint_into(painter, columns=)` does the drawing and
+`_render` only allocates the pixmap - and the export paints through the same
+method the screen does, which is round 37's rule (an export that quietly
+disagrees with the screen is worse than none). Verified by reading the file:
+0 `<image>` elements, 0 base64, 24 paths, 8317 vertices, 135 kB.
+**TWO THINGS ARE DELIBERATELY NOT THE SCREEN'S.** The curve is sampled at
+`SVG_SCALE` (4x) as many columns, because the min/max envelope is a per-PIXEL
+reduction and an SVG has no pixels - at screen resolution it reads as
+polygonal the moment the figure is enlarged. And the PALETTE is the light
+one, because the plot's is a dark-theme palette and does not survive a page.
+**THE MEASUREMENT CHANGED THAT RULE.** The first cut darkened only colours
+above a luminance threshold, on the assumption that the chosen blues and
+oranges print fine and only the near-white measured palette does not. They
+do not: the trace palette runs **0.567 to 0.796** and the measured palette
+**0.776 to 0.910**, so the two OVERLAP and no threshold separates them - and
+every screen colour has a contrast ratio between **1.24:1 and 1.70:1**
+against white, where WCAG asks 3:1 for line art. So every trace is scaled
+down to `PAPER_LUMA` (0.30, i.e. exactly 3:1), by one factor across all three
+channels, which preserves the HUE - the thing that says which trace is which.
+A colour already dark enough is left exactly alone, which is what protects
+one somebody picked by hand. The swap is a context manager over the module
+globals restoring in a `finally`, since those colours are read by name in a
+dozen places and threading a palette through each would be a far larger
+change than the behaviour asked for.
+**AND `.dat` FROM HIS OWN MACHINE CONFIRMED ROUND 100'S GUARD.** His
+`CN-64-Cl-0.05-dry.dat` is a real Riet7 file - header, then bare intensities
+- and reads as 2251 points from 5 to 50 deg through the vendored reader.
+**(3) "THE EXPORT IS BLOCKY WHEN ZOOMED OUT", AND THE CEILING WAS NEVER THE
+STORED GRID.** He asked whether doubling the point density on the peaks would
+cost performance, and whether it could be doubled again for an export. The
+answer to the first is NO, measured; and the second turned out to be the
+whole of the bug.
+**The stored step now follows the PEAK** (`pxrd.step_for`,
+`STORED_PER_FWHM = 20`). A fixed 0.01 deg is 10 points across a 0.1 deg peak
+and 2 across a 0.02 deg one, so it is simultaneously too coarse for a sharp
+pattern and wasteful for a broad one; points per FWHM is the invariant that
+means something. `DEFAULT_STEP = 0` means "derive it", and an explicit step
+in a savefile still wins.
+**IT IS FREE BECAUSE THE ENVELOPE BOUNDS WHAT IS STROKED** (round 96): the
+min/max reduction emits about one point per column whatever is stored, so
+quadrupling the stored density moves the DRAWN point count from 9508 to
+9624 - 1.2% - and the whole cost is building the profile, 6.2 -> 9.1 ms for
+eight patterns. **The wall clock could not have shown this**: the same
+configuration measured 42, 70 and 62 ms on three interleaved runs, so the
+timing on this machine drifts by 50% and the drawn-point count is the
+instrument that settles it. Round 89's rule again - measure the quantity,
+not the picture.
+**AND THE EXPORT'S RESOLUTION COMES FROM THE PEAK TOO** (`export_columns`,
+`SVG_PER_FWHM = 32`). This is what "blocky" was: the widget's own width is
+the wrong ruler for a vector file, and a 939 px plot over 45 degrees gives
+**2.1 columns across a 0.1 degree peak - 8.3 even at the 4x scale**, so the
+peak is an octagon the moment the figure is enlarged. The count is now taken
+from the narrowest trace's FWHM, with the width-based figure as a FLOOR and
+a hard cap so a very sharp peak over a very wide range cannot ask for a
+ten-megabyte file. Measured: 8.3 -> 32.0 columns per FWHM, 101 -> 265 kB,
+37 -> 59 ms to write, and the ledge on the peak flank is gone.
+**(4) AND THE COLOURS WERE TOO DARK - he was right.** `PAPER_LUMA` was 0.30,
+i.e. exactly the WCAG 3:1 for non-text contrast, and WCAG is the wrong anchor
+for a plot line. Measured against the palettes people actually publish with:
+matplotlib `tab10` runs **1.69-3.01 (mean 2.23)**, ColorBrewer Set1 2.22,
+Okabe-Ito 1.90 - so 3:1 was darker than nearly every member of all three.
+0.42 is 2.23:1, `tab10`'s own mean.
+**And the curve is stroked 30% thinner** on his call - `CURVE_WIDTH`, 1.4 ->
+0.98, shared by the screen and the export because they share `paint_into`.
+20 tests. 2083 tests.
+
+Round 100 (2026-09-02, a measured pattern at last - and Christian answered the
+hardest part of it himself):
+"Could you add the loading in of another pattern for comparison now?" - which
+is the whole point of simulating one, and the window could not read a file at
+all. Then, mid-round: **"should there not be plenty of pxrd data file readers
+available in the diffract suite project?"** There are, and taking them is the
+right call rather than a shortcut.
+**THE TEXT FORMATS HAVE NO STANDARD AND THE BINARY ONES CANNOT BE GUESSED.**
+That split is the whole design. `core/pxrdfile.py` reads the text half against
+the only thing every vendor agrees on - two or three columns of numbers under
+some header lines - so it is written to that shape rather than to any one
+instrument, and a third column is the ESD rather than a second pattern.
+`core/bruker.py` is VENDORED from `ACH-Diffraction-Analysis-Suite` (MIT, his),
+kept diffable the way `io.py` is with OWB's `coords.py`, because the `.raw`
+layout was reverse-engineered there against a PowDLL export and is not
+something to re-derive from memory.
+**AND TAKING ONLY HALF OF THEM WAS ITSELF A BUG.** The first cut vendored the
+Bruker readers and left Riet7 `.dat` behind - which is a header line plus a
+block of BARE INTENSITIES with no x column, so the generic two-column reader
+paired them off against one another and produced 276 points running to 1290
+degrees, drawn without an error anywhere. Two fixes, and the general one
+matters far more than the format: `read_riet7` is vendored too, AND
+`pxrdfile.MAX_TWO_THETA` refuses any first column leaving 0-180 deg. That is
+geometry rather than a plausibility check - backscattering is 180 and there
+is nothing past it - so it catches every format whose numbers are not an
+(x, y) table, including the ones nobody has met yet. `.dat` is tried as Riet7
+first and falls back to the text path, because half a dozen programs write an
+ordinary table into the same extension.
+**AND THE VENDORED READER CARRIES A TRAP WORTH THE WHOLE EXERCISE.** A RAW
+range header holds the start angle TWICE - theta at offset 8 and 2-theta at
+offset 16 - and reading the wrong one gives a pattern at HALF the angles,
+which looks like a perfectly ordinary pattern of a different compound. Nothing
+about the numbers says which was read. `.brml` has the same trap one column
+along (`<Datum>` is `time, 1, 2theta, theta, intensity`). It was a comment in
+the vendored source and is now `_RH_THETA`, a named constant a test pins
+against `_RH_START_2THETA - 8`, because the next person to touch the offsets
+should fail at the line rather than at a plausible picture.
+**A MEASUREMENT IS NOT A CRYSTAL, so it lives on the WINDOW.** Everything else
+this window draws hangs off a `Structure` (round 94's rule: per-structure
+settings live on the structure, so deleting a crystal takes its trace with
+it). A measurement belongs to no crystal - it is somebody's file - so
+`MeasuredTrace` is session state on `PxrdWindow`, remembering the path it came
+from so it can be RE-READ. Reload keeps the colour, scale and shift, because a
+scan gets re-integrated and background-subtracted and repeated, and the
+alternative is losing the alignment you just spent ten minutes on.
+**THE TWO NUMBERS ARE KNOBS AND ARE LABELLED AS SUCH.** A measurement and a
+simulation agree on where the peaks ARE and not on how tall they are -
+preferred orientation, absorption, the displacement parameters no CIF here
+carries (round 94) - so the height is a multiplier the eye sets and calling it
+a correction would be a lie. The 2-theta shift is the one that IS physics: a
+flat sample displaced from the focusing circle moves the whole pattern, and to
+first order the shift is a constant.
+**IT SITS AT THE TOP OF THE STACK**, which is where the data belongs in every
+comparison figure - the measurement, and the candidate phases under it.
+**THREE PLACES ASSUME A TRACE HAS REFLECTIONS** and a measurement has none:
+the tick marks, the hover readout and the hkl export all walk
+`trace.pattern.reflections`. `pattern=None` is the honest representation and
+the three guards are the cost of it; inventing a reflection list would have
+been worse in every direction.
+**AND TWO REFUSALS RATHER THAN A WRONG PICTURE.** A file is in 2 theta and
+carries no wavelength, so it cannot be put on a Q axis without inventing one -
+Q is what makes two simulations at different wavelengths comparable (round
+94), and that argument does not reach a measurement whose source is unknown.
+And a measurement running past where the simulation stops is a silently
+TRUNCATED comparison: the curve simply goes flat, which reads as the phase
+having no reflections up there rather than as nothing having been calculated.
+Both are stated in the note line, and the truncation one is recomputed every
+time so raising the range clears it by itself. **The load summary no longer
+overwrites it** - the first cut set the note after `recompute`, so the one
+message that was about a problem lost to "2751 points, 5.000 - 60.000 deg".
+Found by a test.
+**`build_measured_menu` is split from showing it**, like the other two menus:
+`QMenu.exec` spins a modal event loop and a test that calls it never returns
+(round 96, and it would have hung the suite again).
+**VERIFIED AGAINST THE SUITE IT CAME FROM, on his own files.** All three
+shapes - the zipped XML `.brml`, the header-driven Riet7 `.dat` and a plain
+`.xy` - come back **bit-identical** to `achdiff.tools.quickplot`'s own
+readers: same point count, same first and last angle, same first intensity,
+same sum to 1e-12. That is the point of vendoring rather than re-deriving,
+and it is pinned by a test that skips where the sibling repo is not checked
+out (round 92's arrangement with OWB). All **13** pattern files across his
+four PXRD repos read, none refused, and three of them were then stacked over
+a simulation in a real window and looked at.
+32 tests. 2070 tests.
+
 Round 99 (2026-09-01, A3 closed - a boundary copy is the same atom, and now
 it moves like one):
 The oldest standing item on the docket, flagged in round 50 and warned about
@@ -5204,7 +5385,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 2038 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 2083 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -5219,6 +5400,15 @@ Avogadro's tweaks (H 240 not 255, C 50% grey, F shifted blue). See
 THIRD_PARTY_NOTICES.md. NOTE: OWB's `transform.py` carries Cordero-2008
 covalent radii — slightly different values; MoloM deliberately uses Avogadro's
 Pyykkö set so bond perception matches Avogadro exactly.
+
+`molom/core/bruker.py` is **VENDORED** from Christian's own
+`ACH-Diffraction-Analysis-Suite` (`src/achdiff/core/bruker.py` and the
+readers in `tools/quickplot.py`), MIT, Copyright 2026 Christian Nelle, AG
+Henke, TU Dortmund - checked out beside MoloM on both machines. Keep it
+DIFFABLE the way `io.py` is with OWB's `coords.py`: the `.raw` byte layout
+was reverse-engineered there against a PowDLL export, so a fix on either side
+belongs on both. Not taken (yet): `read_pdf_xml`, the ICDD card reader - see
+`docs/OPEN_ITEMS.md` Q11.
 
 Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
 - **Bond perception** (`core/bonding.py`) = `Molecule::perceiveBondsSimple`:
@@ -5470,6 +5660,20 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   lets the plot sample at its own pixel columns at every zoom level;
   `profile` is the regular grid an EXPORT wants and is now a thin wrapper
   over it.
+- `core/pxrdfile.py` — a MEASURED powder pattern read off disk. The text
+  formats have no standard at all beyond "two or three columns of numbers
+  under some header lines", so it is written to that rather than to any one
+  vendor; the third column is the ESD and is not a second pattern. Decides
+  comma-as-decimal PER FILE (a file is written by one machine in one locale),
+  turns a descending scan the right way round, and REFUSES anything under
+  `MIN_POINTS` - a reader that finds something in a prose report is the
+  dangerous kind. `read` dispatches on the extension so the binary formats
+  never reach the text path.
+- `core/bruker.py` — VENDORED from Christian's `ACH-Diffraction-Analysis-Suite`
+  (MIT), keep diffable the way `io.py` is with OWB's `coords.py`. `.raw`
+  (RAW1.01/1.02) and `.brml`. Read `_RH_THETA`'s comment before touching the
+  offsets: the header holds theta and 2-theta eight bytes apart and the wrong
+  one gives a pattern at half the angles, which looks entirely plausible.
 - `core/molsearch.py` — finding a MOLECULE by name, as a LIST (Ctrl+Shift+N).
   The counterpart to `core/resolve.py`, not a replacement: that one cascades
   to ONE structure and still does. Read the module docstring before touching
@@ -5575,6 +5779,51 @@ independent cross-check inside a single fixture.
   vector then spin so the backbone points outward.
 
 ## Hard-won gotchas (don't re-learn these)
+- **THE WIDGET'S WIDTH IS THE WRONG RULER FOR A VECTOR EXPORT** (round 101).
+  A min/max envelope reduces to one point per COLUMN, so the peak detail an
+  SVG carries is set by the column count and not by how finely the profile
+  was computed - a 939 px plot over 45 degrees is 2.1 columns across a
+  0.1 degree peak, and the peak is an octagon as soon as the figure is
+  enlarged. Take the count from the FWHM (`export_columns`), keep the
+  width-based figure as a floor, and cap it.
+- **STORED POINT DENSITY IS NEARLY FREE, AND THE WALL CLOCK CANNOT SHOW IT**
+  (round 101). Quadrupling the profile's resolution moves the DRAWN point
+  count by 1.2% because the envelope bounds it, but timing the repaint gave
+  42, 70 and 62 ms for the SAME configuration on interleaved runs. When a
+  benchmark disagrees with itself, find the deterministic quantity - here the
+  drawn point count - rather than averaging more noise.
+- **A BLITTED PIXMAP CACHE MAKES `render()` PRODUCE A RASTER SVG** (round
+  101). Anything that paints through a QPixmap cache and is then rendered
+  into a `QSvgGenerator` embeds that pixmap as an `<image>`, so the file is
+  an SVG with a bitmap in it - which looks perfect until somebody enlarges
+  it. Split the painting from the device (`paint_into(painter)`) and let both
+  the screen and the export call it, so they cannot disagree. And remember
+  the min/max envelope is a per-PIXEL reduction: a vector device has no
+  pixels, so it needs its own column count or the curve is polygonal.
+- **A SCREEN PALETTE IS NOT A PAGE PALETTE, and the two overlap** (round
+  101). MoloM's trace colours run 0.567-0.796 relative luminance and the
+  measured ones 0.776-0.910, so no threshold tells "a colour somebody chose"
+  from "near-white" - and ALL of them sit between 1.24:1 and 1.70:1 against
+  white, where line art wants 3:1. The rule that works is a CEILING on
+  luminance for every trace (`PAPER_LUMA`), applied by scaling all three
+  channels together so the hue survives.
+- **A GENERIC TWO-COLUMN READER WILL READ ALMOST ANYTHING, AND THAT IS THE
+  BUG** (round 100). A Riet7 `.dat` is a header line plus a block of BARE
+  intensities with no x column, so pairing the numbers off gives 276 points
+  running to 1290 degrees - a pattern of nothing, drawn without an error.
+  The guard that catches the whole class is exact physics rather than a
+  plausibility heuristic: a scattering angle lies between 0 and 180 degrees
+  (`pxrdfile.MAX_TWO_THETA`), so a first column outside that is not an angle
+  and the columns are not what they were taken for. Any format whose numbers
+  are not an (x, y) table - a matrix, a log, a header-driven block - fails
+  this way, so add the format-specific reader AND keep the guard.
+- **THE BRUKER RANGE HEADER CARRIES THETA AND 2-THETA EIGHT BYTES APART**
+  (round 100, `core/bruker.py`). Reading the wrong one gives a pattern at
+  HALF the angles, which looks like a perfectly ordinary pattern of a
+  different compound - nothing about the numbers says which was read. Same
+  trap in `.brml`, one `<Datum>` column along. `_RH_THETA` is a named
+  constant precisely so the next person to touch the offsets fails at the
+  line rather than at a plausible picture.
 - **A DISPLAY value and a STORED value are two different coordinates**
   (round 57). `MolObject.display_coords()` interpolates between frames while
   `structure.coords` is the nearest stored one, so anything that draws or
@@ -7011,7 +7260,7 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 2038 offline tests, 4 skipped, ~100 s.
+1. `python -m pytest tests/ -q` — 2083 offline tests, 4 skipped, ~180 s.
    `tests/conftest.py` sandboxes QSettings, so a GUI test can drive a real
    control without writing into your own MoloM configuration; it also
    **destroys the windows a test created** (round 86), without which the suite

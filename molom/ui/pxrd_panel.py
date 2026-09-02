@@ -30,7 +30,9 @@ deleting a crystal takes its trace with it because the trace was never the
 window's.
 """
 
+import contextlib
 import math
+import os
 
 from PySide6.QtCore import QLocale, QPoint, QPointF, QRect, Qt, Signal
 from PySide6.QtGui import (QColor, QFont, QPainter, QPen, QPixmap, QPolygonF)
@@ -44,7 +46,9 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QColorDialog,
 
 import numpy as np
 
+from ..core import input_map
 from ..core import pxrd
+from ..core import pxrdfile
 from .widgets import FlowLayout
 
 _BG = QColor(38, 38, 38)
@@ -59,6 +63,67 @@ _BAND_EDGE = QColor(240, 200, 90)
 #: Chosen to stay apart on a dark background and when printed grey.
 PALETTE = ("#6ea8ff", "#ffb04e", "#7fd08a", "#e07b7b", "#c79bef",
            "#4fd0c8", "#d8d16a", "#f08ac0")
+
+#: MEASURED patterns get their own, paler range: which curve is data and
+#: which is a calculation has to be readable at a glance, and it is the one
+#: distinction in this window that is not a matter of taste.
+MEASURED_PALETTE = ("#e8e8e8", "#b8c8d8", "#d8c8b8", "#c8d8c0", "#d8c0d0")
+
+#: How much finer than the window an SVG samples the curve, as a FLOOR. An
+#: SVG has no pixels, so the per-column envelope has to be built against
+#: something else.
+SVG_SCALE = 4.0
+
+#: ...and the number that actually decides whether a peak looks like a peak:
+#: how many drawn columns span one FWHM in a vector export. A window is about
+#: 8 at a 45 degree view, which is why an enlarged figure came out blocky -
+#: the ceiling was never the stored grid, it was the per-column reduction.
+#: The cost is bounded because a diffractogram is mostly baseline and the
+#: envelope emits ONE point for a flat column.
+SVG_PER_FWHM = 32.0
+
+#: A hard ceiling on export columns, so that a very sharp peak over a very
+#: wide range cannot ask for a ten-megabyte figure.
+SVG_MAX_COLUMNS = 60000
+
+#: The pen the curve is stroked with. Screen and export share it, because
+#: they share `paint_into` - a figure whose lines are a different weight from
+#: the window is one you cannot judge on screen.
+CURVE_WIDTH = 0.98
+
+#: The plot's palette for a WHITE PAGE. The screen's is a dark-theme choice -
+#: pale ink on a dark ground - and it does not survive being dropped into a
+#: document: the measured traces are nearly invisible on white and the grid,
+#: which is a whisper on black, reads as heavy black rulings. So an SVG is
+#: written in these instead, and `MAX_INK_LUMA` darkens any trace colour that
+#: is too light to read on paper.
+LIGHT_THEME = {
+    "_BG": QColor(255, 255, 255),
+    "_AXIS": QColor(40, 40, 40),
+    "_GRID": QColor(224, 224, 224),
+    "_TEXT_DIM": QColor(60, 60, 60),
+}
+
+#: The relative luminance a trace is darkened TO for the light theme.
+#:
+#: Measured rather than guessed, and the measurement changed the rule: the
+#: trace palette runs 0.567 to 0.796 and the measured palette 0.776 to 0.910,
+#: so the two OVERLAP and no threshold separates "chosen colour" from
+#: "near-white". They are all dark-theme colours - every one of them has a
+#: contrast ratio between 1.24 and 1.70 against white, where WCAG asks 3:1
+#: for line art - so the honest rule is not to catch outliers but to darken
+#: every trace to something that prints. Scaling all three channels by one
+#: factor keeps the HUE, which is the thing that tells two traces apart.
+#:
+#: 0.42 is a contrast of 2.23:1, which is the MEAN of matplotlib's `tab10` -
+#: the most widely used palette in scientific figures - with ColorBrewer
+#: Set1 at 2.22 and Okabe-Ito at 1.90. The first cut used 0.30 (exactly the
+#: WCAG 3:1 for non-text contrast) and Christian was right that everything
+#: came out dark: 3:1 is darker than every member of all three of those
+#: palettes. WCAG is the wrong anchor here - it is about UI elements, and a
+#: plot line in a paper is conventionally lighter - so the empirical
+#: convention wins over the accessibility floor.
+PAPER_LUMA = 0.42
 
 _LEFT = 10          # no intensity numbers to leave room for
 _RIGHT = 12
@@ -87,12 +152,25 @@ MAX_SUBSAMPLES = 16
 
 
 class NumberBox(QDoubleSpinBox):
-    """A spin box that reads "1.5" and "1,5" alike.
+    """A spin box that reads "1.5" and "1,5" alike, and commits on ENTER.
 
     Christian is on a German locale, where Qt's own decimal separator is a
     comma - so a typed "0.15" is not a number and the box quietly keeps its
     old value. A plot is exactly the place where somebody pastes a number
     from a paper, so the box has to take whichever one they have.
+
+    **The typed text is left alone.** The first cut normalised inside
+    `validate`, and Qt writes `validate`'s output back into the box - so a
+    comma turned into a point under the cursor as it was typed. `validate`
+    now only JUDGES the comma form and reports on the text unchanged;
+    `valueFromText` does the conversion, where nobody can see it.
+
+    **And keyboard tracking is off**, which is the other half of the same
+    report: with it on, every keystroke emits `valueChanged`, so typing "15"
+    into a range box goes through "1" first - a value that is below the other
+    end of the range and cannot be drawn. Now the value is committed when
+    Enter is pressed or the box loses focus, which is when the number is
+    finished.
     """
 
     def __init__(self, parent=None):
@@ -100,13 +178,16 @@ class NumberBox(QDoubleSpinBox):
         locale = QLocale(QLocale.C)
         locale.setNumberOptions(QLocale.OmitGroupSeparator)
         self.setLocale(locale)
+        self.setKeyboardTracking(False)
 
     @staticmethod
     def _normalise(text):
         return str(text).strip().replace(",", ".")
 
     def validate(self, text, pos):
-        return super().validate(self._normalise(text), pos)
+        state, _fixed, position = super().validate(self._normalise(text), pos)
+        # The ORIGINAL text back, so what was typed stays on screen.
+        return state, text, position
 
     def valueFromText(self, text):
         return super().valueFromText(self._normalise(text))
@@ -136,6 +217,62 @@ class Trace(object):
         #: The peak width in the units of the axis, which is what says how
         #: finely a pixel column has to be sampled.
         self.fwhm = float(fwhm)
+
+
+@contextlib.contextmanager
+def paper_palette(plot, light=True):
+    """Swap the module's colours - and the traces' - for the duration.
+
+    A context manager over MODULE globals rather than a parameter threaded
+    through fifteen paint calls: the colours are read by name in a dozen
+    places, and passing a palette down to each would be a much larger change
+    than the one behaviour being asked for. It restores in a `finally`, so an
+    exception mid-paint cannot leave the window drawn in the paper palette.
+    """
+    if not light:
+        yield
+        return
+    saved = {name: globals()[name] for name in LIGHT_THEME}
+    original = [t.colour for t in plot.traces]
+    globals().update(LIGHT_THEME)
+    try:
+        for trace, colour in zip(plot.traces, plot.darken_for_paper()):
+            trace.colour = colour
+        yield
+    finally:
+        globals().update(saved)
+        for trace, colour in zip(plot.traces, original):
+            trace.colour = colour
+
+
+class MeasuredTrace(object):
+    """A measured pattern the user opened, plus how it is being shown.
+
+    NOT stored on a structure, unlike everything else this window draws: a
+    measurement is somebody's file and belongs to no crystal, so it lives on
+    the window for the session and remembers where it came from.
+    """
+
+    __slots__ = ("data", "colour", "enabled", "scale", "shift")
+
+    def __init__(self, data, colour):
+        self.data = data
+        self.colour = str(colour)
+        self.enabled = True
+        #: A multiplier on the normalised curve. A measurement and a
+        #: simulation agree on where the peaks ARE and not on how tall they
+        #: are - preferred orientation, absorption, a displacement parameter
+        #: nobody knows - so matching the heights is a knob and not a
+        #: calculation, and calling it one would be a lie.
+        self.scale = 1.0
+        #: Degrees added to every x. A flat sample sits below the focusing
+        #: circle and the whole pattern moves; to first order the correction
+        #: is a constant, and every Rietveld program has this knob.
+        self.shift = 0.0
+
+    @property
+    def name(self):
+        return self.data.name
 
 
 class PxrdPlot(QWidget):
@@ -188,6 +325,10 @@ class PxrdPlot(QWidget):
         if not keep_view:
             self._view_x = self._view_y = None
         self.invalidate()
+
+    #: Set only while painting into an export device, where the sampling
+    #: resolution is a choice rather than the screen's.
+    _columns_override = None
 
     def invalidate(self):
         """Throw the blitted background away and repaint."""
@@ -318,9 +459,19 @@ class PxrdPlot(QWidget):
         ev.accept()
 
     def wheelEvent(self, ev):
-        step = ev.angleDelta().y() / 120.0
-        if not step:
-            step = ev.pixelDelta().y() / 60.0
+        # A trackpad reports PIXELS and a wheel reports 1/8 degrees, so the
+        # two have to be brought to the same unit before either is believed -
+        # `120` is one detent and `PANE_STEP_PIXELS` is the equivalent swipe.
+        # Dividing a trackpad's small deltas by 120 gives about 1% of a zoom
+        # per event, which is Christian's "doesn't immediately react". Round
+        # 16 met this in the viewport, round 79 in the timeline pane, and
+        # `core/input_map` has owned the decision since.
+        pixels = ev.pixelDelta()
+        angles = ev.angleDelta()
+        if pixels.y():
+            step = pixels.y() / float(input_map.PANE_STEP_PIXELS)
+        else:
+            step = angles.y() / float(input_map.PANE_WHEEL_UNITS)
         if not step:
             return
         factor = WHEEL_STEP ** step
@@ -458,6 +609,8 @@ class PxrdPlot(QWidget):
         unit = "2th" if self.axis == pxrd.AXIS_TWO_THETA else "Q"
         best, best_trace, best_gap = None, None, 1e30
         for trace in self.traces:
+            if trace.pattern is None:
+                continue                 # a measurement has nothing to index
             for r in trace.pattern.reflections:
                 value = (r.two_theta if self.axis == pxrd.AXIS_TWO_THETA
                          else r.q)
@@ -514,6 +667,33 @@ class PxrdPlot(QWidget):
         self._paint_cursor(painter)
         self._paint_band(painter)
 
+    @staticmethod
+    def _luma(colour):
+        return (0.2126 * colour.redF() + 0.7152 * colour.greenF()
+                + 0.0722 * colour.blueF())
+
+    def darken_for_paper(self):
+        """Trace colours that are legible on white, parallel to `self.traces`.
+
+        Every trace is brought DOWN to `PAPER_LUMA` - not just the pale ones
+        - because the whole palette is chosen for a dark ground and none of
+        it prints (see that constant). Scaling the three channels by one
+        factor preserves the hue, so the figure still says which trace is
+        which; a colour already dark enough is left exactly as it is, which
+        is what protects a colour the user picked by hand.
+        """
+        out = []
+        for trace in self.traces:
+            colour = QColor(trace.colour)
+            luma = self._luma(colour)
+            if luma > PAPER_LUMA:
+                factor = PAPER_LUMA / max(luma, 1e-6)
+                colour = QColor.fromRgbF(colour.redF() * factor,
+                                         colour.greenF() * factor,
+                                         colour.blueF() * factor)
+            out.append(colour)
+        return out
+
     def _render(self):
         """Everything that does not move with the cursor, into a pixmap.
 
@@ -534,14 +714,34 @@ class PxrdPlot(QWidget):
         pixmap.setDevicePixelRatio(ratio)
         pixmap.fill(_BG)
         p = QPainter(pixmap)
+        self.paint_into(p)
+        p.end()
+        return pixmap
+
+    def paint_into(self, p, columns=None):
+        """Draw the whole plot onto ANY painter.
+
+        Split out of `_render` so that a vector export and the screen go
+        through the same code and cannot drift apart - the rule this project
+        keeps reaching for (round 37: an export that quietly disagrees with
+        the screen is worse than no export). `columns` overrides the sampling
+        resolution, which is what lets an SVG carry a finer curve than the
+        window happens to be wide.
+        """
+        previous, self._columns_override = self._columns_override, columns
+        try:
+            self._paint_all(p)
+        finally:
+            self._columns_override = previous
+
+    def _paint_all(self, p):
         rect = self.plot_rect()
         if not self.traces:
             p.setPen(_TEXT_DIM)
             p.drawText(self.rect(), Qt.AlignCenter,
                        "Nothing to plot.\nOpen a .cif - a powder pattern "
                        "needs a unit cell.")
-            p.end()
-            return pixmap
+            return
         p.setRenderHint(QPainter.Antialiasing, True)
         self._paint_grid(p, rect)
         for trace in self.traces:
@@ -557,8 +757,6 @@ class PxrdPlot(QWidget):
                    Qt.AlignHCenter,
                    "2 theta / degrees" if self.axis == pxrd.AXIS_TWO_THETA
                    else "Q / inverse Angstrom")
-        p.end()
-        return pixmap
 
     @staticmethod
     def _nice_step(span, target=8):
@@ -604,9 +802,11 @@ class PxrdPlot(QWidget):
     def _paint_trace(self, p, rect, trace):
         lo, hi = self.view_x()
         poly = self._envelope(trace, rect, lo, hi)
-        p.setPen(QPen(trace.colour, 1.4))
+        p.setPen(QPen(trace.colour, CURVE_WIDTH))
         if poly is not None:
             p.drawPolyline(poly)
+        if trace.pattern is None:
+            return                       # a measurement has no reflections
         p.setPen(QPen(trace.colour, 1))
         base = (int(self.y_to_px(trace.offset, rect)) + 1 if trace.offset
                 else rect.bottom() - _TICKS_H)
@@ -628,6 +828,8 @@ class PxrdPlot(QWidget):
         Reduce at the resolution the screen actually has and the treads fall
         below one device pixel, where they belong.
         """
+        if self._columns_override:
+            return max(1, int(self._columns_override))
         return max(1, int(round(rect.width()
                                 * float(self.devicePixelRatioF() or 1.0))))
 
@@ -941,6 +1143,89 @@ def short_name(name, limit=LABEL_CHARS):
     return name if len(name) <= limit else name[:limit].rstrip() + "..."
 
 
+class MeasuredOptions(QDialog):
+    """One measured pattern's colour, height and 2 theta shift.
+
+    The two numbers are knobs and are labelled as such. A measurement and a
+    simulation agree on where the peaks ARE and not on how tall they are -
+    preferred orientation, absorption, an unknown displacement parameter -
+    so a height match is the eye's job; and a flat sample sits below the
+    focusing circle, which moves the whole pattern by an amount that is
+    constant to first order.
+    """
+
+    def __init__(self, parent, entry):
+        super().__init__(parent)
+        self.setWindowTitle("Measured pattern - {}".format(entry.name))
+        self.entry = entry
+        self._colour = QColor(entry.colour)
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+        lay.addLayout(form)
+
+        self.colour_btn = QPushButton()
+        self.colour_btn.setFixedHeight(22)
+        self._show_colour()
+        self.colour_btn.clicked.connect(lambda _c=False: self._pick_colour())
+        form.addRow("Colour", self.colour_btn)
+
+        self.scale = NumberBox()
+        self.scale.setRange(0.01, 100.0)
+        self.scale.setDecimals(3)
+        self.scale.setSingleStep(0.05)
+        self.scale.setValue(float(entry.scale))
+        self.scale.setToolTip(
+            "Multiplies the whole curve. Heights are not comparable between "
+            "a measurement and a simulation, so this is a knob rather than "
+            "a correction.")
+        form.addRow("Height", self.scale)
+
+        self.shift = NumberBox()
+        self.shift.setRange(-5.0, 5.0)
+        self.shift.setDecimals(3)
+        self.shift.setSingleStep(0.01)
+        self.shift.setValue(float(entry.shift))
+        self.shift.setToolTip(
+            "Degrees added to every point. A flat sample displaced from the "
+            "focusing circle moves the whole pattern, and to first order the "
+            "shift is a constant.")
+        form.addRow("2 theta shift", self.shift)
+
+        detail = QLabel("{}\n{} points, {:.3f} to {:.3f} deg, step "
+                        "{:.4g}{}".format(
+                            entry.data.path or "(no path)", len(entry.data),
+                            entry.data.two_theta_range[0],
+                            entry.data.two_theta_range[1], entry.data.step(),
+                            "\n" + entry.data.note if entry.data.note else ""))
+        detail.setStyleSheet("color: #9a9a9a;")
+        detail.setWordWrap(True)
+        detail.setMinimumWidth(1)
+        lay.addWidget(detail)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok
+                                   | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def _show_colour(self):
+        self.colour_btn.setStyleSheet(
+            "background: {}; border: 1px solid #666;".format(
+                self._colour.name()))
+        self.colour_btn.setText(self._colour.name())
+
+    def _pick_colour(self):
+        chosen = QColorDialog.getColor(self._colour, self, "Trace colour")
+        if chosen.isValid():
+            self._colour = chosen
+            self._show_colour()
+
+    def apply(self):
+        self.entry.colour = self._colour.name()
+        self.entry.scale = float(self.scale.value())
+        self.entry.shift = float(self.shift.value())
+
+
 SOURCE_HELP = (
     "A wavelength in Angstrom (1.5406), an ENERGY (17.5 keV, 8040 eV), a "
     "named line (Cu Ka1, Mo Ka2), or a doublet with its intensity ratio "
@@ -1168,6 +1453,13 @@ class PxrdWindow(QDialog):
                             | Qt.WindowMaximizeButtonHint
                             | Qt.WindowCloseButtonHint)
         self.rows = []              # [(obj, QCheckBox, colour)]
+        #: Measured patterns the user has opened. They belong to no crystal,
+        #: so unlike everything else here they live on the WINDOW - for the
+        #: session, remembering the path they came from.
+        self.measured = []          # [MeasuredTrace]
+        self._alerts = []           # why something asked for is not drawn
+        self._caveats = []          # standing facts (B = 0 and the like)
+        self._measured_boxes = []   # [(MeasuredTrace, QCheckBox)]
         self._loading = False
         #: Computed patterns, keyed on what they were computed FROM. A change
         #: to the peak width or the stacking must not re-run the structure
@@ -1369,6 +1661,7 @@ class PxrdWindow(QDialog):
         form.addRow("Axis", self.q_axis)
 
         self.margin = QSpinBox()
+        self.margin.setKeyboardTracking(False)
         self.margin.setRange(0, 40)
         self.margin.setValue(5)
         self.margin.setSuffix(" %")
@@ -1379,6 +1672,9 @@ class PxrdWindow(QDialog):
 
         row = FlowLayout(spacing=6)
         for label, slot, tip in (
+                ("Load measured...", lambda _c=False: self.load_measured(),
+                 "Open a measured pattern (.xy, .xye, .csv, Bruker .raw or "
+                 ".brml) and draw it with the simulations"),
                 ("Fit view", lambda _c=False: self._fit(),
                  "Frame everything again (F, or Home)"),
                 ("Axis limits...", lambda _c=False: self.edit_limits(),
@@ -1464,6 +1760,70 @@ class PxrdWindow(QDialog):
                         or {}).get("cell")]
         chosen = {int(i) for i in (selected or ())}
         chosen &= {o.id for o in crystals}
+        self._crystals = crystals
+        self._chosen = chosen
+        self._rebuild_ticks()
+        # DELIBERATELY not written back. A selection says which crystals this
+        # OPENING is about; it is not a decision about the crystals, and
+        # writing it would mean opening the window on one of five silently
+        # switched the other four off in the savefile. Ticking a box by hand
+        # does write, because that IS the decision.
+        self._load_settings()
+        self.recompute(keep_view=False)
+        self.plot.setFocus(Qt.OtherFocusReason)
+
+    def load_measured(self, path=None):
+        """Open a measured pattern and draw it with the simulations.
+
+        The whole point of simulating a pattern is to compare it with one
+        somebody took, and until now the window could not read one.
+        """
+        if path is None:
+            path, _f = QFileDialog.getOpenFileName(
+                self, "Open a measured powder pattern", "",
+                ";;".join(pxrdfile.NAME_FILTERS))
+        if not path:
+            return None
+        try:
+            data = pxrdfile.read(path)
+        except (OSError, pxrdfile.PatternFileError) as exc:
+            self.note.setText("Could not read {}: {}".format(
+                os.path.basename(path), exc))
+            return None
+        colour = MEASURED_PALETTE[len(self.measured) % len(MEASURED_PALETTE)]
+        self.measured.append(MeasuredTrace(data, colour))
+        bits = ["{}: {} points, {:.3f} - {:.3f} deg".format(
+            data.name, len(data), *data.two_theta_range)]
+        if data.note:
+            bits.append(data.note)
+        self._rebuild_ticks()
+        self.recompute(keep_view=False)
+        # `recompute` may have something to say about what was just opened -
+        # that it runs past where the simulation stops, that a Q axis cannot
+        # take it. An ALERT about what was just opened outranks the summary
+        # of it: "2751 points, 5.000 - 60.000 deg" is pleasant, and "your
+        # file is not being drawn" is the thing that needs saying.
+        bits = list(self._alerts) + bits
+        self.note.setText("  -  ".join(bits))
+        # The TOOLTIP keeps everything, including the standing caveats the
+        # line has no room for. Replacing it with the load summary alone is
+        # how "B = 0" quietly stopped being said anywhere at all.
+        self.note.setToolTip("\n".join(bits + list(self._caveats)))
+        return data
+
+    def remove_measured(self, entry):
+        if entry in self.measured:
+            self.measured.remove(entry)
+            self._rebuild_ticks()
+            self.recompute()
+
+    def _rebuild_ticks(self):
+        """The tick row: one box per crystal, then one per measured pattern.
+
+        Rebuilt wholesale rather than patched, because a measurement can be
+        opened or removed at any time and keeping a widget list in step with
+        two source lists by hand is how they drift apart.
+        """
         while self._which_lay.count():
             item = self._which_lay.takeAt(0)
             widget = item.widget()
@@ -1474,8 +1834,10 @@ class PxrdWindow(QDialog):
                 widget.setParent(None)
                 widget.deleteLater()
         self.rows = []
+        self._measured_boxes = []
         self._loading = True
-        for i, obj in enumerate(crystals):
+        chosen = getattr(self, "_chosen", set())
+        for i, obj in enumerate(getattr(self, "_crystals", ())):
             settings = pxrd.settings_of(obj.structure)
             colour = settings.get("colour") or PALETTE[i % len(PALETTE)]
             box = QCheckBox(short_name(obj.name))
@@ -1493,18 +1855,100 @@ class PxrdWindow(QDialog):
             box.toggled.connect(self._on_enabled)
             self._which_lay.addWidget(box)
             self.rows.append((obj, box, colour))
+        for entry in self.measured:
+            box = QCheckBox(short_name(entry.name))
+            box.setChecked(bool(entry.enabled))
+            box.setStyleSheet("QCheckBox { color: " + entry.colour
+                              + "; font-style: italic; }")
+            box.setToolTip(
+                "{}\nMEASURED - {} points, {:.2f} to {:.2f} deg\n{}\n\n"
+                "Right-click for its colour, scale and 2 theta shift".format(
+                    entry.data.path or entry.name, len(entry.data),
+                    entry.data.two_theta_range[0],
+                    entry.data.two_theta_range[1], entry.data.note))
+            box.setContextMenuPolicy(Qt.CustomContextMenu)
+            box.customContextMenuRequested.connect(
+                lambda pos, e=entry, b=box: self._measured_menu(e, b, pos))
+            box.toggled.connect(self._on_measured_toggled)
+            self._which_lay.addWidget(box)
+            self._measured_boxes.append((entry, box))
         self.hkl.which.clear()
         for obj, _box, _c in self.rows:
             self.hkl.which.addItem(obj.name, obj.id)
         self._loading = False
-        # DELIBERATELY not written back. A selection says which crystals this
-        # OPENING is about; it is not a decision about the crystals, and
-        # writing it would mean opening the window on one of five silently
-        # switched the other four off in the savefile. Ticking a box by hand
-        # does write, because that IS the decision.
-        self._load_settings()
-        self.recompute(keep_view=False)
-        self.plot.setFocus(Qt.OtherFocusReason)
+
+    def _mark_suppressed(self, suppressed):
+        """Grey the tick box of any measurement that is not being drawn.
+
+        The note line is four seconds of the user's attention and holds two
+        sentences; the tick box is the thing they are looking at when they
+        wonder where their file went. A box that is ticked next to an empty
+        plot has to say so itself.
+        """
+        ids = {id(e) for e in suppressed}
+        for entry, box in self._measured_boxes:
+            off = id(entry) in ids
+            colour = "#7a7a7a" if off else entry.colour
+            box.setStyleSheet("QCheckBox { color: " + colour
+                              + "; font-style: italic; }")
+            tip = box.toolTip().split("\n\nNOT DRAWN")[0]
+            if off:
+                tip += ("\n\nNOT DRAWN: a measurement is in 2 theta and "
+                        "carries no wavelength, so it cannot be shown on a "
+                        "Q axis.")
+            box.setToolTip(tip)
+
+    def _on_measured_toggled(self, _on=False):
+        if self._loading:
+            return
+        for entry, box in self._measured_boxes:
+            entry.enabled = bool(box.isChecked())
+        self.recompute()
+
+    def build_measured_menu(self, entry):
+        """Built apart from being SHOWN, like the other two menus: `exec`
+        spins a modal event loop, so a test that calls it never returns."""
+        menu = QMenu(self)
+        act = menu.addAction("Settings for {}...".format(entry.name))
+        act.triggered.connect(lambda _c=False: self.edit_measured(entry))
+        reload_ = menu.addAction("Reload from disk")
+        reload_.setEnabled(bool(entry.data.path))
+        reload_.triggered.connect(lambda _c=False: self.reload_measured(entry))
+        menu.addSeparator()
+        remove = menu.addAction("Remove {}".format(entry.name))
+        remove.triggered.connect(lambda _c=False: self.remove_measured(entry))
+        return menu
+
+    def reload_measured(self, entry):
+        """Read the file again, keeping the colour, scale and shift.
+
+        A measurement is somebody else's file and it CHANGES - a scan is
+        re-integrated, a background is subtracted, the run is repeated - and
+        the alternative is removing the trace and losing the alignment you
+        spent the last ten minutes on.
+        """
+        if not entry.data.path:
+            return
+        try:
+            entry.data = pxrdfile.read(entry.data.path)
+        except (OSError, pxrdfile.PatternFileError) as exc:
+            self.note.setText("Could not re-read {}: {}".format(
+                os.path.basename(entry.data.path), exc))
+            return
+        self._rebuild_ticks()
+        self.recompute()
+        self.note.setText("Re-read {}: {} points".format(
+            entry.name, len(entry.data)))
+
+    def _measured_menu(self, entry, box, pos):
+        self.build_measured_menu(entry).exec(box.mapToGlobal(pos))
+
+    def edit_measured(self, entry):
+        dlg = MeasuredOptions(self, entry)
+        if dlg.exec():
+            dlg.apply()
+            self._rebuild_ticks()
+            self.recompute()
 
     def _subject(self):
         """The crystal whose stored settings the shared controls show: the
@@ -1658,6 +2102,8 @@ class PxrdWindow(QDialog):
             if pattern.note:
                 notes.append("{}: {}".format(obj.name, pattern.note))
         axis = pxrd.common_axis([p.wavelength for _o, _c, p in patterns])
+        if not patterns and self.measured:
+            axis = pxrd.AXIS_TWO_THETA
         forced = axis == pxrd.AXIS_Q
         if forced:
             notes.insert(0, "Simulated at different wavelengths, so these are "
@@ -1670,19 +2116,65 @@ class PxrdWindow(QDialog):
         self._loading = False
         if self.q_axis.isChecked():
             axis = pxrd.AXIS_Q
+        # ALERTS explain why something the user asked for is not on screen.
+        # They are kept apart from `notes`, which are standing caveats (B = 0
+        # and the like), because the note line only has room for two and a
+        # caveat that is true of every pattern must never crowd out the one
+        # sentence saying where somebody's file went.
+        alerts = []
+        shown_measured = [e for e in self.measured if e.enabled]
+        suppressed = []
+        if shown_measured and axis == pxrd.AXIS_Q:
+            alerts.append(
+                "{} measured pattern(s) NOT DRAWN: a measurement is in "
+                "2 theta and carries no wavelength, so it cannot be put on a "
+                "Q axis - untick 'Q instead of 2 theta' to see it".format(
+                    len(shown_measured)))
+            suppressed = shown_measured
+            shown_measured = []
+        self._mark_suppressed(suppressed)
         gap = float(self.offset.value())
         traces = []
-        n = max(1, len(patterns))
-        for i, (obj, colour, pattern) in enumerate(patterns):
+        n = max(1, len(patterns) + len(shown_measured))
+        slot = n - 1
+        for entry in shown_measured:
+            # MEASURED FIRST, so it sits at the TOP of a stack. That is where
+            # a measurement belongs in every comparison figure: the data, and
+            # the candidate phases under it.
+            data = entry.data
+            traces.append(Trace(None, entry.name, entry.colour,
+                                data.x + entry.shift,
+                                data.normalised() * entry.scale, None,
+                                gap * slot))
+            slot -= 1
+        for obj, colour, pattern in patterns:
             settings = pxrd.settings_of(obj.structure)
             x, y, sampler, fwhm = self.profile_of(pattern, axis, settings)
             traces.append(Trace(obj, obj.name, colour, x, y, pattern,
-                                gap * (n - 1 - i), sampler=sampler,
-                                fwhm=fwhm))
+                                gap * slot, sampler=sampler, fwhm=fwhm))
+            slot -= 1
         self.plot.y_margin = self.margin.value() / 100.0
         self.plot.set_traces(traces, axis, keep_view=keep_view)
-        self.note.setText("  -  ".join(notes[:2]))
-        self.note.setToolTip("\n".join(notes))
+        # A measurement running past where the simulation stops is a silently
+        # TRUNCATED comparison - the curves simply go flat, which reads as the
+        # phase having no reflections up there rather than as nothing having
+        # been calculated. Recomputed every time, so raising the range clears
+        # it by itself.
+        if shown_measured and patterns:
+            sim_max = max(pxrd.settings_of(o.structure).get(
+                "two_theta_max", pxrd.DEFAULT_TWO_THETA[1])
+                for o, _c, _p in patterns)
+            data_max = max(e.data.two_theta_range[1] + e.shift
+                           for e in shown_measured)
+            if data_max > sim_max + 1.0 and axis == pxrd.AXIS_TWO_THETA:
+                alerts.append(
+                    "the measurement reaches {:.1f} deg and the simulation "
+                    "stops at {:.0f} - raise the 2 theta range to compare "
+                    "the rest".format(data_max, sim_max))
+        ordered = alerts + notes
+        self._alerts, self._caveats = list(alerts), list(notes)
+        self.note.setText("  -  ".join(ordered[:2]))
+        self.note.setToolTip("\n".join(ordered))
         self._show_view()
         self._sync_hkl()
 
@@ -1751,7 +2243,7 @@ class PxrdWindow(QDialog):
         is round 75's lesson about the worst shape a test problem can take.
         """
         menu = QMenu(self)
-        if trace is not None:
+        if trace is not None and trace.obj is not None:
             act = menu.addAction("Settings for {}...".format(trace.name))
             act.triggered.connect(
                 lambda _c=False, o=trace.obj: self.edit_trace(o))
@@ -1759,12 +2251,24 @@ class PxrdWindow(QDialog):
             hide.triggered.connect(
                 lambda _c=False, o=trace.obj: self._set_enabled(o, False))
             menu.addSeparator()
+        elif trace is not None:
+            entry = self._measured_for(trace)
+            if entry is not None:
+                act = menu.addAction("Settings for {}...".format(trace.name))
+                act.triggered.connect(
+                    lambda _c=False, e=entry: self.edit_measured(e))
+                gone = menu.addAction("Remove {}".format(trace.name))
+                gone.triggered.connect(
+                    lambda _c=False, e=entry: self.remove_measured(e))
+                menu.addSeparator()
         for obj, _box, _c in self.rows:
             act = menu.addAction("{}...".format(obj.name))
             act.triggered.connect(lambda _c=False, o=obj: self.edit_trace(o))
         if not self.rows:
             menu.addAction("No crystals").setEnabled(False)
         menu.addSeparator()
+        load = menu.addAction("Load a measured pattern...")
+        load.triggered.connect(lambda _c=False: self.load_measured())
         limits = menu.addAction("Axis limits...\tM")
         limits.triggered.connect(lambda _c=False: self.edit_limits())
         fit = menu.addAction("Fit view\tF")
@@ -1796,6 +2300,12 @@ class PxrdWindow(QDialog):
             self._recolour(obj)
             self._load_settings()
             self.recompute()
+
+    def _measured_for(self, trace):
+        for entry in self.measured:
+            if entry.name == trace.name:
+                return entry
+        return None
 
     def _colour_for(self, obj):
         for candidate, _box, colour in self.rows:
@@ -1852,21 +2362,93 @@ class PxrdWindow(QDialog):
         self.plot.view_changed.emit()
 
     def _fit(self):
+        """Everything home in ONE go - the BUTTON and the menu entry.
+
+        Deliberately not the same as the F key, which calls `reset_view`
+        once and is therefore STAGED (x, then y, then the wheel scale) the
+        way OWB's NMR plotter is. A key you press repeatedly should undo one
+        thing at a time; a button labelled "Fit view" should do what it says
+        on the first click.
+        """
         while self.plot.reset_view():
             pass
         self.mode_label.setText("")
 
     # ----------------------------------------------------------- exporting
     def save_image(self, path=None):
-        """The plot as it stands, as a PNG. Ctrl+S, which is what it is in
-        OWB."""
+        """The plot as it stands. Ctrl+S, which is what it is in OWB.
+
+        SVG as well as PNG, and SVG is the one that belongs in a paper: a
+        diffractogram is a polyline against an axis, i.e. vector content all
+        the way down, and a raster grab of it is a figure that cannot be
+        rescaled and cannot have its line widths adjusted by whoever is
+        laying out the page.
+        """
         if path is None:
             path, _f = QFileDialog.getSaveFileName(
-                self, "Save the plot", "pxrd.png",
-                "PNG image (*.png);;JPEG image (*.jpg)")
+                self, "Save the plot", "pxrd.svg",
+                "SVG image (*.svg);;PNG image (*.png);;JPEG image (*.jpg)")
         if not path:
             return None
+        if os.path.splitext(path)[1].lower() == ".svg":
+            return self.save_svg(path)
         self.plot.grab().save(path)
+        return path
+
+    def export_columns(self, scale=SVG_SCALE):
+        """How many columns to reduce to for a VECTOR export.
+
+        The window's own width is the wrong ruler here: at a 45 degree view a
+        939 px plot gives about 8 columns across a 0.1 degree peak, so the
+        peak is an octagon the moment the figure is enlarged - which is what
+        "blocky when zoomed out" is. So the count is taken from the PEAK
+        (`SVG_PER_FWHM` columns per FWHM of the narrowest trace), with the
+        old width-based figure as a floor and a hard cap above.
+        """
+        plot = self.plot
+        lo, hi = plot.view_x()
+        span = max(hi - lo, 1e-12)
+        floor = int(plot.plot_rect().width() * scale)
+        widths = [t.fwhm for t in plot.traces if t.fwhm > 0.0]
+        if not widths:
+            return min(floor, SVG_MAX_COLUMNS)
+        wanted = int(span / (min(widths) / SVG_PER_FWHM))
+        return max(floor, min(wanted, SVG_MAX_COLUMNS))
+
+    def save_svg(self, path, scale=SVG_SCALE, light=True):
+        """The plot as VECTOR content - which is what a paper wants.
+
+        Painted through `PxrdPlot.paint_into`, the same method the screen
+        uses, so the geometry cannot disagree with the window. Two things are
+        deliberately NOT the screen's:
+
+        * the curve is sampled at `scale` times as many columns. The min/max
+          envelope is a per-PIXEL reduction (round 96) and an SVG has no
+          pixels, so at screen resolution the figure would read as polygonal
+          the moment anybody enlarged it;
+        * the PALETTE is the light one, because the plot's dark theme is a
+          screen choice and does not survive being placed on a page - a
+          measured trace at #e8e8e8 is invisible on white and the grid, a
+          whisper on black, becomes heavy black rulings. Pass `light=False`
+          for a file that matches the window exactly.
+        """
+        from PySide6.QtSvg import QSvgGenerator
+        plot = self.plot
+        gen = QSvgGenerator()
+        gen.setFileName(path)
+        gen.setSize(plot.size())
+        gen.setViewBox(QRect(0, 0, plot.width(), plot.height()))
+        gen.setTitle("MoloM powder pattern")
+        gen.setDescription("; ".join(t.name for t in plot.traces))
+        painter = QPainter(gen)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        columns = self.export_columns(scale)
+        try:
+            with paper_palette(plot, light):
+                painter.fillRect(QRect(0, 0, plot.width(), plot.height()), _BG)
+                plot.paint_into(painter, columns=columns)
+        finally:
+            painter.end()
         return path
 
     def export_reflections(self, path=None):
@@ -1908,6 +2490,9 @@ class PxrdWindow(QDialog):
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("# MoloM simulated powder pattern\n")
             for t in traces:
+                if t.pattern is None:
+                    fh.write("# {}: MEASURED\n".format(t.name))
+                    continue
                 fh.write("# {}: {}{}\n".format(
                     t.name, pxrd.source_label(t.pattern.components),
                     ("  (" + t.pattern.note + ")") if t.pattern.note else ""))
@@ -1921,6 +2506,8 @@ class PxrdWindow(QDialog):
             fh.write("structure,h,k,l,d_angstrom,two_theta_deg,q,"
                      "relative_intensity,multiplicity\n")
             for t in traces:
+                if t.pattern is None:
+                    continue             # a measurement has no reflections
                 top = t.pattern.strongest() or 1.0
                 for r in t.pattern.reflections:
                     fh.write("{},{},{},{},{:.5f},{:.5f},{:.5f},{:.3f},{}\n"

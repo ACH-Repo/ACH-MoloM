@@ -307,7 +307,19 @@ class MolObject:
             cur = np.asarray([xyz[int(i)] for i in idx], dtype=float)
         except (IndexError, ValueError):
             return None
-        return cif_mod.rigid_from_reference(np.asarray(ref, dtype=float), cur)
+        fit = cif_mod.rigid_from_reference(np.asarray(ref, dtype=float), cur)
+        if fit is None:
+            # The sample is no longer rigidly related to the reference: some
+            # of those atoms have been EDITED. The pose the last rebuild
+            # recorded is then the honest answer, and the alternative - a
+            # least-squares rotation nobody performed - is what tilted the
+            # cell box while an atom was being dragged.
+            rot = meta.get("cell_pose_rot")
+            shift = meta.get("cell_pose_shift")
+            if rot and shift:
+                return (np.asarray(rot, dtype=float).reshape(3, 3),
+                        np.asarray(shift, dtype=float).reshape(3))
+        return fit
 
     def apply_modifiers(self):
         # type: () -> int

@@ -630,14 +630,41 @@ a line or its tick box.
 96** - cached on the structure, the source and the range, which is everything
 it depends on. Eight patterns recompute in 37 ms and redraw in 0.5 ms.
 
-**Q2. No measured pattern can be loaded alongside.** The whole point of a
-simulation is to overlay it on a diffractogram somebody measured, and the
-window cannot read one. A two-column `.xy` / `.xye` reader plus a scale-and-
-offset control is a small piece of work; the honest part is deciding what to
-do about the background, which a simulation does not have. Now that the
-window has per-trace settings and its own navigation, this is the obvious
-next thing - and Christian has four other repos full of measured patterns to
-test it against (`ACH-PXRD-Quickplot`, `ACH-Diffraction-Analysis-Suite`).
+**Q2. ~~No measured pattern can be loaded alongside.~~ DONE in round 100** -
+`core/pxrdfile.py` for the text formats, `core/bruker.py` vendored from
+`ACH-Diffraction-Analysis-Suite` for `.raw` and `.brml` (Christian's own
+suggestion, and the right one - the RAW layout was reverse-engineered there).
+Colour, height and 2-theta shift off a right-click on the line or its tick
+box; reload from disk keeps all three.
+**What was deliberately NOT done, and is Q9: the background.** A measurement
+has one and a simulation does not, so the two curves disagree by a smooth
+function of 2 theta before either has said anything about the phase. Right
+now the eye does that subtraction. The options in ascending order of
+commitment: a manual linear baseline between two clicked points; an
+iterative rolling-ball or SNIP estimate (a few lines, no parameters worth
+arguing about, and what every quickplot tool does); or leaving it alone on
+the grounds that a background is a REFINEMENT decision and this window is a
+comparison aid. Worth asking Christian, since `ACH-PXRD-Quickplot` presumably
+already made the choice once.
+
+**Q11. The ICDD PDF card reader was NOT taken, deliberately.**
+`ACH-Diffraction-Analysis-Suite` has `read_pdf_xml`, and a PDF card is
+exactly the reference you want to overlay - but it is a STICK pattern
+(positions and relative intensities, no atoms), which maps onto MoloM's
+`Pattern`/`Reflection` rather than onto `Measured`, and it carries a real
+design decision upstream already made: a card only covers the 2-theta
+interval that was measured, so the pattern is genuinely flat outside it and
+upstream draws that region DASHED. Worth doing, and it is a different shape
+of thing from a measured curve rather than one more file extension.
+
+**Q10. A measured trace cannot be put on a Q axis, correctly, and that is a
+dead end rather than a refusal to work around.** A file is in 2 theta and
+carries no wavelength; the window says so and drops the trace. The fix is to
+let the user STATE the wavelength a scan was taken at - one more field in
+`MeasuredOptions`, defaulting to unset - after which the conversion is the
+same `two_theta_to_q` everything else uses. Small, and it also unlocks
+comparing a Cu measurement against a Mo simulation, which is the case Q
+exists for.
 
 **Q3. B = 0 everywhere, and it is stated rather than fixed.** No CIF vendored
 here carries displacement parameters, so the high-angle intensities are

@@ -2092,9 +2092,28 @@ def crossing_fragments(symbols, frac, cell, slack=0.45, dup_tol=0.1):
     return out_symbols, np.asarray(out_frac)
 
 
-def rigid_from_reference(ref, cur):
-    # type: (np.ndarray, np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]
+#: A fit whose atoms are further than this from being rigidly related to the
+#: reference is not a rigid motion and must not be reported as one. Float
+#: noise from a genuine transform is around 1e-14 A even after a long chain
+#: of rotations, and any edit somebody makes on purpose is orders above this -
+#: so there is no case in the gap.
+RIGID_TOLERANCE = 1e-4
+
+
+def rigid_from_reference(ref, cur, max_rmsd=RIGID_TOLERANCE):
+    # type: (np.ndarray, np.ndarray, Optional[float]) -> Optional[Tuple[np.ndarray, np.ndarray]]
     """Kabsch fit: the rotation+translation carrying `ref` onto `cur`.
+
+    **None when the fit is not RIGID**, which is the whole of `max_rmsd`. A
+    Kabsch fit always returns something - it is a least-squares answer - and
+    for atoms that have been EDITED rather than moved that answer is a
+    rotation nobody performed. Measured: dragging one atom of ferrocene 6 A
+    tilted the cell box by 0.41 A, because that atom was one of the 24 in the
+    reference sample. Asking whether the residual is float noise is the
+    difference between "the crystal was moved" and "the crystal was changed",
+    and every caller here wants the first.
+
+    Pass `max_rmsd=None` to get the old unconditional least-squares answer.
 
     This is how the cell box FOLLOWS its molecule. The alternative — hooking
     every transform path (grab, rotate, tumble, align, apply, undo) to move
@@ -2119,7 +2138,13 @@ def rigid_from_reference(ref, cur):
         return None
     d = 1.0 if np.linalg.det(vt.T @ u.T) > 0 else -1.0
     rot = vt.T @ np.diag([1.0, 1.0, d]) @ u.T
-    return rot, c_cur - rot @ c_ref
+    trans = c_cur - rot @ c_ref
+    if max_rmsd is not None:
+        residual = ref @ rot.T + trans - cur
+        rmsd = float(np.sqrt((residual * residual).sum(axis=1).mean()))
+        if rmsd > float(max_rmsd):
+            return None
+    return rot, trans
 
 
 def reference_sample(coords, limit=24):
