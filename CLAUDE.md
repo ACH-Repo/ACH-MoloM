@@ -292,7 +292,32 @@ Okabe-Ito 1.90 - so 3:1 was darker than nearly every member of all three.
 0.42 is 2.23:1, `tab10`'s own mean.
 **And the curve is stroked 30% thinner** on his call - `CURVE_WIDTH`, 1.4 ->
 0.98, shared by the screen and the export because they share `paint_into`.
-20 tests. 2083 tests.
+**(5) HIS SYMMETRY QUESTION, ANSWERED BY BUILDING IT.** "Is it not possible to
+exploit the y-symmetry of any of the given peak shapes to just mirror one half
+of points sampled over a peak?" The shapes ARE even in d - and the samples are
+not. A peak centre lands BETWEEN grid points, so the offsets on the left are
+not the negatives of those on the right and no two samples share a value.
+Mirroring requires snapping the centre to a grid point, which was built and
+measured: **1.53 -> 1.21 ms, 21% faster, and peaks displaced by up to half a
+step (0.0025 deg) with a 1.45% height error.** That is the wrong trade in this
+window of all places - round 98 verified peak positions at 0.00000 deg against
+pymatgen. The textbook version, a table indexed by |d| (which stores only half
+the domain and IS the symmetry exploitation), is **slower**: 1.75 ms, because
+numpy's `exp` is vectorised and a fancy-indexing gather is not.
+**WHAT THE MEASUREMENT DID TURN UP is that the two components need completely
+different windows.** Both used `12 * FWHM`: a Gaussian there is `exp(-399)`,
+exactly zero in double precision, while a Lorentzian is still 1.7e-3 because
+its tail goes as 1/d^2. `REACH_GAUSSIAN = 3` makes the pure-Gaussian shape
+**1.75 -> 0.79 ms (2.2x)** for a 1.3e-9 % change in the profile.
+**AND IT BUYS THE DEFAULT NOTHING, which is the part worth recording.**
+Splitting a pseudo-Voigt's two halves into separate windows was built and came
+out SLOWER - **1.44 -> 1.53 ms** - because the extra slice and the extra
+accumulate into `y` cost more than the exponentials they remove. So it keeps
+one window. My first prototype reported 1.46 -> 1.17 for exactly this and was
+comparing two differently-structured loops rather than the real one: a
+benchmark whose baseline is not the shipping code is measuring its own
+scaffolding.
+23 tests. 2086 tests.
 
 Round 100 (2026-09-02, a measured pattern at last - and Christian answered the
 hardest part of it himself):
@@ -5385,7 +5410,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 2083 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 2086 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -7260,7 +7285,7 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 2083 offline tests, 4 skipped, ~180 s.
+1. `python -m pytest tests/ -q` — 2086 offline tests, 4 skipped, ~135 s.
    `tests/conftest.py` sandboxes QSettings, so a GUI test can drive a real
    control without writing into your own MoloM configuration; it also
    **destroys the windows a test created** (round 86), without which the suite

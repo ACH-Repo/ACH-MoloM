@@ -647,6 +647,15 @@ the grounds that a background is a REFINEMENT decision and this window is a
 comparison aid. Worth asking Christian, since `ACH-PXRD-Quickplot` presumably
 already made the choice once.
 
+**Q12. CCDC / CSD access - SCOPED, NOT BUILT.** See `docs/CCDC.md` for the
+licensing position (an activation key or a licence server, NOT a `.lic` file
+like PyMOL), the three GitHub risks (the key, the DATA, the package - the
+data being the dangerous one), and the provider architecture. The blocker is
+not code: this machine has Mercury Community, no CSD database and no CSD
+Python API, so nothing CSD-shaped is demonstrable until a licence and the
+Portfolio are installed. Open questions for Christian are in section 5 of
+that file.
+
 **Q11. The ICDD PDF card reader was NOT taken, deliberately.**
 `ACH-Diffraction-Analysis-Suite` has `read_pdf_xml`, and a PDF card is
 exactly the reference you want to overlay - but it is a STICK pattern

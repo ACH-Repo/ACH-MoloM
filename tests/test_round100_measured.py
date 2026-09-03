@@ -793,3 +793,55 @@ def test_the_svg_really_carries_the_extra_vertices(bench, tmp_path):
                    for m in re.findall(r'points="([^"]*)"', body))
 
     assert vertices(fine) > 1.5 * vertices(coarse)
+
+
+# ------------------------------- the two tails are not the same (round 101c)
+def test_the_two_peak_shapes_are_windowed_at_different_distances():
+    """A Gaussian and a Lorentzian die at completely different rates, and
+    both used one window. The Gaussian is exp(-399) at 12 FWHM - exactly
+    zero in double precision - while the Lorentzian is still 1.7e-3 there,
+    because a 1/d^2 tail never really stops."""
+    import math
+    sigma = 1.0 / (2.0 * math.sqrt(2.0 * math.log(2.0)))   # FWHM = 1
+    assert math.exp(-0.5 * (pxrd.REACH_GAUSSIAN / sigma) ** 2) < 1e-10
+    assert 1.0 / (1.0 + (pxrd.REACH_LORENTZIAN / 0.5) ** 2) > 1e-3
+    assert pxrd.REACH_GAUSSIAN < pxrd.REACH_LORENTZIAN
+
+
+def test_narrowing_the_gaussian_window_changes_nothing_that_can_be_seen():
+    """The whole justification: it has to be exact to the precision anybody
+    could ever plot. Measured at 1.3e-9 % of the peak."""
+    s = _open(SOLID_SOLUTION)
+    pxrd.set_settings(s, two_theta_max=50.0)
+    pattern = pxrd.pattern_for(s)
+    peaks = pxrd.peak_positions(pattern, pxrd.AXIS_TWO_THETA)
+    x = np.arange(5.0, 50.0, pxrd.step_for(0.10))
+    narrow = pxrd.profile_at(pattern, x, fwhm=0.10, shape="gaussian",
+                             peaks=peaks)
+    # the same sum with NO windowing at all, which is what it approximates
+    sigma = 0.10 / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+    full = np.zeros_like(x)
+    for centre, height in peaks:
+        full += height * np.exp(-0.5 * ((x - centre) / sigma) ** 2)
+    assert np.max(np.abs(narrow - full)) / float(full.max()) < 1e-9
+
+
+def test_the_pseudo_voigt_keeps_ONE_window(monkeypatch):
+    """Recorded because the arithmetic argues the other way and the
+    measurement does not: splitting its two halves was built and came out
+    SLOWER (1.44 -> 1.53 ms), the extra slice and accumulate costing more
+    than the exponentials they remove. So the default shape must still see
+    every sample the Lorentzian reach covers."""
+    s = _open(SOLID_SOLUTION)
+    pxrd.set_settings(s, two_theta_max=50.0)
+    pattern = pxrd.pattern_for(s)
+    peaks = [(20.0, 100.0)]
+    fwhm = 0.10
+    # a sample 6 FWHM out is past the Gaussian window and inside the
+    # Lorentzian one, so a pseudo-Voigt must still put something there
+    x = np.array([20.0 + 6.0 * fwhm])
+    y = pxrd.profile_at(pattern, x, fwhm=fwhm, shape="pseudo_voigt",
+                        eta=0.5, peaks=peaks)
+    assert y[0] > 0.0
+    lorentz_only = 100.0 * 0.5 / (1.0 + (6.0 * fwhm / (fwhm / 2.0)) ** 2)
+    assert y[0] == pytest.approx(lorentz_only, rel=1e-6)

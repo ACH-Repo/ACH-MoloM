@@ -169,6 +169,27 @@ def step_for(fwhm, step=0.0):
     return fwhm / STORED_PER_FWHM
 
 
+#: How far from its centre each peak shape is still worth evaluating, in
+#: FWHM. They are wildly different and were both 12 until it was measured:
+#: a GAUSSIAN at 12 FWHM is exp(-399), i.e. exactly zero in double precision,
+#: and is already down to 1.5e-11 at 3; a LORENTZIAN at 12 FWHM is still
+#: 1.7e-3 of the peak, because its tail goes as 1/d^2 and never really stops.
+#:
+#: So the Gaussian is being evaluated over four times more axis than it can
+#: contribute to, and narrowing its window is exact: the profile is unchanged
+#: to 0.000000% of the peak and a pure-Gaussian ferrocene pattern goes from
+#: 1.75 to 0.79 ms, i.e. 2.2x. 3 rather than 2 because at 2 FWHM the error
+#: becomes measurable (0.0007%) and there is no reason to sit that close to
+#: the edge for a tenth of a millisecond.
+#:
+#: It buys the PSEUDO-VOIGT nothing, which is worth recording because it is
+#: the default and the arithmetic suggests otherwise. Splitting its two
+#: halves into separate windows was built and measured SLOWER, 1.44 -> 1.53
+#: ms: the extra slice and the extra accumulate into `y` cost more than the
+#: exponentials they remove. So it keeps one window.
+REACH_GAUSSIAN = 3.0
+REACH_LORENTZIAN = 12.0
+
 SHAPE_GAUSSIAN = "gaussian"
 SHAPE_LORENTZIAN = "lorentzian"
 SHAPE_PSEUDO_VOIGT = "pseudo_voigt"
@@ -770,22 +791,35 @@ def profile_at(pattern, x, axis=AXIS_TWO_THETA, fwhm=DEFAULT_FWHM,
     if not peaks or x.size == 0:
         return y
     w = abs(float(fwhm)) or DEFAULT_FWHM
-    reach = w * 12.0
     sigma = w / (2.0 * math.sqrt(2.0 * math.log(2.0)))
     half = w / 2.0
+    g_reach = w * REACH_GAUSSIAN
+    l_reach = w * REACH_LORENTZIAN
     for centre, height in peaks:
-        i0, i1 = np.searchsorted(x, [centre - reach, centre + reach])
-        if i1 <= i0:
-            continue
-        dx = x[i0:i1] - centre
         if shape == SHAPE_GAUSSIAN:
-            y[i0:i1] += height * np.exp(-0.5 * (dx / sigma) ** 2)
+            i0, i1 = np.searchsorted(x, [centre - g_reach, centre + g_reach])
+            if i1 > i0:
+                dx = x[i0:i1] - centre
+                y[i0:i1] += height * np.exp(-0.5 * (dx / sigma) ** 2)
         elif shape == SHAPE_LORENTZIAN:
-            y[i0:i1] += height / (1.0 + (dx / half) ** 2)
+            i0, i1 = np.searchsorted(x, [centre - l_reach, centre + l_reach])
+            if i1 > i0:
+                dx = x[i0:i1] - centre
+                y[i0:i1] += height / (1.0 + (dx / half) ** 2)
         else:
-            g = np.exp(-0.5 * (dx / sigma) ** 2)
-            lo_r = 1.0 / (1.0 + (dx / half) ** 2)
-            y[i0:i1] += height * (eta * lo_r + (1.0 - eta) * g)
+            # ONE window for the pseudo-Voigt, deliberately, even though its
+            # Gaussian half is dead long before `l_reach`. Windowing the two
+            # halves separately was tried and MEASURED SLOWER (1.44 -> 1.53 ms
+            # on ferrocene): the second slice and the second accumulate into
+            # `y` cost more than the exponentials they save. The saving is
+            # only collectable where there is nothing else to slice for,
+            # which is the pure-Gaussian branch above.
+            i0, i1 = np.searchsorted(x, [centre - l_reach, centre + l_reach])
+            if i1 > i0:
+                dx = x[i0:i1] - centre
+                g = np.exp(-0.5 * (dx / sigma) ** 2)
+                lo_r = 1.0 / (1.0 + (dx / half) ** 2)
+                y[i0:i1] += height * (eta * lo_r + (1.0 - eta) * g)
     return y
 
 
