@@ -215,7 +215,75 @@ Structures for a deposition number is fine and costs nothing.
 
 ---
 
-## 5. Open questions for Christian
+## 4b. Does a `.molom` savefile carrying CSD structures matter? YES
+
+Christian asked, 2026-09-03. The rule is explicit and it is the one in
+§2(b), stated by CCDC itself:
+
+> "The licence does not allow external sharing of original data from the CSD,
+> such as making bulk CIF files available to others outside your
+> organization."
+
+and separately, software or data **derived from** the CSD Portfolio may not
+be distributed without CCDC's prior written approval.
+
+So, concretely:
+
+- keeping a `.molom` with CSD structures in it, and working with it, is
+  ordinary licensed use;
+- **sending one outside AG Henke is sharing CSD data**, whatever the file
+  extension says. A savefile is not a neutral container - it holds the
+  coordinates.
+- posting one to a public issue tracker, or committing one to this repo as a
+  test fixture, is the same thing in a more permanent form.
+
+**Where it is genuinely ambiguous, and worth asking rather than assuming:**
+
+1. **What counts as "bulk"?** CCDC does not quantify it. One structure in a
+   figure is plainly fine; a savefile with forty is not obviously either way.
+2. **Is a savefile "original data" or "derived data"?** The two have
+   different rules - original may not be shared at all, derived *may* be
+   permitted or may need a separate agreement - and a `.molom` holds the
+   coordinates verbatim, which argues for the first.
+3. **Does an edited structure change the answer?** A demoted, re-packed,
+   element-substituted cell is arguably a derived work, and arguably still
+   the CSD's coordinates.
+
+**Where to write:** CCDC's own route is a support ticket at
+<https://support.ccdc.cam.ac.uk/support/tickets/new>. Worth doing with the
+site licence's customer number to hand, because the terms vary per licence
+and only CCDC can say what AG Henke's allows.
+
+**What MoloM could do about it, NOT built and wanting a decision:** mark
+structures that came from a licensed source in the savefile, and warn on
+save or on export. That is a small feature and a real decision - it puts a
+dialog in front of an ordinary action - so it is recorded rather than
+assumed.
+
+## 5. What IS built: the key hole, with no key in it
+
+Round 102b. `core/cifsearch.register_provider(key, label, search_fn)` is the
+extension point a CSD tier would use, plus `unregister_provider` and
+`extra_providers`. A registered tier runs in the concurrent fan-out beside
+the local, COD and OPTIMADE ones, is ranked and deduped with them, and a
+failure costs a tier rather than the search (round 37).
+
+`search_fn(query, formula=..., limit=..., timeout=...)` returns `Hit`s. A
+`Hit` carrying CIF text flows into the ordinary import path, so nothing
+downstream needs to know where it came from.
+
+**Nothing about CCDC is in `core/`, and a test asserts it** - no module
+under `molom/core/` may import `ccdc`. The remaining piece is
+`molom/addons/csd_search.py`, which is where the licence probe and the
+actual API calls belong, and it is deliberately unwritten: it cannot be run
+or tested on this machine, and an untested API-call layer is the "mechanism
+with tests and no gesture test" trap this project keeps finding (round 59).
+
+Registration must be conditional on the tier being USABLE - an installed
+`ccdc` with no valid licence would otherwise put a row in the dialog that is
+guaranteed to fail, which is worse than not offering it.
+
+## 6. Open questions for Christian
 
 1. **Does AG Henke have a CSD site licence, and is it a key or a licence
    server?** That decides whether §1's `la-code` or `lf-server` form is the

@@ -198,6 +198,144 @@ other side, and the two export fixes are verified in `tools/smoke_gui.py`
 instead, which now measures the crop and counts ink with and without the cell
 box. 1310 tests.
 
+Round 102 (2026-09-03, three off the docket - N1, N2, N3, and one of them
+was already fixed):
+**(1) N1: A SEARCHED CRYSTAL CLAIMED THE SESSION'S DOCUMENT, and Ctrl+S would
+have written into a deleted directory.** Christian saw the symptom as the
+round-trip banner appearing on an imported crystal. The cause is two correct
+decisions meeting: `open_path` claims `source_path` for the FIRST structure
+file of a session (round 92, so a round trip cannot be re-pointed at whatever
+was opened last), and the crystal search writes its download into a temp
+DIRECTORY it deletes immediately afterwards (round 84, so the object is named
+after a real filename rather than `molom_d2dtna96`). Measured: after a search
+import, `source_path` names a path where `os.path.exists` is False, and
+`on_save` prefers `on_save_geometry_back()` over the project dialog whenever
+it is set.
+**`open_path(path, temporary=True)` is the fix, and it suppresses TWO things**
+- the document claim and the recent-files entry - because they are the same
+promise about a path that is about to stop existing. A recent-files entry into
+a deleted temp directory is the same bug one menu along, and it was there too.
+`_install_structure` keeps taking `path` when `remember` is False, because the
+file is still where the FREQUENCIES are read from: "is this worth remembering"
+and "what file did this come from" are different questions.
+**(2) N2: THE STEPPED ROTATION DROPPED A CRYSTAL OUT OF ORTHOGRAPHIC.** The
+VESTA ribbon's "rotate by the step angle" goes through `Camera.rotate`, which
+pops `auto_ortho` back to perspective - Blender's rule, and round 3's, and
+right for a DRAG, where the pose stops being an axis view the moment the mouse
+moves. A rotation by a TYPED number of degrees is a different gesture: it is
+how the ribbon walks around a cell, and the axis views it walks between are
+deliberately orthographic. `keep_projection=True` holds it; the free drag is
+untouched and a test pins both halves. The parameter is on the CAMERA rather
+than the handler so there is still ONE orbit implementation - the no-roll
+construction is not something a second path should have to re-earn.
+**(3) N3: THE WIDTH HALF WAS ALREADY FIXED, which measuring found before
+anything was changed.** The docket said round 93's resize-on-sort fix had not
+reached the molecule search. It had: both tables put their stretch column in
+`QHeaderView.Stretch`, both word-wrap, and both sum their column widths to the
+VIEWPORT rather than to the longest entry - it arrived through `ResultTable`,
+which round 90 extracted. The note was stale. A test now pins the two tables
+against each other, which is Christian's standing rule (a control in both
+search windows behaves the same in both) made mechanical rather than
+remembered.
+**THE CAS NUMBER IS THE REAL WORK.** `Candidate.cas`, from PubChem's
+synonyms - and it is **validated by its CHECK DIGIT**, not by its shape,
+because a synonym list is full of hyphenated numbers that look like registry
+numbers. Measured: benzoic acid has 264 synonyms of which 2 are CAS-shaped
+and 2 valid, aspirin 698 of which 3 and 3. One BULK request for the whole CID
+list, the same shape as `_properties_for` and for the same reason (round 90:
+PubChem refuses the sixth request in a second, silently), and run
+CONCURRENTLY with it so the two round trips wait together: **+1.0 s serial,
++0.27-0.59 s overlapped** on a ~5 s search. It rides `to_dict`, or a starred
+row would lose the column on reopening. And it is exactly the discriminator
+this dialog exists for - o-, m- and p-xylene share a formula and a weight and
+come back as 95-47-6, 108-38-3 and 106-42-3.
+15 tests. 2101 tests.
+
+Round 102b (2026-09-03, Christian's test pass on round 102 - a span that
+outlived its row, and the round trip re-cut to HIS design):
+**(0) THE DESIGN WAS MINE AND IT WAS WRONG.** Round 92 recorded "opening a
+structure file arms the write-back" as though it were his instruction; it was
+an INFERENCE of mine from "OWB launches `[program, file.xyz]` and nothing
+else". His actual design: "round trips that automatically overwrite geometry
+should only activate if molom is used as an external editor launched from
+OWB. On its own saving in molom should only save the .molom save file state.
+If an edited structure is intended to be saved, then that is a geometry
+export, which should be a different pathway. Even if I launch `molom
+some.xyz` that should just import that xyz."
+**THE LAUNCHER ASKS THROUGH THE ENVIRONMENT, and that is the whole trick.**
+`MOLOM_ROUNDTRIP_FILE=<abs path>`, plus `--roundtrip` for driving it by hand.
+His own question was whether a flag could crash another editor, and the worry
+is justified - whether Avogadro or molden ignores an unknown argument, exits
+non-zero, or opens a file called `--roundtrip` is not consistent and is not
+something OWB can know, because the slot holds whatever the user put there.
+**A program that does not read an environment variable cannot be affected by
+one**, so OWB can set it on EVERY editor launch and only MoloM notices -
+including after the slot is repointed. It carries the PATH rather than a bare
+"1", so a variable left in a shell cannot arm a write-back for something
+opened later. The OWB half is one line and is written into that repo's TODO.
+**(1) A SPAN OUTLIVES THE ROW IT WAS SET ON**, which is the blank second row
+he reported twice. `_add_divider` spans the FAVOURITES rule across every
+column, and `setSpan` belongs to the TABLE at that row index rather than to
+the item - so when the next provider batch lands and the divider moves down,
+the old span stays behind and hides columns 1..n of whatever candidate now
+sits there. It draws blank except for its star while the candidate is
+perfectly intact behind it, **which is why his preview pane showed the
+compound the row would not** - that screenshot is what solved it, because it
+proved the data was fine and only the drawing was wrong. It needs favourites
+AND incremental batches, which is why the first repro missed it. `clearSpans()`.
+Two more found on the way: `_merge` was not carrying `cas` at all, so a CAS
+arriving in a later batch could not fill an existing row; and `_finished`
+DISCARDED the finished enriched list whenever rows had arrived incrementally,
+so any row the incremental path left half-filled stayed that way until the
+dialog was reopened.
+**(2) MOVING A CRYSTAL IN THE ASYMMETRIC VIEW REWROTE ITS ASYMMETRIC UNIT.**
+His report was that the cell box did not follow "only in asymmetric mode
+though not in full cell view", and that shape is the diagnosis:
+`sync_asymmetric_unit` runs ONLY when the base is the asymmetric unit, and it
+wrote back unconditionally. Measured on his `test_DMSO.molom`: a 5 A
+translation rewrote `asym_frac[0]` from (0,0,0) to (1.2321,0,0) and re-pinned
+the cell reference against the moved atoms, so the recovered pose read as
+identity and the box stayed at the origin. **The box was the visible half of
+a data change.** Round 91's rule - a rigid motion is not an edit - one
+function along: the asym branch returned before `_edit_was_rigid` was ever
+consulted.
+**(3) THE NAME COLUMN'S BORDER WAS DEAD BECAUSE QT WILL NOT DRAG A STRETCH
+SECTION.** Not fixed-width by intent; collateral from round 95's fix for the
+width jumping. It is INTERACTIVE now and takes whatever the other columns
+leave (`_reflow`), so it still grows with the window - until the user drags
+it, after which their width stands. "The user did it" is decided by watching
+the header for a mouse button rather than by `sectionResized`, which fires
+for our own writes too and made a programmatic bulk resize pin the column.
+**(4) THE WIDTH HALF OF N3 WAS ALREADY FIXED**, which measuring found before
+anything was changed - both tables were already Stretch + word-wrap + summing
+to the viewport. The docket note was stale. A test pins the two against each
+other now.
+**(5) AN ELEMENT CHANGE ON A SHARED SITE MAKES IT PURE.** Christian: "change
+should make something purely that element, not just change the dominant one."
+Round 87 re-laballed the majority species and kept the rest; picking iodine
+off the periodic table says "this position is iodine", not "call the 50%
+niobium iodine and leave the titanium, nickel and cobalt where they are",
+which is a composition nobody asked for and cannot be read off the picture.
+The site collapses to one row at occupancy 1.0 **and the pie sphere goes with
+it** - `site_occupancy` is what the wedges are drawn from and leaving it
+behind was his "the pie chart is still the underlying partial occupancies".
+Stating a MIXTURE is a different gesture and already had its own dialog since
+round 52.
+**(6) THE CCDC KEY HOLE, WITH NO KEY IN IT** - his framing.
+`cifsearch.register_provider` is the extension point, on round 73's MOPAC
+shape: core owns a registry and a signature, every line that knows the vendor
+lives in an add-on. A registered tier joins the concurrent fan-out and fails
+the same way (a tier, never the search). **A test asserts that nothing under
+`molom/core/` imports `ccdc`.** The add-on itself is deliberately unwritten -
+it cannot be run or tested on a machine with Mercury Community and no CSD.
+**AND THE SAVEFILE QUESTION HAS AN ANSWER: mostly no.** CCDC's licence "does
+not allow external sharing of original data from the CSD", and derived data
+needs their written approval - so a `.molom` full of CSD entries must not
+leave the group. What is genuinely ambiguous is what counts as "bulk" and
+whether a savefile is original or derived; `docs/CCDC.md` 4b says so and
+names the support-ticket route rather than guessing.
+17 tests. 2118 tests.
+
 Round 101 (2026-09-02, a refusal nobody can see - and the plot becomes a
 figure):
 Christian, testing round 100: "I have also loaded in multiple files and the
@@ -5410,7 +5548,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 2086 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 2118 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -7285,7 +7423,7 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 2086 offline tests, 4 skipped, ~135 s.
+1. `python -m pytest tests/ -q` — 2118 offline tests, 4 skipped, ~230 s.
    `tests/conftest.py` sandboxes QSettings, so a GUI test can drive a real
    control without writing into your own MoloM configuration; it also
    **destroys the windows a test created** (round 86), without which the suite

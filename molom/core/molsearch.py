@@ -209,7 +209,7 @@ class Candidate(object):
 
     __slots__ = ("source", "ref", "name", "smiles", "formula", "weight",
                  "inchikey", "iupac_name", "note", "score", "rank_hint",
-                 "query", "verbatim", "pubchem_cid")
+                 "query", "verbatim", "pubchem_cid", "cas")
 
     def __init__(self, source, ref="", name="", smiles="", formula="",
                  weight=None, inchikey="", iupac_name="", note="",
@@ -243,6 +243,12 @@ class Candidate(object):
         #: properties tab could only ever work on rows PubChem itself found,
         #: which is precisely the case that 404s.
         self.pubchem_cid = None
+        #: The CAS Registry Number, where PubChem's synonyms carry one. It is
+        #: on the row because it is what a chemist orders a bottle by and
+        #: what a supplier's catalogue is indexed on - a discriminator that
+        #: works where the formula and the weight do not, which is exactly
+        #: the xylene case this dialog exists for.
+        self.cas = ""
 
     def key(self):
         # type: () -> str
@@ -280,7 +286,8 @@ class Candidate(object):
                 "verbatim": self.verbatim, "pubchem_cid": self.pubchem_cid,
                 "smiles": self.smiles, "formula": self.formula,
                 "weight": self.weight, "inchikey": self.inchikey,
-                "iupac_name": self.iupac_name, "note": self.note}
+                "iupac_name": self.iupac_name, "note": self.note,
+                "cas": self.cas}
 
     def __repr__(self):
         return "<Candidate {} {} {}>".format(self.source, self.ref,
@@ -301,6 +308,7 @@ def candidate_from_dict(data):
             inchikey=data.get("inchikey", ""),
             iupac_name=data.get("iupac_name", ""), note=data.get("note", ""),
             verbatim=bool(data.get("verbatim", False)))
+        cand.cas = str(data.get("cas") or "")
     except Exception:                                   # noqa: BLE001
         return None
     # Not a constructor argument, because it is DERIVED by the join rather
@@ -369,6 +377,75 @@ def _get_json(fetch, url):
         return json.loads(body)
     except ValueError:
         return None
+
+
+#: A CAS Registry Number: two to seven digits, two digits, one check digit.
+_CAS_SHAPE = re.compile(r"^(\d{2,7})-(\d{2})-(\d)$")
+
+
+def valid_cas(text):
+    # type: (str) -> bool
+    """Does `text` look like a CAS number AND pass its check digit?
+
+    The shape alone is not enough. A synonym list is full of hyphenated
+    numbers - catalogue codes, EC numbers, "1,2-4-5" fragments - and the
+    check digit is what separates a registry number from any of them: sum
+    the digits weighted 1, 2, 3... from the right, modulo 10. Measured on
+    PubChem, benzoic acid has two CAS-shaped synonyms and aspirin three, and
+    the digit accepts exactly the right ones.
+    """
+    match = _CAS_SHAPE.match(str(text or "").strip())
+    if match is None:
+        return False
+    body = match.group(1) + match.group(2)
+    check = int(match.group(3))
+    total = sum(int(c) * (i + 1) for i, c in enumerate(reversed(body)))
+    return total % 10 == check
+
+
+def cas_from_synonyms(synonyms):
+    # type: (Sequence[str]) -> str
+    """The first VALID CAS number in a synonym list, or "".
+
+    First rather than shortest or lowest: PubChem ranks synonyms, so its
+    order is real information (the same argument as `rank_hint`), and the
+    registry number for the compound itself comes before those of its
+    hydrates and salts.
+    """
+    for name in synonyms or ():
+        if valid_cas(name):
+            return str(name).strip()
+    return ""
+
+
+def _synonyms_for(cids, fetch, chunk=50):
+    # type: (Sequence[int], Callable, int) -> Dict[int, list]
+    """One request for the whole list, exactly like `_properties_for`.
+
+    A CAS number is not a property, so it needs its own endpoint - but it is
+    the same SHAPE of call, one per chunk rather than one per row, which is
+    what keeps it inside PubChem's five-a-second (round 90).
+    """
+    out = {}                                          # type: Dict[int, list]
+    cids = [c for c in cids if c is not None]
+    for start in range(0, len(cids), chunk):
+        batch = cids[start:start + chunk]
+        url = "{}/pug/compound/cid/{}/synonyms/JSON".format(
+            PUBCHEM, ",".join(str(c) for c in batch))
+        try:
+            data = _pubchem_json(fetch, url)
+        except urllib.error.URLError:
+            continue                     # a missing CAS is not a lost row
+        try:
+            rows = data["InformationList"]["Information"]
+        except (TypeError, KeyError):
+            continue
+        for row in rows if isinstance(rows, list) else []:
+            try:
+                out[int(row["CID"])] = list(row.get("Synonym") or [])
+            except (TypeError, KeyError, ValueError):
+                continue
+    return out
 
 
 def _pubchem_json(fetch, url):
@@ -701,7 +778,24 @@ def enrich(candidates, fetch=None, join=True):
 
     if not by_cid:
         return cands
-    rows = _properties_for(sorted(by_cid), fetch)
+    wanted = sorted(by_cid)
+    # The properties and the synonyms are two independent requests, so they
+    # WAIT concurrently. The process-wide throttle still spaces them out
+    # (round 90 - PubChem refuses the sixth request in a second, silently),
+    # so this does not double the rate; it just stops one round trip being
+    # served after the other has finished.
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            pending = pool.submit(_synonyms_for, wanted, fetch)
+            rows = _properties_for(wanted, fetch)
+            synonyms = pending.result()
+    except Exception:                                   # noqa: BLE001
+        rows = _properties_for(wanted, fetch)
+        synonyms = _synonyms_for(wanted, fetch)
+    for cid, names in synonyms.items():
+        number = cas_from_synonyms(names)
+        for cand in by_cid.get(cid, []):
+            cand.cas = cand.cas or number
     for cid, row in rows.items():
         for cand in by_cid.get(cid, []):
             cand.pubchem_cid = cid
@@ -746,6 +840,7 @@ def _merge(keep, other):
     keep.iupac_name = keep.iupac_name or other.iupac_name
     keep.formula = keep.formula or other.formula
     keep.inchikey = keep.inchikey or other.inchikey
+    keep.cas = keep.cas or other.cas
     if keep.weight is None:
         keep.weight = other.weight
     if other.note and other.note not in keep.note:

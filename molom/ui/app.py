@@ -1537,7 +1537,19 @@ class MainWindow(QMainWindow):
                 # in the asymmetric unit changes ALL EIGHT of its images
                 # together, so the operators still map the structure onto
                 # itself and the group is untouched.
-                self.sync_asymmetric_unit(obj)
+                # ...but a RIGID PLACEMENT is not an edit to the unit
+                # either, and this branch used to write back unconditionally.
+                # Measured on Christian's `test_DMSO.molom`: translating the
+                # crystal 5 A rewrote `asym_frac[0]` from (0, 0, 0) to
+                # (1.2321, 0, 0) and left the cell box behind at the origin,
+                # because the write-back re-pins the reference against the
+                # moved atoms and the recovered pose then reads as identity.
+                # Moving a crystal across the viewport must not rewrite its
+                # asymmetric unit - round 91's rule, one function along, and
+                # it showed up in the asymmetric view ONLY because the full
+                # cell never reaches here.
+                if not self._edit_was_rigid(obj):
+                    self.sync_asymmetric_unit(obj)
                 self._report_packed_images(obj, touched, disagreed, last=True)
                 return
             if self._edit_was_rigid(obj):
@@ -1801,9 +1813,33 @@ class MainWindow(QMainWindow):
             if values is not None and len(values) == len(old_symbols):
                 columns[key] = list(values)
         symbols, out_frac, compacted, cursor = [], [], [], 0
+        kept = []            # source row for each output row
+        purified = []        # output rows whose occupancy becomes a clean 1.0
+        pure_drawn = []      # ...and the drawn atoms they belong to
         for drawn, group in enumerate(rows):
             here = []
             drawn_symbol = str(s.symbols[drawn])
+            lead = int(group[0])
+            # CHANGING THE ELEMENT MAKES THE SITE PURELY THAT ELEMENT.
+            #
+            # Round 87 re-labelled the majority species and kept the rest,
+            # on the argument that nothing should be lost. Christian's call
+            # is the other way and it is the better one: picking an element
+            # off the periodic table says "this position is iodine", not
+            # "call the 50% niobium iodine and leave the titanium, nickel and
+            # cobalt where they are" - which is a composition nobody asked
+            # for and cannot be read off the picture. Stating a MIXTURE is a
+            # different operation and has its own dialog, which is what
+            # `F3 > Crystal: set the occupancies of a shared site` is for.
+            if len(group) > 1 and drawn_symbol != str(old_symbols[lead]):
+                symbols.append(drawn_symbol)
+                out_frac.append(list(frac[drawn]))
+                kept.append(lead)
+                purified.append(cursor)
+                pure_drawn.append(drawn)
+                compacted.append([cursor])
+                cursor += 1
+                continue
             for position, r in enumerate(group):
                 # THE DRAWN SYMBOL WINS ON THE ROW IT REPRESENTS. A single-row
                 # atom is an ordinary site, so changing its element must reach
@@ -1811,20 +1847,36 @@ class MainWindow(QMainWindow):
                 # cut restored the stored symbol unconditionally and silently
                 # discarded every element edit in the asymmetric unit, which
                 # is round 43e's bug reintroduced from a new direction.
-                #
-                # On a MERGED site the drawn atom carries the majority
-                # species (`asym_view` puts that row first), so an element
-                # change there re-labels that species and leaves the others
-                # and every occupancy untouched. Nothing is lost, which is the
-                # test a shared-site edit has to pass.
                 symbols.append(drawn_symbol if position == 0
                                else old_symbols[int(r)])
                 out_frac.append(list(frac[drawn]))
+                kept.append(int(r))
                 here.append(cursor)
                 cursor += 1
             compacted.append(here)
         for key, values in columns.items():
-            meta[key] = [values[int(r)] for r in flat]
+            meta[key] = [values[r] for r in kept]
+        # A collapsed site is FULLY occupied by its new element: the fractions
+        # that made it a mixture describe species that are no longer there.
+        occupancy = meta.get("asym_occupancy")
+        if occupancy is not None and len(occupancy) == len(symbols):
+            for row in purified:
+                occupancy[row] = 1.0
+        # ...and the PIE SPHERE goes with it. `site_occupancy` is what the
+        # viewport draws the wedges from, keyed by DRAWN atom, and leaving it
+        # behind is Christian's "the pie chart is still the underlying partial
+        # occupancies" - an atom labelled iodine still drawn as a four-way
+        # niobium mixture. A rebuild would regenerate it correctly from the
+        # metadata above; the picture in front of the user must not have to
+        # wait for one.
+        if pure_drawn:
+            table = dict(meta.get("site_occupancy") or {})
+            for drawn in pure_drawn:
+                table.pop(str(int(drawn)), None)
+            if table:
+                meta["site_occupancy"] = table
+            else:
+                meta.pop("site_occupancy", None)
         meta["asym_symbols"] = symbols
         meta["asym_frac"] = out_frac
         meta["asym_rows"] = compacted
@@ -3658,9 +3710,14 @@ class MainWindow(QMainWindow):
         # with them under any later transform.
         set_cell_reference(s)
 
-    def _install_structure(self, s, path=None, note=None):
-        # type: (Structure, Optional[str], Optional[str]) -> None
-        """Add a molecule to the scene (imports never replace — outliner)."""
+    def _install_structure(self, s, path=None, note=None, remember=True):
+        # type: (Structure, Optional[str], Optional[str], bool) -> None
+        """Add a molecule to the scene (imports never replace — outliner).
+
+        `path` is still needed when `remember` is False: it is the file the
+        frequencies are read from, which is a different question from whether
+        the file is worth putting in the recent list.
+        """
         self.push_undo()
         self._perceive_fresh(s)
         obj = self.scene.add(s)
@@ -3670,7 +3727,8 @@ class MainWindow(QMainWindow):
         closed = self._autoclose_boundary(obj)
         self._sync_all(fit=True)
         if path:
-            self._push_recent(path)
+            if remember:
+                self._push_recent(path)
             extra = self._attach_frequencies(obj, path)
             note = ", ".join([n for n in (note, extra) if n]) or None
         chem = self.chemistry_note(s)
@@ -4596,8 +4654,18 @@ class MainWindow(QMainWindow):
         self.viewport.set_selection([(obj.id, i) for i in picked])
         return picked, missing
 
-    def open_path(self, path):
-        # type: (str) -> None
+    def open_path(self, path, temporary=False, roundtrip=False):
+        # type: (str, bool, bool) -> None
+        """Open a structure file and ADD it to the scene.
+
+        `temporary` says the file is scratch that the caller is about to
+        delete - a structure downloaded by the crystal search, say. Such an
+        import must not become the session's DOCUMENT and must not join the
+        recent-files list, because both of those are promises about a path
+        that will not exist in a moment. Christian met this from the far end:
+        a searched benzoic acid put up the round-trip banner, and Ctrl+S
+        would have tried to write back into a deleted temp directory.
+        """
         if project.is_project_file(path):
             self.open_project(path)
             return
@@ -4606,14 +4674,24 @@ class MainWindow(QMainWindow):
         # a session claims it: importing a second molecule ADDS to the scene
         # (round 2), and silently re-pointing "Save" at whatever was opened
         # most recently is how a round-trip writes the wrong file.
-        if self.source_path is None and self.project_path is None:
+        # OPENING A FILE IS NOT A ROUND TRIP. `roundtrip` is asked for
+        # explicitly by whoever launched MoloM (`--roundtrip`, or the
+        # environment variable OWB sets) - without it, Ctrl+S saves a `.molom`
+        # project and writing the geometry back out is an EXPORT, which is a
+        # different pathway. The earlier rule, that the first structure file
+        # of a session claims the document, meant that `molom some.xyz` armed
+        # a write-back nobody had asked for.
+        if (roundtrip and not temporary and self.source_path is None
+                and self.project_path is None):
             self.source_path = os.path.abspath(path)
             self._sync_roundtrip_note()
+        remember = None if temporary else path
         try:
             if io.is_smiles_list_file(path):
                 pairs = io.read_smiles_file(path)
                 self._install_smiles_batch(pairs, "SMILES file")
-                self._push_recent(path)
+                if remember:
+                    self._push_recent(remember)
                 return
             structs = io.read_structures(path,
                                          disorder=self.disorder_policy)
@@ -4621,7 +4699,8 @@ class MainWindow(QMainWindow):
             if len(structs) > 1 and io.frames_are_trajectory(structs):
                 s = Structure.from_frames(structs, name=base)
                 note = "{} frames".format(len(structs))
-                self._install_structure(s, path=path, note=note)
+                self._install_structure(s, path=path, note=note,
+                                        remember=bool(remember))
             elif len(structs) > 1:
                 # different species per record -> each becomes its own object
                 for k, (atoms, meta) in enumerate(structs):
@@ -4629,14 +4708,16 @@ class MainWindow(QMainWindow):
                     self._install_structure(
                         Structure.from_atoms(atoms, name=nm,
                                              metadata=meta or {}))
-                self._push_recent(path)
+                if remember:
+                    self._push_recent(remember)
             else:
                 atoms, meta = structs[0]
                 s = Structure.from_atoms(atoms, name=base, metadata=meta or {})
                 note = None
                 if meta and meta.get("source") == "heuristic":
                     note = meta.get("comment", "heuristic import - VERIFY")
-                self._install_structure(s, path=path, note=note)
+                self._install_structure(s, path=path, note=note,
+                                        remember=bool(remember))
         except (io.CoordGenError, ValueError, OSError) as e:
             QMessageBox.critical(self, "Could not open", str(e))
 
@@ -4777,7 +4858,9 @@ class MainWindow(QMainWindow):
                 with open(path, "w", encoding="utf-8") as fh:
                     fh.write(text)
                 before = self.scene.n_objects
-                self.open_path(path)
+                # Scratch, deleted in the `finally` below - so it must not
+                # become the document or join the recent files (N1).
+                self.open_path(path, temporary=True)
                 installed += self.scene.n_objects - before
             finally:
                 shutil.rmtree(folder, ignore_errors=True)
@@ -7367,7 +7450,11 @@ class MainWindow(QMainWindow):
         to re-earn."""
         cam = self.viewport.camera
         per_deg = cam.PX_PER_REV / 360.0 / max(cam.rotate_speed, 1e-6)
-        cam.rotate(float(d_deg_x) * per_deg, float(d_deg_y) * per_deg)
+        # ...and it stays INSIDE the axis view: a crystal's axis views are
+        # orthographic on purpose and are levelled on a cell axis, and a
+        # stepped walk around the cell must unwind neither (N2).
+        cam.rotate(float(d_deg_x) * per_deg, float(d_deg_y) * per_deg,
+                   keep_axis_view=True)
         self.viewport.update()
 
     def _on_ribbon_pan(self, dx_px, dy_px):

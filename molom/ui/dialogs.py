@@ -2153,7 +2153,7 @@ class _MolResultTable(ResultTable):
     the picture beside the table is for.
     """
 
-    COLUMNS = ("★", "Name", "Formula", "M / g mol-1", "Source")
+    COLUMNS = ("★", "Name", "Formula", "M / g mol-1", "CAS", "Source")
     STAR = 0
     NUMERIC_COLUMNS = {3: "weight"}
     STRETCH_COLUMN = 1
@@ -2167,6 +2167,7 @@ class _MolResultTable(ResultTable):
                 cand.label(),
                 cand.formula,
                 "" if cand.weight is None else "{:.2f}".format(cand.weight),
+                cand.cas,
                 cand.source)
 
     def key_for(self, cand):
@@ -2334,6 +2335,22 @@ class MoleculeSearchDialog(QDialog):
             # Nothing arrived incrementally (an injected search, or a
             # provider that answered only at the end).
             self.table.set_results(result.candidates)
+        elif result.candidates:
+            # RECONCILE with the finished list. The incremental path merges
+            # each provider's batch as it lands, and a row whose key did not
+            # match anything (an empty InChIKey, a provider that answered
+            # before its enrichment) would otherwise stay half-filled for the
+            # rest of the session - visible as a row with no name that comes
+            # good only when the dialog is closed and reopened, which is what
+            # Christian saw. `merge_batch` is safe here for the same reason
+            # it is safe incrementally: a drawn row is FILLED IN, never moved
+            # or removed (round 78).
+            from ..core import molsearch
+            added, updated = molsearch.merge_batch(self.table.results,
+                                                   result.candidates)
+            if added or updated:
+                self.table.refill()
+        self._absorb_favourite_updates()
         text = result.summary() if not self.candidates else (
             _result_line(self.candidates, result.query, noun="compound")
             + (" - " + result.ambiguous if result.ambiguous else ""))
@@ -2341,6 +2358,38 @@ class MoleculeSearchDialog(QDialog):
             text += "\n" + "; ".join(result.trouble[:3])
         self.info.setText(text)
         self._refresh_preview()
+
+    def _absorb_favourite_updates(self):
+        """Give a stored favourite anything the live search just learned.
+
+        A favourite is a SNAPSHOT of the row that was starred, so one saved
+        before a column existed does not have it - Christian starred these
+        before the CAS number was a column, and they came back blank in it.
+        Re-fetching every favourite would be a request per star; folding in
+        what this search already knows costs nothing and is self-healing,
+        which is the same argument `merge_batch` makes one level up.
+        """
+        favourites = self.table.favourites
+        if not favourites:
+            return
+        changed = False
+        for cand in self.table.results:
+            stored = favourites.get(cand.key())
+            if stored is None:
+                continue
+            for field in ("cas", "formula", "inchikey", "iupac_name"):
+                if not getattr(stored, field, "") and getattr(cand, field, ""):
+                    setattr(stored, field, getattr(cand, field))
+                    changed = True
+            if stored.weight is None and cand.weight is not None:
+                stored.weight = cand.weight
+                changed = True
+        if changed:
+            # The dict is the one the window saves when the dialog closes,
+            # whatever the outcome - starring something and then pressing
+            # Cancel is an ordinary way to use a bookmark list - so mutating
+            # it in place is all the persistence this needs.
+            self.table.refill()
 
     # -------------------------------------------------------------- preview
     def _is_dark(self):

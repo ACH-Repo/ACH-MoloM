@@ -536,8 +536,11 @@ beside `PropertiesDock.add_page`.
 buffers** - one `QOpenGLWidget` cannot have two parents - so a workspace that
 also shows the crystal doubles the rebuild cost per scene change.
 
-**N1. THE ROUND-TRIP BANNER APPEARS ON AN IMPORTED CRYSTAL, and it is worse
-than cosmetic.** Christian: "I was looking at a benzoic acid cif from crystal
+**N1. ~~THE ROUND-TRIP BANNER APPEARS ON AN IMPORTED CRYSTAL.~~ DONE, round
+102** - `open_path(path, temporary=True)`, which the crystal search's import
+now passes. It suppresses BOTH the `source_path` claim and the recent-files
+entry, because those are the same promise about a path that is about to be
+deleted. The original report:** Christian: "I was looking at a benzoic acid cif from crystal
 search... when I deleted it, suddenly the round-trip text popped up. I think it
 shows up directly after importing any crystal structure." Diagnosed: `open_path`
 claims `source_path` for the FIRST structure file opened, and the crystal search
@@ -546,17 +549,40 @@ afterwards (round 84). So MoloM claims a round trip to a path that no longer
 exists, and Ctrl+S would try to write there. A searched or otherwise temporary
 import must not claim the document.
 
-**N2. "Rotate by the step angle" switches a crystal from orthographic to
-perspective.** The VESTA ribbon's stepped rotation goes through the ordinary
+**N2. ~~"Rotate by the step angle" switches a crystal from orthographic to
+perspective.~~ DONE, round 102** - `Camera.rotate(keep_projection=True)`. A
+free DRAG still pops back, which is Blender's rule and round 3's; a stepped
+rotation by a typed number of degrees is a different gesture. The report:** The VESTA ribbon's stepped rotation goes through the ordinary
 orbit, which pops the camera back to perspective (round 3's `auto_ortho`).
 Wrong for a crystal, where the axis views are deliberately orthographic.
 
-**N3. The column-width rules must be IDENTICAL in both search windows.** Round
-93 fixed the resize-on-sort in `ui/search_table.py`, which the crystal search
-uses - and the molecule search apparently did not pick it up. Worth checking
-why, since both subclass `ResultTable`. **Standing rule from Christian: any
-control that exists in both search windows should behave the same in both.**
-Also wanted: **the CAS number as a default column** in the molecule search.
+**N3. ~~The column-width rules must be IDENTICAL in both search windows.~~
+DONE, round 102 - and the width half was ALREADY FIXED.** Measured before
+changing anything: both tables put the stretch column in `QHeaderView.Stretch`,
+both word-wrap, and both sum their column widths to the viewport rather than
+to the longest entry. The round-93 fix reached the molecule search through
+`ResultTable` after all; that docket note was stale. A test now pins the two
+against each other, which is the standing rule made mechanical.
+**The CAS number IS new.** `Candidate.cas`, filled from PubChem's synonyms -
+one bulk request for the whole CID list, the same shape as `_properties_for`,
+and run CONCURRENTLY with it so the wait overlaps (measured: +1.0 s serial,
++0.27-0.59 s overlapped, on a ~5 s search). Validated by its CHECK DIGIT
+rather than its shape, because a synonym list is full of hyphenated numbers.
+It is exactly the discriminator this dialog exists for: the three xylenes
+share a formula and a weight and have distinct registry numbers.
+
+**N5. ~~Changing an element on a shared site only relabelled the dominant
+species.~~ DONE, round 102b** - it now makes the site PURELY that element,
+occupancy 1.0, and clears the pie sphere with it. Christian's call, and the
+better one: picking an element off the periodic table says "this position is
+iodine", not "call the 50% niobium iodine and leave the titanium, nickel and
+cobalt". Stating a MIXTURE is a different gesture and already had its own
+dialog (`F3 > Crystal: set the occupancies of a shared site`, round 52).
+
+**N6. LOCAL OPSIN was considered and REFUSED.** `py2opsin` bundles the OPSIN
+jar, so a systematic name would resolve with no network at all - but it
+needs a Java runtime, and Christian's answer was no. Recorded so nobody
+re-proposes it.
 
 **N4. A distribute operator.** F3: with several structures selected, spread
 them along x, y or z; a typed number sets the clear space between them; commit
@@ -646,6 +672,27 @@ arguing about, and what every quickplot tool does); or leaving it alone on
 the grounds that a background is a REFINEMENT decision and this window is a
 comparison aid. Worth asking Christian, since `ACH-PXRD-Quickplot` presumably
 already made the choice once.
+
+**Q12b. The CCDC KEY HOLE is built; the key is not.** Round 102b:
+`cifsearch.register_provider` / `unregister_provider` / `extra_providers`,
+with a registered tier running in the same concurrent fan-out as local, COD
+and OPTIMADE and failing the same way (a tier, never the search). Nothing
+under `molom/core/` imports `ccdc` and a test asserts it. What remains is
+`molom/addons/csd_search.py` - the licence probe and the API calls - left
+unwritten deliberately, because it cannot be run or tested here and an
+untested API layer is round 59's trap. Christian's own framing: "build the
+key hole but not actually put in the key yet".
+
+**Q13. A savefile carrying CSD structures is a redistribution question, and
+the answer is mostly NO.** CCDC: the licence "does not allow external
+sharing of original data from the CSD"; derived data needs their written
+approval. So a `.molom` full of CSD entries must not leave the group, go in
+an issue, or become a fixture. **Ambiguous and worth asking CCDC** (support
+ticket, with the site licence's customer number): what counts as "bulk",
+whether a savefile is original or derived data, and whether editing changes
+that. **Not built, wanting a decision:** marking licensed-source structures
+in the savefile so MoloM can warn on save or export - a real feature that
+puts a dialog in front of an ordinary action. See `docs/CCDC.md` section 4b.
 
 **Q12. CCDC / CSD access - SCOPED, NOT BUILT.** See `docs/CCDC.md` for the
 licensing position (an activation key or a licence server, NOT a `.lic` file

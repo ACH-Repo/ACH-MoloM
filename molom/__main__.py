@@ -121,6 +121,47 @@ def _where():
     return 0
 
 
+#: How a LAUNCHER asks for the round trip without risking anybody else's
+#: command line. Set to the absolute path of the file being handed over.
+ROUNDTRIP_ENV = "MOLOM_ROUNDTRIP_FILE"
+
+
+def roundtrip_requested(path, flag=False, environ=None):
+    # type: (str, bool, Optional[dict]) -> bool
+    """Was this file handed over FOR EDITING, or just opened?
+
+    Opening a file is not a round trip. `molom some.xyz` imports it and
+    Ctrl+S saves a `.molom` project; the geometry write-back is a separate,
+    deliberate mode - Christian's design, and the earlier behaviour (any file
+    argument arms the write-back) was an inference of mine rather than an
+    instruction.
+
+    Two ways in, and the ENVIRONMENT one is the interesting half.
+
+    ORCA Workbench launches whatever program sits in its editor slot as
+    `[program, file]` and nothing else, so it cannot pass a flag without
+    passing it to Avogadro and molden too - and whether an unknown argument
+    is ignored, or exits non-zero, or opens a file named `--roundtrip`, is
+    not consistent across programs and is not something OWB can know. An
+    ENVIRONMENT VARIABLE has no such problem: a program that does not read it
+    cannot be affected by it, so OWB can set it on every editor launch and
+    only MoloM will notice.
+
+    It carries the PATH rather than a bare "1" so that a variable left in a
+    shell cannot arm the write-back for some unrelated file opened later.
+    """
+    if flag:
+        return True
+    env = os.environ if environ is None else environ
+    wanted = (env.get(ROUNDTRIP_ENV) or "").strip()
+    if not wanted or not path:
+        return False
+    try:
+        return os.path.samefile(wanted, path)
+    except OSError:
+        return os.path.abspath(wanted) == os.path.abspath(path)
+
+
 def main(argv=None):
     # type: (list) -> int
     parser = argparse.ArgumentParser(
@@ -133,6 +174,11 @@ def main(argv=None):
                              "0-BASED, matching ORCA and so ORCA Workbench's "
                              "%%geom constraints; two to four of them also "
                              "report the bond, angle or dihedral")
+    parser.add_argument("--roundtrip", action="store_true",
+                        help="the file was opened FOR EDITING by another "
+                             "program: Ctrl+S writes the geometry back over "
+                             "it. Without this, opening a file just imports "
+                             "it and Ctrl+S saves a .molom project.")
     parser.add_argument("--where", action="store_true",
                         help="print the launcher path for ORCA Workbench's "
                              "3D viewer/editor slots and exit")
@@ -185,7 +231,8 @@ def main(argv=None):
     win = MainWindow()
     win.show_startup()   # maximized by default; Settings offers windowed
     if args.file:
-        win.open_path(args.file)
+        win.open_path(args.file, roundtrip=roundtrip_requested(args.file,
+                                                              args.roundtrip))
         if selection:
             picked, missing = win.select_atom_indices(selection)
             note = "Selected atom{} {} (0-based)".format(

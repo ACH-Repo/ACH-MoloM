@@ -175,7 +175,7 @@ def _roundtrip(win, tmp_path):
     win.active_id = seed.id
     win.export_visible(path)
     win.scene.remove(seed.id)
-    win.open_path(path)
+    win.open_path(path, roundtrip=True)      # as OWB launches it (round 102)
     obj = win.scene.objects[-1]
     win.active_id = obj.id
     return path, obj

@@ -206,11 +206,25 @@ class Camera:
         axis = np.array([dy_px, dx_px, 0.0]) / dist
         return quat_from_axis_angle(axis, angle)
 
-    def rotate(self, dx_px, dy_px, pivot=None):
+    def rotate(self, dx_px, dy_px, pivot=None, keep_axis_view=False):
         """Turntable-orbit by a pixel delta about `pivot` (world coords;
-        default = self.center): yaw about world Z, pitch about view X."""
+        default = self.center): yaw about world Z, pitch about view X.
+
+        An axis view is held together by TWO things a free orbit unwinds -
+        the orthographic projection, and a cell axis as the up vector, which
+        the world-Z-up turntable cannot represent. Both are correct to undo
+        for a DRAG, where the pose stops being an axis view the moment the
+        mouse moves. `keep_axis_view` is for the other gesture: a STEPPED
+        rotation by a typed number of degrees, which is how the crystal
+        ribbon walks AROUND a cell and stays in its frame throughout.
+
+        Undoing only one of the two was measured as a **180 degree camera
+        movement for a zero-degree step** - `level_horizon` flipping b and c
+        on the first click, which is what Christian saw as the axes jumping.
+        So the flag covers both, and it has to: they are one pose.
+        """
         rate = self.rotate_speed * 2.0 * np.pi / self.PX_PER_REV
-        if self.auto_level:
+        if self.auto_level and not keep_axis_view:
             # Coming out of a crystallographic axis view: restore the ordinary
             # world-Z-up pose FIRST, so the turntable starts from something it
             # can express. Blender does the same thing with auto-perspective.
@@ -225,9 +239,9 @@ class Camera:
         self.rotation = quat_normalize(
             quat_mul(q_pitch, quat_mul(self.rotation, q_yaw)))
         self._reposition_center(r_old, pivot)
-        if self.auto_ortho:            # Blender: orbiting an axis view
-            self.orthographic = False  # pops back to perspective
-            self.auto_ortho = False
+        if self.auto_ortho and not keep_axis_view:
+            self.orthographic = False  # Blender: orbiting an axis view
+            self.auto_ortho = False    # pops back to perspective
 
     def level_horizon(self):
         # type: () -> None

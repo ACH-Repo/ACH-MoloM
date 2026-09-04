@@ -36,7 +36,10 @@ def opened(tmp_path):
                     "H 0.000000 0.757000 -0.469000\n"
                     "H 0.000000 -0.757000 -0.469000\n", encoding="utf-8")
     win = MainWindow()
-    win.open_path(str(path))
+    # AS ORCA WORKBENCH LAUNCHES IT. Round 102: opening a file is no longer a
+    # round trip by itself - `molom some.xyz` imports it and Ctrl+S saves a
+    # project - so the launcher has to ask for the write-back explicitly.
+    win.open_path(str(path), roundtrip=True)
     return win, str(path)
 
 

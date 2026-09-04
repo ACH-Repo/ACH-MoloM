@@ -16,7 +16,7 @@ it; persisting them is the window's job, which is why `favourites_changed` is
 a signal rather than a call into settings from here.
 """
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (QAbstractItemView, QHeaderView, QTableWidget,
                                QTableWidgetItem)
@@ -99,6 +99,14 @@ class ResultTable(QTableWidget):
         self._sort_column = None
         self._sort_desc = False
         self._loading_stars = False
+        #: True once the user has dragged the stretch column themselves, after
+        #: which `_reflow` leaves it alone - a width somebody set by hand is a
+        #: decision, and recomputing it on the next resize would be round 78's
+        #: rule broken (nothing the user is looking at is recomputed under
+        #: their hand).
+        self._stretch_pinned = False
+        self._reflowing = False
+        self._user_dragging = False
         #: The row set the columns were last fitted to.
         self._sized_for = None
         # Sorting is driven by hand rather than by `setSortingEnabled(True)`,
@@ -123,7 +131,28 @@ class ResultTable(QTableWidget):
         # the culprit." A very long name is exactly when the two disagree
         # most, which is why it looked like a name-length problem: it was.
         if 0 <= self.STRETCH_COLUMN < len(self.COLUMNS):
-            head.setSectionResizeMode(self.STRETCH_COLUMN, QHeaderView.Stretch)
+            # INTERACTIVE rather than Stretch, because Qt refuses to let a
+            # Stretch section be dragged at all - the handle on its right edge
+            # does not even change the cursor. Christian: "the border between
+            # name and Formula cannot even show the adjust icon when hovered
+            # over." It was not fixed-width by intent; it was unresizable as a
+            # side effect of how it was made to stop jumping (round 95).
+            #
+            # What replaces Stretch is `_reflow`: the column is given the
+            # space the others leave, recomputed on every resize UNTIL the
+            # user drags it, after which their width stands. So it still
+            # grows with the window, it is still never FITTED to its longest
+            # entry (which is what put it at 1771 px inside a 796 px
+            # viewport), and it can now be set by hand.
+            head.setSectionResizeMode(self.STRETCH_COLUMN,
+                                      QHeaderView.Interactive)
+            head.sectionResized.connect(self._section_resized)
+            # `sectionResized` fires for OUR writes as well as the user's, and
+            # "the user set this width" is a decision while "the layout moved
+            # it" is not. The honest discriminator is whether the mouse is
+            # down on the header, so the header is watched for that rather
+            # than every programmatic write being remembered to guard itself.
+            head.installEventFilter(self)
             # The star is a 26 px control rather than a column of data, and a
             # header's minimum is global - so it has to come down far enough
             # for `refill`'s `setColumnWidth(STAR, 26)` to mean anything.
@@ -161,6 +190,42 @@ class ResultTable(QTableWidget):
         self.resizeColumnToContents(column)
         self.resizeRowsToContents()
 
+    def eventFilter(self, watched, event):
+        if watched is self.horizontalHeader():
+            if event.type() == QEvent.MouseButtonPress:
+                self._user_dragging = True
+            elif event.type() == QEvent.MouseButtonRelease:
+                self._user_dragging = False
+        return super().eventFilter(watched, event)
+
+    def _section_resized(self, column, _old, _new):
+        """A DRAG on the stretch column pins it. Neither our own reflow nor a
+        relayout does - only a hand on the mouse."""
+        if (column == self.STRETCH_COLUMN and self._user_dragging
+                and not self._reflowing):
+            self._stretch_pinned = True
+
+    def _reflow(self):
+        """Give the stretch column whatever the other columns leave.
+
+        This is what `QHeaderView.Stretch` was doing, done by hand so the
+        section stays Interactive and can be dragged. `_reflowing` guards the
+        write, or setting the width would look like the user setting it.
+        """
+        column = self.STRETCH_COLUMN
+        if not (0 <= column < len(self.COLUMNS)) or self._stretch_pinned:
+            return
+        others = sum(self.columnWidth(c) for c in range(self.columnCount())
+                     if c != column)
+        room = max(80, self.viewport().width() - others)
+        if abs(room - self.columnWidth(column)) <= 1:
+            return
+        self._reflowing = True
+        try:
+            self.setColumnWidth(column, room)
+        finally:
+            self._reflowing = False
+
     def resizeEvent(self, ev):
         """A wrapped cell's HEIGHT depends on its column's WIDTH, and nothing
         in Qt propagates that on its own - so widening the window leaves a
@@ -168,6 +233,7 @@ class ResultTable(QTableWidget):
         narrowing it clips the second line off a name that has just grown
         one."""
         super().resizeEvent(ev)
+        self._reflow()
         self.resizeRowsToContents()
 
     # -------------------------------------------------------- for subclasses
@@ -262,6 +328,15 @@ class ResultTable(QTableWidget):
     def refill(self):
         results = self.ordered_results()
         extra = self.favourites_below(results)
+        # THE SPAN OUTLIVES THE ROW IT WAS SET ON. `_add_divider` spans the
+        # rule across every column, and a span belongs to the TABLE at that
+        # row index rather than to the item - so when the next batch lands
+        # and the divider moves down, the old span stays behind and hides
+        # columns 1..n of whatever candidate now sits there. The row draws
+        # blank except for its star, while the candidate is perfectly intact
+        # behind it - which is why Christian's preview pane showed the
+        # compound the row would not.
+        self.clearSpans()
         self._divider_rows = set()
         self._shown = list(results)
         divider_at = None
@@ -287,13 +362,18 @@ class ResultTable(QTableWidget):
         signature = tuple(self.key_for(e) for e in self._shown if e is not None)
         if signature != getattr(self, "_sized_for", None):
             self._sized_for = signature
-            # Column BY COLUMN, skipping the stretch one: the bulk call would
-            # override its Stretch mode (see `__init__`) and start the flicker
-            # again.
+            # Column BY COLUMN, skipping the stretch one. The bulk call is
+            # `resizeSections(ResizeToContents)`, which by documented design
+            # ignores the per-section mode - and fitting the NAME column to
+            # its longest entry is what put it at 1771 px inside a 796 px
+            # viewport (round 95). Its width comes from `_reflow` instead.
             for column in range(len(self.COLUMNS)):
                 if column != self.STRETCH_COLUMN:
                     self.resizeColumnToContents(column)
         self.setColumnWidth(self.STAR, 26)
+        # The fixed columns have just changed width, so the stretch column's
+        # share of the row has changed with them.
+        self._reflow()
         self.resizeRowsToContents()
 
     def _fill_row(self, row, entry):

@@ -789,6 +789,57 @@ class Results(object):
         return base
 
 
+# ------------------------------------------------------ extra tiers
+#: Search tiers contributed at run time, `{key: (label, callable)}`.
+#:
+#: THE KEY HOLE, and deliberately nothing in it. Round 73 established the
+#: shape for MOPAC: core owns a registry and a signature, and every line that
+#: knows what a particular vendor is lives in `molom/addons/`. The reason is
+#: not tidiness - it is that `core/` must stay installable, testable offline
+#: and PUBLISHABLE, and a licensed database is none of those things.
+#:
+#: The tier this exists for is the CSD. See `docs/CCDC.md`: access needs a
+#: licence and an activation key, the `ccdc` package is not on PyPI and can
+#: never be a dependency here, and CSD data may not be redistributed - so no
+#: fixture, no cache in the repo, and nothing about it in core.
+_EXTRA = {}      # type: Dict[str, Tuple[str, Callable]]
+
+
+def register_provider(key, label, search_fn):
+    # type: (str, str, Callable) -> None
+    """Add a search tier.
+
+    `search_fn(query, formula=..., limit=..., timeout=...)` returns a list of
+    `Hit`, and may raise - `search` records the failure and steps over it, so
+    a tier that is down costs a tier and never the answer (round 37).
+
+    Registering is the ADD-ON's decision and should be conditional on the
+    tier actually being usable: an installed package with no valid licence
+    would otherwise put a row in the dialog that is guaranteed to fail, which
+    is worse than not offering it.
+    """
+    key = str(key or "").strip()
+    if not key:
+        raise ValueError("a provider needs a key")
+    if not callable(search_fn):
+        raise TypeError("a provider needs a callable")
+    _EXTRA[key] = (str(label or key), search_fn)
+
+
+def unregister_provider(key):
+    # type: (str) -> None
+    """Remove a tier. Safe to call for one that was never registered - an
+    add-on may be switched off before it ever registered anything."""
+    _EXTRA.pop(str(key or "").strip(), None)
+
+
+def extra_providers():
+    # type: () -> Dict[str, Tuple[str, Callable]]
+    """What is registered, as a copy. The dialog asks this to say which tiers
+    a search will reach BEFORE it runs one."""
+    return dict(_EXTRA)
+
+
 def search(query, roots=(), fetch=None, network=True, limit=None,
            timeout=TIMEOUT_S, providers=OPTIMADE_PROVIDERS):
     # type: (str, Sequence[str], Optional[Callable], bool, Optional[int], float, Sequence) -> Results
@@ -829,6 +880,15 @@ def search(query, roots=(), fetch=None, network=True, limit=None,
         jobs.append((SOURCE_COD,
                      lambda: search_cod(query, fetch=fetch, timeout=timeout,
                                         formula=formula)))
+    # Registered tiers run alongside the built-in ones, under the same rule:
+    # one thread, one timeout, and a failure that costs a tier rather than
+    # the search. They are asked whether or not `network` is set, because a
+    # registered tier may be a LOCAL database - the CSD is installed on the
+    # machine, not fetched - and only the tier itself knows.
+    for key, (_label, fn) in sorted(_EXTRA.items()):
+        jobs.append((key, (lambda f=fn: f(query, formula=formula,
+                                          limit=PER_SOURCE_LIMIT,
+                                          timeout=timeout))))
 
     import threading
     found = {}
