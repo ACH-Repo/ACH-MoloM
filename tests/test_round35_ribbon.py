@@ -76,30 +76,40 @@ def test_look_along_gives_a_proper_right_handed_view_basis():
             assert _is_view_basis(orient.look_along(cell, key))
 
 
-def test_the_chosen_axis_points_into_the_screen():
-    """Mercury's convention: the axis you picked goes AWAY from you, with the
-    cell origin at the top left."""
+def test_the_chosen_axis_points_AT_the_viewer():
+    """Round 103b reversed round 35b's Mercury convention, on Christian's
+    call: the camera comes in from the POSITIVE side, so the axis you picked
+    points at you. His reason is MoloM's rather than Mercury's - "mercury
+    doesn't have gridlines in its viewport which can be in front of what is
+    being looked at", and coming in from underneath puts the floor grid
+    between the eye and the crystal. The far side is still one more press."""
     for cell in (CUBIC, MONOCLINIC, TRICLINIC):
         for key in orient.AXIS_KEYS:
             forward = -orient.look_along(cell, key)[2]
             axis = orient.axis_vector(cell, key)
-            assert float(np.dot(forward, axis)) == pytest.approx(1.0)
-            # ...and the flip shows the other side.
+            assert float(np.dot(forward, axis)) == pytest.approx(-1.0)
+            # ...and the flip shows the other side, which is where the old
+            # default now lives.
             flipped = -orient.look_along(cell, key, flip=True)[2]
-            assert float(np.dot(flipped, axis)) == pytest.approx(-1.0)
+            assert float(np.dot(flipped, axis)) == pytest.approx(1.0)
 
 
-def test_the_next_axis_goes_right_and_the_one_after_goes_DOWN():
-    """Christian's b-view comparison: MoloM was "exactly mirrored around the
-    red a axis" against Mercury. A mirror is not a rotation, so it can only
-    be the sign of the up vector — a runs DOWN the screen, not up."""
-    for key, right, down in (("a", "b", "c"), ("b", "c", "a"),
-                             ("c", "a", "b")):
+def test_the_next_axis_goes_right_and_the_one_after_goes_UP():
+    """The half that MUST move with the camera side, or the view becomes a
+    MIRROR - which is a thing no camera rotation can undo, and is exactly
+    what Christian reported in round 35b ("exactly mirrored around the red a
+    axis"). Turning the camera round and leaving `k+2` pointing down would
+    have reintroduced it, so both are reversed together and `k+1` still runs
+    right."""
+    for key, right, up in (("a", "b", "c"), ("b", "c", "a"),
+                           ("c", "a", "b")):
         basis = orient.look_along(CUBIC, key)
         assert np.allclose(basis[0], orient.axis_vector(CUBIC, right),
                            atol=1e-9)
-        assert np.allclose(basis[1], -orient.axis_vector(CUBIC, down),
+        assert np.allclose(basis[1], orient.axis_vector(CUBIC, up),
                            atol=1e-9)
+        # ...and it is a ROTATION, not a reflection, in every case.
+        assert float(np.linalg.det(basis)) == pytest.approx(1.0)
 
 
 def test_the_b_view_is_wide_when_c_is_the_long_axis():

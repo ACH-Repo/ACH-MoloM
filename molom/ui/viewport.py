@@ -2932,6 +2932,85 @@ class MolViewport(QOpenGLWidget):
         self.grabMouse()
         self._apply_internal()
 
+    #: `_internal["kind"]` for the whole-object spread. Not one of
+    #: `core/internal.py`'s coordinates - it moves OBJECTS rather than atoms -
+    #: but it rides the same modal, because everything except "what does the
+    #: number mean" is identical: drag or type, Shift to creep, click or Enter
+    #: to confirm, right-click or Esc to revert. A second modal would be 26
+    #: more touch points in this file for one differing line.
+    DISTRIBUTE = "distribute"
+
+    def start_distribute(self, axis="x"):
+        """Spread the selected molecules along an axis, `gap` A apart.
+
+        The number is the CLEAR SPACE between neighbours, not their centre
+        spacing - Christian's "a typed number sets the clear space between
+        them" - so it means the same thing whatever sizes are in the
+        selection, which centre spacing does not.
+        """
+        from ..core import align as align_mod
+        axis = str(axis or "x").lower()[:1]
+        index = {"x": 0, "y": 1, "z": 2}.get(axis)
+        if index is None:
+            return
+        unit = np.zeros(3)
+        unit[index] = 1.0
+        ids = []
+        for obj_id, _atom in self.selection:
+            if obj_id not in ids:
+                ids.append(obj_id)
+        objs = [self.scene.get(i) for i in ids] if self.scene else []
+        objs = [o for o in objs if o is not None and o.structure.n_atoms]
+        if len(objs) < 2:
+            self.status_message.emit(
+                "Select at least two molecules to distribute — click one atom "
+                "of each, or double-click to take whole molecules")
+            return
+        entries, frames = [], {}
+        for obj in objs:
+            centre, width = align_mod.axis_extent(obj.structure.coords, unit)
+            entries.append({"obj_id": obj.id, "centre": centre,
+                            "width": width, "origin": np.array(obj.origin,
+                                                               dtype=float)})
+            frames[obj.id] = [f.copy() for f in obj.structure.frames]
+        widest = max(e["width"] for e in entries) or 1.0
+        state = manipulate.ScalarState(
+            2.0, (4.0 * widest) / max(self.width(), 1), minimum=0.0,
+            unit="A", label="Gap along {}".format(axis))
+        if not self._begin_edit():
+            return
+        self._internal = {
+            "kind": self.DISTRIBUTE, "obj_id": entries[0]["obj_id"],
+            "axis": unit, "entries": entries, "state": state,
+            "rows": [], "picks": [], "blocked": False, "frames": frames,
+        }
+        self.grabKeyboard()
+        self.grabMouse()
+        self._apply_internal()
+
+    def _apply_distribute(self, it):
+        from ..core import align as align_mod
+        gap = float(it["state"].value())
+        entries = it["entries"]
+        wanted = align_mod.distribute_offsets(
+            [e["width"] for e in entries], [e["centre"] for e in entries],
+            gap=gap)
+        axis = it["axis"]
+        for entry, target in zip(entries, wanted):
+            obj = self.scene.get(entry["obj_id"])
+            if obj is None:
+                continue
+            shift = axis * (target - entry["centre"])
+            saved = it["frames"].get(entry["obj_id"]) or []
+            for k, frame in enumerate(saved):
+                if k < obj.structure.n_frames:
+                    obj.structure.frames[k][:] = frame + shift
+            # The origin is a point ON the molecule (round 70), so it travels
+            # with it or the cell box and every later transform desynchronise.
+            obj.origin = entry["origin"] + shift
+        self.status_message.emit(it["state"].status_text())
+        self.refresh_geometry()
+
     def _apply_internal(self):
         """Re-derive from the SNAPSHOT every update, never cumulatively.
 
@@ -2941,6 +3020,9 @@ class MolViewport(QOpenGLWidget):
         """
         it = self._internal
         if it is None:
+            return
+        if it["kind"] == self.DISTRIBUTE:
+            self._apply_distribute(it)
             return
         obj = self.scene.get(it["obj_id"]) if self.scene else None
         if obj is None:
@@ -2965,6 +3047,28 @@ class MolViewport(QOpenGLWidget):
         self._internal = None
         self.releaseKeyboard()
         self.releaseMouse()
+        if it["kind"] == self.DISTRIBUTE:
+            if not commit:
+                for obj_id, saved in (it["frames"] or {}).items():
+                    obj = self.scene.get(obj_id) if self.scene else None
+                    if obj is None:
+                        continue
+                    for k, frame in enumerate(saved):
+                        if k < obj.structure.n_frames:
+                            obj.structure.frames[k][:] = frame
+                for entry in it["entries"]:
+                    obj = self.scene.get(entry["obj_id"]) if self.scene else None
+                    if obj is not None:
+                        obj.origin = entry["origin"]
+                self._cancel_model_edit()
+                self.status_message.emit("Distribute cancelled")
+            else:
+                self.status_message.emit(
+                    "{} molecules distributed, {:.2f} A apart".format(
+                        len(it["entries"]), it["state"].value()))
+                self.edit_committed.emit()
+            self.refresh_geometry()
+            return
         obj = self.scene.get(it["obj_id"]) if self.scene else None
         if not commit:
             if obj is not None:
@@ -6261,7 +6365,8 @@ class MolViewport(QOpenGLWidget):
         if self._internal is not None:
             # Nudge the number, the same way scroll drives the R modal — the
             # trackpad path, where a precise horizontal drag is awkward.
-            span = 0.02 if self._internal["kind"] == internal.DISTANCE else 1.0
+            span = (0.02 if self._internal["kind"] in
+                    (internal.DISTANCE, self.DISTRIBUTE) else 1.0)
             self._internal["state"].add_delta(np.sign(dy) * span)
             self._apply_internal()
             return

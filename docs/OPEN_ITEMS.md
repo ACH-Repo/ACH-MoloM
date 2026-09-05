@@ -466,7 +466,22 @@ than a bug, but nobody has checked which of the two counts the file SHOULD
 have, and a count that changes when you look at a structure two different ways
 is the kind of thing that needs an answer written down.
 
-**M2. A savefile can carry damage done by a fixed bug.** `MF.molom` has CsF
+**M2. ~~A savefile can carry damage done by a fixed bug.~~ DONE, round 103.**
+Investigated properly and it was smaller than this note implied. COD 9008621
+is `F m -3 m` like its four siblings; round 91's bug demoted it and the
+savefile recorded that. **The atoms were never touched** - `demote_to_p1`
+replaces the asymmetric unit (2 atoms -> all 27) and the operators (192 -> 1),
+so the structure is intact and spglib answers `Fm-3m`, number 225,
+unambiguously from those 27 atoms. The F3 re-derivation already repaired it
+completely. Two things were missing and both are now built: `cell_frozen` is
+CLEARED by a successful re-derivation (earned, because `reevaluate_symmetry`
+refuses any group that cannot rebuild the cell - so success is proof that the
+condition the freeze guards against no longer holds), and the ❖ page OFFERS
+it, with a dialog that says the atoms are not touched and that the file keeps
+the old symmetry until saved again. Found while testing: the re-derived
+`asym_frac` was not snapped, so `-9.45e-17 % 1.0` came back as
+`0.9999999999999999` and the cell round-tripped 21 -> 22 atoms - round 87's
+float-sign bug in a second place. The original wording: `MF.molom` has CsF
 stored as `P 1` with `cell_frozen`, so opening it after the round-91 fix still
 shows the demoted crystal - the fix stops it happening again and cannot undo
 what is already written. `F3 > Crystal: re-derive the space group` is the
@@ -584,9 +599,57 @@ jar, so a systematic name would resolve with no network at all - but it
 needs a Java runtime, and Christian's answer was no. Recorded so nobody
 re-proposes it.
 
-**N4. A distribute operator.** F3: with several structures selected, spread
-them along x, y or z; a typed number sets the clear space between them; commit
-on click, like the other modals.
+**N4. ~~A distribute operator.~~ DONE, round 103.** `align.axis_extent` +
+`align.distribute_offsets` in core, driven by the existing scalar modal
+(`viewport.DISTRIBUTE` rides `_internal` rather than adding a second modal -
+that would have been 26 more touch points in `viewport.py` for one differing
+line). Three decisions worth keeping: the extent is measured ALONG THE AXIS
+rather than as a bounding radius (a long flat molecule laid along x is nearly
+its own length wide in x, and a radius leaves a hole); the existing ORDER is
+kept, so it tidies an arrangement rather than reshuffling it into scene-id
+order; and the GROUP does not move, being recentred on the span it already
+occupied.
+
+**N7. Deleting an EMPTY molecule entry.** Christian, 2026-09-05: "if there is
+a molecule entry with no atoms and the outliner entry is selected, does
+pressing Del not delete the entry because no atoms can be selected?" Exactly
+that - the window's Del runs the delete OPERATOR, which acts on selected
+atoms, so the one object you could not get rid of was the one there was
+nothing else to do with. The right-click menu had always offered it. DONE,
+round 103: `OutlinerPanel.keyPressEvent` handles Delete on OBJECT rows.
+
+**N8. The axis-view flip is now "in direct succession".** It used to survive
+anything - view down a, rotate, press a again, and you got the far side.
+Decided by comparing the camera's ORIENTATION rather than by hooking every
+gesture that could change it, so a trackpad orbit, the ribbon's stepped
+rotation, the compass and F3 all reset it without being listed. A PAN or ZOOM
+deliberately does not: those leave you looking down the same axis. DONE,
+round 103.
+
+**N9. ~~The default axis view came in from the negative side.~~ DONE, round
+103b.** Christian's call, and his reason is MoloM's rather than Mercury's:
+"mercury doesn't have gridlines in its viewport which can be in front of what
+is being looked at on a view rotate" - coming in from underneath puts the
+floor grid between the eye and the crystal. Nothing is lost, since the far
+side is still one more press of the same button. **Both halves reversed
+together**: turning the camera round while leaving `k+2` pointing down would
+be a MIRROR, which is what round 35b was fixing in the first place. `k+1`
+still runs right, `k+2` now runs up, determinant +1 on every axis of every
+cell tried. The original wording:
+Christian: "I think that a,b,c views should always come in from the positive
+direction by default." Measured: every default axis view puts the camera on
+the NEGATIVE side of the axis, so "view along c" looks from underneath - and
+for a cell with c near +z the eye is below the xy plane, which is what he
+noticed. But that is DELIBERATE and is `orient.look_along`'s documented
+convention, arrived at in round 35b after three tries against his own Mercury
+screenshots: the cell origin sits top-left, the chosen axis goes INTO the
+screen, and the other two run right and down in cyclic order. **Flipping only
+the camera side would produce a MIRROR** - "axis away" plus "second axis
+down" is what makes the layout match Mercury, and round 35b records that he
+identified the mirror himself ("exactly mirrored around the red a axis"). To
+come in from the positive side without mirroring, the second axis has to run
+UP instead of down, which is a different presentation convention from
+Mercury's. Wants his decision, not a guess.
 
 ---
 
@@ -713,7 +776,76 @@ interval that was measured, so the pattern is genuinely flat outside it and
 upstream draws that region DASHED. Worth doing, and it is a different shape
 of thing from a measured curve rather than one more file extension.
 
-**Q10. A measured trace cannot be put on a Q axis, correctly, and that is a
+**Q10. ~~A measured trace cannot be put on a Q axis.~~ DONE, round 103b,
+widened round 104** - `MeasuredTrace.wavelength`, stated in the right-click
+settings, 0 meaning "not stated". Round 104 made the field TEXT rather than a
+spin box, parsed by `pxrd.parse_source`: a spin box has one unit and a fixed
+number of decimals and Christian needs neither - "I need to be able to input
+0.161699 exactly, or 70 keV. (dimensionless input => Angstrom, with dimension
+=> case-insensitive)". That parser has read wavelengths, energies in keV/eV
+and named lines since round 96, so this is one reader rather than a second
+that would drift from it. The conversion was never the problem; not knowing lambda was,
+and that is a fact about the FILE rather than about the axis. Traces that
+have been told are converted with `q_from_two_theta`; the rest are dropped
+with the alert saying what to do about it. The original wording:
+
+**Q9. ~~The background.~~ DONE, round 103b** - Christian's own proposal:
+"doesn't topas use Chebyshev polynomial functions for bg subtractions? Can't
+we just use those? another right click settings option of tickbox > turn on
+chebyshev bg subtraction and then a integer selection box with a default of,
+say, six?" Built exactly so. `core/background.py`, order 6 by default, and
+the fit is a LOWER ENVELOPE rather than a least-squares curve - a plain
+polynomial passes through the mean and is dragged up by every peak, then
+subtracts intensity belonging to the phase. Measured: the clipped fit lands
+within 1.0-1.5% of the tallest peak against a known foot and keeps 100% of
+the peak, where a naive fit overshoots the true background by 30 on average.
+The clip refits the ORIGINAL data each pass; clipping the already-clipped
+copy compounds and the estimate creeps downwards (measured as a residual
+drifting from 4.9 to 23 across one pattern).
+**Round 104 added the half Chebyshev cannot do**: at synchrotron wavelengths
+the direct beam leaves a steep decay near 2 theta 0 that a low-order
+polynomial cannot represent alongside an otherwise flat pattern. Measured on
+his `i15-1-70985_tth_det2_norm_0.xy`, the tallest point in the whole file is
+**171 400 at 2 theta 0.080** - the beam-stop edge, nine times the tallest real
+Bragg peak - so every peak was drawn at a tenth of its height. It is a POWER
+LAW rather than the exponential it looks like (rms 2 630 against 9 443), and
+it comes off FIRST, which is his own sequencing: "perhaps this should be
+applied first so that chebyshev can work on a pre-processed pattern where it
+can truly shine." The rise INTO the edge is dropped rather than fitted (no
+smooth function takes out a nine-point ramp without taking peaks with it),
+with `beam_stop_edge` finding it from the turning point. 171 400 at 0.080 ->
+18 195 at 2.950. ~~**Still open, and it is why "Ignore below" is a dial**: a
+single power law cannot follow the ramped shoulder at the very edge, so a
+residual is left at the start.~~
+**ROUND 105 REPLACED THE MODEL, on Christian's design, and the residual goes
+with it.** "I still don't like the results... I think we can achieve
+something very nice if we give up on capturing amorphous contributions and go
+through the pattern from high to low angle." `background.rolling_background`
+walks the pattern high to low and lets the background follow it only as fast
+as a background plausibly changes, bridging anything steeper. Every prop the
+Chebyshev needed - the clipping, the bolted-on power law, the beam-stop
+finder telling it where to start - is gone, because a small-angle foot comes
+off as part of the ordinary pass. Both models are kept and chosen in the
+dialog: a real amorphous hump is a thing a polynomial can carry and the walk
+deliberately cannot.
+**And it turned up a bug in `beam_stop_edge` that had been eating a degree of
+real data.** It answered with the in-window maximum, so on
+`i15-1-84514_tth_det2_norm_0.xy` - which starts at 373 counts and climbs for
+a whole degree, the stop being outside the recorded range - it returned 1.20
+degrees, the tallest BRAGG PEAK in the file, and the trim threw away
+everything below it. A maximum is believed to be an edge only if it is inside
+`MAX_SHADOW` and the pattern has decayed to half of it by the end of the
+window; otherwise nothing is dropped. That fix helps the Chebyshev path too.
+**What the walk costs, measured rather than hoped about**: a peak has to
+stand roughly `6 * slope * FWHM` above its background to survive, so weak
+reflections on a strong background are lost and the knob is the lever. That
+linearity is what set the default - amorphous rejection turned out NOT to
+constrain it (two amorphous scans and an empty capillary come off to
+0.3-0.7% of their range at every slope from 0.5 to 3.0), so 1.0 is chosen for
+the weak peaks while still sitting an order of magnitude above every
+peak-free background slope measured.
+
+**Q10-old. A measured trace cannot be put on a Q axis, correctly, and that is a
 dead end rather than a refusal to work around.** A file is in 2 theta and
 carries no wavelength; the window says so and drops the trace. The fix is to
 let the user STATE the wavelength a scan was taken at - one more field in

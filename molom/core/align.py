@@ -141,6 +141,69 @@ def zstack_offsets(radii, gap=2.0):
     return zs
 
 
+def distribute_offsets(extents, positions, gap=2.0):
+    # type: (list, list, float) -> list
+    """Where each object's CENTRE goes so neighbours clear each other by `gap`.
+
+    `extents` is each object's FULL width along the chosen axis and
+    `positions` its current centre on that axis. Returns the new centres, in
+    the same order as the input.
+
+    Three decisions, and the first two are what make this feel right rather
+    than merely correct.
+
+    **The extent is measured along the AXIS, not as a bounding radius.**
+    `zstack_offsets` uses radii, which is fine for dropping SMILES results in
+    a column but wrong here: a long flat molecule laid along x is nearly its
+    own length wide in x and almost nothing in y, and spacing it by its
+    radius leaves a hole you did not ask for.
+
+    **The existing ORDER is kept.** Objects are laid out in the order of their
+    current positions along the axis, so distributing tidies an arrangement
+    up rather than reshuffling it into scene-id order - which would move
+    things past each other for no reason the user can see.
+
+    **The GROUP does not move.** The result is recentred on the span the
+    objects already occupy, so distributing three molecules does not also
+    slide them off to one side.
+    """
+    n = len(extents)
+    if n == 0:
+        return []
+    if n != len(positions):
+        raise ValueError("one extent and one position per object")
+    order = sorted(range(n), key=lambda i: float(positions[i]))
+    gap = float(gap)
+    centres = [0.0] * n
+    cursor = 0.0
+    for k, i in enumerate(order):
+        half = abs(float(extents[i])) / 2.0
+        if k:
+            prev = order[k - 1]
+            cursor += abs(float(extents[prev])) / 2.0 + gap + half
+        centres[i] = cursor
+    before = sum(float(p) for p in positions) / n
+    after = sum(centres) / n
+    shift = before - after
+    return [c + shift for c in centres]
+
+
+def axis_extent(coords, axis_unit):
+    # type: (np.ndarray, np.ndarray) -> tuple
+    """`(centre, width)` of these atoms projected on a unit axis.
+
+    The width a molecule really occupies along the direction it is about to
+    be spread along - which is the number `distribute_offsets` wants and the
+    one a bounding sphere cannot give.
+    """
+    xyz = np.asarray(coords, dtype=float).reshape(-1, 3)
+    if not len(xyz):
+        return 0.0, 0.0
+    t = xyz @ np.asarray(axis_unit, dtype=float)
+    lo, hi = float(t.min()), float(t.max())
+    return 0.5 * (lo + hi), hi - lo
+
+
 def align_planar_to_plane(coords, target_normal, tol=0.15):
     # type: (np.ndarray, np.ndarray, float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]
     """Rotation laying the molecule's largest planar cluster into the target

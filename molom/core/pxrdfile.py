@@ -59,6 +59,35 @@ NAME_FILTERS = (
     "All files (*)",
 )
 
+#: Extensions that are certainly NOT a powder pattern, for deciding whether
+#: a DROPPED file is worth handing to `read`. Deliberately a list of what to
+#: refuse rather than a list of what to accept: the text formats have no
+#: standard and a pattern turns up under `.txt`, `.asc` and half a dozen
+#: house extensions, so a whitelist would refuse real data. What this stops
+#: is a structure or a picture being read as a table of numbers - and note
+#: `.xyz` is in here while `.xy` is not, which is a distinction one character
+#: wide and the reason this is written down rather than guessed at each time.
+NOT_PATTERNS = frozenset((
+    ".cif", ".mmcif", ".xyz", ".molom", ".mol", ".mol2", ".sdf", ".pdb",
+    ".cml", ".gro", ".hin", ".gzmat", ".pdbqt", ".mdl", ".inp", ".blend",
+    ".py", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".svg",
+    ".pdf", ".zip", ".gz", ".7z", ".exe", ".dll", ".docx", ".xlsx", ".pptx",
+))
+
+
+def looks_like_pattern(path):
+    # type: (str) -> bool
+    """Could this file be a powder pattern? Extension only, and permissive.
+
+    The reader is the only thing that can really tell, so this exists to keep
+    an obvious mis-drop - a .cif, a screenshot - from being read as a table
+    of numbers. Anything that gets past it and turns out not to be a pattern
+    is refused by `read` with a reason, which is a better answer than a drop
+    that silently does nothing.
+    """
+    return os.path.splitext(str(path))[1].lower() not in NOT_PATTERNS
+
+
 #: Extensions read by a FORMAT-SPECIFIC reader rather than as text. These are
 #: binary, so there is no text fallback to try - a failure here is a failure.
 BINARY_READERS = {".raw": "read_raw", ".brml": "read_brml"}

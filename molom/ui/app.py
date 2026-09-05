@@ -178,6 +178,9 @@ class MainWindow(QMainWindow):
         self.active_id = None            # type: Optional[int]
         self.undo = UndoStack(limit=int(self.settings.value("undo_limit", 30)))
         self._last_axis_align = None     # {"obj_id", "axis", "pivot"}
+        #: The camera pose the last a/b/c button left behind, so a SECOND
+        #: press can tell "again" from "again, after moving".
+        self._last_axis_pose = None
         self._align_preview = None       # pose captured when A armed
         # Objects whose frame moved while they were hidden: their bonds are
         # re-perceived when they come back, not while nobody can see them.
@@ -420,6 +423,7 @@ class MainWindow(QMainWindow):
         self.crystal_page.view_changed.connect(self._on_crystal_view_chosen)
         self.crystal_page.occupancy_toggled.connect(
             self._on_occupancy_display)
+        self.crystal_page.rederive_requested.connect(self._on_rederive_frozen)
         self.crystal_page.outside_toggled.connect(
             lambda on: self._on_packing_option(self.active_id, "outside", on))
         self.crystal_page.copies_toggled.connect(
@@ -797,6 +801,14 @@ class MainWindow(QMainWindow):
               "Align 2 selected atoms to the {} axis".format(name),
               lambda c, a=axis: c.on_align_axis(a), enabled=two_same,
               category="Edit")
+        for axis in ("x", "y", "z"):
+            r("distribute_" + axis,
+              "Distribute selected molecules along {}".format(axis.upper()),
+              lambda c, a=axis: c.viewport.start_distribute(a),
+              enabled=lambda c: len({o for o, _a in c.viewport.selection}) > 1,
+              category="Edit",
+              aliases=("spread", "space out", "arrange", "lay out",
+                       "separate", "distribute"))
         r("flip_alignment", "Flip last axis alignment (reverse direction)",
           lambda c: c.on_flip_alignment(),
           enabled=lambda c: c._last_axis_align is not None, category="Edit")
@@ -808,8 +820,13 @@ class MainWindow(QMainWindow):
           category="Edit", shortcut="Shift+A (object mode)", key="Shift+A")
         r("delete_selected", "Delete selected atoms (or a measurement)",
           lambda c: c.on_delete_selected(),
+          # The predicate has to cover every case the operator handles, or
+          # `run_op` refuses it and the key never arrives - which is round
+          # 60's lesson, and is why an empty molecule could not be deleted:
+          # it has no atoms to select, so `viewport.selection` is empty.
           enabled=lambda c: bool(c.viewport.selection
-                                 or c.viewport.has_measurement_target()),
+                                 or c.viewport.has_measurement_target()
+                                 or c.empty_selected_objects()),
           category="Edit",
           shortcut="Del or X", key="Del", extra_keys=("X",))
         r("hide_selected", "Hide the selected atoms",
@@ -4345,6 +4362,18 @@ class MainWindow(QMainWindow):
                 "distance": float(cam.distance),
                 "rotation": [float(v) for v in cam.rotation],
                 "orthographic": bool(cam.orthographic),
+                # AN AXIS VIEW IS NOT JUST A POSE. `auto_ortho` and
+                # `auto_level` are what make the next orbit pop back to
+                # perspective and level the horizon, so a file saved while
+                # looking down a cell axis reopened without them as a view
+                # that was orthographic FOREVER - Christian: "rotating the
+                # camera doesn't pop back to perspective. It should."
+                #
+                # BOTH, never one: `Camera.rotate` measured undoing only one
+                # of the two as a 180 degree camera movement for a
+                # zero-degree step, because they are one pose.
+                "auto_ortho": bool(cam.auto_ortho),
+                "auto_level": bool(cam.auto_level),
                 # WHICH camera you were looking through, so reopening a file
                 # puts you back in the shot rather than in a free view that
                 # merely happens to sit where the shot was. The pose above is
@@ -4601,7 +4630,11 @@ class MainWindow(QMainWindow):
             cam.distance = float(view.get("distance", cam.distance))
             cam.rotation = np.asarray(view["rotation"], dtype=float)
             cam.orthographic = bool(view.get("orthographic", False))
-            cam.auto_ortho = False
+            # Absent in a file written before round 105, and False is the
+            # right answer for one: a plain orthographic view chosen by hand
+            # is meant to stay orthographic, and only an AXIS view pops back.
+            cam.auto_ortho = bool(view.get("auto_ortho", False))
+            cam.auto_level = bool(view.get("auto_level", False))
         self.viewport.selected_camera_id = view.get("selected_camera")
         through = view.get("looking_through")
         if through is not None and self.scene.camera(through) is not None:
@@ -5228,6 +5261,22 @@ class MainWindow(QMainWindow):
         self.outliner.sync(self.scene, self.active_id)
         self._after_edit()
 
+    def empty_selected_objects(self):
+        """Selected outliner rows whose molecule has NO ATOMS.
+
+        The one thing Delete can mean when the viewport has nothing selected.
+        Narrow on purpose: an object with atoms is deleted by selecting them,
+        so widening this to every highlighted row would let Del destroy the
+        molecule you are looking at - `highlight` makes the active object's
+        row current, so something is nearly always selected there.
+        """
+        out = []
+        for obj_id in self.outliner.selected_object_ids():
+            obj = self.scene.get(obj_id)
+            if obj is not None and obj.structure.n_atoms == 0:
+                out.append(obj_id)
+        return out
+
     def on_delete_selected(self):
         # A hovered or selected MEASUREMENT is what Delete takes first: it is
         # the thing under the cursor, it is drawn highlighted to say so, and it
@@ -5238,6 +5287,20 @@ class MainWindow(QMainWindow):
             return
         sel = self.viewport.selection
         if not sel:
+            # NOTHING TO DELETE IN THE VIEWPORT. The only object Delete can
+            # still mean is an EMPTY one, which is the whole of the gap:
+            # every other molecule is reachable through its atoms, and a row
+            # that merely happens to be highlighted must not be destroyed by
+            # a key the user pressed expecting nothing to happen.
+            #
+            # It has to live HERE rather than in `OutlinerPanel.keyPressEvent`,
+            # which is where round 103b put it and why the fix never reached a
+            # hand: `Del` is a WindowShortcut QAction, and a window shortcut is
+            # dispatched before the focused widget sees a key press at all. The
+            # panel's own handler could not fire and its test never noticed,
+            # because the test called `keyPressEvent` directly.
+            for obj_id in self.empty_selected_objects():
+                self._on_obj_delete(obj_id)
             return
         self.push_undo()
         removed_objs = []
@@ -6810,6 +6873,54 @@ class MainWindow(QMainWindow):
                 obj.name, len(orbit),
                 occ_mod.describe(chosen) or "a plain full atom"), 8000)
 
+    def _on_rederive_frozen(self):
+        """The ❖ page's way out of a frozen P1 cell.
+
+        Christian: "should we not just have an option to re-derive the space
+        group if the user is explicitly informed they're about to change
+        something?" - so it SAYS what it will do first, and names the two
+        things people would want to know: that the atoms are not touched, and
+        that the file on disk keeps the old symmetry until it is saved again.
+        MoloM cannot protect a file anyway ("they can just save as and
+        overwrite and the file system does what it does"), so the honest
+        thing is to be clear rather than cautious.
+        """
+        obj = self._crystal_subject()
+        if obj is None:
+            return
+        meta = obj.structure.metadata or {}
+        was = meta.get("spacegroup") or "P 1"
+        answer = QMessageBox.question(
+            self, "Re-derive the space group",
+            "<b>{}</b> is stored as {} because its full cell was edited."
+            "<br><br>MoloM can work the symmetry out again from where the "
+            "atoms are now. The <b>atoms are not changed</b> - only the "
+            "space group, the operators and the asymmetric unit derived from "
+            "them - and the answer is refused if it cannot rebuild this cell "
+            "exactly.<br><br>The file on disk keeps {} until you save "
+            "again.".format(obj.name, was, was),
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes)
+        if answer != QMessageBox.Yes:
+            return
+        self.push_undo()
+        found = self.reevaluate_symmetry(obj, announce=False)
+        self._sync_crystal_page()
+        meta = obj.structure.metadata or {}
+        if found:
+            self.statusBar().showMessage(
+                "{}: {} -> {} ({} operator(s), {} site(s)) - the contents "
+                "switch is live again".format(
+                    obj.name, was, found, len(meta.get("symops") or []),
+                    len(meta.get("asym_symbols") or [])), 9000)
+        else:
+            # `reevaluate_symmetry` refuses a group that cannot rebuild the
+            # cell, so "nothing changed" here means the coordinates really do
+            # only have P1 - which is a fact about the structure rather than a
+            # failure, and the cell stays frozen for the reason it was frozen.
+            self.statusBar().showMessage(
+                "{}: the coordinates still only have {} - nothing to "
+                "recover".format(obj.name, was), 8000)
+
     def on_reevaluate_symmetry(self):
         """F3: re-derive the space group, on demand rather than on edit."""
         obj = self._active_obj()
@@ -7007,8 +7118,16 @@ class MainWindow(QMainWindow):
         # completion runs — 210 drawn atoms came back as 168. Wrapping here
         # makes the stored unit the canonical cell content, which is what
         # `expand` would have produced, so the rebuild reproduces the picture.
-        meta["asym_frac"] = [[float(v) for v in (content[i] % 1.0)]
-                             for i in reps]
+        # SNAPPED BEFORE AND AFTER THE WRAP, which is round 87's bug met in a
+        # second place. A symmetry operator produces an exact zero as
+        # `-9.45e-17`, and `-9.45e-17 % 1.0` is `0.9999999999999999` - the FAR
+        # face, so the next expansion gives that site an extra boundary copy
+        # and the cell comes back one atom larger. Measured on the solid
+        # solution: demote, re-derive, asym -> cell, and 21 atoms became 22.
+        # Snapping first sends it to a clean 0.0, which wraps to itself.
+        snapped = np.asarray(_snap_fractional(content), dtype=float)
+        wrapped = _snap_fractional(snapped % 1.0)
+        meta["asym_frac"] = [list(wrapped[i]) for i in reps]
         # The parallel columns describe the OLD sites, so they cannot be
         # sliced — but they need not be thrown away either: `packing.pack`
         # records which asymmetric-unit site each DRAWN atom came from, so
@@ -7117,6 +7236,21 @@ class MainWindow(QMainWindow):
                     .format(obj.name, symbol, len(ops), n_reps, n_content,
                             was or "the stored symmetry"), 9000)
             return None
+        # THE FREEZE IS EARNED BACK. `cell_frozen` (round 52) stops the
+        # contents radio regenerating the cell from `asym_symbols` + `symops`,
+        # because after an arbitrary edit those two may describe something
+        # else entirely - that is the MOF-5 failure where 616 drawn atoms came
+        # back as 7. But `_reconstructs` above has just PROVED that the unit
+        # and the operators rebuild exactly these atoms, which is precisely
+        # the condition the freeze guards against. Once that holds there is
+        # nothing left to protect, and leaving it set greys the page for a
+        # crystal that is no longer in any danger.
+        #
+        # Note what the freeze was never for: it does not protect the FILE.
+        # Christian: "we can't really stop them from overwriting the original
+        # file either." Quite - it protects the structure in memory from
+        # being regenerated out of metadata that does not match it.
+        meta.pop("cell_frozen", None)
         meta["symmetry_source"] = spacegroups.SOURCE_DERIVED
         meta["symmetry_note"] = (
             "symmetry re-derived from the edited coordinates: {} -> {} "
@@ -7397,8 +7531,30 @@ class MainWindow(QMainWindow):
         # Clicking the SAME axis again views it from the other side, which is
         # what Mercury spends a second row of x−/x+ buttons on. One button
         # that alternates costs no width and is one less thing to find.
+        # IN DIRECT SUCCESSION, which is what "again" means. The memory used
+        # to survive anything - rotate the crystal, come back to `a`, and you
+        # got the far side, because `_last_axis_view` still said "a".
+        # Christian: "If I press direction once, rotate and then press it
+        # again, the rotation should start from positive again. Start from
+        # negative only if pressed twice directly in succession."
+        #
+        # Decided by comparing the camera's ORIENTATION rather than by hooking
+        # every gesture that could change it. A trackpad orbit, the ribbon's
+        # stepped rotation, the compass, F3, a saved camera - all of them turn
+        # the camera, and a list of them is a list that goes stale. "Is the
+        # view still pointing where I left it?" cannot.
+        #
+        # A PAN or a ZOOM deliberately does NOT reset it: those leave you
+        # looking down the same axis, so pressing the button again still means
+        # "the other side". Only a rotation takes you OFF the axis, and that
+        # is the case where a second press means "put me back" - which is
+        # exactly the distinction Christian drew ("press it once, ROTATE, and
+        # then press it again").
+        unmoved = (self._last_axis_pose is not None
+                   and np.allclose(cam.rotation, self._last_axis_pose,
+                                   atol=1e-9))
         flip = (key == getattr(self, "_last_axis_view", None)
-                and not getattr(self, "_last_axis_flip", False))
+                and unmoved and not getattr(self, "_last_axis_flip", False))
         self._last_axis_view, self._last_axis_flip = key, flip
         try:
             basis = orient.look_along(cell, key, flip=flip)
@@ -7412,6 +7568,9 @@ class MainWindow(QMainWindow):
         # honestly "down the axis" without perspective convergence.
         cam.orthographic = True
         cam.auto_ortho = True
+        # Remembered AFTER the pose is applied, so the next press can ask
+        # whether anything has moved it since.
+        self._last_axis_pose = np.array(cam.rotation, copy=True)
         # The up vector here is a CELL axis, which the world-Z-up turntable
         # cannot represent — so the next orbit levels back to the ordinary
         # viewport alignment rather than starting from a pose it has no way

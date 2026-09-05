@@ -462,6 +462,7 @@ class CrystalPage(QWidget):
     cell_remove_requested = Signal()
     frac_apply_requested = Signal()
     pxrd_requested = Signal()
+    rederive_requested = Signal()
 
     #: Has the ACTIVE molecule's cell been edited into P1?
     _frozen = False
@@ -650,6 +651,30 @@ class CrystalPage(QWidget):
             "Just the sites the file lists, before symmetry is applied")
         for b in (self.asym_radio, self.cell_radio, self.pack_radio):
             lay.addWidget(b)
+
+        # THE WAY OUT OF A FROZEN CELL, offered where the greyed control is.
+        # An edited full cell is P1 with `cell_frozen` set, and the repair -
+        # re-deriving the group from the coordinates - existed only as an F3
+        # operator you had to know the name of. A greyed control that cannot
+        # say what would un-grey it is the thing this project keeps finding.
+        # Shown ONLY when frozen, because on an ordinary crystal it would be
+        # a button offering to change something that is already right.
+        self.rederive_btn = QPushButton("Re-derive the space group...")
+        self.rederive_btn.setToolTip(
+            "Work the symmetry out from where the atoms are now. The atoms "
+            "themselves are not touched.")
+        self.rederive_btn.clicked.connect(
+            lambda _c=False: self.rederive_requested.emit())
+        self.rederive_btn.hide()
+        self.frozen_note = QLabel(
+            "This cell was edited, so it is stored as <b>P1</b> and the "
+            "contents switch is off - the atoms you see ARE the structure.")
+        self.frozen_note.setWordWrap(True)
+        self.frozen_note.setMinimumWidth(1)
+        self.frozen_note.setStyleSheet("color: #c8a45a;")
+        self.frozen_note.hide()
+        lay.addWidget(self.frozen_note)
+        lay.addWidget(self.rederive_btn)
 
         row = QHBoxLayout()
         self.na = QSpinBox()
@@ -1087,6 +1112,8 @@ class CrystalPage(QWidget):
                 "This cell was edited, so it is P1: the atoms you see "
                 "ARE the structure. Repeat it with an Array modifier."
                 if self._frozen else "")
+        self.frozen_note.setVisible(has and self._frozen)
+        self.rederive_btn.setVisible(has and self._frozen)
         self._sync_pack_enabled()
         # Nothing was refused on this molecule, so there is nothing to
         # override — greyed, and the count says why rather than leaving a

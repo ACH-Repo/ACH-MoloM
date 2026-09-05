@@ -538,6 +538,7 @@ a grab or a rotation *during* the drag, not on commit.
 | Crystal: re-derive the space group from the coordinates | F3 (also automatic on every edit to a full cell) |
 | Crystal: simulate the powder pattern (PXRD)... | **Ctrl+Shift+D**, the ❖ page's button, View ▸ Crystal ▸ Powder pattern, or F3 (opens on the SELECTED crystals) |
 | Make the selected substituent coplanar with its ring | F3 |
+| Distribute selected molecules along X / Y / Z | F3 - a live modal: drag or type the CLEAR SPACE between neighbours, click to confirm, Esc to revert |
 
 **Editing a crystal, and what happens to its symmetry.** Which of two things
 happens depends on whether a **symmetry modifier** is on the stack:
@@ -641,6 +642,13 @@ and `.brml`, and Riet7 `.dat`. Right-click the curve or its tick box for its
 **colour, height and 2 theta shift**, to **reload it from disk** (keeping all
 three - a scan gets re-integrated, and losing the alignment you just set is
 the reason not to re-open it), or to remove it.
+
+Its right-click settings also carry the **wavelength** the scan was taken at
+(0 = not stated) and a **Chebyshev background subtraction** with a settable
+order, defaulting to 6 - TOPAS's own model and its own common default. State
+the wavelength and the trace can go on the **Q axis**, which is what makes it
+comparable with a simulation at a different one; leave it unstated and it is
+dropped there, with the note saying why.
 
 The measurement is drawn at the **top of the stack**, in a paler palette, in
 italics in the tick row - which curve is data and which is a calculation is

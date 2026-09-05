@@ -21,6 +21,7 @@ import pytest
 
 from molom.core import bruker
 from molom.core import io as io_mod
+from molom.core import background as bg_mod
 from molom.core import pxrd
 from molom.core import pxrdfile
 from molom.core.structure import Structure
@@ -845,3 +846,306 @@ def test_the_pseudo_voigt_keeps_ONE_window(monkeypatch):
     assert y[0] > 0.0
     lorentz_only = 100.0 * 0.5 / (1.0 + (6.0 * fwhm / (fwhm / 2.0)) ** 2)
     assert y[0] == pytest.approx(lorentz_only, rel=1e-6)
+
+
+# ------------------- Q9: a Chebyshev background, Q10: a wavelength (r103b)
+def test_the_background_fit_is_a_LOWER_ENVELOPE_not_a_least_squares_curve():
+    """The whole difficulty. A plain polynomial fit passes through the MEAN
+    of the data, so it is dragged up by every peak and then subtracts
+    intensity belonging to the phase - worst exactly where the pattern is
+    most crystalline. Measured against a known foot: the clipped fit is
+    within 1.5% of the tallest peak, the naive one overshoots by 30 on
+    average."""
+    from molom.core import background as bg
+    x = np.linspace(5.0, 60.0, 2000)
+    foot = 900.0 * np.exp(-(x - 4.0) / 9.0) + 60.0 + 0.8 * x
+    peaks = np.zeros_like(x)
+    for centre in (12.0, 26.0, 33.0, 41.0):
+        peaks += 3000.0 * np.exp(-0.5 * ((x - centre) / 0.08) ** 2)
+    y = foot + peaks
+    estimate = bg.chebyshev_background(x, y, order=6)
+    assert np.max(np.abs(estimate - foot)) < 0.05 * peaks.max()
+    # ...and a naive fit really is worse, which is why the clipping is there
+    t = 2.0 * (x - x.min()) / np.ptp(x) - 1.0
+    naive = np.polynomial.chebyshev.chebval(
+        t, np.polynomial.chebyshev.chebfit(t, y, 6))
+    assert np.mean(naive - foot) > np.mean(np.abs(estimate - foot))
+
+
+def test_subtracting_the_background_keeps_the_PEAKS():
+    """The test a background correction has to pass: it may flatten the
+    baseline and must not eat the signal."""
+    from molom.core import background as bg
+    x = np.linspace(5.0, 60.0, 2000)
+    foot = 500.0 + 5.0 * x
+    peaks = 2000.0 * np.exp(-0.5 * ((x - 30.0) / 0.1) ** 2)
+    corrected, estimate = bg.subtract_background(x, foot + peaks, order=6)
+    top = int(np.argmax(peaks))
+    assert corrected[top] == pytest.approx(peaks[top], rel=0.02)
+    away = np.abs(x - 30.0) > 2.0
+    assert abs(float(np.mean(corrected[away]))) < 5.0
+    assert np.all(corrected >= 0.0), "the default floors at zero"
+
+
+def test_the_order_is_the_users_and_six_is_the_default():
+    """TOPAS's own common default, and Christian's suggestion."""
+    from molom.core import background as bg
+    assert bg.DEFAULT_ORDER == 6
+    x = np.linspace(5.0, 60.0, 500)
+    y = 100.0 + np.sin(x / 3.0) * 40.0
+    flat = bg.chebyshev_background(x, y, order=0)
+    curvy = bg.chebyshev_background(x, y, order=12)
+    assert np.ptp(flat) < 1e-6, "order 0 is a constant"
+    assert np.ptp(curvy) > np.ptp(flat)
+
+
+def test_a_pattern_shorter_than_the_polynomial_is_refused_gracefully():
+    from molom.core import background as bg
+    out = bg.chebyshev_background([1.0, 2.0], [5.0, 7.0], order=6)
+    assert out.shape == (2,)
+    assert np.allclose(out, 5.0)          # flat at the minimum, not a crash
+
+
+def test_the_background_comes_off_BEFORE_the_normalisation(bench, tmp_path):
+    """Which is the point of doing it in the window rather than the reader:
+    every trace is scaled to its own strongest point, so a foot eats the
+    dynamic range and the peaks come out short against the simulation."""
+    win = bench
+    w = win._pxrd_window
+    path = tmp_path / "foot.xy"
+    x = np.linspace(5.0, 60.0, 2000)
+    peaks = 2000.0 * np.exp(-0.5 * ((x - 30.0) / 0.1) ** 2)
+    y = peaks + 800.0 * np.exp(-(x - 4.0) / 9.0) + 50.0
+    path.write_text("".join("%.4f %.2f\n" % (u, v) for u, v in zip(x, y)),
+                    encoding="utf-8")
+    w.load_measured(str(path))
+    entry = w.measured[0]
+    away = np.abs(x - 30.0) > 2.0
+    _bx, before = w.measured_curve(entry)
+    entry.background = True
+    _ax, after = w.measured_curve(entry)
+    assert float(np.mean(after[away])) < float(np.mean(before[away]))
+    assert float(after.max()) == pytest.approx(100.0)
+
+
+def test_a_measurement_CAN_go_on_a_Q_axis_once_it_states_its_wavelength(
+        bench, tmp_path):
+    """Round 100 refused it, correctly: a file gives 2 theta and carries no
+    wavelength, so converting meant inventing one. The conversion was never
+    the problem - not knowing lambda was, and that is a fact about the file
+    rather than about the axis. So it is asked for."""
+    win = bench
+    w = win._pxrd_window
+    w.load_measured(_measured_file(tmp_path))
+    entry = w.measured[0]
+    assert entry.wavelength == 0.0
+    w.q_axis.setChecked(True)
+    assert _traces(win, measured=True) == [], "no wavelength, not drawn"
+    assert "wavelength" in w.note.text()
+    entry.wavelength = 1.5406
+    w.recompute()
+    drawn = _traces(win, measured=True)
+    assert len(drawn) == 1
+    q = drawn[0].x
+    assert q[0] == pytest.approx(
+        pxrd.q_from_two_theta(entry.data.x[0] + entry.shift, 1.5406))
+    assert q[-1] > q[0]
+
+
+def test_the_measured_options_dialog_carries_both(bench, tmp_path):
+    pytest.importorskip("PySide6")
+    from molom.ui import pxrd_panel
+    win = bench
+    w = win._pxrd_window
+    w.load_measured(_measured_file(tmp_path))
+    entry = w.measured[0]
+    dlg = pxrd_panel.MeasuredOptions(w, entry)
+    dlg.wavelength.setText("0.7093")         # Mo K-alpha1
+    dlg.background.setChecked(True)
+    dlg.bg_order.setValue(8)
+    dlg.apply()
+    assert entry.wavelength == pytest.approx(0.7093)
+    assert entry.background is True
+    assert entry.bg_order == 8
+    # the order box is dead while the tick is off, which is the round-43 rule
+    dlg2 = pxrd_panel.MeasuredOptions(w, entry)
+    dlg2.background.setChecked(False)
+    assert not dlg2.bg_order.isEnabled()
+
+
+# ------------------- the small-angle tail, and a wavelength in any unit (r104)
+def test_the_beam_stop_edge_is_where_the_intensity_STOPS_RISING():
+    """Intensity behind a beam stop rises to the edge of the shadow and
+    decays after it, so the turning point is the first usable angle and
+    everything below it is inside the shadow rather than being data."""
+    from molom.core import background as bg
+    x = np.linspace(0.0, 10.0, 1001)
+    y = np.where(x < 0.08, 8000 + 2e6 * x ** 2, 1400.0 / np.maximum(x, 0.08))
+    assert bg.beam_stop_edge(x, y) == pytest.approx(0.08, abs=0.011)
+
+
+def test_the_small_angle_tail_is_a_POWER_LAW_not_an_exponential():
+    """Christian described it as "an exponential looking curve close to
+    2theta = 0". Measured on his own synchrotron file over 0.1-5 deg, a
+    power law fits with rms 2630 and an exponential 9443 - so it looks
+    exponential and is not, and the model follows the measurement."""
+    from molom.core import background as bg
+    x = np.linspace(0.1, 12.0, 3000)
+    y = 12000.0 * x ** -0.78
+    tail = bg.low_angle_tail(x, y, start=0.1, cutoff=6.0)
+    assert np.max(np.abs(tail - y)) / y.max() < 0.03
+
+
+def test_the_tail_fit_is_a_LOWER_ENVELOPE_too():
+    """The Bragg peaks in the fitted window sit ON the tail, so a plain
+    least-squares line through them rides up and subtracts intensity that
+    belongs to the phase - the same argument as the Chebyshev."""
+    from molom.core import background as bg
+    x = np.linspace(0.1, 12.0, 3000)
+    true = 12000.0 * x ** -0.78
+    peaks = np.zeros_like(x)
+    for centre in (2.0, 3.5, 4.8):
+        peaks += 9000.0 * np.exp(-0.5 * ((x - centre) / 0.02) ** 2)
+    tail = bg.low_angle_tail(x, true + peaks, start=0.1, cutoff=6.0)
+    assert np.max(np.abs(tail - true)) / true.max() < 0.06
+
+
+def test_remove_low_angle_drops_the_shadow_and_takes_the_tail_off():
+    from molom.core import background as bg
+    x = np.linspace(0.0, 10.0, 1001)
+    # Continuous across the edge, as real data is: a smooth shadow ramp
+    # multiplying the small-angle decay, so the pattern has a TURNING POINT
+    # rather than a step.
+    decay = 1400.0 / np.maximum(x, 1e-6) ** 0.78
+    ramp = 1.0 - np.exp(-(np.maximum(x, 0.0) / 0.05) ** 3)
+    y = decay * ramp
+    xk, yk, start = bg.remove_low_angle(x, y)
+    assert start == pytest.approx(0.07, abs=0.02)
+    assert xk[0] >= start and len(xk) < len(x)
+    # The claim is that the low-angle end STOPS DOMINATING: before, the
+    # tallest point in the pattern is the beam stop; after, it is not.
+    assert x[int(np.argmax(y))] < 0.2, "before: the beam stop is the tallest"
+    assert float(np.max(yk)) < 0.05 * float(np.max(y)), \
+        "after: the divergence is gone"
+
+
+def test_a_pattern_with_no_room_to_fit_is_returned_untouched():
+    from molom.core import background as bg
+    x = np.array([1.0, 2.0, 3.0])
+    y = np.array([5.0, 4.0, 3.0])
+    xk, yk, _s = bg.remove_low_angle(x, y)
+    assert len(xk) == 3
+
+
+def test_the_tail_comes_off_BEFORE_the_chebyshev(bench, tmp_path):
+    """Christian's own sequencing: "perhaps this should be applied first so
+    that chebyshev can work on a pre-processed pattern where it can truly
+    shine." Right, and it is why one is not enough: a low-order polynomial
+    cannot follow a near-divergence at one end of an otherwise flat pattern.
+    """
+    from molom.core import background as bg
+    win = bench
+    w = win._pxrd_window
+    path = tmp_path / "synchrotron.xy"
+    x = np.linspace(0.0, 20.0, 2001)
+    # CONTINUOUS across the beam-stop edge, as real data is: the shadow is a
+    # smooth ramp multiplying the small-angle decay, so the pattern has a
+    # turning point rather than a step. A discontinuous fixture would leave a
+    # residual the size of the step and would be testing its own scaffolding.
+    decay = 1400.0 / np.maximum(x, 1e-6) ** 0.78
+    ramp = 1.0 - np.exp(-(np.maximum(x, 0.0) / 0.05) ** 3)
+    peaks = np.zeros_like(x)
+    for centre in (6.0, 9.0, 13.0):
+        peaks += 900.0 * np.exp(-0.5 * ((x - centre) / 0.05) ** 2)
+    path.write_text("".join("%.4f %.3f\n" % (u, v)
+                            for u, v in zip(x, decay * ramp + peaks + 200.0)),
+                    encoding="utf-8")
+    w.load_measured(str(path))
+    entry = w.measured[0]
+    # NAMED, because the default model is the rolling walk now and this
+    # test is about the Chebyshev path: the power-law tail is the crutch
+    # the polynomial needs to reach the small-angle end, and the walk has
+    # its own allowance for that foot instead (round 105).
+    entry.bg_method = bg_mod.METHOD_CHEBYSHEV
+
+    x0, y0 = w.measured_curve(entry)
+    assert x0[int(np.argmax(y0))] < 1.0, \
+        "raw: the beam stop is the tallest thing in the pattern"
+    # Both curves are NORMALISED to 100, so comparing their maxima says
+    # nothing - what changes is WHICH feature the 100 belongs to, and how
+    # tall a real peak is on that scale. That is the whole complaint: the
+    # beam stop was eating the dynamic range.
+    def peak_height(xa, ya, centre=6.0):
+        near = np.abs(xa - centre) < 0.3
+        return float(np.max(ya[near])) if near.any() else 0.0
+
+    before = peak_height(x0, y0)
+    entry.low_angle = True
+    xs, ys = w.measured_curve(entry)
+    assert xs[0] >= 0.02, "the shadow points are dropped"
+    # 2.9x on this fixture; on Christian's own synchrotron file the beam
+    # stop is NINE times the tallest Bragg peak, so the gain there is larger.
+    assert peak_height(xs, ys) > 2.5 * before,         "a real peak is now a real fraction of the scale"
+    entry.background = True
+    xb, yb = w.measured_curve(entry)
+    # ...and the Chebyshev takes the flat remainder off on top of that
+    away = np.abs(xb - 6.0) > 1.0
+    assert float(np.median(yb[away])) <= float(np.median(ys[away]))
+
+    # AND WHAT THE "IGNORE BELOW" DIAL IS FOR. A single power law cannot
+    # follow the ramped shoulder right at the beam-stop edge, so a residual
+    # is left at the very start - small next to strong Bragg peaks (on
+    # Christian's own file a real peak still wins at 2 theta 2.95) and not
+    # next to weak ones, as here. Raising the dial past it is the lever, and
+    # that is why it is a dial rather than a constant.
+    assert xb[int(np.argmax(yb))] < 1.0, "the residual still wins on this one"
+    entry.low_start = 0.3
+    xd, yd = w.measured_curve(entry)
+    assert xd[int(np.argmax(yd))] > 3.0, "raising it puts a real peak on top"
+
+
+def test_a_wavelength_may_be_written_with_ANY_unit(bench, tmp_path):
+    """Christian: "I need to be able to input 0.161699 exactly, or 70 keV.
+    (dimensionless input => Angstrom, with dimension => case-insensitive)."
+    Parsed by the SAME reader the simulated traces use, rather than a second
+    one that would drift from it."""
+    pytest.importorskip("PySide6")
+    from molom.ui import pxrd_panel
+    win = bench
+    w = win._pxrd_window
+    w.load_measured(_measured_file(tmp_path))
+    dlg = pxrd_panel.MeasuredOptions(w, w.measured[0])
+    for text, wanted in (("0.161699", 0.161699),      # bare = Angstrom
+                         ("0.1617 A", 0.1617),
+                         ("70 keV", 0.17712),
+                         ("70KEV", 0.17712),          # case-insensitive
+                         ("17.5 kev", 0.708481),
+                         ("Cu Ka1", 1.540598)):
+        dlg.wavelength.setText(text)
+        assert dlg.stated_wavelength() == pytest.approx(wanted, abs=1e-6), text
+    # ...and it says what it understood while it is being typed, because a
+    # source box that quietly falls back is round 96's bug.
+    dlg.wavelength.setText("70 keV")
+    assert "0.17712" in dlg.wavelength_note.text()
+    dlg.wavelength.setText("banana")
+    assert dlg.stated_wavelength() == 0.0
+    assert "not understood" in dlg.wavelength_note.text()
+    dlg.wavelength.setText("")
+    assert dlg.stated_wavelength() == 0.0
+
+
+def test_the_precision_is_not_capped_at_five_decimals(bench, tmp_path):
+    """The spin box was, and 0.161699 is six."""
+    pytest.importorskip("PySide6")
+    from molom.ui import pxrd_panel
+    win = bench
+    w = win._pxrd_window
+    w.load_measured(_measured_file(tmp_path))
+    entry = w.measured[0]
+    dlg = pxrd_panel.MeasuredOptions(w, entry)
+    dlg.wavelength.setText("0.161699")
+    dlg.apply()
+    assert entry.wavelength == pytest.approx(0.161699, abs=1e-9)
+    # ...and it survives a round trip through the dialog
+    again = pxrd_panel.MeasuredOptions(w, entry)
+    assert again.stated_wavelength() == pytest.approx(0.161699, abs=1e-9)

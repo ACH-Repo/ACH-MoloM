@@ -105,12 +105,31 @@ def look_along(cell, key, flip=False):
     axes — a* is by definition normal to b and c, so the b–c plane is what you
     see, and showing it in the direct axes is what makes the picture readable.
     """
-    forward = axis_vector(cell, key)
-    if flip:
-        forward = -forward
     index = "abc".index(str(key)[0])
-    down = axis_vector(cell, "abc"[(index + 2) % 3])
-    return view_basis(forward, -down)
+    third = axis_vector(cell, "abc"[(index + 2) % 3])
+    # THE CAMERA COMES IN FROM THE POSITIVE SIDE, so the chosen axis points AT
+    # the viewer and `k+2` runs UP. Round 35b had it the other way round -
+    # axis away, `k+2` down - which is Mercury's layout (origin top-left,
+    # positive displacements running down the page) and was matched against
+    # Christian's own Mercury screenshots at the time.
+    #
+    # He changed it on 2026-09-05, and the reason is MoloM's and not
+    # Mercury's: "mercury doesn't have gridlines in its viewport which can be
+    # in front of what is being looked at on a view rotate." Coming in from
+    # underneath puts the floor grid between the eye and the crystal. Nothing
+    # is lost - the far side is still one more press of the same button.
+    #
+    # BOTH are reversed together, and that is the part to get right: turning
+    # the camera round while leaving `k+2` pointing down is a MIRROR, and no
+    # camera rotation can undo a mirror. Round 35b found that out from the
+    # other direction, when he reported a view "exactly mirrored around the
+    # red a axis". Reversing the up vector with the forward one keeps the
+    # handedness, so `k+1` still runs RIGHT.
+    forward = -axis_vector(cell, key)
+    up = third
+    if flip:
+        forward, up = -forward, -up
+    return view_basis(forward, up)
 
 
 #: The classical CLINOGRAPHIC projection, which is what "standard orientation

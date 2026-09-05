@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QColorDialog,
 import numpy as np
 
 from ..core import input_map
+from ..core import background as bg_mod
 from ..core import pxrd
 from ..core import pxrdfile
 from .widgets import FlowLayout
@@ -133,6 +134,12 @@ _TICKS_H = 12       # the tick strip of reflection positions
 
 #: One wheel notch scales the intensities by this, Mestrenova's step and
 #: OWB's. Ctrl+wheel zooms x by the same factor about the cursor.
+#: How far the cursor must travel before a press on the plot becomes a
+#: stack reorder rather than a click. Cumulative from the PRESS, which
+#: is round 5's lesson: a trackpad delivers one or two pixels per
+#: event, so a per-event threshold never trips.
+REORDER_SLOP = 5
+
 WHEEL_STEP = 1.2
 Y_SCALE_LIMITS = (1e-3, 1e4)
 
@@ -253,7 +260,16 @@ class MeasuredTrace(object):
     the window for the session and remembers where it came from.
     """
 
-    __slots__ = ("data", "colour", "enabled", "scale", "shift")
+    __slots__ = ("data", "colour", "enabled", "scale", "shift",
+                 "wavelength", "background", "bg_method", "bg_slope",
+                 "bg_tail", "bg_smooth", "bg_order",
+                 "trim", "low_angle", "low_cutoff", "low_start")
+
+    #: Everything except the data itself, which is what the options dialog
+    #: snapshots so that Cancel can put it back. Derived from `__slots__`
+    #: rather than listed again, because a knob added to one and not the
+    #: other is a knob Cancel silently keeps.
+    SETTINGS = tuple(n for n in __slots__ if n != "data")
 
     def __init__(self, data, colour):
         self.data = data
@@ -269,6 +285,37 @@ class MeasuredTrace(object):
         #: circle and the whole pattern moves; to first order the correction
         #: is a constant, and every Rietveld program has this knob.
         self.shift = 0.0
+        #: The wavelength this scan was taken at, or 0 for "not stated".
+        #: A file gives 2 theta and almost never says what produced it, so
+        #: this cannot be read - but once the user states it the trace can go
+        #: on a Q axis, which is what makes it comparable with a simulation
+        #: at a DIFFERENT wavelength (round 94's whole argument for Q).
+        self.wavelength = 0.0
+        #: Subtract a background before drawing. Christian's call - see
+        #: `core/background.py` for both models.
+        self.background = False
+        #: Which model. The rolling walk is the default because it is the one
+        #: that copes with a synchrotron foot; the Chebyshev is still here
+        #: because it is what a Rietveld program does and because it can
+        #: carry an amorphous hump, which the walk deliberately cannot.
+        self.bg_method = bg_mod.METHOD_ROLLING
+        #: The rolling walk's sensitivity, and its small-angle allowance.
+        self.bg_slope = bg_mod.DEFAULT_SLOPE
+        self.bg_tail = bg_mod.DEFAULT_TAIL
+        self.bg_smooth = bg_mod.DEFAULT_SMOOTH
+        self.bg_order = bg_mod.DEFAULT_ORDER
+        #: Drop the beam-stop shadow. Independent of the model, because the
+        #: ramp at the edge of the shadow is a spike no background model
+        #: should be asked to explain - see `background.trim_below`.
+        self.trim = False
+        #: Take the small-angle tail off FIRST, so the Chebyshev works on a
+        #: pattern it can actually follow - Christian's own sequencing, and
+        #: it is right: a low-order polynomial cannot represent a
+        #: near-divergence at one end of an otherwise flat pattern.
+        self.low_angle = False
+        self.low_cutoff = bg_mod.DEFAULT_LOW_CUTOFF
+        #: 0 finds the beam-stop edge itself.
+        self.low_start = 0.0
 
     @property
     def name(self):
@@ -282,6 +329,9 @@ class PxrdPlot(QWidget):
     mode_changed = Signal(str)
     view_changed = Signal()
     trace_menu = Signal(object, QPoint)     # (Trace or None, global pos)
+    #: (from index, to index) into `traces`, top-to-bottom - the two
+    #: patterns the user has dragged onto one another.
+    reorder_requested = Signal(int, int)
 
     ZOOM_CYCLE = ("zoom_h", "zoom_v", "zoom_box", None)
     PAN_CYCLE = ("pan_h", "pan_v", "pan_free", None)
@@ -314,6 +364,11 @@ class PxrdPlot(QWidget):
         self._cursor = None
         self._mode = None
         self._drag = None
+        #: A stack reorder in progress: which band was picked up,
+        #: which one the cursor is over, and the bands measured at
+        #: PRESS time - re-measuring them per move would move the
+        #: target under the hand while it is being aimed at.
+        self._reorder = None
         #: The blitted background: everything that does not follow the mouse.
         self._cache = None
         self._cache_key = None
@@ -445,6 +500,11 @@ class PxrdPlot(QWidget):
 
     def keyPressEvent(self, ev):
         key = ev.key()
+        if key == Qt.Key_Escape and self._reorder is not None:
+            self._reorder = None       # nothing swaps
+            self.update()
+            ev.accept()
+            return
         if key == Qt.Key_Z:
             self.cycle_mode(self.ZOOM_CYCLE)
         elif key == Qt.Key_P:
@@ -495,7 +555,21 @@ class PxrdPlot(QWidget):
                                  ev.globalPosition().toPoint())
             ev.accept()
             return
-        if ev.button() != Qt.LeftButton or not self._mode:
+        if ev.button() != Qt.LeftButton:
+            super().mousePressEvent(ev)
+            return
+        if not self._mode:
+            # NO MODE ARMED, so a left drag is free to mean something, and
+            # what it means is rearranging the stack. Christian: "I would
+            # like to also be able to drag and drop the patterns so I can
+            # arrange them in a preferred order."
+            bands = self.stack_bands()
+            index = self.band_at(ev.position().y(), bands)
+            if index is not None:
+                self._reorder = {"from": index, "to": None, "bands": bands,
+                                 "py": ev.position().y()}
+                ev.accept()
+                return
             super().mousePressEvent(ev)
             return
         rect = self.plot_rect()
@@ -508,6 +582,12 @@ class PxrdPlot(QWidget):
 
     def mouseMoveEvent(self, ev):
         self._cursor = ev.position()
+        if self._reorder is not None:
+            state = self._reorder
+            if abs(ev.position().y() - state["py"]) >= REORDER_SLOP:
+                state["to"] = self.band_at(ev.position().y(), state["bands"])
+            self.update()
+            return
         drag = self._drag
         if drag is not None and drag["mode"].startswith("pan"):
             rect = self.plot_rect()
@@ -539,6 +619,13 @@ class PxrdPlot(QWidget):
         self.update()
 
     def mouseReleaseEvent(self, ev):
+        if self._reorder is not None and ev.button() == Qt.LeftButton:
+            state, self._reorder = self._reorder, None
+            self.update()
+            if state["to"] is not None and state["to"] != state["from"]:
+                self.reorder_requested.emit(state["from"], state["to"])
+            ev.accept()
+            return
         drag, self._drag = self._drag, None
         if drag is None or ev.button() != Qt.LeftButton:
             super().mouseReleaseEvent(ev)
@@ -629,6 +716,98 @@ class PxrdPlot(QWidget):
                 "Q = {:.4f} 1/A".format(best_trace.name, best.label(), more,
                                         best.two_theta, best.d, best.q))
 
+    # ------------------------------------------------ reordering the stack
+    def stack_bands(self):
+        """Top and bottom pixel of each trace's own band in the stack.
+
+        A stacked trace occupies the strip of the plot between its own
+        baseline and its neighbours', so the boundaries are the MIDPOINTS
+        between adjacent baselines and the two ends run to the edges. That is
+        the geometry the drag highlights, so it is the geometry the drag has
+        to hit-test against - deriving it twice is how the highlight and the
+        drop come to disagree.
+
+        Empty when there is nothing to reorder: fewer than two traces, or an
+        offset of zero, where every baseline is the same pixel and there is
+        no vertical order to rearrange.
+        """
+        n = len(self.traces)
+        if n < 2:
+            return []
+        rect = self.plot_rect()
+        top = float(rect.top())
+        bottom = float(rect.bottom() - _TICKS_H)
+        ys = [float(self.y_to_px(t.offset, rect)) for t in self.traces]
+        if max(ys) - min(ys) < 1.0:
+            return []
+        # By SCREEN position rather than by list order, so the bands are the
+        # ones the eye sees whichever way round the stack was built.
+        order = sorted(range(n), key=lambda i: ys[i])
+        bands = [None] * n
+        for k, i in enumerate(order):
+            upper = top if k == 0 else 0.5 * (ys[order[k - 1]] + ys[i])
+            lower = bottom if k == n - 1 else 0.5 * (ys[i] + ys[order[k + 1]])
+            bands[i] = (upper, lower)
+        return bands
+
+    def band_at(self, py, bands=None):
+        """Which trace's band `py` falls in, clamped to the ends.
+
+        Clamped rather than None outside, because a drag that runs off the
+        top of the plot plainly means the top of the stack, and refusing it
+        would make the gesture fail exactly where somebody aims generously.
+        """
+        bands = self.stack_bands() if bands is None else bands
+        if not bands:
+            return None
+        for i, (upper, lower) in enumerate(bands):
+            if upper <= py < lower:
+                return i
+        # above everything / below everything
+        return min(range(len(bands)), key=lambda i: min(abs(py - bands[i][0]),
+                                                        abs(py - bands[i][1])))
+
+    def reordering(self):
+        """`(from, to)` while a swap is being dragged, else None. For tests
+        and for anything that wants to know the gesture is live."""
+        if self._reorder is None or self._reorder["to"] is None:
+            return None
+        return self._reorder["from"], self._reorder["to"]
+
+    def _paint_reorder(self, p):
+        """The two bands that will swap, drawn over the blitted picture.
+
+        Painted here rather than into the cache for the reason every other
+        moving thing is: the picture has not changed, only what is being
+        pointed at, and rebuilding several thousand points per mouse move is
+        what this window was rewritten to stop doing.
+        """
+        state = self._reorder
+        if state is None or state["to"] is None:
+            return
+        bands = state["bands"]
+        rect = self.plot_rect()
+        for index, active in ((state["from"], False), (state["to"], True)):
+            if index is None or index >= len(bands):
+                continue
+            upper, lower = bands[index]
+            colour = QColor(self.traces[index].colour)
+            fill = QColor(colour)
+            fill.setAlpha(70 if active else 40)
+            p.fillRect(QRect(rect.left(), int(upper),
+                             rect.width(), int(lower - upper)), fill)
+            pen = QColor(colour)
+            p.setPen(QPen(pen, 2 if active else 1,
+                          Qt.SolidLine if active else Qt.DashLine))
+            p.drawRect(QRect(rect.left(), int(upper),
+                             rect.width() - 1, int(lower - upper) - 1))
+        p.setPen(QPen(_TEXT_DIM, 1))
+        p.setFont(QFont(self.font().family(), 8))
+        upper, lower = bands[state["to"]]
+        p.drawText(rect.left() + 6, int(0.5 * (upper + lower)) + 4,
+                   "swap with {}".format(
+                       short_name(self.traces[state["to"]].name)))
+
     # ------------------------------------------------------------- painting
     def _key(self):
         # The device pixel ratio is IN the key: dragging the window to a
@@ -666,6 +845,7 @@ class PxrdPlot(QWidget):
         # several thousand points.
         self._paint_cursor(painter)
         self._paint_band(painter)
+        self._paint_reorder(painter)
 
     @staticmethod
     def _luma(colour):
@@ -1090,6 +1270,7 @@ class TraceOptions(QDialog):
         if chosen.isValid():
             self._colour = chosen
             self._show_colour()
+            self._live()
 
     def _describe(self):
         """Say what the source text was UNDERSTOOD as, while it is being
@@ -1154,10 +1335,16 @@ class MeasuredOptions(QDialog):
     constant to first order.
     """
 
-    def __init__(self, parent, entry):
+    def __init__(self, parent, entry, on_change=None):
         super().__init__(parent)
         self.setWindowTitle("Measured pattern - {}".format(entry.name))
         self.entry = entry
+        #: Called after every change, so the plot follows the controls. The
+        #: dialog therefore EDITS the trace as it goes, which is why `reject`
+        #: has to put the old settings back.
+        self._on_change = on_change
+        self._loading = False
+        self._before = self.snapshot()
         self._colour = QColor(entry.colour)
         lay = QVBoxLayout(self)
         form = QFormLayout()
@@ -1191,6 +1378,178 @@ class MeasuredOptions(QDialog):
             "shift is a constant.")
         form.addRow("2 theta shift", self.shift)
 
+        # TEXT, not a spin box, and parsed by the SAME reader the simulated
+        # traces use. A spin box has a fixed number of decimals and one unit,
+        # and Christian needs neither: "I need to be able to input 0.161699
+        # exactly, or 70 keV." `parse_source` has read a wavelength, an
+        # energy in keV or eV and a named line since round 96 - a synchrotron
+        # user states an energy and never a wavelength - so this is one
+        # parser rather than a second one that would drift from it.
+        self.wavelength = QLineEdit(
+            "" if not entry.wavelength else "{:.10g}".format(entry.wavelength))
+        self.wavelength.setPlaceholderText("not stated")
+        self.wavelength.setToolTip(
+            "The wavelength this scan was taken at. A bare number is "
+            "Angstrom (0.161699); a number with a unit is read as written "
+            "and the unit is case-insensitive (70 keV, 8040 eV, 0.1617 A). "
+            "A pattern file gives 2 theta and almost never says what "
+            "produced it, so MoloM cannot know - but once it is stated the "
+            "trace can go on a Q axis, which is what makes it comparable "
+            "with a simulation at a DIFFERENT wavelength. Leave it empty "
+            "for 'not stated'.")
+        self.wavelength.textChanged.connect(self._check_wavelength)
+        form.addRow("Wavelength", self.wavelength)
+        self.wavelength_note = QLabel("")
+        self.wavelength_note.setStyleSheet("color: #9a9a9a;")
+        self.wavelength_note.setWordWrap(True)
+        self.wavelength_note.setMinimumWidth(1)
+        form.addRow("", self.wavelength_note)
+
+        # THE BACKGROUND, with two models behind one tick. Christian asked
+        # for Chebyshev first - "doesn't topas use Chebyshev polynomial
+        # functions for bg subtractions?" - and then for something better on
+        # a synchrotron foot, which is the rolling walk. Both are here and
+        # the walk is the default; see `core/background.py` for the argument.
+        self.background = QCheckBox("Subtract a background")
+        self.background.setChecked(bool(entry.background))
+        self.background.setToolTip(
+            "A measurement has a background and a simulation does not. Every "
+            "trace here is normalised to its own strongest point, so a large "
+            "foot - synchrotron data especially - eats the dynamic range and "
+            "the peaks come out short against the phase they are being "
+            "compared with.")
+        form.addRow("Background", self.background)
+
+        self.bg_method = QComboBox()
+        self.bg_method.addItem("Rolling derivative (peaks only)",
+                               bg_mod.METHOD_ROLLING)
+        self.bg_method.addItem("Chebyshev polynomial (TOPAS)",
+                               bg_mod.METHOD_CHEBYSHEV)
+        self.bg_method.setCurrentIndex(
+            1 if entry.bg_method == bg_mod.METHOD_CHEBYSHEV else 0)
+        self.bg_method.setToolTip(
+            "ROLLING walks the pattern from high angle to low and lets the "
+            "background follow it only as fast as a background plausibly "
+            "changes; anything steeper is a peak and is bridged. It removes "
+            "a small-angle foot as part of the same pass, and it gives up on "
+            "amorphous scattering - whatever is not a peak is background.\n\n"
+            "CHEBYSHEV is the Rietveld model, and is the one to reach for "
+            "when the sample has a real amorphous hump you want kept.")
+        form.addRow("Model", self.bg_method)
+
+        self.bg_slope = NumberBox()
+        self.bg_slope.setRange(0.05, 50.0)
+        self.bg_slope.setDecimals(2)
+        self.bg_slope.setSingleStep(0.25)
+        self.bg_slope.setValue(float(entry.bg_slope))
+        self.bg_slope.setToolTip(
+            "The sensitivity. How steeply the background may climb toward "
+            "low angle, as a fraction of its own height per degree - "
+            "anything faster is decided to be a peak and is bridged.\n\n"
+            "LOWER treats more of the pattern as peak. Peaks are eaten when "
+            "it is too high and the background stops coming off when it is "
+            "too low; roughly, 0.5 divided by the peak width in degrees. "
+            "Measured across real files: a peak-free background runs 0.02 to "
+            "0.06 per degree, a purely amorphous halo tops out near 1.2, and "
+            "Bragg peaks run 3 to 24.")
+        form.addRow("Peak slope / deg", self.bg_slope)
+
+        self.bg_tail = NumberBox()
+        self.bg_tail.setRange(0.0, 6.0)
+        self.bg_tail.setDecimals(2)
+        self.bg_tail.setSingleStep(0.25)
+        self.bg_tail.setValue(float(entry.bg_tail))
+        self.bg_tail.setToolTip(
+            "How steep a POWER LAW the background may be at the small-angle "
+            "end, as an exponent. A power law's relative slope is b/x, which "
+            "diverges as 2 theta goes to zero - so without this allowance a "
+            "synchrotron foot is read as one enormous peak however the slope "
+            "above is set. 0 switches it off, which is what a genuine Bragg "
+            "peak below half a degree would want.")
+        form.addRow("Small-angle foot", self.bg_tail)
+
+        self.bg_smooth = QSpinBox()
+        self.bg_smooth.setRange(1, 51)
+        self.bg_smooth.setSingleStep(2)
+        self.bg_smooth.setKeyboardTracking(False)
+        self.bg_smooth.setValue(int(entry.bg_smooth))
+        self.bg_smooth.setToolTip(
+            "Points in the moving average the slope is measured on. Its job "
+            "is to stop point-to-point noise reading as a slope, which would "
+            "sit the background on the bottom of the noise band. Wider is "
+            "steadier and starts flattening narrow peaks, so keep it well "
+            "under the number of points across a peak.")
+        form.addRow("Smoothing / points", self.bg_smooth)
+
+        self.bg_order = QSpinBox()
+        self.bg_order.setRange(0, 20)
+        self.bg_order.setKeyboardTracking(False)
+        self.bg_order.setValue(int(entry.bg_order))
+        self.bg_order.setToolTip(
+            "Polynomial order. Higher follows a more structured baseline and "
+            "eventually starts eating the peaks; six is TOPAS's own common "
+            "default.")
+        form.addRow("Order", self.bg_order)
+
+        # THE SMALL-ANGLE TAIL, which Chebyshev cannot reach. Christian: "very
+        # short wavelengths in synchrotron radiation record very small
+        # scattering angles. you get an exponential looking curve close to
+        # 2theta = 0. Chebyshev cannot remove that." The rolling walk has its
+        # own allowance for exactly that, so this row belongs to Chebyshev.
+        self.low_angle = QCheckBox("Remove the small-angle tail first")
+        self.low_angle.setChecked(bool(entry.low_angle))
+        self.low_angle.setToolTip(
+            "At very short wavelengths the direct beam leaves a steep decay "
+            "at the low-angle end, and a low-order polynomial cannot follow "
+            "a near-divergence at one end of an otherwise flat pattern. This "
+            "fits a power law to it and takes it off BEFORE the Chebyshev, "
+            "and drops the points inside the beam-stop shadow - the rise "
+            "into the stop is not a measurement of anything.")
+        form.addRow("Small angle", self.low_angle)
+
+        self.trim = QCheckBox("Drop the beam-stop shadow")
+        self.trim.setChecked(bool(entry.trim))
+        self.trim.setToolTip(
+            "The rise into the edge of the beam stop is a spike, and no "
+            "background model should be asked to explain it - so those "
+            "points are dropped rather than fitted. Independent of the "
+            "model, unlike the power-law tail the Chebyshev needs.")
+        form.addRow("Beam stop", self.trim)
+
+        self.low_cutoff = NumberBox()
+        self.low_cutoff.setRange(0.1, 90.0)
+        self.low_cutoff.setDecimals(2)
+        self.low_cutoff.setSingleStep(0.5)
+        self.low_cutoff.setValue(float(entry.low_cutoff))
+        self.low_cutoff.setToolTip(
+            "Fit the tail up to here; past it the Chebyshev takes over. Far "
+            "enough to pin the decay, near enough that Bragg peaks are a "
+            "small part of what it sees. It is also the window 'auto' looks "
+            "for the beam-stop edge in.")
+        form.addRow("Fit up to / deg", self.low_cutoff)
+
+        self.low_start = NumberBox()
+        self.low_start.setRange(0.0, 90.0)
+        self.low_start.setDecimals(3)
+        self.low_start.setSingleStep(0.01)
+        self.low_start.setValue(float(entry.low_start))
+        self.low_start.setSpecialValueText("auto")
+        self.low_start.setToolTip(
+            "Drop everything below this angle. 'auto' finds the beam-stop "
+            "edge itself: intensity RISES to the edge of the shadow and "
+            "decays after it, so the turning point is the first usable "
+            "angle. On a 0.16 A synchrotron scan that is about 0.08 deg - "
+            "and where a scan never reaches the shadow at all, 'auto' says "
+            "so and nothing is dropped.")
+        form.addRow("Ignore below / deg", self.low_start)
+
+        self._form = form
+        self.background.toggled.connect(lambda _o=False: self._sync_bg())
+        self.bg_method.currentIndexChanged.connect(lambda _i: self._sync_bg())
+        self.low_angle.toggled.connect(lambda _o=False: self._sync_bg())
+        self.trim.toggled.connect(lambda _o=False: self._sync_bg())
+        self._sync_bg()
+
         detail = QLabel("{}\n{} points, {:.3f} to {:.3f} deg, step "
                         "{:.4g}{}".format(
                             entry.data.path or "(no path)", len(entry.data),
@@ -1207,6 +1566,97 @@ class MeasuredOptions(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         lay.addWidget(buttons)
+        self._wire_live()
+
+    def _wire_live(self):
+        """Write every control straight through to the trace as it is moved.
+
+        Christian's ask, and the two halves of it are one Qt property apart:
+        "Direct when values are changed via the arrows and after hitting
+        enter to confirm when something is typed in a text box." That is
+        exactly what `setKeyboardTracking(False)` gives - `valueChanged`
+        fires at once for the step arrows and the arrow keys, and for typed
+        text only on Enter or when the box loses focus. `NumberBox` has had
+        it since round 98, for the neighbouring reason that a half-typed
+        number is a value that cannot be drawn.
+
+        The wavelength is a QLineEdit and has no such property, so it takes
+        `editingFinished`, which is Enter and focus-out and nothing else.
+        """
+        for box in (self.scale, self.shift, self.bg_slope, self.bg_tail,
+                    self.low_cutoff, self.low_start, self.bg_order,
+                    self.bg_smooth):
+            box.valueChanged.connect(self._live)
+        for tick in (self.background, self.low_angle, self.trim):
+            tick.toggled.connect(self._live)
+        self.bg_method.currentIndexChanged.connect(self._live)
+        self.wavelength.editingFinished.connect(self._live)
+
+    def _live(self, *_args):
+        if self._loading:
+            return
+        self.apply()
+        if self._on_change is not None:
+            self._on_change()
+
+    def snapshot(self):
+        # type: () -> dict
+        """Everything the dialog can change, so Cancel can put it back.
+
+        A dialog that redraws as it is touched has already changed the thing
+        it is describing by the time Cancel is pressed, so Cancel has to mean
+        something: it restores this and redraws again. Taken from
+        `MeasuredTrace.SETTINGS` rather than listed here, because a setting
+        added to the trace and not to this list is one Cancel quietly keeps.
+        """
+        return {name: getattr(self.entry, name)
+                for name in MeasuredTrace.SETTINGS}
+
+    def restore(self, state):
+        for name, value in state.items():
+            setattr(self.entry, name, value)
+
+    def reject(self):
+        self.restore(self._before)
+        if self._on_change is not None:
+            self._on_change()
+        super().reject()
+
+    def _sync_bg(self):
+        """Show the rows the chosen model uses, and only those.
+
+        Both models are on one form, so the alternative is a page of controls
+        of which half do nothing - and a live-looking control that is not in
+        the path is the thing this project keeps finding as a bug. The rows
+        are HIDDEN rather than only greyed, because greyed says "not now" and
+        these say "not this model".
+        """
+        form = self._form
+        on = self.background.isChecked()
+        rolling = self.bg_method.currentData() != bg_mod.METHOD_CHEBYSHEV
+        # The MODEL is always offered, because it decides the low-angle
+        # controls as well as the subtraction; the model's own parameters go
+        # with the tick, since they mean nothing while nothing is subtracted.
+        # The low-angle rows do NOT go with the tick: dropping the beam-stop
+        # shadow, and taking a power-law foot off, are each worth doing on
+        # their own - and a control that is in the path while its row is
+        # hidden is the same bug as a live-looking control that is not.
+        for widget, wanted in ((self.bg_method, True),
+                               (self.bg_slope, on and rolling),
+                               (self.bg_tail, on and rolling),
+                               (self.bg_smooth, on and rolling),
+                               (self.bg_order, on and not rolling),
+                               (self.low_angle, not rolling),
+                               (self.trim, rolling),
+                               (self.low_cutoff, not rolling)):
+            widget.setEnabled(bool(wanted))
+            form.setRowVisible(widget, bool(wanted))
+        # "Ignore below" belongs to whichever of the two drops points, and to
+        # neither when nothing does.
+        trimming = (self.trim.isChecked() if rolling
+                    else self.low_angle.isChecked())
+        self.low_start.setEnabled(bool(trimming))
+        form.setRowVisible(self.low_start, True)
 
     def _show_colour(self):
         self.colour_btn.setStyleSheet(
@@ -1224,6 +1674,52 @@ class MeasuredOptions(QDialog):
         self.entry.colour = self._colour.name()
         self.entry.scale = float(self.scale.value())
         self.entry.shift = float(self.shift.value())
+        self.entry.wavelength = self.stated_wavelength()
+        self.entry.background = bool(self.background.isChecked())
+        self.entry.bg_method = str(self.bg_method.currentData())
+        self.entry.bg_slope = float(self.bg_slope.value())
+        self.entry.bg_tail = float(self.bg_tail.value())
+        self.entry.bg_smooth = int(self.bg_smooth.value())
+        self.entry.bg_order = int(self.bg_order.value())
+        self.entry.trim = bool(self.trim.isChecked())
+        self.entry.low_angle = bool(self.low_angle.isChecked())
+        self.entry.low_cutoff = float(self.low_cutoff.value())
+        self.entry.low_start = float(self.low_start.value())
+
+    def stated_wavelength(self):
+        # type: () -> float
+        """What the box says, in Angstrom, or 0 for "not stated".
+
+        Unreadable text is 0 rather than an error: the note under the field
+        has already said so while it was being typed, and refusing to close
+        the dialog over a wavelength nobody has to give would be worse.
+        """
+        text = self.wavelength.text().strip()
+        if not text:
+            return 0.0
+        try:
+            return float(pxrd.parse_source(text)[0][0])
+        except (ValueError, IndexError, TypeError):
+            return 0.0
+
+    def _check_wavelength(self, _text=""):
+        """Say what was understood, while it is being typed.
+
+        A source box that quietly falls back is how a whole pattern comes out
+        at the wrong angles with nothing on screen to say so (round 96) - and
+        here it would silently drop the trace off the Q axis instead."""
+        text = self.wavelength.text().strip()
+        if not text:
+            self.wavelength_note.setText("not stated - the Q axis needs one")
+            return
+        try:
+            value = float(pxrd.parse_source(text)[0][0])
+        except (ValueError, IndexError, TypeError):
+            self.wavelength_note.setText(
+                "not understood - try 0.161699, or 70 keV")
+            return
+        self.wavelength_note.setText(
+            "{:.6g} A  ({:.4g} keV)".format(value, pxrd.energy_kev(value)))
 
 
 SOURCE_HELP = (
@@ -1457,6 +1953,13 @@ class PxrdWindow(QDialog):
         #: so unlike everything else here they live on the WINDOW - for the
         #: session, remembering the path they came from.
         self.measured = []          # [MeasuredTrace]
+        #: The stack, top to bottom, as trace KEYS - see `_stack_key`. It
+        #: spans crystals and measurements together, because "put this
+        #: measurement under that phase" is a statement about one stack and
+        #: not about two lists. Session state on the WINDOW, like `measured`
+        #: itself: a measurement is not saved, so an order over both cannot
+        #: be either.
+        self._stack_keys = []
         self._alerts = []           # why something asked for is not drawn
         self._caveats = []          # standing facts (B = 0 and the like)
         self._measured_boxes = []   # [(MeasuredTrace, QCheckBox)]
@@ -1483,6 +1986,9 @@ class PxrdWindow(QDialog):
         self.tabs.addTab(self.hkl, "Reflections (hkl)")
         self.tabs.currentChanged.connect(lambda _i: self._sync_hkl())
         self._hkl_tab = self.tabs.count() - 1
+        # A pattern file is something you have in a folder next to the
+        # window, so dropping it on the plot is the obvious gesture.
+        self.setAcceptDrops(True)
         self.resize(*self.opening_size())
 
     #: What the window opens at, before it is clamped to the screen. Wider
@@ -1520,6 +2026,7 @@ class PxrdWindow(QDialog):
         self.plot.setMinimumHeight(160)
         self.plot.hovered.connect(self._on_hover)
         self.plot.mode_changed.connect(self._on_mode)
+        self.plot.reorder_requested.connect(self.swap_in_stack)
         self.plot.view_changed.connect(self._show_view)
         self.plot.trace_menu.connect(self._trace_menu)
 
@@ -1773,31 +2280,57 @@ class PxrdWindow(QDialog):
         self.plot.setFocus(Qt.OtherFocusReason)
 
     def load_measured(self, path=None):
-        """Open a measured pattern and draw it with the simulations.
+        """Open measured pattern(s) and draw them with the simulations.
 
         The whole point of simulating a pattern is to compare it with one
-        somebody took, and until now the window could not read one.
+        somebody took. `path` is a single file, for the callers that name
+        one; with none, the dialog takes SEVERAL, because a comparison is
+        routinely against a row of scans and picking them one at a time is
+        four dialogs to do one thing.
         """
         if path is None:
-            path, _f = QFileDialog.getOpenFileName(
-                self, "Open a measured powder pattern", "",
+            paths, _f = QFileDialog.getOpenFileNames(
+                self, "Open measured powder patterns", "",
                 ";;".join(pxrdfile.NAME_FILTERS))
-        if not path:
+        else:
+            paths = [path]
+        return self.load_measured_files(paths)
+
+    def load_measured_files(self, paths):
+        """Read each of `paths`, keep the ones that are patterns, redraw.
+
+        Returns the last pattern read, or None if none of them was one -
+        which is what the single-file callers want and what the drop handler
+        ignores. A file that cannot be read costs its own line in the note
+        and nothing else: dropping five files of which one is a stray text
+        file should still open the four.
+        """
+        opened, failed, data = [], [], None
+        for path in paths:
+            if not path:
+                continue
+            try:
+                data = pxrdfile.read(path)
+            except (OSError, pxrdfile.PatternFileError) as exc:
+                failed.append("{}: {}".format(os.path.basename(path), exc))
+                data = None
+                continue
+            colour = MEASURED_PALETTE[len(self.measured)
+                                      % len(MEASURED_PALETTE)]
+            self.measured.append(MeasuredTrace(data, colour))
+            opened.append(data)
+        if not opened and not failed:
             return None
-        try:
-            data = pxrdfile.read(path)
-        except (OSError, pxrdfile.PatternFileError) as exc:
-            self.note.setText("Could not read {}: {}".format(
-                os.path.basename(path), exc))
-            return None
-        colour = MEASURED_PALETTE[len(self.measured) % len(MEASURED_PALETTE)]
-        self.measured.append(MeasuredTrace(data, colour))
-        bits = ["{}: {} points, {:.3f} - {:.3f} deg".format(
-            data.name, len(data), *data.two_theta_range)]
-        if data.note:
-            bits.append(data.note)
+        bits = []
+        if failed:
+            bits.append("Could not read " + "; ".join(failed))
+        for one in opened:
+            bits.append("{}: {} points, {:.3f} - {:.3f} deg".format(
+                one.name, len(one), *one.two_theta_range))
+            if one.note:
+                bits.append(one.note)
         self._rebuild_ticks()
-        self.recompute(keep_view=False)
+        self.recompute(keep_view=not opened)
         # `recompute` may have something to say about what was just opened -
         # that it runs past where the simulation stops, that a Q axis cannot
         # take it. An ALERT about what was just opened outranks the summary
@@ -1809,7 +2342,45 @@ class PxrdWindow(QDialog):
         # line has no room for. Replacing it with the load summary alone is
         # how "B = 0" quietly stopped being said anywhere at all.
         self.note.setToolTip("\n".join(bits + list(self._caveats)))
-        return data
+        return opened[-1] if opened else None
+
+    # ------------------------------------------------------- drag and drop
+    def dropped_patterns(self, mime):
+        """The local files in `mime` that could be powder patterns.
+
+        Decided by extension and only to the extent of ruling out the things
+        that certainly are not - a structure, a picture, an archive - because
+        the text formats have no standard and the reader is the only thing
+        that can really tell. Anything that gets past this and turns out not
+        to be a pattern is refused by `pxrdfile.read` with a reason, which is
+        a better message than a drop that silently does nothing.
+        """
+        if mime is None or not mime.hasUrls():
+            return []
+        out = []
+        for url in mime.urls():
+            path = url.toLocalFile()
+            if path and os.path.isfile(path) \
+                    and pxrdfile.looks_like_pattern(path):
+                out.append(path)
+        return out
+
+    def dragEnterEvent(self, ev):
+        if self.dropped_patterns(ev.mimeData()):
+            ev.acceptProposedAction()
+        else:
+            ev.ignore()
+
+    def dragMoveEvent(self, ev):
+        self.dragEnterEvent(ev)
+
+    def dropEvent(self, ev):
+        paths = self.dropped_patterns(ev.mimeData())
+        if not paths:
+            ev.ignore()
+            return
+        ev.acceptProposedAction()
+        self.load_measured_files(paths)
 
     def remove_measured(self, entry):
         if entry in self.measured:
@@ -1944,11 +2515,29 @@ class PxrdWindow(QDialog):
         self.build_measured_menu(entry).exec(box.mapToGlobal(pos))
 
     def edit_measured(self, entry):
-        dlg = MeasuredOptions(self, entry)
+        """The settings, applied AS THEY ARE TOUCHED.
+
+        Christian: "Changing the parameters in the settings where the
+        settings for bg subtraction live, should update the plot
+        immediately." A background is judged by looking at the curve, so a
+        dialog you have to close before you can see what it did makes the
+        knob unusable - you cannot tune a sensitivity by guessing, closing,
+        looking and reopening.
+
+        The dialog therefore writes straight through to the trace, and
+        Cancel puts back what was there when it opened - which it has to,
+        because by then the trace has already been changed a dozen times.
+        """
+        dlg = MeasuredOptions(self, entry, on_change=self._measured_changed)
         if dlg.exec():
             dlg.apply()
-            self._rebuild_ticks()
-            self.recompute()
+        self._measured_changed()
+
+    def _measured_changed(self):
+        """Redraw for a live edit: the tick row carries the colour and the
+        name, so it is rebuilt alongside the curve."""
+        self._rebuild_ticks()
+        self.recompute()
 
     def _subject(self):
         """The crystal whose stored settings the shared controls show: the
@@ -2084,6 +2673,100 @@ class PxrdWindow(QDialog):
             self._patterns[key] = cached
         return cached
 
+    # ------------------------------------------------- the order of the stack
+    @staticmethod
+    def _stack_key(kind, item):
+        """A key for one drawable, stable while the window is open.
+
+        A crystal is keyed by its scene id, which survives being reloaded and
+        re-selected; a measurement by identity, which is all there is - it is
+        session state and the objects live in `self.measured`.
+        """
+        if kind == "measured":
+            return ("measured", id(item))
+        return ("pattern", item[0].id)
+
+    def _ordered(self, items):
+        """`items` in the user's stack order, and the order remembered.
+
+        The remembered order governs only the RELATIVE order of the traces it
+        knows about; anything it has never seen keeps the slot the caller
+        built it in. That is what makes the default and the override compose
+        instead of fighting: a measurement opened into a window whose crystal
+        has already been dragged still lands on top, because the crystal's
+        remembered position says nothing about where a measurement goes.
+
+        The first cut ranked unknown keys LAST, which is the same rule read
+        carelessly, and it put every newly opened measurement at the BOTTOM
+        of the stack - caught by round 100's test that the measurement sits
+        on top.
+
+        A key that is no longer drawn (a crystal unticked, a measurement
+        removed) keeps its PLACE in the remembered order rather than being
+        dropped, so ticking it back on puts it where it was.
+        """
+        rank = {key: i for i, key in enumerate(self._stack_keys)}
+        keys = [self._stack_key(kind, item) for kind, item in items]
+        # The slots held by traces the order knows, and those traces sorted
+        # into it. Everything else is left exactly where the caller put it.
+        slots = [i for i, key in enumerate(keys) if key in rank]
+        known = sorted(slots, key=lambda i: rank[keys[i]])
+        out = list(items)
+        for slot, source in zip(slots, known):
+            out[slot] = items[source]
+
+        drawn = [self._stack_key(kind, item) for kind, item in out]
+        # Fold the drawn keys back into the remembered order, keeping the
+        # ones that are not on screen where they were.
+        merged, pending = [], list(drawn)
+        seen = set(drawn)
+        for key in self._stack_keys:
+            if key in seen:
+                if pending:
+                    merged.append(pending.pop(0))
+            else:
+                merged.append(key)
+        merged.extend(pending)
+        self._stack_keys = merged
+        return out
+
+    def swap_in_stack(self, first, second):
+        """Swap two DRAWN positions, and redraw.
+
+        `first` and `second` index the traces the plot is showing, which is
+        what the gesture can name. The swap is applied to the remembered
+        order by exchanging those two keys' places in it, so a hidden trace
+        sitting between them keeps its own place instead of being shuffled by
+        a swap it was not part of.
+        """
+        traces = self.plot.traces
+        if not (0 <= first < len(traces) and 0 <= second < len(traces)) \
+                or first == second:
+            return
+        keys = [self._trace_key(t) for t in traces]
+        a, b = keys[first], keys[second]
+        if a is None or b is None:
+            return
+        order = list(self._stack_keys)
+        try:
+            ia, ib = order.index(a), order.index(b)
+        except ValueError:
+            return
+        order[ia], order[ib] = order[ib], order[ia]
+        self._stack_keys = order
+        self.recompute()
+        self.note.setText("Swapped {} and {} in the stack".format(
+            short_name(traces[first].name), short_name(traces[second].name)))
+
+    def _trace_key(self, trace):
+        """The stack key for a drawn `Trace`, or None."""
+        if trace.obj is not None:
+            return ("pattern", trace.obj.id)
+        for entry in self.measured:
+            if entry.name == trace.name:
+                return ("measured", id(entry))
+        return None
+
     def recompute(self, keep_view=True):
         """Rebuild the traces and draw them."""
         patterns, notes = [], []
@@ -2124,34 +2807,45 @@ class PxrdWindow(QDialog):
         alerts = []
         shown_measured = [e for e in self.measured if e.enabled]
         suppressed = []
-        if shown_measured and axis == pxrd.AXIS_Q:
-            alerts.append(
-                "{} measured pattern(s) NOT DRAWN: a measurement is in "
-                "2 theta and carries no wavelength, so it cannot be put on a "
-                "Q axis - untick 'Q instead of 2 theta' to see it".format(
-                    len(shown_measured)))
-            suppressed = shown_measured
-            shown_measured = []
+        if axis == pxrd.AXIS_Q:
+            # A measurement CAN go on a Q axis - once somebody says what
+            # wavelength it was taken at. The conversion was never the
+            # problem; not knowing lambda was, and that is a fact about the
+            # file rather than about the axis (round 100). So the ones that
+            # have been told are converted and only the rest are dropped.
+            suppressed = [e for e in shown_measured if not e.wavelength]
+            shown_measured = [e for e in shown_measured if e.wavelength]
+            if suppressed:
+                alerts.append(
+                    "{} measured pattern(s) NOT DRAWN: a Q axis needs the "
+                    "wavelength the scan was taken at - right-click the "
+                    "trace to state it".format(len(suppressed)))
         self._mark_suppressed(suppressed)
         gap = float(self.offset.value())
+        # MEASURED FIRST by default, so it sits at the TOP of a stack. That
+        # is where a measurement belongs in every comparison figure: the
+        # data, and the candidate phases under it. `_ordered` then applies
+        # anything the user has dragged, which can only ever be a permutation
+        # of this - a default and an override, not two sources of truth.
+        items = ([("measured", e) for e in shown_measured]
+                 + [("pattern", p) for p in patterns])
+        items = self._ordered(items)
         traces = []
-        n = max(1, len(patterns) + len(shown_measured))
+        n = max(1, len(items))
         slot = n - 1
-        for entry in shown_measured:
-            # MEASURED FIRST, so it sits at the TOP of a stack. That is where
-            # a measurement belongs in every comparison figure: the data, and
-            # the candidate phases under it.
-            data = entry.data
-            traces.append(Trace(None, entry.name, entry.colour,
-                                data.x + entry.shift,
-                                data.normalised() * entry.scale, None,
-                                gap * slot))
-            slot -= 1
-        for obj, colour, pattern in patterns:
-            settings = pxrd.settings_of(obj.structure)
-            x, y, sampler, fwhm = self.profile_of(pattern, axis, settings)
-            traces.append(Trace(obj, obj.name, colour, x, y, pattern,
-                                gap * slot, sampler=sampler, fwhm=fwhm))
+        for kind, item in items:
+            if kind == "measured":
+                x, y = self.measured_curve(item)
+                if axis == pxrd.AXIS_Q:
+                    x = pxrd.q_from_two_theta(x, item.wavelength)
+                traces.append(Trace(None, item.name, item.colour, x,
+                                    y * item.scale, None, gap * slot))
+            else:
+                obj, colour, pattern = item
+                settings = pxrd.settings_of(obj.structure)
+                x, y, sampler, fwhm = self.profile_of(pattern, axis, settings)
+                traces.append(Trace(obj, obj.name, colour, x, y, pattern,
+                                    gap * slot, sampler=sampler, fwhm=fwhm))
             slot -= 1
         self.plot.y_margin = self.margin.value() / 100.0
         self.plot.set_traces(traces, axis, keep_view=keep_view)
@@ -2300,6 +2994,49 @@ class PxrdWindow(QDialog):
             self._recolour(obj)
             self._load_settings()
             self.recompute()
+
+    def measured_curve(self, entry):
+        """`(two_theta, normalised intensity)` for one measured trace.
+
+        The background comes off BEFORE the normalisation, which is the whole
+        point of doing it here rather than in the reader: every trace in this
+        window is scaled to its own strongest point, so a large foot eats the
+        dynamic range and the peaks come out short against the simulation
+        they are being compared with. Christian: "the experimental would have
+        a massive foot like you often see in synchrotron data."
+        """
+        data = entry.data
+        x = np.asarray(data.x, dtype=float)
+        y = np.asarray(data.y, dtype=float)
+        rolling = entry.bg_method != bg_mod.METHOD_CHEBYSHEV
+        # THE BEAM-STOP SHADOW GOES FIRST, whichever model follows. The rise
+        # into the edge of the stop is not a measurement of anything, and no
+        # smooth function takes out a nine-point ramp without taking real
+        # peaks with it.
+        if entry.trim and rolling:
+            x, y, _edge = bg_mod.trim_below(
+                x, y, start=entry.low_start, cutoff=entry.low_cutoff)
+        # THE SMALL-ANGLE TAIL, for the Chebyshev only. Christian: "perhaps
+        # this should be applied first so that chebyshev can work on a
+        # pre-processed pattern where it can truly shine." Exactly so - the
+        # polynomial cannot follow a near-divergence at one end, and once the
+        # tail is gone what is left is the smooth background it is good at.
+        # The rolling walk has its own allowance for that foot and wants no
+        # power law fitted underneath it, so it never comes down this branch.
+        if entry.low_angle and not rolling:
+            x, y, _edge = bg_mod.remove_low_angle(
+                x, y, start=entry.low_start, cutoff=entry.low_cutoff)
+        if entry.background:
+            if rolling:
+                y, _est = bg_mod.subtract_rolling(
+                    x, y, slope=entry.bg_slope, tail=entry.bg_tail,
+                    smooth_points=entry.bg_smooth)
+            else:
+                y, _est = bg_mod.subtract_background(x, y,
+                                                     order=entry.bg_order)
+        x = x + entry.shift
+        top = float(y.max()) if y.size else 0.0
+        return x, (y * (100.0 / top) if top > 0 else y)
 
     def _measured_for(self, trace):
         for entry in self.measured:

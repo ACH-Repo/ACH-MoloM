@@ -251,6 +251,388 @@ this dialog exists for - o-, m- and p-xylene share a formula and a weight and
 come back as 95-47-6, 108-38-3 and 106-42-3.
 15 tests. 2101 tests.
 
+Round 103 (2026-09-05, M2 - a frozen P1 cell can be recovered, and it was
+mostly already possible):
+Christian: "Is it not just deposited as P1 incorrectly? should we not just
+have an option to re-derive the space group if the user is explicitly
+informed they're about to change something? We can't really stop them from
+overwriting the original file either."
+**IT WAS NOT DEPOSITED AS P1 - MoloM DID THAT, and the atoms survived.**
+COD 9008621 is `F m -3 m` like its four siblings in `MF.molom`; round 91's
+bug demoted it and the savefile recorded the damage. `demote_to_p1` replaces
+the asymmetric unit (2 atoms -> all 27) and the operators (192 -> 1) and
+never touches a coordinate - so the structure is intact and **spglib answers
+`Fm-3m`, number 225, unambiguously from those 27 atoms**. The F3
+re-derivation already repaired it end to end: P1/1 op/27-atom unit ->
+Fm-3m/192 ops/2-atom unit, 27 atoms throughout.
+**SO THE OPTION HE ASKED FOR EXISTED. What was missing was two smaller
+things**, and the first is a straight bug.
+**(1) `cell_frozen` WAS NOT CLEARED BY A SUCCESSFUL RE-DERIVATION**, so the
+❖ page stayed greyed for a crystal that was no longer in any danger - which
+reads as "still broken" when it is not. Clearing it is EARNED rather than
+assumed: round 52's `_reconstructs` refuses any group that cannot rebuild the
+cell (the MOF-5 failure, `R3m` over 42 atoms where the cell holds 424), so a
+successful re-derivation is a PROOF that the stored unit and operators
+reproduce exactly these atoms - which is precisely the condition the freeze
+guards against.
+**And Christian's argument sharpens what the freeze is FOR.** He is right
+that MoloM cannot stop anyone overwriting a file - "they can just save as and
+overwrite and the file system does what it does". The freeze was never
+protecting the file on disk; it protects the structure IN MEMORY from being
+regenerated out of metadata that does not match it, because the ❖ contents
+radio rebuilds the atoms from `asym_symbols` + `symops`. Once those provably
+match, there is nothing left to protect.
+**(2) NOBODY WAS TOLD THE OPTION EXISTED.** It was an F3 operator you had to
+know the name of, while the thing being looked at was a greyed radio button.
+The offer is now on the ❖ page, shown ONLY when the cell is frozen, and it
+says what it will do first - the atoms are not changed, only the group, the
+operators and the unit derived from them; the answer is refused if it cannot
+rebuild the cell exactly; and the FILE keeps the old symmetry until saved
+again. That last line matters because re-deriving fixes the session and not
+the savefile.
+**AND TESTING IT TURNED UP ROUND 87'S BUG IN A SECOND PLACE.** After a
+demote-and-re-derive the solid solution round-tripped **21 -> asym 2 -> cell
+22 atoms**, where an untouched crystal holds at 21.
+`resync_derived_asymmetric_unit` stores the unit as `content % 1.0` and never
+snapped it - and a symmetry operator produces an exact zero as `-9.45e-17`,
+whose modulo is `0.9999999999999999`, i.e. the FAR face, earning that site an
+extra boundary copy. Round 87 met this in the write-back and added
+`_snap_fractional`; the derived path never got it. Snapped before AND after
+the wrap, and both vendored crystals now round-trip exactly (21 -> 21,
+210 -> 210) whether or not they have been demoted.
+7 tests. 2125 tests.
+
+Round 103b (2026-09-05, Christian's three questions - two bugs, one
+convention, and N4):
+**(0) A 36-HOUR BACKGROUND PROCESS WAS MINE.** An orphaned
+`pytest tests/ -q --no-header -p no:cacheprovider` from 2026-09-03, started
+with `nohup ... &` so it outlived the shell that launched it and never died.
+Killed. The other live python was HIS MoloM window with `MF.molom` open and
+was left alone. Lesson: use the harness's own background mode, which reports
+completion, rather than detaching a process nothing will ever reap.
+**(1) THE AXIS-VIEW FLIP SURVIVED ANYTHING, and that is the bug he felt.**
+"If I press direction once, rotate and then press it again, the rotation
+should start from positive again. Start from negative only if pressed twice
+directly in succession." `_last_axis_view` remembered the key and nothing
+else, so view-down-a, orbit away, press a again gave the FAR side. Decided
+now by comparing the camera's ORIENTATION rather than by hooking every
+gesture that could change it - a trackpad orbit, the ribbon's stepped
+rotation, the compass, F3 and a saved camera all reset it without being
+listed, and a list of them is a list that goes stale. A PAN or a ZOOM
+deliberately does not reset it: those leave you looking down the same axis,
+so "again" still means the other side; only a rotation takes you off it.
+**HIS OTHER HALF WAS NOT REPRODUCED, and measuring said so.** "Does the
+rotated view start under or above the xy plane depending on which direction
+you chose?" No - a horizontal orbit out of a c view leaves the eye at
+-32.304 either way. My first harness said it did, and it was wrong: it
+called the axis button TWICE, so what it measured was the flip. Fourth
+faulty instrument of the session.
+**WHAT IS REAL is that every default axis view comes in from the NEGATIVE
+side** - "view along c" looks from underneath, which for a cell with c near
++z puts the eye below the xy plane. That is `orient.look_along`'s documented
+convention and round 35b arrived at it after three tries against his own
+Mercury screenshots. **Left alone deliberately and recorded as N9**: flipping
+only the camera side produces a MIRROR, because "axis away" plus "second axis
+down" is what makes the layout Mercury's, and round 35b records that he
+spotted that mirror himself. Coming in from the positive side without
+mirroring means the second axis runs UP, which is a different presentation
+convention - his decision, not a guess.
+**(2) AN EMPTY MOLECULE COULD NOT BE DELETED.** "Does pressing Del not delete
+the entry because no atoms can be selected?" Exactly that: the window's Del
+runs the delete OPERATOR, which acts on selected ATOMS, so the one object you
+could not get rid of was the one there was nothing else to do with. The
+right-click menu had always offered it. `OutlinerPanel.keyPressEvent` now
+handles Delete on OBJECT rows and leaves atom rows to the operator, which
+knows about hydrogens, packed images and the undo step.
+**(3) N4, THE DISTRIBUTE OPERATOR.** `align.axis_extent` +
+`align.distribute_offsets`, driven by the EXISTING scalar modal -
+`viewport.DISTRIBUTE` rides `_internal` rather than adding a second modal,
+because everything except "what does the number mean" is identical and a
+parallel modal would be 26 more touch points in `viewport.py`. Three
+decisions: the extent is measured ALONG THE AXIS rather than as a bounding
+radius (`zstack_offsets` uses radii, which is right for dropping SMILES
+results in a column and wrong here - a long flat molecule laid along x is
+nearly its own length wide in x, and a radius leaves a hole); the existing
+ORDER is kept, so it tidies an arrangement rather than reshuffling it into
+scene-id order; and the GROUP does not move, being recentred on the span it
+already occupied. The number is the CLEAR SPACE between neighbours, which
+means the same thing whatever sizes are in the selection - centre spacing
+does not.
+9 tests. 2134 tests.
+
+Round 103c (2026-09-05, N9 reversed on his call, and the background he asked
+for by name):
+**(1) THE AXIS VIEWS COME IN FROM THE POSITIVE SIDE NOW**, which reverses
+round 35b's Mercury convention. His reason is MoloM's and not Mercury's:
+"mercury doesn't have gridlines in its viewport which can be in front of what
+is being looked at on a view rotate" - coming in from underneath puts the
+floor grid between the eye and the crystal, and Mercury has no grid to get in
+the way. Nothing is lost, because the far side is still one more press of the
+same button: "starting from below is still available when the axis button is
+pressed twice, so its just a default view change according to my personal
+preference that doesn't remove any functionality."
+**BOTH HALVES HAD TO REVERSE TOGETHER, and that is the whole of the care
+needed.** Turning the camera round while leaving `k+2` pointing down is a
+MIRROR, and no camera rotation can undo one - which is exactly the bug round
+35b was fixing when he reported a view "exactly mirrored around the red a
+axis". So `forward` and `up` are negated together: `k+1` still runs RIGHT,
+`k+2` now runs UP, and the determinant is +1 on every axis of every cell
+tried. Round 35b's two tests moved with the code (round 71's rule) and one of
+them gained the determinant check.
+**(2) Q10: A MEASUREMENT CAN STATE ITS WAVELENGTH**, and then it goes on the
+Q axis. Round 100 refused it correctly - a file gives 2 theta and carries no
+wavelength - but the refusal was about not KNOWING lambda rather than about
+the axis, and that is a fact about the file which the user can simply supply.
+0 means "not stated"; a trace that has been told is converted and the rest
+are dropped with an alert saying what to do.
+**(3) Q9: THE BACKGROUND, and Christian named the method himself.** "doesn't
+topas use Chebyshev polynomial functions for bg subtractions? Can't we just
+use those? another right click settings option of tickbox > turn on chebyshev
+bg subtraction and then a integer selection box with a default of, say, six?"
+TOPAS does, so do GSAS-II and FullProf, and `core/background.py` is built to
+that with order 6 as the default. His reading of WHY it matters was right
+too: every trace here is normalised to its own strongest point, so "the
+experimental would have a massive foot like you often see in synchrotron
+data" eats the dynamic range and the peaks come out short against the
+simulation.
+**THE FIT HAS TO BE A LOWER ENVELOPE, NOT A LEAST-SQUARES CURVE**, which is
+the only real difficulty. A plain polynomial passes through the MEAN, so it
+is dragged up by every peak and then subtracts intensity belonging to the
+phase - worst exactly where the pattern is most crystalline. Measured against
+a known foot: the iteratively clipped fit is within **1.0-1.5% of the tallest
+peak** and keeps **100%** of that peak, where a naive Chebyshev fit of the
+same order **overshoots the true background by 30 on average**.
+**AND THE CLIP MUST REFIT THE ORIGINAL DATA, not the already-clipped copy.**
+Clipping `working` compounds - every pass lowers the points it lowered last
+time - so the estimate creeps DOWNWARDS and the subtraction leaves a rising
+positive residual. Measured on a 500 + 5x baseline under one sharp peak: the
+residual drifted from 4.9 to 23 across the pattern before that line read `y`
+instead of `working`. Caught by the test asserting a flat baseline, not by
+reading.
+16 tests. 2141 tests.
+
+Round 105b (2026-09-05, Christian's test pass on round 105 - two bugs, and
+the stack becomes arrangeable):
+**(1) AN AXIS VIEW IS NOT JUST A POSE, and the savefile only carried the
+pose.** "Quitting in an axis view of a crystal is orthographic. if that is
+saved just before quit, the program launches in orthographic view, but
+rotating the camera doesn't pop back to perspective. It should."
+`_view_state` stored `orthographic` and the restore then set
+`cam.auto_ortho = False` OUTRIGHT - so a file written while looking down a
+cell axis reopened as a view that was orthographic forever, and the flag
+that makes the next orbit pop back was thrown away by the one line that
+mentioned it.
+**BOTH FLAGS, NEVER ONE.** `auto_level` has the same hole and is the more
+dangerous half: the up vector of an axis view is a CELL axis, which the
+world-Z-up turntable cannot represent, so a restored axis view would also
+have LURCHED on its first orbit. `Camera.rotate`'s own docstring records
+that undoing only one of the two was measured as **a 180 degree camera
+movement for a zero-degree step**, because the projection and the up vector
+are one pose. Absent in an older file means False for both, which is right:
+a plain orthographic view chosen by hand is meant to stay orthographic, and
+only an AXIS view pops back.
+**(2) ROUND 103b'S DELETE FIX COULD NEVER FIRE, and its test is why nobody
+noticed.** "pressing delete on a mol with no atoms in the outliner doesn't
+remove it. Check MF.molom for that." His file really does carry two empty
+objects. The fix was `OutlinerPanel.keyPressEvent`, and **`Del` is a
+window-level QAction** - round 16 binds every operator key that way - so Qt
+dispatches the window shortcut BEFORE the focused widget sees a key press
+and the panel's handler is unreachable. The test called `keyPressEvent`
+directly and passed on a path no hand can take. **Round 59's lesson exactly,
+and this file states it: a mechanism with tests and no gesture test is a
+feature nobody can reach.**
+So it moved to the operator, which is what the key actually runs, and the
+panel's override was REMOVED rather than left as a second implementation
+that cannot fire. `run_op` refuses a disabled operator, so the predicate had
+to be widened with it (round 60's rule, one more time).
+**AND THE FIRST CUT OF THAT WAS TOO BROAD - the full suite caught it.**
+Falling through to "every selected outliner row" made Del delete the
+molecule you are looking at, because `highlight` makes the active object's
+row current and something is therefore nearly always selected there. Round
+60's test - `delete_selected` must be DISABLED with an empty selection - is
+what failed. `empty_selected_objects()` narrows it to rows whose molecule
+has NO ATOMS, which is the whole of the gap: anything with atoms is already
+reachable through them.
+**(3) THE STACK CAN BE ARRANGED BY HAND.** "I would like to also be able to
+drag and drop the patterns so I can arrange them in a preferred order. This
+should come with horizontal highlighting bands that show which patterns will
+swap places in the stack." A stacked trace already OWNS a horizontal strip of
+the plot - the one between its own baseline and its neighbours' - so
+`PxrdPlot.stack_bands` derives the bands from the baselines and the drag
+highlights and hit-tests against the SAME list, since deriving it twice is
+how a highlight and a drop come to disagree. A swap, which is his word, not
+an insertion.
+**IT NEEDED NO NEW GESTURE, because a plain left-drag on the plot did
+nothing**: `mousePressEvent` returned early with no zoom or pan mode armed.
+So the reorder takes the drag only when nothing else has claimed it, and `Z`
+and `P` are untouched.
+**AT OFFSET 0 THERE IS NOTHING TO REARRANGE, said rather than guessed.**
+Every baseline is then the same pixel, so no band can name a trace -
+`stack_bands` returns empty and the gesture is simply not offered, instead of
+picking one of several traces the cursor is equally over.
+**THE ORDER IS A DEFAULT PLUS AN OVERRIDE, and getting that wrong broke
+round 100.** `_ordered` lets the remembered order govern only the RELATIVE
+order of the traces it knows about; anything new keeps the slot the caller
+built it in. The first cut ranked unknown keys LAST - the same rule read
+carelessly - which put **every newly opened measurement at the BOTTOM** of
+the stack, and round 100's "the measurement sits at the top" is what caught
+it. A trace switched off keeps its PLACE rather than being dropped, so
+ticking it back on puts it where it was.
+The order spans crystals and measurements together, because "put this
+measurement under that phase" is one stack and not two lists - and it is
+session state on the WINDOW for the same reason `measured` is: a measurement
+is not saved, so an order over both cannot be either.
+16 tests. 2188 tests.
+
+Round 105 (2026-09-05, the background model replaced - Christian's design,
+and every prop the old one needed went with it):
+"I still don't like the results. It seems to be especially problematic given
+that the very beginning of the 2theta range is not just decaying from
+maximum, but actually starts low, spikes strongly, then decays by power law
+until zero... I want to basically run a rolling first derivative on a
+smoothed pattern so that spikes stand out and do not get flattened while also
+continuous rises will be taken out because the rolling derivative has a
+sensitivity parameter that dictates when background subtraction hits a peak
+and needs to stop fitting the pattern. Is this possible?"
+**IT IS, AND IT IS ONE RULE.** `background.rolling_background` walks the
+pattern from HIGH angle to LOW and lets the background FALL as fast as the
+data does while it may only RISE at `slope`, as a fraction of its own height
+per degree. Anything steeper is a peak. Measured on his own scans before it
+was written: a peak-free background runs **0.02-0.06 per degree**, a purely
+amorphous halo tops out at **1.18**, and Bragg peaks run **3 to 24**.
+**THE WALK DIRECTION DOES MORE WORK THAN IT LOOKS, and that is his
+instruction rather than an optimisation.** Because "rise" is measured
+leftwards, ONE pass handles the two ends of a peak in opposite ways: coming
+down onto the high-angle flank the limit binds and the peak is bridged;
+carrying on over the top and down the low-angle flank the envelope is already
+low, so it stays there until the data comes back to meet it. No peak state,
+no shoulders to find. **And the climb into a beam stop is a FALL leftwards**,
+so the limit never applies to it and the envelope follows it to the floor -
+which is exactly the case round 104's power law was bolted on for.
+**SO EVERY PROP THE CHEBYSHEV NEEDED IS GONE**: the iterative clipping that
+stops a least-squares curve fitting the peaks, the separate power law because
+a polynomial cannot reach one end, and the beam-stop finder telling the power
+law where to start. Both models are kept and chosen in the dialog, because a
+real amorphous hump is a thing a polynomial can carry and the walk
+deliberately cannot - which is Christian's own trade, stated in his words.
+**IT VECTORISES EXACTLY, which is not a detail because it reruns on every
+touch of the knob.** `b[i] = min(s[i], b[i+1] * exp(slope * dx))` unrolls to
+`min over j >= i of s[j] * exp(slope * (x[j] - x[i]))`, i.e. in log space a
+suffix minimum of `log(s) + slope * x` - one `np.minimum.accumulate`.
+**0.23 ms against 3.4 ms** for the loop at 3841 points, and it is an identity
+rather than an approximation, so a test drives the loop and compares.
+**THE HALF HE NAMED THAT A CONSTANT LIMIT CANNOT DO: a power law's relative
+slope is `b/x`, which DIVERGES as 2 theta goes to zero.** So a synchrotron
+foot is certain to exceed any constant limit near the origin and is read as
+one enormous peak - measured, a real Bragg peak came out at **1.9%** of the
+scale. `tail` widens the limit by `tail / x` per degree, which is a power-law
+allowance and costs an ordinary pattern 3-5% (at 30 degrees it is 1.5/30 per
+degree and simply does not bite). Same file: **1.9% -> 29.6%**.
+**AND A BUG THAT HAD BEEN EATING A DEGREE OF REAL DATA.** `beam_stop_edge`
+answered with the in-window maximum, so on his `i15-1-84514` - which starts
+at 373 counts and climbs for a whole degree, the stop being outside the
+recorded range - it returned **1.20 degrees, the tallest Bragg peak in the
+file**, and the trim threw away everything below it. Then the power law was
+fitted to a RISING region and the Chebyshev clipped most of the rest to zero.
+A maximum is believed to be an edge only if it lies within `MAX_SHADOW` and
+the pattern has decayed to half of it by the end of the window; otherwise
+nothing is dropped. Both paths are better for it.
+**THE DEFAULT WAS SET BY MEASURING WHAT CONSTRAINS IT FROM EACH SIDE, and
+neither side was where it was first guessed.** The cost of a high limit is
+the WEAK PEAKS - a peak must stand about `6 * slope * FWHM` above its
+background to survive, so for a 0.06 degree peak that is 8.9% at slope 0.5,
+16.1% at 1.0 and 31.6% at 2.0, linear in both. The cost of a low one is
+following a real background, and a background is gentle: against a synthetic
+decay of 2.0 per degree the reconstruction is within **0.4%** at slope 1.0.
+**What does NOT constrain it is amorphous rejection**, which is the surprise
+and is why the first guess of 2.0 was wrong: a halo is WIDE, so the envelope
+catches up with it whatever the limit - two amorphous scans and an
+empty-capillary background come off to **0.3-0.7% of their range at every
+slope from 0.5 to 3.0**. So 1.0.
+**A SECOND REFINEMENT PASS WAS BUILT AND REJECTED ON MEASUREMENT.**
+Interpolating across the detected peaks instead of letting the envelope climb
+into them is the obvious improvement and buys **0.5-1% of peak height and
+~1% of background rms** across four peak widths, which does not pay for a
+peak-region state machine. The plain one-pass envelope ships.
+**DRAG AND DROP**, his first ask: several files at once, `pxrdfile.
+looks_like_pattern` ruling out only what certainly is not a pattern - a list
+of what to REFUSE rather than what to accept, because the text formats have
+no standard and a pattern turns up under `.txt` and half a dozen house
+extensions. Note `.xyz` is refused and `.xy` is not, a distinction one
+character wide. The Open dialog takes several now too, and one unreadable
+file costs its own line in the note and nothing else.
+**AND THE SETTINGS REDRAW AS THEY ARE TOUCHED**, his second: "Direct when
+values are changed via the arrows and after hitting enter to confirm when
+something is typed in a text box." That is `setKeyboardTracking(False)`,
+which `NumberBox` has had since round 98 for the neighbouring reason - so the
+work was wiring, plus the thing a live dialog then owes: **Cancel has to put
+the old settings back**, because by the time it is pressed the trace has been
+changed a dozen times. `MeasuredTrace.SETTINGS` is derived from `__slots__`
+rather than listed twice, since a knob in one and not the other is a knob
+Cancel silently keeps.
+**One live-control rule applied in both directions.** The two models put
+different rows on one form, so the rows a model does not use are HIDDEN
+rather than greyed - greyed says "not now" and these say "not this model".
+And the low-angle rows are NOT hidden with the background tick, because they
+act whether or not a background is subtracted: a control that is in the path
+while its row is hidden is the same bug as a live-looking control that is
+not.
+22 tests. 2171 tests.
+
+Round 104 (2026-09-05, his synchrotron file - the tail Chebyshev cannot reach,
+and a wavelength in any unit):
+**(1) THE WAVELENGTH BOX IS TEXT NOW, parsed by the SAME reader the simulated
+traces use.** "I need to be able to input 0.161699 exactly, or 70 keV.
+(dimensionless input => Angstrom, with dimension => case-insensitive)." A spin
+box has one unit and a fixed number of decimals and he needs neither -
+0.161699 is six. `pxrd.parse_source` has read a wavelength, an energy in keV
+or eV and a named line since round 96, precisely because a synchrotron user
+states an energy and never a wavelength, so this is one parser rather than a
+second that would drift from it. It says what it understood while it is being
+typed, which is round 96's rule: a source box that quietly falls back is how
+a pattern comes out at the wrong angles with nothing on screen to say so.
+**(2) CHEBYSHEV CANNOT REACH THE SMALL-ANGLE TAIL, and his diagnosis was
+right.** "very short wavelengths in synchrotron radiation record very small
+scattering angles. you get an exponential looking curve close to 2theta = 0.
+Chebyshev cannot remove that." Measured on his own
+`i15-1-70985_tth_det2_norm_0.xy`: the tallest point in the WHOLE pattern is
+**171 400 at 2 theta 0.080**, which is the beam-stop edge and not a
+reflection - **nine times** the tallest real Bragg peak (~19 400). Since
+every trace here is normalised to its own strongest point, every real peak
+was being drawn at a tenth of its height.
+**IT IS A POWER LAW, NOT AN EXPONENTIAL, and that was measured rather than
+taken from the description.** Fitting both to 0.1-5 deg: `a x^-b` gives rms
+**2 630**, `a e^-x/t` gives **9 443**. So it looks exponential and is not,
+and `core/background.py` fits the power law - exponent about 0.78 there.
+**TWO PROBLEMS AT THAT END AND ONLY ONE IS SUBTRACTABLE.** The smooth decay
+is a background and comes off as one. The RISE into the beam-stop edge is not
+a measurement of anything - intensity climbs 8 707 -> 171 400 over eight
+hundredths of a degree because that is the shadow - and no smooth function
+takes out a nine-point ramp without taking real peaks with it. So those
+points are DROPPED, and `beam_stop_edge` finds the turning point itself:
+intensity rises to the edge and decays after it, so the maximum IS the
+boundary. Auto on his file gives 0.080.
+**APPLIED FIRST, which is his own sequencing and is right**: "perhaps this
+should be applied first so that chebyshev can work on a pre-processed pattern
+where it can truly shine." A low-order polynomial cannot represent a
+near-divergence at one end of an otherwise flat pattern; once the tail is
+gone what is left is the smooth background it is good at. Measured end to
+end on his file: **171 400 at 0.080 -> 18 195 at 2.950**, a peak 0.030 deg
+wide at half height.
+**WHAT IT DOES NOT DO, said out loud rather than papered over.** A single
+power law cannot follow the ramped shoulder right at the edge, so a residual
+is left at the very start - small beside strong peaks (his file still puts a
+real peak on top) and not beside weak ones. Raising "Ignore below" past it is
+the lever, which is why that is a dial and not a constant; a test drives
+exactly that.
+**AND A MODEL CHANGE THAT WAS TRIED AND REVERTED.** Fitting `a x^-b + c` by
+subtracting an estimated pedestal before the log fit looks obviously better
+and is worse: `a x^-b - c` is not a power law, so the log-log line is biased
+and the model then OVERSHOOTS at the start - measured at 20% of the peak
+height on a pure test curve, against an undershoot of a few percent without
+it. The pedestal is the Chebyshev's job.
+8 tests. 2149 tests.
+
 Round 102b (2026-09-03, Christian's test pass on round 102 - a span that
 outlived its row, and the round trip re-cut to HIS design):
 **(0) THE DESIGN WAS MINE AND IT WAS WRONG.** Round 92 recorded "opening a
@@ -5548,7 +5930,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 2118 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 2188 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -5823,6 +6205,13 @@ Behavioural constants (verified against avogadrolibs sources, 2026-07-30):
   lets the plot sample at its own pixel columns at every zoom level;
   `profile` is the regular grid an EXPORT wants and is now a thin wrapper
   over it.
+- `core/background.py` — the Chebyshev background under a MEASURED pattern,
+  TOPAS's model because Christian asked for it by name. The one thing to know
+  before touching it: the fit is a LOWER ENVELOPE, not a least-squares curve.
+  A plain polynomial passes through the mean, is dragged up by every peak,
+  and then subtracts intensity belonging to the phase. It clips iteratively -
+  and each pass refits the ORIGINAL data, because clipping the already-clipped
+  copy compounds and walks the estimate downwards.
 - `core/pxrdfile.py` — a MEASURED powder pattern read off disk. The text
   formats have no standard at all beyond "two or three columns of numbers
   under some header lines", so it is written to that rather than to any one
@@ -7423,7 +7812,7 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 2118 offline tests, 4 skipped, ~230 s.
+1. `python -m pytest tests/ -q` — 2188 offline tests, 4 skipped, ~120 s.
    `tests/conftest.py` sandboxes QSettings, so a GUI test can drive a real
    control without writing into your own MoloM configuration; it also
    **destroys the windows a test created** (round 86), without which the suite

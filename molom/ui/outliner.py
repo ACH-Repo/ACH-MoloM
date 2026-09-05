@@ -1443,6 +1443,15 @@ class OutlinerPanel(QWidget):
             item.setCheckState(self.EYE_COLUMN, want)
 
     # ------------------------------------------------------------- helpers
+    # NO `keyPressEvent` FOR DELETE, and that is the round-103b fix put
+    # where it can actually fire. `Del` is a window-level QAction (round 16
+    # binds every operator key that way), and Qt dispatches a window shortcut
+    # BEFORE the focused widget sees a key press - so a handler here could
+    # never run, and the test that pinned it called `keyPressEvent` directly
+    # and so never noticed. `MainWindow.on_delete_selected` falls through to
+    # `selected_object_ids()` when the viewport has nothing to delete, which
+    # is the same behaviour reached by the key that really arrives.
+
     def selected_object_ids(self):
         out = []
         for item in self.tree.selectedItems():

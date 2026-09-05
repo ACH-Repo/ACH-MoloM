@@ -7,6 +7,7 @@ import os
 import shutil
 import tempfile
 
+import numpy as np
 import pytest
 
 from molom.core import camera as camera_mod
@@ -368,6 +369,8 @@ def test_the_name_column_can_be_dragged_and_then_stays_put():
 
 # ------------------------ #4: an element change makes the site PURE (r102b)
 SOLID = os.path.join(HERE, "data", "cod_1547149_solid_solution.cif")
+FERROCENE_OR_SOLID = os.path.join(HERE, "data",
+                                  "cod_2101932_ferrocene.cif")
 
 
 def _asym(win, path):
@@ -522,3 +525,297 @@ def test_core_does_not_import_ccdc_anywhere():
             for name in names:
                 assert not name.split(".")[0] == "ccdc", \
                     "%s imports ccdc" % os.path.basename(path)
+
+
+# ------------------------------ M2: a frozen P1 cell can be recovered (r103)
+def _demoted(win, path):
+    """A crystal in the state round 91's bug left `MF.molom`'s CsF in: the
+    atoms intact, the group thrown away, the cell frozen."""
+    win.open_path(path)
+    obj = [o for o in win.scene.objects
+           if (o.structure.metadata or {}).get("cell")][-1]
+    win.active_id = obj.id
+    win.demote_to_p1(obj)
+    assert obj.structure.metadata.get("cell_frozen")
+    return obj
+
+
+def test_a_demotion_leaves_the_ATOMS_alone(win):
+    """Which is why it is recoverable at all: `demote_to_p1` replaces the
+    asymmetric unit and the operators, not the coordinates."""
+    win.open_path(SOLID)
+    obj = [o for o in win.scene.objects
+           if (o.structure.metadata or {}).get("cell")][-1]
+    before = np.array(obj.structure.coords, copy=True)
+    win.demote_to_p1(obj)
+    assert np.allclose(obj.structure.coords, before)
+
+
+def test_re_deriving_unfreezes_the_cell(win):
+    """The freeze exists because after an arbitrary edit the stored unit and
+    operators may not rebuild the cell - the MOF-5 failure where 616 atoms
+    came back as 7. `reevaluate_symmetry` REFUSES any group that cannot
+    reconstruct it, so a successful re-derivation is proof that the condition
+    the freeze guards against no longer holds."""
+    obj = _demoted(win, SOLID)
+    meta = obj.structure.metadata
+    found = win.reevaluate_symmetry(obj, announce=False)
+    assert found, "the coordinates still have their symmetry"
+    assert not meta.get("cell_frozen")
+    assert len(meta["symops"]) > 1
+
+
+def test_a_refused_re_derivation_leaves_the_freeze_in_place(win, monkeypatch):
+    """"Nothing changed" must not un-grey anything: if the coordinates really
+    only have P1, the cell is frozen for the reason it was frozen."""
+    obj = _demoted(win, SOLID)
+    meta = obj.structure.metadata
+    monkeypatch.setattr(win, "reevaluate_symmetry",
+                        lambda o, announce=True: None)
+    from molom.ui import app as app_mod
+    from PySide6.QtWidgets import QMessageBox
+    monkeypatch.setattr(app_mod.QMessageBox, "question",
+                        staticmethod(lambda *a, **k: QMessageBox.Yes))
+    win.viewport.set_selection([(obj.id, 0)])
+    win._sync_crystal_page()
+    win.crystal_page.rederive_btn.click()
+    assert meta.get("cell_frozen"), "a refusal must not unfreeze the cell"
+
+
+def test_the_page_offers_the_way_out_ONLY_when_it_is_needed(win):
+    """A greyed control that cannot say what would un-grey it is the thing
+    this project keeps finding. On an ordinary crystal the button would be
+    offering to change something that is already right."""
+    win.open_path(SOLID)
+    obj = [o for o in win.scene.objects
+           if (o.structure.metadata or {}).get("cell")][-1]
+    win.active_id = obj.id
+    win.viewport.set_selection([(obj.id, 0)])
+    win._sync_crystal_page()
+    page = win.crystal_page
+    # `isHidden`, not `isVisible`: the latter folds in every ancestor, and
+    # this page lives on a QStackedWidget inside a dock that is usually shut
+    # (round 34).
+    assert page.rederive_btn.isHidden()
+    assert page.frozen_note.isHidden()
+    win.demote_to_p1(obj)
+    win._sync_crystal_page()
+    assert not page.rederive_btn.isHidden()
+    assert not page.frozen_note.isHidden()
+    assert not page.cell_radio.isEnabled()
+
+
+def test_pressing_it_repairs_the_crystal_and_re_enables_the_switch(
+        win, monkeypatch):
+    from molom.ui import app as app_mod
+    from PySide6.QtWidgets import QMessageBox
+    obj = _demoted(win, SOLID)
+    meta = obj.structure.metadata
+    n_atoms = obj.structure.n_atoms
+    monkeypatch.setattr(app_mod.QMessageBox, "question",
+                        staticmethod(lambda *a, **k: QMessageBox.Yes))
+    win.viewport.set_selection([(obj.id, 0)])
+    win._sync_crystal_page()
+    win.crystal_page.rederive_btn.click()
+    assert not meta.get("cell_frozen")
+    assert len(meta["symops"]) > 1
+    assert obj.structure.n_atoms == n_atoms, "the atoms are not touched"
+    assert win.crystal_page.cell_radio.isEnabled()
+    assert win.crystal_page.rederive_btn.isHidden()
+
+
+def test_cancelling_changes_nothing(win, monkeypatch):
+    """It says what it is about to do FIRST - Christian's "if the user is
+    explicitly informed they're about to change something"."""
+    from molom.ui import app as app_mod
+    from PySide6.QtWidgets import QMessageBox
+    obj = _demoted(win, SOLID)
+    meta = obj.structure.metadata
+    before = (meta.get("spacegroup"), len(meta.get("symops") or []),
+              meta.get("cell_frozen"))
+    monkeypatch.setattr(app_mod.QMessageBox, "question",
+                        staticmethod(lambda *a, **k: QMessageBox.Cancel))
+    win.viewport.set_selection([(obj.id, 0)])
+    win._sync_crystal_page()
+    win.crystal_page.rederive_btn.click()
+    assert (meta.get("spacegroup"), len(meta.get("symops") or []),
+            meta.get("cell_frozen")) == before
+
+
+def test_the_contents_switch_round_trips_after_the_repair(win, monkeypatch):
+    """The point of un-greying it: asym -> cell has to work again, and give
+    back the cell it started from."""
+    from molom.ui import app as app_mod
+    from PySide6.QtWidgets import QMessageBox
+    obj = _demoted(win, SOLID)
+    n_atoms = obj.structure.n_atoms
+    monkeypatch.setattr(app_mod.QMessageBox, "question",
+                        staticmethod(lambda *a, **k: QMessageBox.Yes))
+    win.viewport.set_selection([(obj.id, 0)])
+    win._sync_crystal_page()
+    win.crystal_page.rederive_btn.click()
+    win.on_crystal_view("asym")
+    assert win.scene.get(obj.id).structure.n_atoms < n_atoms
+    win.on_crystal_view("cell")
+    assert win.scene.get(obj.id).structure.n_atoms == n_atoms
+
+
+# ----------------------------------- the axis-view flip, and Del (round 103)
+def test_the_axis_flip_only_applies_to_a_press_in_DIRECT_succession(win):
+    """Christian: "If I press direction once, rotate and then press it again,
+    the rotation should start from positive again. Start from negative only
+    if pressed twice directly in succession." The memory used to survive
+    anything at all."""
+    from molom.core.camera import quat_to_mat3
+    win.open_path(FERROCENE_OR_SOLID)
+    cam = win.viewport.camera
+
+    def apart(a, b):
+        return np.degrees(np.arccos(
+            np.clip((np.trace(b @ a.T) - 1) / 2.0, -1.0, 1.0)))
+
+    win._on_ribbon_axis("c")
+    first = quat_to_mat3(cam.rotation).copy()
+    win._on_ribbon_axis("c")
+    assert apart(first, quat_to_mat3(cam.rotation)) > 170, \
+        "twice in a row IS the other side"
+
+    win._last_axis_view = None
+    win._on_ribbon_axis("c")
+    first = quat_to_mat3(cam.rotation).copy()
+    cam.rotate(40.0, 0.0)                      # the user orbits away
+    win._on_ribbon_axis("c")
+    assert apart(first, quat_to_mat3(cam.rotation)) < 1e-6, \
+        "after rotating, the button is a FIRST press again"
+
+
+def test_a_pan_or_zoom_does_NOT_reset_the_flip(win):
+    """Deliberate: those leave you looking down the same axis, so pressing
+    again still means "the other side". Only a rotation takes you off it."""
+    from molom.core.camera import quat_to_mat3
+    win.open_path(FERROCENE_OR_SOLID)
+    cam = win.viewport.camera
+    win._on_ribbon_axis("c")
+    first = quat_to_mat3(cam.rotation).copy()
+    win._on_ribbon_zoom(20.0)
+    win._on_ribbon_axis("c")
+    ang = np.degrees(np.arccos(np.clip(
+        (np.trace(quat_to_mat3(cam.rotation) @ first.T) - 1) / 2.0, -1, 1)))
+    assert ang > 170
+
+
+def test_a_different_axis_button_resets_it_too(win):
+    from molom.core.camera import quat_to_mat3
+    win.open_path(FERROCENE_OR_SOLID)
+    cam = win.viewport.camera
+    win._on_ribbon_axis("a")
+    first = quat_to_mat3(cam.rotation).copy()
+    win._on_ribbon_axis("b")
+    win._on_ribbon_axis("a")
+    ang = np.degrees(np.arccos(np.clip(
+        (np.trace(quat_to_mat3(cam.rotation) @ first.T) - 1) / 2.0, -1, 1)))
+    assert ang < 1e-6
+
+
+def test_DELETE_removes_an_empty_molecule_from_the_outliner(win):
+    """Christian: "if there is a molecule entry with no atoms and the
+    outliner entry is selected, does pressing Del not delete the entry
+    because no atoms can be selected?" Exactly that - the window's Del runs
+    the delete OPERATOR, which acts on selected atoms, so the one object you
+    could not get rid of was the one there was nothing else to do with."""
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+    obj_id = win.new_empty_molecule()
+    assert win.scene.get(obj_id).structure.n_atoms == 0
+    win.outliner.highlight(obj_id)
+    win.outliner.tree.setCurrentItem(win.outliner.tree.topLevelItem(0))
+    assert win.outliner.selected_object_ids() == [obj_id]
+    before = win.scene.n_objects
+    # THROUGH THE KEY, not through the handler. Round 103b called
+    # `outliner.keyPressEvent` directly, which is how it came to pin a fix
+    # that no hand could reach: `Del` is a window-level QAction and Qt
+    # dispatches it before the focused widget sees the key at all.
+    win.run_op("delete_selected")
+    assert win.scene.n_objects == before - 1
+
+
+# ------------------------------------------------- N4: distribute (round 103)
+def test_distribute_leaves_an_exact_clearance_and_keeps_the_group_put():
+    """The number is the CLEAR SPACE between neighbours, not their centre
+    spacing, so it means the same thing whatever sizes are in the selection.
+    And the group is recentred on the span it already occupied - spreading
+    three molecules must not also slide them off to one side."""
+    from molom.core import align
+    widths, centres = [4.0, 2.0, 6.0], [0.0, 10.0, 20.0]
+    out = align.distribute_offsets(widths, centres, gap=3.0)
+    for k in range(2):
+        clear = ((out[k + 1] - widths[k + 1] / 2.0)
+                 - (out[k] + widths[k] / 2.0))
+        assert clear == pytest.approx(3.0)
+    assert sum(out) / 3.0 == pytest.approx(sum(centres) / 3.0)
+
+
+def test_distribute_keeps_the_ORDER_the_objects_already_had():
+    """Tidying an arrangement up, not reshuffling it into scene-id order -
+    which would move things past each other for no visible reason."""
+    from molom.core import align
+    out = align.distribute_offsets([2.0, 6.0, 4.0], [10.0, 20.0, 0.0],
+                                   gap=3.0)
+    assert out[2] < out[0] < out[1]        # the one at x=0 stays leftmost
+
+
+def test_the_extent_is_measured_along_the_AXIS_not_as_a_radius():
+    """A long flat molecule laid along x is nearly its own length wide in x
+    and almost nothing in y; a bounding radius would leave a hole."""
+    from molom.core import align
+    coords = np.array([[-5.0, 0.0, 0.0], [5.0, 0.1, 0.0]])
+    cx, wx = align.axis_extent(coords, np.array([1.0, 0.0, 0.0]))
+    cy, wy = align.axis_extent(coords, np.array([0.0, 1.0, 0.0]))
+    assert wx == pytest.approx(10.0)
+    assert wy == pytest.approx(0.1)
+    assert cx == pytest.approx(0.0)
+
+
+def test_the_distribute_modal_previews_commits_and_reverts(win):
+    """Same contract as every other modal: move to preview, click to confirm,
+    Esc to revert exactly."""
+    from molom.core import align, build
+    unit = np.array([1.0, 0.0, 0.0])
+    ids = []
+    for k in range(3):
+        obj = win.scene.add(build.cubane())
+        obj.structure.frames[0][:] += np.array([k * 1.0, 0.0, 0.0])
+        ids.append(obj.id)
+    win.viewport.set_selection([(i, 0) for i in ids])
+
+    def gaps():
+        v = [align.axis_extent(win.scene.get(i).structure.coords, unit)
+             for i in ids]
+        return [((v[k + 1][0] - v[k + 1][1] / 2.0)
+                 - (v[k][0] + v[k][1] / 2.0)) for k in range(len(v) - 1)]
+
+    start = gaps()
+    win.viewport.start_distribute("x")
+    assert win.viewport._internal is not None
+    win.viewport._internal["state"].add_delta(1.0)      # 2.0 -> 3.0 A
+    win.viewport._apply_internal()
+    assert all(g == pytest.approx(3.0) for g in gaps())
+    win.viewport._finish_internal(True)
+    assert all(g == pytest.approx(3.0) for g in gaps())
+
+    win.viewport.set_selection([(i, 0) for i in ids])
+    win.viewport.start_distribute("x")
+    win.viewport._internal["state"].add_delta(5.0)
+    win.viewport._apply_internal()
+    win.viewport._finish_internal(False)
+    assert gaps() == pytest.approx([3.0, 3.0]), "cancel must revert exactly"
+    assert start != pytest.approx(gaps())
+
+
+def test_distribute_refuses_a_selection_of_one(win):
+    """Two is the fewest that can have a gap between them."""
+    from molom.core import build
+    obj = win.scene.add(build.cubane())
+    win.viewport.set_selection([(obj.id, 0)])
+    win.viewport.start_distribute("x")
+    assert win.viewport._internal is None
