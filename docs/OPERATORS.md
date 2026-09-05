@@ -1702,3 +1702,37 @@ density, solubility and the rest - each value with its source. It shows up to
 three values per heading and says how many more there were, because there is
 no such thing as "the melting point": aspirin's own record carries seven, in
 three unit conventions, one of them without a unit at all.
+
+
+## ORCA constraints and a relaxed surface scan (round 106, roadmap F4)
+
+`orca_constraint` - "ORCA: constrain or scan the selected coordinate..." -
+off F3 and off the viewport's right-click menu, live whenever the selection
+names a coordinate: **1 atom** freezes a Cartesian position, **2** a bond,
+**3** an angle, **4** a dihedral. That mapping is
+`internal.kind_for_count`'s, the same one the measurement readout uses, so
+the menu and the block writer cannot disagree about what picking three atoms
+means. Indices are **0-based**, as ORCA's are and as `--select` already was.
+
+The dialog writes a `%geom` block to the clipboard - freeze where it is,
+freeze at a value, or scan a range - in ORCA Workbench's own format, pinned
+byte for byte against its `geomspec` by a test.
+
+**Preview the scan** walks the coordinate over its range and relaxes
+everything else at each point with the force field, baking the result as
+ordinary FRAMES: the scene clock plays them, the timeline gives them a
+strip, and the Blender export keyframes them. It is the same shape of
+calculation ORCA runs and is not a substitute for it - what it answers is
+which atoms move and how far. A dihedral inside a ring is refused, because
+the only atom allowed to move lies on the axis it would turn about.
+
+## Keyframed animation in the Blender export (round 106, roadmap C1)
+
+A **Keyframe the animation** tick on the Blender export dialog. Every atom
+is already its own Blender object, so an animation is per-object keys on
+`location` and per-bond keys on the whole matrix - no new geometry. Every
+rendered frame is BAKED rather than keyframing the source frames: MoloM's
+player turns the rigid part of a motion as a rotation and Blender's linear
+interpolation would take the chord instead, contracting a rotating molecule
+at the half-way point. The cost is file size, and the export's summary says
+what it is.

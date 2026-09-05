@@ -17,8 +17,10 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox,
                                QLineEdit,
                                QListWidget, QListWidgetItem, QPushButton,
                                QScrollArea, QSlider, QSpinBox,
+                               QPlainTextEdit,
                                QTableWidget, QTableWidgetItem, QVBoxLayout,
                                QWidget)
+from PySide6.QtWidgets import QApplication
 
 from ..core import blender_export as bx
 from ..core import cellbox as cellbox_mod
@@ -26,8 +28,11 @@ from ..core import cif as cif_mod
 from ..core import cifsearch
 from ..core import depict as depict_mod
 from ..core import molprops
+from ..core import orca as orca_mod
+from ..core import scan as scan_mod
 from ..core import flight, input_map
 from ..core import style as style_mod
+from .widgets import FlowLayout
 from .search_table import ResultTable
 from .widgets import make_text_selectable
 
@@ -803,6 +808,23 @@ class BlenderExportDialog(QDialog):
             "afterwards, instead of baking the detail in here.")
         form.addRow("", self.subsurf)
 
+        # C1. Every atom is its own object already, so an animation is
+        # per-object keyframes; what it costs is FILE SIZE, and saying so
+        # here is cheaper than discovering it.
+        self.animate = QCheckBox("Keyframe the animation")
+        self.animate.setChecked(bool(getattr(opts, "animate", False)))
+        self.animate.setToolTip(
+            "Bake one keyframe per rendered frame for every atom and bond, "
+            "over the transport bar's own looping interval - so Blender "
+            "plays exactly what the viewport plays. "
+            "Baked rather than keyframing only the source frames, because "
+            "MoloM turns the rigid part of a motion as a ROTATION and "
+            "Blender's linear interpolation would take the chord instead, "
+            "contracting a rotating molecule at the half-way point. The "
+            "cost is file size: a 25-frame scan of a 14-atom molecule is "
+            "about 1.3 MB.")
+        form.addRow("", self.animate)
+
         self.meta_glow = QCheckBox("Meta atoms glow (emissive)")
         self.meta_glow.setChecked(bool(opts.meta_glow))
         self.meta_glow.setToolTip(
@@ -972,6 +994,7 @@ class BlenderExportDialog(QDialog):
             bond_sides=self.bond_sides.value(),
             shade_smooth=self.shade_smooth.isChecked(),
             subsurf=self.subsurf.isChecked(),
+            animate=self.animate.isChecked(),
             meta_glow=self.meta_glow.isChecked(),
             unit_cell=self.unit_cell.isChecked(),
             polyhedra=self.polyhedra.isChecked(),
@@ -2447,3 +2470,211 @@ class MoleculeSearchDialog(QDialog):
     def _take_one(self, cand):
         self.chosen = [cand]
         self.accept()
+
+
+class OrcaConstraintDialog(QDialog):
+    """Turn the selection into an ORCA `%geom` block - and show what it does.
+
+    Roadmap F4. MoloM has read indices out of a `%geom` block since round 92
+    and could not write one, which is the half you want when you are looking
+    at a structure and deciding what to freeze.
+
+    **THE FORMAT IS ORCA WORKBENCH'S**, produced by `core/orca.py` and pinned
+    against OWB's own `geomspec` by a test - see that module. This dialog
+    only decides WHICH coordinate and what to do with it.
+
+    **AND IT CAN SHOW YOU THE SCAN.** Christian: "If I want a more visual way
+    of showing what a restraint/scan in ORCA will do, I think it would be
+    good to see it animated within molom." Preview bakes the scan into the
+    molecule's frames with `core/scan.py`, so the scene clock plays it and
+    the Blender export can render it - none of which needed anything new,
+    which is the argument for having built it at all.
+    """
+
+    def __init__(self, parent, obj, rows):
+        super().__init__(parent)
+        self.setWindowTitle("ORCA constraint - {}".format(obj.name))
+        self.obj = obj
+        self.rows = list(rows)
+        self.ctype = orca_mod.coord_type(len(self.rows))
+        self._preview = None
+        lay = QVBoxLayout(self)
+
+        coords = obj.structure.coords
+        self.current = (orca_mod.measure_value(self.ctype, self.rows, coords)
+                        if self.ctype != "C" else 0.0)
+        label, _n, unit = orca_mod.COORD_TYPES[self.ctype]
+        names = " - ".join(str(i) for i in self.rows)
+        head = QLabel("{} on atoms {}{}".format(
+            label, names,
+            "" if self.ctype == "C"
+            else "   currently {:.4f} {}".format(self.current, unit)))
+        head.setStyleSheet("font-weight: bold;")
+        lay.addWidget(head)
+        note = QLabel("Indices are 0-based, as ORCA's are - round 92's rule, "
+                      "and the whole point is that the numbers can be pasted "
+                      "between the two programs.")
+        note.setStyleSheet("color: #9a9a9a;")
+        note.setWordWrap(True)
+        note.setMinimumWidth(1)
+        lay.addWidget(note)
+
+        form = QFormLayout()
+        lay.addLayout(form)
+
+        self.mode = QComboBox()
+        self.mode.addItem("Freeze it where it is", "freeze")
+        if self.ctype != "C":
+            self.mode.addItem("Freeze it at a value", "value")
+            self.mode.addItem("Scan it (relaxed surface scan)", "scan")
+        form.addRow("What to do", self.mode)
+
+        self.value = _number(self.current, unit)
+        form.addRow("Value / {}".format(unit or "-"), self.value)
+
+        lo, hi = self._scan_defaults()
+        self.start = _number(lo, unit)
+        self.end = _number(hi, unit)
+        form.addRow("Scan from / {}".format(unit or "-"), self.start)
+        form.addRow("Scan to / {}".format(unit or "-"), self.end)
+        self.steps = QSpinBox()
+        self.steps.setRange(1, 360)
+        self.steps.setValue(orca_mod.DEFAULT_SCAN_STEPS)
+        self.steps.setKeyboardTracking(False)
+        self.steps.setToolTip(
+            "ORCA counts STEPS, so N gives N + 1 geometries - the last one "
+            "is the end value and is a real point, not a repeat of the "
+            "first.")
+        form.addRow("Steps", self.steps)
+
+        self.text = QPlainTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setMinimumHeight(96)
+        self.text.setStyleSheet("font-family: Consolas, monospace;")
+        lay.addWidget(self.text)
+
+        row = FlowLayout()
+        self.copy_btn = QPushButton("Copy %geom block")
+        self.copy_btn.clicked.connect(lambda _c=False: self._copy())
+        row.addWidget(self.copy_btn)
+        self.preview_btn = QPushButton("Preview the scan")
+        self.preview_btn.setToolTip(
+            "Walk the coordinate over its range, relaxing everything else at "
+            "each point with a force field, and bake the result as frames "
+            "this window can play. It is the same SHAPE of calculation ORCA "
+            "runs and emphatically not a substitute for it - what it answers "
+            "is which atoms move and how far.")
+        self.preview_btn.clicked.connect(lambda _c=False: self._run_preview())
+        row.addWidget(self.preview_btn)
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        row.addWidget(close)
+        lay.addLayout(row)
+
+        self.status = QLabel("")
+        self.status.setStyleSheet("color: #9a9a9a;")
+        self.status.setWordWrap(True)
+        self.status.setMinimumWidth(1)
+        lay.addWidget(self.status)
+
+        for w in (self.value, self.start, self.end):
+            w.valueChanged.connect(self._sync)
+        self.steps.valueChanged.connect(self._sync)
+        self.mode.currentIndexChanged.connect(self._sync)
+        self._sync()
+
+    def _scan_defaults(self):
+        """Somewhere sensible to start, from what the coordinate IS.
+
+        A bond wants to be pulled (its own length out to about twice it); an
+        angle or a torsion wants the whole circle, because that is the scan
+        anybody runs first.
+        """
+        if self.ctype == "B":
+            return self.current, self.current + 1.5
+        if self.ctype == "D":
+            return -180.0, 180.0
+        if self.ctype == "A":
+            return max(30.0, self.current - 40.0), min(179.0,
+                                                       self.current + 40.0)
+        return 0.0, 0.0
+
+    def mode_key(self):
+        return str(self.mode.currentData())
+
+    def spec(self):
+        """The ORCA spec for what is currently chosen."""
+        mode = self.mode_key()
+        if mode == "scan":
+            return orca_mod.spec([], self.scan_item())
+        value = self.value.value() if mode == "value" else None
+        return orca_mod.spec([orca_mod.constraint(self.rows, value,
+                                                  self.ctype)])
+
+    def scan_item(self):
+        return orca_mod.scan(self.rows, self.start.value(), self.end.value(),
+                             self.steps.value(), self.ctype)
+
+    def _sync(self, *_a):
+        mode = self.mode_key()
+        scanning = mode == "scan"
+        form = self.layout().itemAt(2)
+        for w, on in ((self.value, mode == "value"),
+                      (self.start, scanning), (self.end, scanning),
+                      (self.steps, scanning)):
+            w.setEnabled(on)
+            if isinstance(form, QFormLayout):
+                form.setRowVisible(w, on)
+        self.preview_btn.setEnabled(scanning)
+        try:
+            self.text.setPlainText(orca_mod.geom_block(self.spec()))
+        except orca_mod.OrcaSpecError as exc:
+            self.text.setPlainText("# {}".format(exc))
+
+    def _copy(self):
+        text = self.text.toPlainText()
+        if not text or text.startswith("#"):
+            return
+        QApplication.clipboard().setText(text)
+        self.status.setText("Copied - paste it into an ORCA input, or into "
+                            "ORCA Workbench's geometry spec.")
+
+    def _run_preview(self):
+        """Bake the scan onto the molecule as frames.
+
+        Not a thread: measured at 3 ms per point on butane, so a 36-point
+        torsion scan is under a tenth of a second and a progress dialog would
+        be on screen for less time than it takes to read.
+        """
+        window = self.parent()
+        obj = self.obj
+        s = obj.structure
+        try:
+            item = self.scan_item()
+        except orca_mod.OrcaSpecError as exc:
+            self.status.setText(str(exc))
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            frames, info = scan_mod.scan_frames(
+                s.symbols, s.coords, s.bonds, item)
+        except Exception as exc:                 # never take the window down
+            QApplication.restoreOverrideCursor()
+            self.status.setText("The preview failed: {}".format(exc))
+            return
+        finally:
+            if QApplication.overrideCursor() is not None:
+                QApplication.restoreOverrideCursor()
+        if hasattr(window, "install_scan_preview"):
+            window.install_scan_preview(obj, frames, info)
+        self.status.setText(scan_mod.preview_note(info))
+
+
+def _number(value, unit):
+    from .pxrd_panel import NumberBox     # reads a decimal comma (round 98)
+    box = NumberBox()
+    box.setRange(-100000.0, 100000.0)
+    box.setDecimals(4)
+    box.setSingleStep(0.1 if unit == "A" else 5.0)
+    box.setValue(float(value))
+    return box

@@ -139,8 +139,22 @@ molecule.
 
 ## C. Export and rendering
 
-**C1. KEYFRAME ANIMATION in the Blender export** (roadmap 7) — fully scoped,
-not built. Every atom is already its own object, so it is per-object keyframes
+**C1. ~~KEYFRAME ANIMATION in the Blender export~~ DONE, round 106.** Every
+rendered frame is BAKED, which is the opposite of what the scoping below
+proposed and the scoping was wrong: MoloM's player uses `interpolate.
+rigid_lerp`, which splits the Kabsch rotation out and TURNS it, precisely
+because a plain lerp sends every atom along the chord and a rotating molecule
+contracts at the half-way point (round 22) - and Blender's linear
+interpolation IS that plain lerp. So source-frame keys would have made the
+render disagree with the viewport on exactly the case round 22 exists to fix.
+Connectivity is taken from the first frame and any change is reported.
+Verified by RUNNING Blender: butane's central torsion over 25 baked frames
+came back from the .blend with the methyl hydrogens sweeping 4.306 A, the
+three frozen scan atoms at 0.000, every fcurve LINEAR and 40 of 40 objects
+animated. Measured cost: 79.8 kB of script, 1.3 MB of .blend.
+The original scoping, kept because the reasoning is what matters:
+**C1-old. KEYFRAME ANIMATION in the Blender export** (roadmap 7) — fully
+scoped, not built. Every atom is already its own object, so it is per-object keyframes
 on `location`, bonds on `matrix_world`. Two decisions first: bake every frame
 vs. source frames with explicitly-set LINEAR interpolation (Blender's default
 Bezier would not match MoloM's player); and what to do when connectivity
@@ -252,7 +266,23 @@ candidate. Worth a decision before anyone spends that.
 Ctrl+S writes the geometry back over the opened file, which is what OWB's own
 instruction means. `coords_locked` was always OWB's half and already worked.
 
-**F4. The constraint traffic is ONE-WAY.** MoloM reads indices out of a
+**F4. ~~The constraint traffic is ONE-WAY.~~ DONE, round 106** -
+`core/orca.py`, the `orca_constraint` operator and a right-click entry.
+Constraints AND a relaxed surface scan, in ORCA Workbench's own spec shape
+and text, pinned byte for byte against its `geomspec` by a test that skips
+where the sibling repo is not checked out.
+**AND THE CROSS-CHECK FOUND A BUG IN OWB, not in MoloM.** `geomspec.measure`
+has an INVERTED DIHEDRAL SIGN: against RDKit's `GetDihedralDeg` - the IUPAC
+convention ORCA itself uses - MoloM agrees on 200 of 200 random geometries
+and ORCA Workbench on none. A dihedral of the wrong sign describes the
+MIRROR IMAGE and an input file carrying it would look perfectly reasonable,
+which is why that was the one measurement worth checking against another
+program. It does not affect what MoloM writes (a literal number passes
+through unchanged); it does affect OWB's own `current` and `D(i,j,k,l)`
+value EXPRESSIONS, which are resolved through the faulty measurement.
+**Not fixed here, because it is another repository's code.**
+The original wording:
+**F4-old. The constraint traffic is ONE-WAY.** MoloM reads indices out of a
 `%geom` block and cannot hand a selection back as one. "Copy selection as an
 ORCA constraint" - two atoms to a `B`, three to an `A`, four to a `D` - is a
 small, obvious next step, and MoloM already knows which kind a selection

@@ -411,6 +411,76 @@ instead of `working`. Caught by the test asserting a flat baseline, not by
 reading.
 16 tests. 2141 tests.
 
+Round 106 (2026-09-06, F4 and C1 together, on Christian's reading that they
+belong together - and the cross-check found the bug in the OTHER program):
+"I think it makes sense to do keyframe animation and geometry constraints/
+relaxed surface scans together. If I want a more visual way of showing what a
+restraint/scan in ORCA will do, I think it would be good to see it animated
+within molom. but that is still too rough of an idea."
+**F4 WAS NOT "INVENT A CONSTRAINT FORMAT" - OWB ALREADY HAS ONE.**
+`orca_workbench/core/geomspec.py` is a complete `%geom` builder covering
+constraints AND one relaxed surface scan, with a spec shape and
+geometry-derived expressions. So `core/orca.py` produces that same spec and
+that same text, and a test IMPORTS OWB's module and compares the two strings
+- round 92's arrangement. Re-implemented rather than imported because MoloM
+must not require OWB to be installed; the cross-check is what stops them
+drifting. Which coordinate a selection means is `internal.kind_for_count`'s
+answer, not a second rule: 1 atom a Cartesian freeze, 2 a bond, 3 an angle,
+4 a dihedral, 0-based as round 92 settled.
+**AND THE CROSS-CHECK EARNED ITS PLACE IMMEDIATELY: OWB'S DIHEDRAL SIGN IS
+INVERTED.** Settled by a THIRD implementation rather than by argument -
+RDKit's `GetDihedralDeg` is the IUPAC convention ORCA itself uses, and over
+200 random geometries **MoloM agrees 200 times and ORCA Workbench none**. A
+dihedral of the wrong sign describes the MIRROR IMAGE and the input file
+would look perfectly reasonable, which is exactly why that was the one
+measurement worth checking against another program at all. It does not
+affect what MoloM writes - a literal number passes through OWB unchanged -
+and it does affect OWB's own `current` / `D(i,j,k,l)` expressions. Not fixed
+here: it is another repository's code, and it is written into the docket.
+**C1'S SCOPING WAS WRONG AND THE CODE SAYS WHY.** The docket proposed
+keyframing the SOURCE frames with LINEAR interpolation. But MoloM's player
+does not interpolate linearly: `interpolate.rigid_lerp` splits the Kabsch
+rotation out and TURNS it, precisely because a plain lerp sends every atom
+along the chord and a rotating molecule visibly contracts at the half-way
+point (round 22) - and Blender's linear interpolation IS that plain lerp. So
+source-frame keys would have made the render disagree with the viewport on
+exactly the case round 22 exists to fix, which is round 37's rule broken. So
+**every rendered frame is BAKED**, and what that costs is stated rather than
+discovered: 79.8 kB of script and 1.3 MB of .blend for 25 frames of a
+14-atom molecule.
+**VERIFIED BY RUNNING BLENDER** (round 37's rule): butane's central torsion
+came back from the .blend with the methyl hydrogens sweeping **4.306 A**,
+the three frozen scan atoms at **0.000**, every fcurve LINEAR and 40 of 40
+objects animated. The first probe measured `C.0` at three frames, found it
+still, and proved nothing - it is one of the FROZEN scan atoms. "Animated"
+is not "moving", and the fix was to report which objects moved MOST.
+**THE SCAN PREVIEW IS A FEW LINES ON TOP OF WHAT EXISTED, which is the
+argument for having built it.** `internal.apply` already steps a coordinate
+and carries the trailing fragment; `forcefield.optimize` already takes atoms
+to hold still; `Structure.frames` and the scene clock already animate. So
+`core/scan.py` walks the range and relaxes the rest at each point, and the
+result is ORDINARY FRAMES - the clock plays them, the timeline gives them a
+strip, the Blender export keyframes them, and none of that had to learn what
+a scan is. Round 27's dividend again.
+**CHECKED AGAINST CHEMISTRY, not against numbers chosen here.** Butane's
+torsional profile comes out anti at 0.00, gauche **0.63** at +-65, H-eclipsed
+**3.86** at +-120 and syn **6.54** at 0, symmetric to 0.05 - which is the
+measured curve. 3 ms per point, so a 37-point scan is 0.08 s and needs no
+thread.
+**EACH POINT CONTINUES FROM THE LAST**, which is what makes it a relaxed
+SCAN rather than a row of independent optimisations, and is what ORCA does.
+The energy profile is recorded because the optimiser already returns it and
+not keeping it would be throwing away the answer while keeping the pictures.
+**AND A RING DIHEDRAL IS REFUSED, found by driving the real dialog on
+cubane.** It reported 180 degrees of drift and thirteen identical pictures:
+a blocked coordinate lets only `picks[2]` move, and for a DIHEDRAL that atom
+lies ON the j-k axis it would be turned about, so the value cannot change at
+all. A bond or an angle in the same ring is fine, because the one mover is
+off the axis in both - so it is decided by TRYING the largest step and
+seeing whether the value moved, which catches every degenerate case rather
+than the one that was thought of.
+32 tests. 2218 tests.
+
 Round 105b (2026-09-05, Christian's test pass on round 105 - two bugs, and
 the stack becomes arrangeable):
 **(1) AN AXIS VIEW IS NOT JUST A POSE, and the savefile only carried the
@@ -5930,7 +6000,7 @@ with them automatically).
 
 ## The golden architectural rule (inherited from OWB)
 **`molom/core/` is UI-free AND GL-free** — pure numpy/stdlib, unit-testable
-offline (`python -m pytest tests/ -q`, 2188 tests, no display needed).
+offline (`python -m pytest tests/ -q`, 2218 tests, no display needed).
 **`molom/ui/` is a thin shell**: `viewport.py` only uploads buffers and
 forwards events; `app.py` only wires menus to core calls. Keep it that way:
 new feature = core function + test first, then a UI hook.
@@ -7812,7 +7882,7 @@ independent cross-check inside a single fixture.
   changes are diffable from here on.
 
 ## Verification workflow
-1. `python -m pytest tests/ -q` — 2188 offline tests, 4 skipped, ~120 s.
+1. `python -m pytest tests/ -q` — 2218 offline tests, 4 skipped, ~215 s.
    `tests/conftest.py` sandboxes QSettings, so a GUI test can drive a real
    control without writing into your own MoloM configuration; it also
    **destroys the windows a test created** (round 86), without which the suite

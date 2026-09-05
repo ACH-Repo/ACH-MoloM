@@ -2753,6 +2753,14 @@ class MolViewport(QOpenGLWidget):
                     "of the molecule follows.".format(
                         internal.label_for(kind).lower(), names)))
             self._twist_entry(obj_id, rows, entries)
+        if found is not None and orca_ready(len(found[1])):
+            # F4: the same selection that names an internal coordinate names
+            # an ORCA constraint, so it belongs in the same menu rather than
+            # only behind an operator whose name you have to know.
+            entries.append((
+                "op:orca_constraint", "ORCA constraint / scan...",
+                "Freeze this coordinate, or define a relaxed surface scan "
+                "over it - and preview what the scan does"))
         if self.selection:
             entries.append(("op:hide_selected", "Hide  (H)",
                             "Hide the selected atoms; Alt+H shows them again"))
@@ -7370,3 +7378,14 @@ class MolViewport(QOpenGLWidget):
             self._apply_grab()
         elif self._rotate is not None:
             self._apply_rotate()
+
+
+def orca_ready(n_picks):
+    """Does a selection of this size name an ORCA coordinate?
+
+    Asked through `core/orca.py` rather than re-listed here, so the menu, the
+    operator's predicate and the block writer cannot disagree about what
+    picking three atoms means.
+    """
+    from ..core import orca as orca_mod
+    return orca_mod.coord_type(int(n_picks)) is not None

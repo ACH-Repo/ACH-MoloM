@@ -41,6 +41,8 @@ from ..core import templates as tpl_mod
 from ..core import vibrations as vib_mod
 from ..core import timeline as timeline_mod
 from ..core import cifsearch
+from ..core import orca as orca_mod
+from ..core import scan as scan_mod
 from ..core import molprops
 from ..core import meta as meta_mod
 from ..core.camera import quat_from_mat3, quat_to_mat3
@@ -628,6 +630,15 @@ class MainWindow(QMainWindow):
           shortcut="File menu / F3")
         r("copy_smiles", "Copy SMILES of the selected molecule to clipboard",
           lambda c: c.on_copy_smiles(), enabled=sel, category="Molecule")
+        # F4: the constraint traffic was ONE-WAY. MoloM has read indices out
+        # of a `%geom` block since round 92 and could not write one.
+        r("orca_constraint",
+          "ORCA: constrain or scan the selected coordinate...",
+          lambda c: c.on_orca_constraint(),
+          enabled=lambda c: c.orca_picks() is not None,
+          category="Molecule",
+          aliases=("geom", "constraint", "freeze", "scan", "%geom",
+                   "relaxed surface scan", "restraint"))
         r("name_from_structure", "Name molecule from its structure (PubChem)",
           lambda c: c.on_name_from_structure(), enabled=has_active,
           category="Molecule")
@@ -3116,6 +3127,33 @@ class MainWindow(QMainWindow):
             # it on the box tick would silently make them fall back to the
             # drawn bonds and come out open.
             cell_of=cell_of)
+        # C1: KEYFRAMES. Every atom is already its own Blender object, so an
+        # animation is per-object keys and needs no new geometry - and every
+        # rendered frame is BAKED rather than letting Blender interpolate
+        # between source frames, because MoloM's player turns the rigid part
+        # of a motion as a rotation and Blender's linear interpolation would
+        # take the chord instead (round 22). `seek` is the window's own
+        # playback path, so the render cannot drift from the viewport by
+        # having a second idea of what a frame is.
+        if getattr(options, "animate", False) and self.timeline.has_animation:
+            was = self.timeline.time
+            times = anim_mod.frame_times(self.timeline)
+
+            def seek(t):
+                self.timeline.seek(t)
+                self._apply_timeline()
+
+            try:
+                anim = blender_mod.collect_animation(
+                    self.scene, style, options, times, seek, cell_of=cell_of)
+            finally:
+                self.timeline.seek(was)
+                self._apply_timeline()
+            data["animation"] = {
+                "frame_start": 1, "fps": int(self.timeline.fps),
+                "atoms": anim["atoms"], "bonds": anim["bonds"]}
+            for note in anim["notes"]:
+                self.statusBar().showMessage(note, 9000)
         title = ", ".join(o.name for o in self.scene.visible_objects()
                           if o.structure.n_atoms) or "scene"
         return blender_mod.build_script(
@@ -3142,6 +3180,62 @@ class MainWindow(QMainWindow):
         one function answers both.
         """
         return meta_mod.resolved_symbols(obj.structure)
+
+    # ------------------------------------------------- ORCA constraints (F4)
+    def orca_picks(self):
+        """`(object, rows)` when the selection is one usable coordinate.
+
+        One atom is a Cartesian freeze and two, three or four are a bond, an
+        angle or a dihedral - `core/orca.py` decides that, from
+        `internal.kind_for_count`, so the constraint and the measurement
+        readout cannot disagree about what picking three atoms means.
+        """
+        found = self.viewport.internal_picks()
+        if found is None:
+            return None
+        obj_id, rows = found
+        if orca_mod.coord_type(len(rows)) is None:
+            return None
+        obj = self.scene.get(obj_id)
+        return None if obj is None else (obj, rows)
+
+    def on_orca_constraint(self):
+        picks = self.orca_picks()
+        if picks is None:
+            self.statusBar().showMessage(
+                "Select 1 atom (freeze it), or 2, 3 or 4 in ONE molecule for "
+                "a bond, angle or dihedral", 6000)
+            return
+        obj, rows = picks
+        from .dialogs import OrcaConstraintDialog
+        OrcaConstraintDialog(self, obj, rows).exec()
+
+    def install_scan_preview(self, obj, frames, info):
+        """Bake a relaxed scan onto a molecule as ordinary FRAMES.
+
+        Ordinary is the whole point: the scene clock plays them, the timeline
+        gives them a strip, the Blender export keyframes them and the image
+        export renders them - none of which had to learn what a scan is. Same
+        dividend as round 27's, where a normal mode became frames and no
+        vibration-specific code reached the player.
+
+        Connectivity is FROZEN across the frames (`bonding.FIXED_BONDS`), for
+        round 57's reason: perception is a distance rule rather than a
+        bond-breaking criterion, so a stick blinking out halfway along a
+        stretch is a distraction from the motion being looked at.
+        """
+        self.push_undo()
+        s = obj.structure
+        s.frames = [np.asarray(f, dtype=float) for f in frames]
+        s.set_frame(0)
+        s.metadata[bonding.FIXED_BONDS] = True
+        self._sync_traj_bar()
+        self.timeline.fit_range()
+        self._sync_all()
+        self.statusBar().showMessage(
+            "Scan preview on {}: {}".format(obj.name,
+                                            scan_mod.preview_note(info)),
+            12000)
 
     def on_copy_smiles(self):
         obj = self._selected_object()
